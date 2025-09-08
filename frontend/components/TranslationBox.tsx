@@ -6,6 +6,8 @@ import { useTranslationSocket } from '../utils/useTranslationSocket'
 import { useSentenceBuffer } from '../utils/useSentenceBuffer';
 import { useClauseCommit } from '../utils/useClauseCommit';
 import { d, g, pv } from '../utils/debug';
+import { useDeepgramProducer } from "../lib/useDeepgramProducer";
+import { useSpeak } from "../lib/useSpeak";
 
 const availableLanguages = [
   { code: 'ko', name: 'Korean' },
@@ -29,6 +31,12 @@ export default function TranslationBox() {
   const [volume, setVolume] = useState(1)
   const [pauseListening, setPauseListening] = useState(false)
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
+  // targetLang can be whatever you use; "en" shown as example
+  const { start: dgStart, stop: dgStop, status, partial, lastCommit, errorMsg } =
+    useDeepgramProducer();
+
+  // const isListening = status === "streaming";   // derive listening state from Deepgram
+  const { speak } = useSpeak(targetLang);
 
   // Refs
   const synthRef = useRef<any>(null)
@@ -64,6 +72,7 @@ export default function TranslationBox() {
     if (!recognitionRef.current || recActiveRef.current) return;
     try { recognitionRef.current.start(); } catch { }
   };
+
 
   const clauseHandlers = useMemo(() => ({
     onPartial: (t: string) => {
@@ -135,30 +144,53 @@ export default function TranslationBox() {
     try { recognitionRef.current?.stop(); } catch { }
   };
 
-  // ✅ When server broadcasts a new translation (Prepared/Live), update UI + TTS
-  useEffect(() => {
-    const incoming = (last?.text || '').trim()
-    if (!incoming) return
-
-    setTranslated(incoming)
-
-    if (!isMuted && incoming !== 'Translation failed') {
-      enqueueTranslation(incoming)
-    }
-  }, [last.text]) // runs when server broadcast (or direct reply) changes
-
+  // ✅ Throttled sender to WS (avoid spamming)
   // ✅ Throttled sender to WS (avoid spamming)
   const sendSentence = useCallback((sentence: string) => {
-    const s = sentence.trim()
-    if (!s) return
-    if (s === lastSentRef.current) return
-    lastSentRef.current = s
-    // Let backend choose Prepared vs Live and broadcast back
-    sendProducerText(s, sourceLang, targetLang)
-  }, [sendProducerText, sourceLang, targetLang])
+    const s = sentence.trim();
+    if (!s) return;
+    if (s === lastSentRef.current) return;
+    lastSentRef.current = s;
+
+    // Normalize to base language codes like your other handlers:
+    const src = (sourceLang || 'ko').split('-')[0];
+    const tgt = (targetLang || 'en').split('-')[0];
+
+    // text, src, tgt, isPartial, id?, rev?, final?
+    sendProducerText(s, src, tgt, false, undefined, undefined, true);
+  }, [sendProducerText, sourceLang, targetLang]);
+
+  useEffect(() => {
+    if (partial && partial !== text) setText(partial);
+  }, [partial]);
+
+  useEffect(() => {
+    const src = (last?.srcText || "").trim();
+    if (src && src !== text) {
+      setText(src);
+    }
+  }, [last?.seq]); // runs on each finalized commit
+
+
+  useEffect(() => {
+    setIsListening(status === "streaming");
+  }, [status]);
+
+
+
+  useEffect(() => {
+    const incoming = (last?.text || '').trim();
+    if (!incoming) return;
+    setTranslated(incoming);
+    if (!isMuted && incoming !== 'Translation failed') {
+      enqueueTranslation(incoming);
+    }
+  }, [last?.seq, isMuted]); // 👈 use seq instead of text
+
+  useEffect(() => { setIsListening(status === "streaming"); }, [status]);
 
   const throttledSendSentence = useRef(throttle(sendSentence, 800)).current
-
+  const buffer = useSentenceBuffer(throttledSendSentence);
 
   // 🧠 Speech Synthesis init
   useEffect(() => {
@@ -180,98 +212,98 @@ export default function TranslationBox() {
   }, [])
 
   // ====== Your robust recognition effect ======
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    if (!('webkitSpeechRecognition' in window)) return
+  // useEffect(() => {
+  //   if (typeof window === 'undefined') return
+  //   if (!('webkitSpeechRecognition' in window)) return
 
-    const recognition = new (window as any).webkitSpeechRecognition()
-    recognition.lang = mapToLocale(sourceLang)
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.maxAlternatives = 1
+  //   const recognition = new (window as any).webkitSpeechRecognition()
+  //   recognition.lang = mapToLocale(sourceLang)
+  //   recognition.continuous = true
+  //   recognition.interimResults = true
+  //   recognition.maxAlternatives = 1
 
-    recognition.onstart = () => {
-      finalizedIdxRef.current = 0
-      resetClause()
-      d('asr', 'start lang=' + mapToLocale(sourceLang))
-      recActiveRef.current = true
-      wantListeningRef.current = true
-      setIsListening(true)
-      resetIdleTimer()
-    }
+  //   recognition.onstart = () => {
+  //     finalizedIdxRef.current = 0
+  //     resetClause()
+  //     d('asr', 'start lang=' + mapToLocale(sourceLang))
+  //     recActiveRef.current = true
+  //     wantListeningRef.current = true
+  //     setIsListening(true)
+  //     resetIdleTimer()
+  //   }
 
-    recognition.onend = () => {
-      d('asr', 'end (willRestart=' + (wantListeningRef.current && !pauseListening) + ')')
-      recActiveRef.current = false
-      if (wantListeningRef.current && !pauseListening) {
-        setIsListening(true)
-        scheduleRestart(250)
-      } else {
-        setIsListening(false)
-      }
-    }
+  //   recognition.onend = () => {
+  //     d('asr', 'end (willRestart=' + (wantListeningRef.current && !pauseListening) + ')')
+  //     recActiveRef.current = false
+  //     if (wantListeningRef.current && !pauseListening) {
+  //       setIsListening(true)
+  //       scheduleRestart(250)
+  //     } else {
+  //       setIsListening(false)
+  //     }
+  //   }
 
-    recognition.onerror = (e: any) => {
-      const err = e?.error
-      if (err === 'no-speech' || err === 'audio-capture' || err === 'network' || err === 'aborted') {
-        recActiveRef.current = false
-        if (wantListeningRef.current && !pauseListening) {
-          setIsListening(true)
-          scheduleRestart(400)
-        }
-        return
-      }
-      console.warn('SpeechRecognition error:', err || e)
-    }
+  //   recognition.onerror = (e: any) => {
+  //     const err = e?.error
+  //     if (err === 'no-speech' || err === 'audio-capture' || err === 'network' || err === 'aborted') {
+  //       recActiveRef.current = false
+  //       if (wantListeningRef.current && !pauseListening) {
+  //         setIsListening(true)
+  //         scheduleRestart(400)
+  //       }
+  //       return
+  //     }
+  //     console.warn('SpeechRecognition error:', err || e)
+  //   }
 
-    recognition.onresult = (event: any) => {
-      // guard: Chrome can rebase results
-      if (finalizedIdxRef.current > event.results.length) finalizedIdxRef.current = 0
+  //   recognition.onresult = (event: any) => {
+  //     // guard: Chrome can rebase results
+  //     if (finalizedIdxRef.current > event.results.length) finalizedIdxRef.current = 0
 
-      let interim = ''
-      let finals = 0
+  //     let interim = ''
+  //     let finals = 0
 
-      for (let i = finalizedIdxRef.current; i < event.results.length; i++) {
-        const r = event.results[i]
-        const t = r[0]?.transcript ?? ''
-        if (!t) continue
-        if (r.isFinal) {
-          finals++
-          g('final', 'text', t)
-          feedFinal(t)
-          finalizedIdxRef.current = i + 1
-        } else {
-          interim += t
-        }
-      }
+  //     for (let i = finalizedIdxRef.current; i < event.results.length; i++) {
+  //       const r = event.results[i]
+  //       const t = r[0]?.transcript ?? ''
+  //       if (!t) continue
+  //       if (r.isFinal) {
+  //         finals++
+  //         g('final', 'text', t)
+  //         feedFinal(t)
+  //         finalizedIdxRef.current = i + 1
+  //       } else {
+  //         interim += t
+  //       }
+  //     }
 
-      const trimmed = interim.trim()
-      if (trimmed) {
-        d('interim', `len=${trimmed.length} finals=${finals} text="${pv(trimmed)}"`)
-        resetIdleTimer()
-        feedInterim(trimmed)
-        setText(trimmed)
-      } else if (finals) {
-        d('interim', `none finals=${finals}`)
-      }
-    }
+  //     const trimmed = interim.trim()
+  //     if (trimmed) {
+  //       d('interim', `len=${trimmed.length} finals=${finals} text="${pv(trimmed)}"`)
+  //       resetIdleTimer()
+  //       feedInterim(trimmed)
+  //       setText(trimmed)
+  //     } else if (finals) {
+  //       d('interim', `none finals=${finals}`)
+  //     }
+  //   }
 
-    recognitionRef.current = recognition
-    if (isListening && !recActiveRef.current) {
-      try { recognition.start() } catch { }
-    }
+  //   recognitionRef.current = recognition
+  //   if (isListening && !recActiveRef.current) {
+  //     try { recognition.start() } catch { }
+  //   }
 
-    return () => {
-      try { recognition.stop() } catch { }
-      recActiveRef.current = false
-      wantListeningRef.current = false
-      if (restartTimerRef.current) clearTimeout(restartTimerRef.current)
-      if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
-      finalizedIdxRef.current = 0
-      resetClause()
-    }
-    // ✅ deps are stable now (handlers/config are memoized)
-  }, [sourceLang, pauseListening, isListening, feedInterim, feedFinal, resetClause])
+  //   return () => {
+  //     try { recognition.stop() } catch { }
+  //     recActiveRef.current = false
+  //     wantListeningRef.current = false
+  //     if (restartTimerRef.current) clearTimeout(restartTimerRef.current)
+  //     if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
+  //     finalizedIdxRef.current = 0
+  //     resetClause()
+  //   }
+  //   // ✅ deps are stable now (handlers/config are memoized)
+  // }, [sourceLang, pauseListening, isListening, feedInterim, feedFinal, resetClause])
 
 
   // ✅ Enqueue translation for TTS playback
@@ -306,29 +338,21 @@ export default function TranslationBox() {
     utter.volume = volume;
 
     const voices = synthRef.current.getVoices();
-    const sel = voices.find((v: SpeechSynthesisVoice) => v.name === selectedVoiceName) || voices[0];
+    const sel =
+      voices.find((v: SpeechSynthesisVoice) => v.name === selectedVoiceName) ||
+      voices[0];
     utter.voice = sel;
 
     isSpeakingRef.current = true;
 
-    // 🔇 Pause mic during TTS, but keep UI button on Stop
-    if (recognitionRef.current && isListening) {
-      stopRecognition(true);       // helper sets wantListeningRef=false and stops cleanly
-      setIsListening(true);    // keep button showing Stop during TTS
-    }
+    // ❌ REMOVE THIS:  (it was causing dropped clauses)
+    // if (status === "streaming") { dgStop(); }
 
     utter.onend = () => {
       isSpeakingRef.current = false;
+      // ❌ REMOVE THIS too:
+      // if (!pauseListening) { dgStart().catch(() => {}); }
 
-      // ▶️ Resume mic after TTS if user still wants to listen
-      if (!pauseListening) {
-        wantListeningRef.current = true; // user intent to keep listening
-        scheduleRestart(300);            // gentle restart delay
-        setIsListening(true);            // keep button on Stop
-        resetIdleTimer();                // reset silence window
-      }
-
-      // Continue queued items
       if (ttsQueueRef.current.length > 0) {
         setTimeout(() => playNextInQueue(), 300);
       }
@@ -336,14 +360,6 @@ export default function TranslationBox() {
 
     utter.onerror = () => {
       isSpeakingRef.current = false;
-
-      if (!pauseListening) {
-        wantListeningRef.current = true;
-        scheduleRestart(300);
-        setIsListening(true);
-        resetIdleTimer();
-      }
-
       if (ttsQueueRef.current.length > 0) {
         setTimeout(() => playNextInQueue(), 300);
       }
@@ -354,26 +370,19 @@ export default function TranslationBox() {
 
 
   // ====== When you press Start/Stop, use these ======
-  const handleStartListening = () => {
-    if (!recognitionRef.current) {
-      alert('Speech recognition is not supported in this browser.');
-      return;
-    }
-    lastInterimRef.current = '';      // reset baseline each session
+  const handleStartListening = async () => {
+    lastInterimRef.current = '';
     setText('');
     setTranslated('');
     ttsQueueRef.current = [];
     synthRef.current?.cancel();
     isSpeakingRef.current = false;
 
-    wantListeningRef.current = true;
-    setIsListening(true);             // button → Stop
-    try { recognitionRef.current.start(); } catch { }
+    try { await dgStart(); } catch (e: any) { alert(`Mic start failed: ${e?.message || e}`); }
   };
 
   const handleStopListening = () => {
-    stopRecognition(false);           // hard stop (clear intent)
-    setIsListening(false);            // button → Start
+    dgStop();
   };
 
   // 🧽 Clear
@@ -517,6 +526,12 @@ export default function TranslationBox() {
           />
         </div>
       </div>
+      <div className="text-sm text-gray-500 mb-1">Partial (Deepgram):</div>
+      <div className="min-h-6 text-gray-700 mb-3">{partial || "…"}</div>
+      <div className="text-sm text-gray-600 mb-2">
+        Deepgram: <b>{status}</b>{errorMsg ? ` · ${errorMsg}` : ""}
+      </div>
+
 
       {/* Voice selection */}
       <div className="mt-6">

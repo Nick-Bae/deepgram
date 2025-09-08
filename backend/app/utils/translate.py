@@ -1,44 +1,56 @@
+# backend/app/utils/translate.py
 import os
-from openai import OpenAI
 from dotenv import load_dotenv
 
-# ✅ Load environment variables from .env
+# OpenAI >= 1.0
+from openai import AsyncOpenAI
+
 load_dotenv()
 
-# ✅ Set OpenAI API key and model from .env
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-model = os.getenv("OPENAI_MODEL", "gpt-4o")
+_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # fast & good; use gpt-4o if you want
+_API_KEY = os.getenv("OPENAI_API_KEY")
 
-def translate_text(text: str, source: str, target: str) -> str:
-    """
-    Translates text from `source` language to `target` language using OpenAI API.
-    Args:
-        text (str): Text to be translated
-        source (str): Source language (e.g., 'ko')
-        target (str): Target language (e.g., 'en')
-    Returns:
-        str: Translated text or error message
-    """
-    if not text.strip():
-        return "No text provided for translation."
+_client: AsyncOpenAI | None = None
 
-    system_prompt = (
-        f"You are a theological translator. "
-        f"Translate from {source} to {target}, ensuring spiritual and theological accuracy. "
-        f"Do not summarize. Provide only the translated text without additional information."
+def _get_client() -> AsyncOpenAI:
+    global _client
+    if _client is None:
+        if not _API_KEY:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        _client = AsyncOpenAI(api_key=_API_KEY)
+    return _client
+
+async def translate_text(text: str, source: str, target: str) -> str:
+    """
+    Async translator. Returns ONLY the translated text (no quotes/explanations).
+    On any API error, it fails open by returning the original text.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    client = _get_client()
+
+    system = (
+        f"You are a professional simultaneous interpreter. "
+        f"Translate faithfully from {source} to {target}. "
+        f"Do not explain, do not add quotes, do not add brackets—"
+        f"output ONLY the translation text."
     )
 
     try:
-        response = client.chat.completions.create(
-            model=model,
+        resp = await client.chat.completions.create(
+            model=_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ]
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.2,
         )
-
-        translated = response.choices[0].message.content.strip()
-        return translated
+        out = (resp.choices[0].message.content or "").strip()
+        # strip any accidental quotes
+        return out.strip('"\u201c\u201d')
     except Exception as e:
-        print(f"❌ Error with OpenAI translation: {e}")
-        return "Translation failed due to an API error."
+        # Log and fail open (so the pipeline keeps moving)
+        print(f"[TX] OpenAI error: {e}")
+        return text

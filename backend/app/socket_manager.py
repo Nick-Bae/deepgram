@@ -1,36 +1,29 @@
-# app/socket_manager.py
-
+# backend/app/socket_manager.py
+from typing import Set
 from fastapi import WebSocket
-from starlette.websockets import WebSocketDisconnect  # ✅ Import the missing exception
-from typing import List
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active: Set[WebSocket] = set()
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.add(ws)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, ws: WebSocket):
+        try:
+            self.active.remove(ws)
+        except KeyError:
+            pass
 
-    async def broadcast(self, message: dict):
-        disconnected = []
-        for connection in self.active_connections:
+    async def broadcast(self, message):
+        dead = []
+        for ws in list(self.active):
             try:
-                await connection.send_json(message)
-            except WebSocketDisconnect:
-                print("❌ Skipping disconnected client.")
-                disconnected.append(connection)
-            except Exception as e:
-                print("⚠️ WebSocket error:", str(e))
-                disconnected.append(connection)
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
 
-        # Clean up dead sockets
-        for conn in disconnected:
-            self.disconnect(conn)
-
-# Export a singleton instance to reuse anywhere
 manager = ConnectionManager()

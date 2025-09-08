@@ -7,12 +7,13 @@ import { d } from './debug';
 
 type Meta = {
   translated?: string;
-  mode?: 'pre' | 'realtime';
+  mode?: 'pre' | 'realtime' | 'live';
   match_score?: number;
   matched_source?: string | null;
   partial?: boolean;
   segment_id?: string | number;
   rev?: number;
+  seq?: number;
 };
 
 type ServerBroadcast = {
@@ -31,15 +32,26 @@ type ServerReply = {
   method?: string;
 };
 
+type ServerLive = {
+  mode: 'live' | 'pre' | 'realtime';
+  text: string;
+  seq?: number;
+  src?: { text?: string; lang?: string };
+  tgt?: { lang?: string };
+};
+
 export type LastState = {
-  text: string;          // last committed translated text
+  text: string;
   lang: string;
   mode: 'pre' | 'realtime';
   matchScore: number;
   matchedSource: string | null;
-  preview?: string;      // latest preview/partial
+  preview?: string;
   segmentId?: string | number;
   rev?: number;
+  seq: number;               // <- make non-optional for simpler logic
+  srcText?: string;
+  srcLang?: string;
 };
 
 export function useTranslationSocket({ isProducer = false }: { isProducer?: boolean } = {}) {
@@ -51,24 +63,29 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     mode: 'realtime',
     matchScore: 0,
     matchedSource: null,
+    seq: 0,                  // <- start at 0
   });
 
-  // simple reconnect-with-backoff
   const retryRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
 
+  const seqRef = useRef(0);
+  const nextSeq = () => ++seqRef.current;
+
   useEffect(() => {
     aliveRef.current = true;
 
+    // sanity: catch bad WS_URLs (double paths, missing scheme, etc.)
+    if (!/^wss?:\/\/.+/.test(WS_URL)) {
+      console.warn('[ws] Suspicious WS_URL:', WS_URL);
+    }
+
     const connect = () => {
       if (!aliveRef.current) return;
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
+      if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
 
-      try { wsRef.current?.close(); } catch { }
+      try { wsRef.current?.close(); } catch {}
       const ws = new WebSocket(WS_URL);
       wsRef.current = ws;
 
@@ -79,9 +96,10 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         d('ws', 'open');
         setConnected(true);
         retryRef.current = 0;
+        // reset local seq on a fresh connection so effects re-run on first message
+        seqRef.current = 0;
         if (!isProducer) {
-          // optional: let server know this is a consumer
-          try { ws.send(JSON.stringify({ type: 'consumer_join' })); } catch { }
+          try { ws.send(JSON.stringify({ type: 'consumer_join' })); } catch {}
         }
       };
 
@@ -99,56 +117,86 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
       };
 
       ws.onmessage = (evt: MessageEvent) => {
-        try {
-          const raw = JSON.parse(evt.data as string);
+        // helpful one-line peek at traffic shape:
+        // d('ws<-', (evt.data as string).slice(0, 200));
+        let raw: any;
+        try { raw = JSON.parse(evt.data as string); } catch { return; }
+        if (!raw || typeof raw !== 'object') return;
 
-          // { type: "translation", payload, lang, meta? }
-          if (raw && typeof raw === 'object' && raw.type === 'translation') {
-            const b = raw as ServerBroadcast;
-            const meta = b.meta ?? {};
-            const isPartial = !!meta.partial;
-            const segId = meta.segment_id;
-            const rev = typeof meta.rev === 'number' ? meta.rev : 0;
+        // Shape 3: { mode: 'live'|'pre'|'realtime', text, seq?, src?, tgt? }
+        if (typeof raw.text === 'string' && raw.mode) {
+          const mode = (raw.mode === 'live' ? 'realtime' : raw.mode) as 'pre' | 'realtime';
+          const seq = typeof raw.seq === 'number' ? raw.seq : nextSeq();
+          const srcText = typeof raw?.src?.text === 'string' ? raw.src.text : undefined;
+          const srcLang = typeof raw?.src?.lang === 'string' ? raw.src.lang : undefined;
 
-            if (isPartial) {
-              setLast((prev) => ({
-                ...prev,
-                preview: b.payload ?? meta.translated ?? '',
-                segmentId: segId,
-                rev,
-              }));
-            } else {
-              setLast({
-                text: b.payload ?? meta.translated ?? '',
-                lang: b.lang ?? 'en',
-                mode: (meta.mode as 'pre' | 'realtime') ?? 'realtime',
-                matchScore: typeof meta.match_score === 'number' ? meta.match_score : 0,
-                matchedSource: (meta.matched_source as string) ?? null,
-                preview: undefined,
-                segmentId: segId,
-                rev,
-              });
-            }
-            return;
-          }
-
-          // { translated, mode, ... }
-          if (raw && typeof raw === 'object' && 'translated' in raw) {
-            const r = raw as ServerReply;
-            setLast({
-              text: r.translated,
-              lang: 'en',
-              mode: r.mode,
-              matchScore: r.match_score,
-              matchedSource: r.matched_source ?? null,
-            });
-            return;
-          }
-
-          // ignore everything else
-        } catch {
-          // ignore parse errors
+          setLast({
+            text: raw.text,
+            lang: (raw.tgt?.lang as string) || 'en',
+            mode,
+            matchScore: 0,
+            matchedSource: null,
+            preview: undefined,
+            segmentId: seq,
+            rev: 0,
+            seq,
+            srcText,
+            srcLang,
+          });
+          return;
         }
+
+        // Shape 1: { type: 'translation', payload, lang, meta }
+        if (raw.type === 'translation') {
+          const b = raw as ServerBroadcast;
+          const meta = b.meta ?? {};
+          const isPartial = !!meta.partial;
+          const segId = meta.segment_id;
+          const rev = typeof meta.rev === 'number' ? meta.rev : 0;
+          const seq = typeof meta.seq === 'number' ? meta.seq : nextSeq();
+
+          if (isPartial) {
+            setLast((prev) => ({
+              ...prev,
+              preview: b.payload ?? meta.translated ?? '',
+              segmentId: segId,
+              rev,
+              seq,     // track latest seq even on partials (safe)
+            }));
+          } else {
+            setLast({
+              text: b.payload ?? meta.translated ?? '',
+              lang: b.lang ?? 'en',
+              mode: (meta.mode === 'live' ? 'realtime' : (meta.mode as 'pre' | 'realtime')) ?? 'realtime',
+              matchScore: typeof meta.match_score === 'number' ? meta.match_score : 0,
+              matchedSource: (meta.matched_source as string) ?? null,
+              preview: undefined,
+              segmentId: segId,
+              rev,
+              seq,
+            });
+          }
+          return;
+        }
+
+        // Shape 2: { translated, mode, ... }
+        if ('translated' in raw) {
+          const r = raw as ServerReply;
+          setLast({
+            text: r.translated,
+            lang: 'en',
+            mode: r.mode,
+            matchScore: r.match_score,
+            matchedSource: r.matched_source ?? null,
+            preview: undefined,
+            segmentId: undefined,
+            rev: 0,
+            seq: nextSeq(),
+          });
+          return;
+        }
+
+        // ignore everything else
       };
     };
 
@@ -157,11 +205,11 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     return () => {
       aliveRef.current = false;
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-      try { wsRef.current?.close(); } catch { }
+      try { wsRef.current?.close(); } catch {}
     };
   }, [isProducer]);
 
-  // 👇 Producer send helper
+  // Producer → server
   const sendProducerText = useCallback(
     (text: string, source: string, target: string, isPartial: boolean, id?: number, rev?: number, finalFlag?: boolean) => {
       const ws = wsRef.current;
@@ -171,12 +219,11 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         ? { type: 'producer_partial', text, source, target }
         : { type: 'producer_commit', text, source, target, id, rev, final: !!finalFlag };
 
-      try { d('ws->', JSON.stringify(payload)); } catch { }
+      try { d('ws->', JSON.stringify(payload)); } catch {}
       ws.send(JSON.stringify(payload));
     },
     []
   );
 
-  // ✅ Always return the same shape
   return { connected, last, sendProducerText };
 }
