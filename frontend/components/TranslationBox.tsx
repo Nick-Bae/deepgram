@@ -1,13 +1,17 @@
 'use client'
 
-import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
+import { useMemo, useState, useEffect, useRef } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
-import { useSentenceBuffer } from '../utils/useSentenceBuffer';
-import { useClauseCommit } from '../utils/useClauseCommit';
-import { d, g, pv } from '../utils/debug';
-import { useDeepgramProducer } from "../lib/useDeepgramProducer";
-import { useSpeak } from "../lib/useSpeak";
+import { API_URL } from '../utils/urls'
+import { useDeepgramProducer } from '../lib/useDeepgramProducer'
+
+const DEBUG = process.env.NEXT_PUBLIC_DEBUG === '1';
+
+function clip(s: string, n = 120) {
+  const t = (s || '').trim();
+  return t.length > n ? t.slice(0, n) + '…' : t;
+}
 
 const availableLanguages = [
   { code: 'ko', name: 'Korean' },
@@ -17,447 +21,432 @@ const availableLanguages = [
 ]
 
 export default function TranslationBox() {
-  // 🔌 WebSocket (producer mode)
-  const { connected, last, sendProducerText } = useTranslationSocket({ isProducer: true })
+  const { connected, last, sendProducerText } = useTranslationSocket({ isProducer: true });
 
-  // UI states
+  // UI state
   const [text, setText] = useState('')
   const [translated, setTranslated] = useState('')
   const [isListening, setIsListening] = useState(false)
-  const [loading, setLoading] = useState(false)
   const [sourceLang, setSourceLang] = useState('ko')
   const [targetLang, setTargetLang] = useState('en')
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
-  const [pauseListening, setPauseListening] = useState(false)
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
-  // targetLang can be whatever you use; "en" shown as example
-  const { start: dgStart, stop: dgStop, status, partial, lastCommit, errorMsg } =
-    useDeepgramProducer();
 
-  // const isListening = status === "streaming";   // derive listening state from Deepgram
-  const { speak } = useSpeak(targetLang);
+  // Deepgram mic producer
+  const { start: dgStart, stop: dgStop, status, partial, errorMsg } =
+    useDeepgramProducer ? useDeepgramProducer() : { start: async () => { }, stop: () => { }, status: 'idle', partial: '', errorMsg: '' }
 
-  // Refs
-  const synthRef = useRef<any>(null)
-  const recognitionRef = useRef<any>(null)
+  // TTS refs
+  const synthRef = useRef<SpeechSynthesis | null>(null)
   const ttsQueueRef = useRef<string[]>([])
-  const isSpeakingRef = useRef<boolean>(false)
-  const lastSentRef = useRef<string>('') // prevent duplicates to WS
-  const wantListeningRef = useRef(false);
-  const recActiveRef = useRef(false);
-  const restartTimerRef = useRef<number | null>(null);
-  const idleTimerRef = useRef<number | null>(null);
-  const lastInterimRef = useRef('');
-  const segmentCounterRef = useRef(0);
-  const currentSegmentRef = useRef<number | null>(null);
-  const revRef = useRef(0);
-  const finalizedIdxRef = useRef(0);
+  const speakingRef = useRef(false)
+  const lastHandledSeqRef = useRef(0)       // gate: handle each seq once (final or soft-final)
+  const currentSpokenRef = useRef('')
 
-  const mapToLocale = (code: string) => {
-    switch (code) {
-      case 'ko': return 'ko-KR';
-      case 'en': return 'en-US';
-      case 'zh-CN': return 'zh-CN';
-      case 'es': return 'es-ES';
-      default: return code; // fall back if already a locale
-    }
-  };
-  const MIN_DELTA_CHARS = 2;          // ignore tiny deltas like “은”, “요”
-  const NEW_UTTERANCE_DROP = 0.6;     // treat big shrink as a new utterance
-  const IDLE_MS = 12000; // silence window before auto-stop (tweak as you like)
+  // Clause buffer + timing
+  const clauseRef = useRef('')
+  const lingerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastInterimRef = useRef('')
 
-  const startRecognition = () => {
-    wantListeningRef.current = true;
-    if (!recognitionRef.current || recActiveRef.current) return;
-    try { recognitionRef.current.start(); } catch { }
-  };
+  const LINGER_MS = 1000
+  const MIN_FINAL_CHARS = 28
+  const introHoldRe = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
+  const eosRe = /[.!?。！？]$|(?:습니다|입니다|할까요|했어요|했지요|했네요)$/
 
+  const CLIENT_DRIVEN = false
+  const MIN_PREVIEW_CHARS = 10
+  const lastPreviewSentRef = useRef('')
 
-  const clauseHandlers = useMemo(() => ({
-    onPartial: (t: string) => {
-      const src = (sourceLang || 'ko').split('-')[0];
-      const tgt = (targetLang || 'en').split('-')[0];
-      d('send', `partial → ${src}->${tgt} "${pv(t)}"`);
-      sendProducerText(t, src, tgt, true); // partial
-    },
-    onCommit: ({ id, rev, text, final }: { id: number; rev: number; text: string; final: boolean }) => {
-      const src = (sourceLang || 'ko').split('-')[0];
-      const tgt = (targetLang || 'en').split('-')[0];
-      d('send', `commit  → ${src}->${tgt} id=${id} rev=${rev} final=${final} "${pv(text)}"`);
-      // 👇 pass final here
-      sendProducerText(text, src, tgt, false, id, rev, final);
-    }
-  }), [sendProducerText, sourceLang, targetLang]);
+  // Track stability of non-final WS lines per seq (for soft-final fallback)
+  const softMapRef = useRef<Map<number, { text: string; count: number; first: number; last: number }>>(new Map())
 
-
-  // ✅ stable config object
-  const clauseCfg = useMemo(() => ({
-    forceAfterMs: 1400,
-    connectiveForceAfterMs: 2300,
-    vadSilenceMs: 420,
-    minChunkChars: 6,        // was 12
-    minFirstCommitChars: 8,  // was 16
-    commitConnectives: true,
-    connectiveCommitAfterMs: 900,
-    minConnectiveChars: 6,
-  }), [])
-
-  const { feedInterim, feedFinal, tick, reset: resetClause } =
-    useClauseCommit(clauseHandlers, clauseCfg)
-
-
-  // drive time-based commits ~10Hz
-  useEffect(() => {
-    const id = setInterval(() => tick(), 100)
-    return () => clearInterval(id)
-  }, [tick])
-
-  const scheduleRestart = (delayMs = 300) => {
-    if (restartTimerRef.current) {
-      clearTimeout(restartTimerRef.current);
-      restartTimerRef.current = null;
-    }
-    restartTimerRef.current = window.setTimeout(() => {
-      if (wantListeningRef.current && !recActiveRef.current && recognitionRef.current) {
-        try { recognitionRef.current.start(); } catch { }
-      }
-    }, delayMs);
-  };
-
-  const resetIdleTimer = () => {
-    if (idleTimerRef.current) {
-      clearTimeout(idleTimerRef.current);
-      idleTimerRef.current = null;
-    }
-    idleTimerRef.current = window.setTimeout(() => {
-      // Auto-stop after silence
-      wantListeningRef.current = false;
-      try { recognitionRef.current?.stop(); } catch { }
-      setIsListening(false); // flip button to Start
-    }, IDLE_MS);
-  };
-
-  // Soft stop that preserves "intent" when keepIntent=true (use for TTS pause)
-  const stopRecognition = (keepIntent = false) => {
-    if (!keepIntent) wantListeningRef.current = false;
-    try { recognitionRef.current?.stop(); } catch { }
-  };
-
-  // ✅ Throttled sender to WS (avoid spamming)
-  // ✅ Throttled sender to WS (avoid spamming)
-  const sendSentence = useCallback((sentence: string) => {
-    const s = sentence.trim();
-    if (!s) return;
-    if (s === lastSentRef.current) return;
-    lastSentRef.current = s;
-
-    // Normalize to base language codes like your other handlers:
-    const src = (sourceLang || 'ko').split('-')[0];
-    const tgt = (targetLang || 'en').split('-')[0];
-
-    // text, src, tgt, isPartial, id?, rev?, final?
-    sendProducerText(s, src, tgt, false, undefined, undefined, true);
-  }, [sendProducerText, sourceLang, targetLang]);
-
-  useEffect(() => {
-    if (partial && partial !== text) setText(partial);
-  }, [partial]);
-
-  useEffect(() => {
-    const src = (last?.srcText || "").trim();
-    if (src && src !== text) {
-      setText(src);
-    }
-  }, [last?.seq]); // runs on each finalized commit
-
-
-  useEffect(() => {
-    setIsListening(status === "streaming");
-  }, [status]);
-
-
-
-  useEffect(() => {
-    const incoming = (last?.text || '').trim();
-    if (!incoming) return;
-    setTranslated(incoming);
-    if (!isMuted && incoming !== 'Translation failed') {
-      enqueueTranslation(incoming);
-    }
-  }, [last?.seq, isMuted]); // 👈 use seq instead of text
-
-  useEffect(() => { setIsListening(status === "streaming"); }, [status]);
-
-  const throttledSendSentence = useRef(throttle(sendSentence, 800)).current
-  const buffer = useSentenceBuffer(throttledSendSentence);
-
-  // 🧠 Speech Synthesis init
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    synthRef.current = window.speechSynthesis
-
-    const loadVoices = () => {
-      const voices = synthRef.current.getVoices()
-      if (voices?.length) {
-        setSelectedVoiceName(voices[0].name)
-      } else {
-        window.speechSynthesis.onvoiceschanged = () => {
-          const updated = synthRef.current.getVoices()
-          setSelectedVoiceName(updated[0]?.name || '')
-        }
-      }
-    }
-    loadVoices()
-  }, [])
-
-  // ====== Your robust recognition effect ======
-  // useEffect(() => {
-  //   if (typeof window === 'undefined') return
-  //   if (!('webkitSpeechRecognition' in window)) return
-
-  //   const recognition = new (window as any).webkitSpeechRecognition()
-  //   recognition.lang = mapToLocale(sourceLang)
-  //   recognition.continuous = true
-  //   recognition.interimResults = true
-  //   recognition.maxAlternatives = 1
-
-  //   recognition.onstart = () => {
-  //     finalizedIdxRef.current = 0
-  //     resetClause()
-  //     d('asr', 'start lang=' + mapToLocale(sourceLang))
-  //     recActiveRef.current = true
-  //     wantListeningRef.current = true
-  //     setIsListening(true)
-  //     resetIdleTimer()
-  //   }
-
-  //   recognition.onend = () => {
-  //     d('asr', 'end (willRestart=' + (wantListeningRef.current && !pauseListening) + ')')
-  //     recActiveRef.current = false
-  //     if (wantListeningRef.current && !pauseListening) {
-  //       setIsListening(true)
-  //       scheduleRestart(250)
-  //     } else {
-  //       setIsListening(false)
-  //     }
-  //   }
-
-  //   recognition.onerror = (e: any) => {
-  //     const err = e?.error
-  //     if (err === 'no-speech' || err === 'audio-capture' || err === 'network' || err === 'aborted') {
-  //       recActiveRef.current = false
-  //       if (wantListeningRef.current && !pauseListening) {
-  //         setIsListening(true)
-  //         scheduleRestart(400)
-  //       }
-  //       return
-  //     }
-  //     console.warn('SpeechRecognition error:', err || e)
-  //   }
-
-  //   recognition.onresult = (event: any) => {
-  //     // guard: Chrome can rebase results
-  //     if (finalizedIdxRef.current > event.results.length) finalizedIdxRef.current = 0
-
-  //     let interim = ''
-  //     let finals = 0
-
-  //     for (let i = finalizedIdxRef.current; i < event.results.length; i++) {
-  //       const r = event.results[i]
-  //       const t = r[0]?.transcript ?? ''
-  //       if (!t) continue
-  //       if (r.isFinal) {
-  //         finals++
-  //         g('final', 'text', t)
-  //         feedFinal(t)
-  //         finalizedIdxRef.current = i + 1
-  //       } else {
-  //         interim += t
-  //       }
-  //     }
-
-  //     const trimmed = interim.trim()
-  //     if (trimmed) {
-  //       d('interim', `len=${trimmed.length} finals=${finals} text="${pv(trimmed)}"`)
-  //       resetIdleTimer()
-  //       feedInterim(trimmed)
-  //       setText(trimmed)
-  //     } else if (finals) {
-  //       d('interim', `none finals=${finals}`)
-  //     }
-  //   }
-
-  //   recognitionRef.current = recognition
-  //   if (isListening && !recActiveRef.current) {
-  //     try { recognition.start() } catch { }
-  //   }
-
-  //   return () => {
-  //     try { recognition.stop() } catch { }
-  //     recActiveRef.current = false
-  //     wantListeningRef.current = false
-  //     if (restartTimerRef.current) clearTimeout(restartTimerRef.current)
-  //     if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
-  //     finalizedIdxRef.current = 0
-  //     resetClause()
-  //   }
-  //   // ✅ deps are stable now (handlers/config are memoized)
-  // }, [sourceLang, pauseListening, isListening, feedInterim, feedFinal, resetClause])
-
-
-  // ✅ Enqueue translation for TTS playback
-  const enqueueTranslation = (translatedText: string) => {
-    if (!translatedText.trim()) return
-    // Dedup queue to avoid echoes
-    if (ttsQueueRef.current.length && ttsQueueRef.current[ttsQueueRef.current.length - 1] === translatedText) {
-      return
-    }
-    if (synthRef.current.speaking || isSpeakingRef.current) {
-      ttsQueueRef.current.push(translatedText)
-      return
-    }
-    ttsQueueRef.current.push(translatedText)
-    playNextInQueue()
+  // ---------- TTS helpers ----------
+  function mapToTTSLocale(code: string) {
+    const b = (code || '').split('-')[0];
+    if (b === 'en') return 'en-US';
+    if (b === 'ko') return 'ko-KR';
+    if (b === 'zh') return 'zh-CN';
+    if (b === 'es') return 'es-ES';
+    return code || 'en-US';
   }
 
-  // ✅ Play next TTS item
-  const playNextInQueue = () => {
-    if (
-      ttsQueueRef.current.length === 0 ||
-      isMuted ||
-      isSpeakingRef.current ||
-      synthRef.current.speaking
-    ) return;
+  function ensureTTSReady() {
+    try {
+      if (!synthRef.current) return;
+      // Kick the engine so Chrome actually speaks later
+      const u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      synthRef.current.cancel();
+      synthRef.current.speak(u);
+      synthRef.current.resume?.();
+    } catch {}
+  }
 
-    const nextText = ttsQueueRef.current.shift();
-    if (!nextText) return;
+  const playNext = () => {
+    if (speakingRef.current || !synthRef.current || isMuted) return;
 
-    const utter = new SpeechSynthesisUtterance(nextText);
-    utter.lang = targetLang;
+    const next = ttsQueueRef.current.shift();
+    if (!next) return;
+
+    const utter = new SpeechSynthesisUtterance(next);
+    utter.lang = mapToTTSLocale(targetLang);
     utter.volume = volume;
 
     const voices = synthRef.current.getVoices();
     const sel =
-      voices.find((v: SpeechSynthesisVoice) => v.name === selectedVoiceName) ||
+      voices.find(v => v.name === selectedVoiceName) ||
+      voices.find(v => v.lang === utter.lang) ||
       voices[0];
-    utter.voice = sel;
 
-    isSpeakingRef.current = true;
+    if (sel) utter.voice = sel;
 
-    // ❌ REMOVE THIS:  (it was causing dropped clauses)
-    // if (status === "streaming") { dgStop(); }
+    speakingRef.current = true;
+    currentSpokenRef.current = next;
+
+    console.log('[FE][TTS][start]', { text: clip(next), voice: sel?.name, lang: utter.lang });
 
     utter.onend = () => {
-      isSpeakingRef.current = false;
-      // ❌ REMOVE THIS too:
-      // if (!pauseListening) { dgStart().catch(() => {}); }
-
-      if (ttsQueueRef.current.length > 0) {
-        setTimeout(() => playNextInQueue(), 300);
-      }
+      speakingRef.current = false;
+      console.log('[FE][TTS][end]');
+      if (ttsQueueRef.current.length) setTimeout(playNext, 300);
     };
-
-    utter.onerror = () => {
-      isSpeakingRef.current = false;
-      if (ttsQueueRef.current.length > 0) {
-        setTimeout(() => playNextInQueue(), 300);
-      }
+    utter.onerror = (e) => {
+      speakingRef.current = false;
+      console.warn('[FE][TTS][error]', e);
+      if (ttsQueueRef.current.length) setTimeout(playNext, 300);
     };
 
     synthRef.current.speak(utter);
   };
 
+  const enqueueFinalTTS = (s: string) => {
+    const t = s.trim();
+    if (!t) return;
 
-  // ====== When you press Start/Stop, use these ======
+    if (currentSpokenRef.current === t) {
+      console.log('[FE][TTS][drop-current-dup]', clip(t));
+      return;
+    }
+    const tail = ttsQueueRef.current[ttsQueueRef.current.length - 1];
+    if (tail === t) {
+      console.log('[FE][TTS][drop-tail-dup]', clip(t));
+      return;
+    }
+
+    console.log('[FE][TTS][enqueue]', clip(t));
+    ttsQueueRef.current.push(t);
+    playNext();
+  };
+
+  // ---------- Speech Synthesis init ----------
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    synthRef.current = window.speechSynthesis;
+
+    const onVoices = () => {
+      const vs = synthRef.current?.getVoices() || [];
+      console.log('[FE][TTS][voices]', vs.map(v => `${v.name} (${v.lang})`));
+      // Prefer a voice that matches targetLang if possible
+      if (!selectedVoiceName && vs.length) {
+        const want = mapToTTSLocale(targetLang);
+        const byLang = vs.find(v => v.lang === want);
+        setSelectedVoiceName((byLang || vs[0]).name);
+      }
+    };
+
+    onVoices();
+    window.speechSynthesis.onvoiceschanged = onVoices;
+
+    // Warm-up once on mount
+    ensureTTSReady();
+
+    // Keep engine alive when tab regains focus (some browsers pause it)
+    const vis = () => { try { synthRef.current?.resume?.(); } catch {} };
+    document.addEventListener('visibilitychange', vis);
+    return () => document.removeEventListener('visibilitychange', vis);
+  }, [selectedVoiceName, targetLang]);
+
+  // ---------- WS: consume broadcasts (single effect, with soft-final fallback) ----------
+  useEffect(() => {
+    const seq = Number((last as any)?.seq || 0);
+    const incoming = String((last as any)?.text || '').trim();
+    const meta = (last as any)?.meta;
+    const isFinal = typeof meta?.is_final === 'boolean' ? meta.is_final : false;
+
+    if (!incoming) return;
+
+    console.log('[FE][WS][in]', { seq, isFinal, out: clip(incoming) });
+    setTranslated(incoming);
+
+    if (isFinal) {
+      // Only handle first true-final per seq
+      if (seq && seq <= lastHandledSeqRef.current) {
+        console.log('[FE][WS][final][skip-already-handled]', seq);
+        return;
+      }
+      if (seq) lastHandledSeqRef.current = seq;
+
+      if (!isMuted && incoming !== currentSpokenRef.current) {
+        enqueueFinalTTS(incoming);
+      } else {
+        console.log('[FE][TTS][skip]', { isMuted, sameAsCurrent: incoming === currentSpokenRef.current });
+      }
+      // We handled a real final; clear any soft cache for this seq
+      softMapRef.current.delete(seq);
+      return;
+    }
+
+    // Soft-final fallback: when finals aren’t flagged by backend
+    if (!seq) return; // require seq to avoid accidental repeats
+    const now = Date.now();
+    const prev = softMapRef.current.get(seq);
+    if (!prev) {
+      softMapRef.current.set(seq, { text: incoming, count: 1, first: now, last: now });
+    } else {
+      const same = incoming === prev.text;
+      const entry = {
+        text: incoming,
+        count: prev.count + (same ? 1 : 0),
+        first: prev.first,
+        last: now,
+      };
+      softMapRef.current.set(seq, entry);
+
+      // Consider it "stable enough" if repeated at least twice, OR lingered > 900ms
+      const stable = entry.count >= 2 || (now - entry.first) > 900;
+      if (stable && eosRe.test(incoming) && seq > lastHandledSeqRef.current) {
+        console.log('[FE][WS][soft-final]', { seq, out: clip(incoming) });
+        lastHandledSeqRef.current = seq;
+        if (!isMuted && incoming !== currentSpokenRef.current) {
+          enqueueFinalTTS(incoming);
+        }
+      }
+    }
+  }, [last, isMuted]);
+
+  // ---------- Deepgram partials → clause buffer ----------
+  useEffect(() => {
+    const cur = (partial || '').trim();
+    if (!cur) return;
+
+    console.log('[FE][DG][partial]', clip(cur));
+
+    const prev = lastInterimRef.current;
+    let delta = '';
+
+    if (cur.startsWith(prev)) {
+      delta = cur.slice(prev.length);
+    } else {
+      const old = clauseRef.current.trim();
+
+      if (old) {
+        const oldLooksComplete = eosRe.test(old) || old.length >= MIN_FINAL_CHARS + 10;
+        if (oldLooksComplete) {
+          console.log('[FE][clause][rebase->final]', clip(old));
+          sendFinalNow(old);
+        } else {
+          console.log('[FE][clause][rebase->drop-short]', clip(old));
+        }
+      }
+      clauseRef.current = '';
+      delta = cur;
+    }
+
+    if (delta) {
+      console.log('[FE][clause][delta]', clip(delta));
+      clauseRef.current += delta;
+
+      sendPreview(clauseRef.current);
+
+      if (eosRe.test(clauseRef.current)) {
+        sendFinalNow(clauseRef.current);
+        clauseRef.current = '';
+      } else {
+        scheduleFinal();
+      }
+    }
+
+    lastInterimRef.current = cur;
+    setText(cur);
+  }, [partial]);
+
+  // ---------- Keep isListening in sync with Deepgram ----------
+  useEffect(() => {
+    setIsListening(status === 'streaming')
+    if (status !== 'streaming' && clauseRef.current.trim()) {
+      sendFinalNow(clauseRef.current)
+      clauseRef.current = ''
+    }
+  }, [status])
+
+  // ---------- HTTP translate (client-driven OFF by default) ----------
+  async function postTranslate(s: string, finalFlag: boolean) {
+    const body = {
+      text: s,
+      source: (sourceLang || 'ko').split('-')[0],
+      target: (targetLang || 'en').split('-')[0],
+      final: finalFlag
+    };
+
+    console.log(`[FE][HTTP][${finalFlag ? 'final' : 'preview'}] → /api/translate`, {
+      source: body.source,
+      target: body.target,
+      in: clip(s)
+    });
+
+    try {
+      const res = await fetch(`${API_URL}/api/translate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const txt = await res.text().catch(() => '');
+      console.log('[FE][HTTP][res]', res.status, res.ok, clip(txt));
+    } catch (e) {
+      console.warn('[FE][HTTP][error]', e);
+    }
+  }
+
+  const sendPreview = useMemo(
+    () =>
+      throttle((fullClause: string) => {
+        if (!CLIENT_DRIVEN) return;
+
+        const s = (fullClause || '').trim();
+        if (!s) return;
+
+        if (s.length < MIN_PREVIEW_CHARS && !eosRe.test(s)) return;
+        if (s.length < MIN_FINAL_CHARS && introHoldRe.test(s)) return;
+
+        if (!eosRe.test(s)) {
+          if (s === lastPreviewSentRef.current) return;
+          if (Math.abs(s.length - lastPreviewSentRef.current.length) < 2) return;
+        }
+
+        if (DEBUG) console.log('[FE][preview][clause]', clip(s));
+        lastPreviewSentRef.current = s;
+        postTranslate(s, false);
+      }, 400),
+    [CLIENT_DRIVEN, sourceLang, targetLang]
+  );
+
+  function sendFinalNow(s: string) {
+    const clean = (s || '').trim();
+    if (!clean) return;
+
+    if (typeof (sendPreview as any).cancel === 'function') {
+      (sendPreview as any).cancel();
+    }
+
+    if (CLIENT_DRIVEN) {
+      if (DEBUG) console.log('[FE][final][clause]', clip(clean));
+      postTranslate(clean, true);
+    } else {
+      if (DEBUG) console.log('[FE][final][clause][no-http]', clip(clean));
+    }
+
+    lastPreviewSentRef.current = '';
+  }
+
+  function scheduleFinal() {
+    if (lingerTimerRef.current) clearTimeout(lingerTimerRef.current);
+    lingerTimerRef.current = setTimeout(() => {
+      const s = clauseRef.current.trim();
+      if (!s) return;
+
+      if (s.length < MIN_FINAL_CHARS && !eosRe.test(s)) return;
+      if (s.length < MIN_FINAL_CHARS && introHoldRe.test(s)) return;
+
+      sendFinalNow(s);
+      clauseRef.current = '';
+    }, LINGER_MS);
+  }
+
+  function onPartialKorean(newChunk: string) {
+    if (!newChunk) return
+    clauseRef.current += newChunk
+    sendPreview(clauseRef.current)
+    if (eosRe.test(clauseRef.current)) {
+      sendFinalNow(clauseRef.current)
+      clauseRef.current = ''
+    } else {
+      scheduleFinal()
+    }
+  }
+
+  // ---------- Start/Stop mic ----------
   const handleStartListening = async () => {
-    lastInterimRef.current = '';
-    setText('');
-    setTranslated('');
-    ttsQueueRef.current = [];
-    synthRef.current?.cancel();
-    isSpeakingRef.current = false;
-
-    try { await dgStart(); } catch (e: any) { alert(`Mic start failed: ${e?.message || e}`); }
-  };
-
-  const handleStopListening = () => {
-    dgStop();
-  };
-
-  // 🧽 Clear
-  const handleClear = () => {
+    lastInterimRef.current = ''
+    clauseRef.current = ''
     setText('')
     setTranslated('')
-    handleStopListening()
-    synthRef.current?.cancel()
     ttsQueueRef.current = []
-    isSpeakingRef.current = false
-  }
-  const lastLogged = useRef<string | null>(null);
-  useEffect(() => {
-    if (!translated) return;
-    if (translated === lastLogged.current) return;
-    console.log('[RT][commit] translation:', translated);
-    lastLogged.current = translated;
-  }, [translated]);
+    synthRef.current?.cancel()
+    speakingRef.current = false
 
+    // Warm up TTS right before we expect to speak
+    ensureTTSReady()
+
+    try { await dgStart() } catch (e: any) { alert(`Mic start failed: ${e?.message || e}`) }
+  }
+
+  const handleStopListening = () => {
+    dgStop()
+  }
 
   return (
     <div className="w-full max-w-3xl mx-auto p-6 bg-white rounded-xl shadow-md">
-      {/* Header */}
       <h2 className="text-2xl font-bold text-gray-700 mb-4 text-center">🎤 Real-Time Translator</h2>
+
       <div className="flex items-center mb-4 gap-2">
-        <span
-          className={`inline-block w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}
-          title={connected ? 'Connected' : 'Disconnected'}
-        />
+        <span className={`inline-block w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
         <span className="text-sm text-gray-600">
-          WebSocket: {connected ? 'Connected' : 'Disconnected'} {last.mode ? `· ${last.mode}` : ''}
-          {last.mode === 'pre' ? ` (score ${last.matchScore.toFixed(2)})` : ''}
+          WebSocket: {connected ? 'Connected' : 'Disconnected'}· Deepgram: {status}{errorMsg ? ` · ${errorMsg}` : ''}
         </span>
       </div>
 
-      {/* Status */}
-      {loading && (
-        <div className="mb-4 text-blue-500 text-sm text-center animate-pulse">
-          Translating... Please wait.
-        </div>
-      )}
-
-      {/* Language controls */}
       <div className="flex gap-4 mb-4">
         <div className="flex flex-col w-1/2">
           <label className="text-gray-600 mb-1">Source Language</label>
-          <select
-            value={sourceLang}
-            onChange={(e) => setSourceLang(e.target.value)}
-            className="p-2 border rounded shadow-sm focus:outline-none"
-          >
-            {availableLanguages.map((lang) => (
-              <option key={lang.code} value={lang.code}>
-                {lang.name}
-              </option>
-            ))}
+          <select value={sourceLang} onChange={e => setSourceLang(e.target.value)} className="p-2 border rounded shadow-sm">
+            {availableLanguages.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
           </select>
         </div>
         <div className="flex flex-col w-1/2">
           <label className="text-gray-600 mb-1">Target Language</label>
-          <select
-            value={targetLang}
-            onChange={(e) => setTargetLang(e.target.value)}
-            className="p-2 border rounded shadow-sm focus:outline-none"
-          >
-            {availableLanguages.map((lang) => (
-              <option key={lang.code} value={lang.code}>
-                {lang.name}
-              </option>
-            ))}
+          <select value={targetLang} onChange={e => setTargetLang(e.target.value)} className="p-2 border rounded shadow-sm">
+            {availableLanguages.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
           </select>
         </div>
       </div>
 
-      {/* Input + Mic */}
+      <div className="mb-4 flex gap-2">
+        <button
+          onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')}
+          className="px-3 py-2 bg-gray-200 rounded hover:bg-gray-300"
+        >
+          Test TTS
+        </button>
+        <button
+          onClick={() => setIsMuted(m => !m)}
+          className="px-3 py-2 bg-gray-200 rounded hover:bg-gray-300"
+        >
+          {isMuted ? 'Unmute' : 'Mute'}
+        </button>
+        <div className="flex items-center gap-2">
+          <label className="text-gray-600">Vol</label>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.1}
+            value={volume}
+            onChange={(e) => setVolume(parseFloat(e.target.value))}
+          />
+        </div>
+      </div>
+
       <div className="flex gap-4 items-center mb-4">
         <textarea
           value={text}
@@ -473,23 +462,6 @@ export default function TranslationBox() {
         </button>
       </div>
 
-      {/* Send typed text as one sentence */}
-      <div className="flex gap-2 mb-4">
-        <button
-          onClick={() => buffer.add(text)}
-          className="px-3 py-2 bg-gray-200 rounded hover:bg-gray-300"
-        >
-          Add Chunk
-        </button>
-        <button
-          onClick={() => buffer.flush(true)}
-          className="px-3 py-2 bg-gray-200 rounded hover:bg-gray-300"
-        >
-          Flush Now
-        </button>
-      </div>
-
-      {/* Translated output (from server broadcast) */}
       {translated && (
         <div className="mt-6">
           <h3 className="text-lg font-medium text-gray-800 mb-2">🖥️ Translated Text:</h3>
@@ -499,41 +471,6 @@ export default function TranslationBox() {
         </div>
       )}
 
-      {/* Controls */}
-      <div className="flex gap-4 mt-6">
-        <button
-          onClick={handleClear}
-          className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition"
-        >
-          Clear
-        </button>
-        <button
-          onClick={() => setIsMuted(!isMuted)}
-          className={`px-4 py-2 rounded transition ${isMuted ? 'bg-gray-400' : 'bg-green-500 text-white hover:bg-green-600'}`}
-        >
-          {isMuted ? 'Unmute' : 'Mute'}
-        </button>
-        <div className="flex items-center gap-2">
-          <label className="text-gray-600">Volume</label>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.1}
-            value={volume}
-            onChange={(e) => setVolume(parseFloat(e.target.value))}
-            className="w-24"
-          />
-        </div>
-      </div>
-      <div className="text-sm text-gray-500 mb-1">Partial (Deepgram):</div>
-      <div className="min-h-6 text-gray-700 mb-3">{partial || "…"}</div>
-      <div className="text-sm text-gray-600 mb-2">
-        Deepgram: <b>{status}</b>{errorMsg ? ` · ${errorMsg}` : ""}
-      </div>
-
-
-      {/* Voice selection */}
       <div className="mt-6">
         <label className="text-gray-600 mb-2 block">Choose Voice</label>
         <select
@@ -541,12 +478,11 @@ export default function TranslationBox() {
           onChange={(e) => setSelectedVoiceName(e.target.value)}
           className="p-2 border rounded shadow-sm focus:outline-none w-full"
         >
-          {synthRef.current &&
-            synthRef.current.getVoices().map((voice: SpeechSynthesisVoice) => (
-              <option key={voice.name} value={voice.name}>
-                {voice.name} ({voice.lang})
-              </option>
-            ))}
+          {synthRef.current && synthRef.current.getVoices().map((v: SpeechSynthesisVoice) => (
+            <option key={v.name} value={v.name}>
+              {v.name} ({v.lang})
+            </option>
+          ))}
         </select>
       </div>
     </div>
