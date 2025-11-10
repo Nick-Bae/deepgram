@@ -146,7 +146,7 @@ export default function TranslationBox() {
 
     const onVoices = () => {
       const vs = synthRef.current?.getVoices() || [];
-      console.log('[FE][TTS][voices]', vs.map(v => `${v.name} (${v.lang})`));
+      // console.log('[FE][TTS][voices]', vs.map(v => `${v.name} (${v.lang})`));
       // Prefer a voice that matches targetLang if possible
       if (!selectedVoiceName && vs.length) {
         const want = mapToTTSLocale(targetLang);
