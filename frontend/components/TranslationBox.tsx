@@ -49,8 +49,8 @@ export default function TranslationBox() {
   const lingerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastInterimRef = useRef('')
 
-  const LINGER_MS = 1000
-  const MIN_FINAL_CHARS = 28
+  const LINGER_MS = 300
+  const MIN_FINAL_CHARS = 10
   const introHoldRe = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
   const eosRe = /[.!?。！？]$|(?:습니다|입니다|할까요|했어요|했지요|했네요)$/
 

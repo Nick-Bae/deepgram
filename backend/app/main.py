@@ -647,7 +647,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
           - else start/refresh a ~1.2s timer; on timeout, commit whatever we have
         """
         SENTENCE_PUNCT = tuple(".?!。？！…")
-        COMMIT_WAIT_MS = 1200
+        COMMIT_WAIT_MS = 500
 
         pending_kr: str | None = None
         pending_task: asyncio.Task | None = None
