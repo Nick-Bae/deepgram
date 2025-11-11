@@ -87,7 +87,15 @@ export function useDeepgramProducer() {
       if (status === "streaming") return;
       setStatus("starting"); setErrorMsg(null);
 
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
+      const AudioCtor =
+        window.AudioContext ||
+        (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+      if (!AudioCtor) {
+        throw new Error("Web Audio API is not supported in this browser");
+      }
+
+      const ctx = new AudioCtor({ sampleRate: 48000 });
       ctxRef.current = ctx;
       await ensurePcmWorklet(ctx);
 
@@ -103,7 +111,6 @@ export function useDeepgramProducer() {
       streamRef.current = stream;
 
       const src = ctx.createMediaStreamSource(stream);
-      // @ts-ignore
       const worklet = new AudioWorkletNode(ctx, "pcm-worklet", { numberOfInputs: 1, numberOfOutputs: 0 });
       src.connect(worklet);
       portRef.current = worklet.port;
@@ -127,8 +134,9 @@ export function useDeepgramProducer() {
       portRef.current.onmessage = (evt: MessageEvent) => {
         if (ws.readyState === WebSocket.OPEN) ws.send(evt.data); // 16-bit PCM @ 48k
       };
-    } catch (err: any) {
-      setErrorMsg(err?.message || String(err));
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setErrorMsg(message);
       setStatus("error");
     }
   }

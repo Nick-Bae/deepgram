@@ -163,9 +163,8 @@ export default function Display() {
             gap: "0.35em",
           }}
         >
-          {enLines.length > 0 ? (
-            enLines.map((line, i) => (
-              // eslint-disable-next-line react/no-array-index-key
+              {enLines.length > 0 ? (
+                enLines.map((line, i) => (
               <div
                 key={`${i}-${line.slice(0, 12)}`}
                 style={{

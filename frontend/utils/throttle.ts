@@ -1,17 +1,27 @@
 // components/utils/throttle.ts
 
-export function throttle<T extends (...args: any[]) => void>(
-    func: T,
-    delay: number
-  ): (...args: Parameters<T>) => void {
-    let lastCall = 0;
-  
-    return (...args: Parameters<T>) => {
-      const now = new Date().getTime();
-      if (now - lastCall >= delay) {
-        lastCall = now;
-        func(...args);
-      }
-    };
-  }
+export type ThrottledFn<T extends (...args: unknown[]) => void> = ((
+  ...args: Parameters<T>
+) => void) & { cancel: () => void };
+
+export function throttle<T extends (...args: unknown[]) => void>(
+  func: T,
+  delay: number
+): ThrottledFn<T> {
+  let lastCall = 0;
+
+  const wrapped = ((...args: Parameters<T>) => {
+    const now = Date.now();
+    if (now - lastCall >= delay) {
+      lastCall = now;
+      func(...args);
+    }
+  }) as ThrottledFn<T>;
+
+  wrapped.cancel = () => {
+    lastCall = 0;
+  };
+
+  return wrapped;
+}
   

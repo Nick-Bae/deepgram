@@ -20,8 +20,18 @@ const availableLanguages = [
   { code: 'es', name: 'Spanish' },
 ]
 
+const LINGER_MS = 300
+const MIN_FINAL_CHARS = 10
+const FINALIZE_PULSE_MS = 2600
+const MIN_FORCE_FINALIZE_CHARS = 8
+const INTRO_HOLD_RE = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
+const EOS_RE = /[.!?。！？]$|(?:습니다|입니다|할까요|했어요|했지요|했네요)$/
+const CLIENT_DRIVEN = false
+const MIN_PREVIEW_CHARS = 10
+const PREVIEW_THROTTLE_MS = 400
+
 export default function TranslationBox() {
-  const { connected, last, sendProducerText } = useTranslationSocket({ isProducer: true });
+  const { connected, last } = useTranslationSocket({ isProducer: true });
 
   // UI state
   const [text, setText] = useState('')
@@ -34,10 +44,7 @@ export default function TranslationBox() {
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
 
   // Deepgram mic producer
-  const { start: dgStart, stop: dgStop, finalize: dgFinalize, status, partial, errorMsg } =
-    useDeepgramProducer
-      ? useDeepgramProducer()
-      : { start: async () => { }, stop: () => { }, finalize: () => { }, status: 'idle', partial: '', errorMsg: '' }
+  const { start: dgStart, stop: dgStop, finalize: dgFinalize, status, partial, errorMsg } = useDeepgramProducer()
 
   // TTS refs
   const synthRef = useRef<SpeechSynthesis | null>(null)
@@ -51,15 +58,6 @@ export default function TranslationBox() {
   const lingerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastInterimRef = useRef('')
   const lastFinalizeAtRef = useRef(0)
-  const LINGER_MS = 300
-  const MIN_FINAL_CHARS = 10
-  const FINALIZE_PULSE_MS = 2600
-  const MIN_FORCE_FINALIZE_CHARS = 8
-  const introHoldRe = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
-  const eosRe = /[.!?。！？]$|(?:습니다|입니다|할까요|했어요|했지요|했네요)$/
-
-  const CLIENT_DRIVEN = false
-  const MIN_PREVIEW_CHARS = 10
   const lastPreviewSentRef = useRef('')
 
   // Track stability of non-final WS lines per seq (for soft-final fallback)
@@ -127,7 +125,7 @@ export default function TranslationBox() {
     } catch {}
   }
 
-  const playNext = () => {
+  const playNext = useCallback(() => {
     if (speakingRef.current || !synthRef.current || isMuted) return;
 
     const next = ttsQueueRef.current.shift();
@@ -162,9 +160,9 @@ export default function TranslationBox() {
     };
 
     synthRef.current.speak(utter);
-  };
+  }, [isMuted, selectedVoiceName, targetLang, volume]);
 
-  const enqueueFinalTTS = (s: string) => {
+  const enqueueFinalTTS = useCallback((s: string) => {
     const t = s.trim();
     if (!t) return;
 
@@ -181,7 +179,7 @@ export default function TranslationBox() {
     console.log('[FE][TTS][enqueue]', clip(t));
     ttsQueueRef.current.push(t);
     playNext();
-  };
+  }, [playNext]);
 
   // ---------- Speech Synthesis init ----------
   useEffect(() => {
@@ -213,15 +211,10 @@ export default function TranslationBox() {
 
   // ---------- WS: consume broadcasts (single effect, with soft-final fallback) ----------
   useEffect(() => {
-    const seq = Number((last as any)?.seq || 0);
-    const incoming = String((last as any)?.text || '').trim();
-    const meta = (last as any)?.meta;
-    const isFinal = typeof meta?.is_final === 'boolean' ? meta.is_final : false;
-    const committedSrc = typeof (last as any)?.srcText === 'string'
-      ? String((last as any)?.srcText).trim()
-      : typeof (last as any)?.src?.text === 'string'
-        ? String((last as any)?.src?.text).trim()
-        : '';
+    const seq = last.seq ?? 0;
+    const incoming = (last.text || '').trim();
+    const isFinal = !!last.meta?.is_final;
+    const committedSrc = typeof last.srcText === 'string' ? last.srcText.trim() : '';
 
     if (!incoming) return;
 
@@ -270,7 +263,7 @@ export default function TranslationBox() {
 
       // Consider it "stable enough" if repeated at least twice, OR lingered > 900ms
       const stable = entry.count >= 2 || (now - entry.first) > 900;
-      if (stable && eosRe.test(incoming) && seq > lastHandledSeqRef.current) {
+      if (stable && EOS_RE.test(incoming) && seq > lastHandledSeqRef.current) {
         console.log('[FE][WS][soft-final]', { seq, out: clip(incoming) });
         lastHandledSeqRef.current = seq;
         if (!isMuted && incoming !== currentSpokenRef.current) {
@@ -278,7 +271,7 @@ export default function TranslationBox() {
         }
       }
     }
-  }, [last, isMuted]);
+  }, [enqueueFinalTTS, isMuted, last]);
 
   // ---------- Deepgram partials → clause buffer ----------
   useEffect(() => {
@@ -296,7 +289,7 @@ export default function TranslationBox() {
       const old = clauseRef.current.trim();
 
       if (old) {
-        const oldLooksComplete = eosRe.test(old) || old.length >= MIN_FINAL_CHARS + 10;
+        const oldLooksComplete = EOS_RE.test(old) || old.length >= MIN_FINAL_CHARS + 10;
         if (oldLooksComplete) {
           console.log('[FE][clause][rebase->final]', clip(old));
           sendFinalNow(old);
@@ -314,7 +307,7 @@ export default function TranslationBox() {
 
       sendPreview(clauseRef.current);
 
-      if (eosRe.test(clauseRef.current)) {
+      if (EOS_RE.test(clauseRef.current)) {
         sendFinalNow(clauseRef.current);
         clauseRef.current = '';
       } else {
@@ -324,7 +317,7 @@ export default function TranslationBox() {
 
     lastInterimRef.current = cur;
     setText(cur);
-  }, [partial]);
+  }, [partial, scheduleFinal, sendFinalNow, sendPreview]);
 
   // ---------- Keep isListening in sync with Deepgram ----------
   useEffect(() => {
@@ -336,7 +329,7 @@ export default function TranslationBox() {
       sendFinalNow(clauseRef.current)
       clauseRef.current = ''
     }
-  }, [status])
+  }, [sendFinalNow, status])
 
   useEffect(() => {
     if (status !== 'streaming') return
@@ -344,7 +337,7 @@ export default function TranslationBox() {
     const interval = setInterval(() => {
       const clause = clauseRef.current.trim()
       if (!clause) return
-      if (clause.length < MIN_FORCE_FINALIZE_CHARS && !eosRe.test(clause)) return
+      if (clause.length < MIN_FORCE_FINALIZE_CHARS && !EOS_RE.test(clause)) return
 
       const now = Date.now()
       if (now - lastFinalizeAtRef.current < FINALIZE_PULSE_MS * 0.8) return
@@ -356,7 +349,7 @@ export default function TranslationBox() {
   }, [status, triggerFinalize])
 
   // ---------- HTTP translate (client-driven OFF by default) ----------
-  async function postTranslate(s: string, finalFlag: boolean) {
+  const postTranslate = useCallback(async (s: string, finalFlag: boolean) => {
     const body = {
       text: s,
       source: (sourceLang || 'ko').split('-')[0],
@@ -381,7 +374,7 @@ export default function TranslationBox() {
     } catch (e) {
       console.warn('[FE][HTTP][error]', e);
     }
-  }
+  }, [sourceLang, targetLang]);
 
   const sendPreview = useMemo(
     () =>
@@ -391,10 +384,10 @@ export default function TranslationBox() {
         const s = (fullClause || '').trim();
         if (!s) return;
 
-        if (s.length < MIN_PREVIEW_CHARS && !eosRe.test(s)) return;
-        if (s.length < MIN_FINAL_CHARS && introHoldRe.test(s)) return;
+        if (s.length < MIN_PREVIEW_CHARS && !EOS_RE.test(s)) return;
+        if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
 
-        if (!eosRe.test(s)) {
+        if (!EOS_RE.test(s)) {
           if (s === lastPreviewSentRef.current) return;
           if (Math.abs(s.length - lastPreviewSentRef.current.length) < 2) return;
         }
@@ -402,54 +395,43 @@ export default function TranslationBox() {
         if (DEBUG) console.log('[FE][preview][clause]', clip(s));
         lastPreviewSentRef.current = s;
         postTranslate(s, false);
-      }, 400),
-    [CLIENT_DRIVEN, sourceLang, targetLang]
+      }, PREVIEW_THROTTLE_MS),
+    [postTranslate]
   );
 
-  function sendFinalNow(s: string) {
-    const clean = (s || '').trim();
-    if (!clean) return;
+  const sendFinalNow = useCallback(
+    (s: string) => {
+      const clean = (s || '').trim();
+      if (!clean) return;
 
-    if (typeof (sendPreview as any).cancel === 'function') {
-      (sendPreview as any).cancel();
-    }
+      sendPreview.cancel();
 
-    if (CLIENT_DRIVEN) {
-      if (DEBUG) console.log('[FE][final][clause]', clip(clean));
-      postTranslate(clean, true);
-    } else {
-      if (DEBUG) console.log('[FE][final][clause][no-http]', clip(clean));
-    }
+      if (CLIENT_DRIVEN) {
+        if (DEBUG) console.log('[FE][final][clause]', clip(clean));
+        postTranslate(clean, true);
+      } else {
+        if (DEBUG) console.log('[FE][final][clause][no-http]', clip(clean));
+      }
 
-    lastPreviewSentRef.current = '';
-    triggerFinalize('clause complete');
-  }
+      lastPreviewSentRef.current = '';
+      triggerFinalize('clause complete');
+    },
+    [postTranslate, sendPreview, triggerFinalize]
+  );
 
-  function scheduleFinal() {
+  const scheduleFinal = useCallback(() => {
     if (lingerTimerRef.current) clearTimeout(lingerTimerRef.current);
     lingerTimerRef.current = setTimeout(() => {
       const s = clauseRef.current.trim();
       if (!s) return;
 
-      if (s.length < MIN_FINAL_CHARS && !eosRe.test(s)) return;
-      if (s.length < MIN_FINAL_CHARS && introHoldRe.test(s)) return;
+      if (s.length < MIN_FINAL_CHARS && !EOS_RE.test(s)) return;
+      if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
 
       sendFinalNow(s);
       clauseRef.current = '';
     }, LINGER_MS);
-  }
-
-  function onPartialKorean(newChunk: string) {
-    if (!newChunk) return
-    clauseRef.current += newChunk
-    sendPreview(clauseRef.current)
-    if (eosRe.test(clauseRef.current)) {
-      sendFinalNow(clauseRef.current)
-      clauseRef.current = ''
-    } else {
-      scheduleFinal()
-    }
-  }
+  }, [sendFinalNow]);
 
   // ---------- Start/Stop mic ----------
   const handleStartListening = async () => {
@@ -464,7 +446,12 @@ export default function TranslationBox() {
     // Warm up TTS right before we expect to speak
     ensureTTSReady()
 
-    try { await dgStart() } catch (e: any) { alert(`Mic start failed: ${e?.message || e}`) }
+    try {
+      await dgStart()
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e)
+      alert(`Mic start failed: ${message}`)
+    }
   }
 
   const handleStopListening = () => {

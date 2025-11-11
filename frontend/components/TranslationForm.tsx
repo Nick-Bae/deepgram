@@ -12,13 +12,12 @@ export default function TranslationForm() {
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
 
-  const synthRef = useRef<any>(null)
+  const synthRef = useRef<SpeechSynthesis | null>(null)
 
-useEffect(() => {
-  if (typeof window !== 'undefined') {
+  useEffect(() => {
+    if (typeof window === 'undefined') return
     synthRef.current = window.speechSynthesis
-  }
-}, [])
+  }, [])
 
 
   const handleTranslate = async () => {
@@ -42,7 +41,7 @@ useEffect(() => {
         const utterance = new SpeechSynthesisUtterance(data.translated)
         utterance.lang = 'zh-CN'
         utterance.volume = volume // Volume: 0.0 to 1.0
-        synthRef.current.speak(utterance)
+        synthRef.current?.speak(utterance)
       }
     } catch (error) {
       console.error('Error translating:', error)
