@@ -56,7 +56,21 @@ export type LastState = {
   meta?: Meta;
 };
 
-export function useTranslationSocket({ isProducer = false }: { isProducer?: boolean } = {}) {
+export type TranslationSocketHook = {
+  connected: boolean;
+  last: LastState;
+  sendProducerText: (
+    text: string,
+    source: string,
+    target: string,
+    isPartial: boolean,
+    id?: number,
+    rev?: number,
+    finalFlag?: boolean
+  ) => void;
+};
+
+export function useTranslationSocket({ isProducer = false }: { isProducer?: boolean } = {}): TranslationSocketHook {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const [last, setLast] = useState<LastState>({

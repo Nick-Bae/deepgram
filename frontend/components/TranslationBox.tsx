@@ -30,8 +30,13 @@ const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
 
+type CancelableFn<T extends (...args: any[]) => void> = ((...args: Parameters<T>) => void) & {
+  cancel: () => void
+}
+
 export default function TranslationBox() {
-  const { connected, last } = useTranslationSocket({ isProducer: true });
+  const { connected, last } = useTranslationSocket({ isProducer: true })
+  const lastMeta = (last as typeof last & { meta?: { is_final?: boolean } }).meta
 
   // UI state
   const [text, setText] = useState('')
@@ -44,7 +49,11 @@ export default function TranslationBox() {
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
 
   // Deepgram mic producer
-  const { start: dgStart, stop: dgStop, finalize: dgFinalize, status, partial, errorMsg } = useDeepgramProducer()
+  const dgController = useDeepgramProducer() as ReturnType<typeof useDeepgramProducer> & {
+    finalize?: () => void
+  }
+  const { start: dgStart, stop: dgStop, status, partial, errorMsg } = dgController
+  const dgFinalize = dgController.finalize ?? (() => {})
 
   // TTS refs
   const synthRef = useRef<SpeechSynthesis | null>(null)
@@ -125,7 +134,7 @@ export default function TranslationBox() {
         lastPreviewSentRef.current = s;
         postTranslate(s, false);
       }, PREVIEW_THROTTLE_MS)
-  , [postTranslate]);
+  , [postTranslate]) as CancelableFn<(fullClause: string) => void>
 
   const sendFinalNow = useCallback(
     (s: string) => {
@@ -296,7 +305,7 @@ export default function TranslationBox() {
   useEffect(() => {
     const seq = last.seq ?? 0;
     const incoming = (last.text || '').trim();
-    const isFinal = !!last.meta?.is_final;
+    const isFinal = !!lastMeta?.is_final;
     const committedSrc = typeof last.srcText === 'string' ? last.srcText.trim() : '';
 
     if (!incoming) return;

@@ -1,6 +1,16 @@
 // frontend/lib/useDeepgramProducer.ts
 import { useRef, useState } from "react";
 
+export type DeepgramProducerController = {
+  status: "idle" | "starting" | "streaming" | "stopped" | "error";
+  partial: string;
+  lastCommit: string;
+  errorMsg: string | null;
+  start: () => Promise<void>;
+  stop: () => void;
+  finalize: () => void;
+};
+
 function wsDeepgramURL() {
   const env = process.env.NEXT_PUBLIC_WS_URL || "";
   try {
@@ -71,7 +81,7 @@ async function ensurePcmWorklet(ctx: AudioContext) {
   }
 }
 
-export function useDeepgramProducer() {
+export function useDeepgramProducer(): DeepgramProducerController {
   const [status, setStatus] = useState<"idle" | "starting" | "streaming" | "stopped" | "error">("idle");
   const [partial, setPartial] = useState("");
   const [lastCommit, setLastCommit] = useState("");
