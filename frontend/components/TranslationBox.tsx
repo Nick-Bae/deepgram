@@ -30,13 +30,12 @@ const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
 
-type CancelableFn<T extends (...args: any[]) => void> = ((...args: Parameters<T>) => void) & {
+type CancelableFn<T extends (...args: unknown[]) => void> = ((...args: Parameters<T>) => void) & {
   cancel: () => void
 }
 
 export default function TranslationBox() {
   const { connected, last } = useTranslationSocket({ isProducer: true })
-  const lastMeta = (last as typeof last & { meta?: { is_final?: boolean } }).meta
 
   // UI state
   const [text, setText] = useState('')
@@ -52,8 +51,8 @@ export default function TranslationBox() {
   const dgController = useDeepgramProducer() as ReturnType<typeof useDeepgramProducer> & {
     finalize?: () => void
   }
-  const { start: dgStart, stop: dgStop, status, partial, errorMsg } = dgController
-  const dgFinalize = dgController.finalize ?? (() => {})
+  const { start: dgStart, stop: dgStop, status, partial, errorMsg, finalize } = dgController
+  const dgFinalize = useMemo(() => finalize ?? (() => {}), [finalize])
 
   // TTS refs
   const synthRef = useRef<SpeechSynthesis | null>(null)
@@ -305,6 +304,7 @@ export default function TranslationBox() {
   useEffect(() => {
     const seq = last.seq ?? 0;
     const incoming = (last.text || '').trim();
+    const lastMeta = (last as typeof last & { meta?: { is_final?: boolean } }).meta;
     const isFinal = !!lastMeta?.is_final;
     const committedSrc = typeof last.srcText === 'string' ? last.srcText.trim() : '';
 
