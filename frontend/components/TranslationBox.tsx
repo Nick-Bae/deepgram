@@ -78,6 +78,91 @@ export default function TranslationBox() {
     [dgFinalize]
   )
 
+  // ---------- HTTP translate (client-driven OFF by default) ----------
+  const postTranslate = useCallback(async (s: string, finalFlag: boolean) => {
+    const body = {
+      text: s,
+      source: (sourceLang || 'ko').split('-')[0],
+      target: (targetLang || 'en').split('-')[0],
+      final: finalFlag
+    };
+
+    console.log(`[FE][HTTP][${finalFlag ? 'final' : 'preview'}] → /api/translate`, {
+      source: body.source,
+      target: body.target,
+      in: clip(s)
+    });
+
+    try {
+      const res = await fetch(`${API_URL}/api/translate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const txt = await res.text().catch(() => '');
+      console.log('[FE][HTTP][res]', res.status, res.ok, clip(txt));
+    } catch (e) {
+      console.warn('[FE][HTTP][error]', e);
+    }
+  }, [sourceLang, targetLang]);
+
+  const sendPreview = useMemo(
+    () =>
+      throttle((fullClause: string) => {
+        if (!CLIENT_DRIVEN) return;
+
+        const s = (fullClause || '').trim();
+        if (!s) return;
+
+        if (s.length < MIN_PREVIEW_CHARS && !EOS_RE.test(s)) return;
+        if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
+
+        if (!EOS_RE.test(s)) {
+          if (s === lastPreviewSentRef.current) return;
+          if (Math.abs(s.length - lastPreviewSentRef.current.length) < 2) return;
+        }
+
+        if (DEBUG) console.log('[FE][preview][clause]', clip(s));
+        lastPreviewSentRef.current = s;
+        postTranslate(s, false);
+      }, PREVIEW_THROTTLE_MS),
+    [postTranslate]
+  );
+
+  const sendFinalNow = useCallback(
+    (s: string) => {
+      const clean = (s || '').trim();
+      if (!clean) return;
+
+      sendPreview.cancel();
+
+      if (CLIENT_DRIVEN) {
+        if (DEBUG) console.log('[FE][final][clause]', clip(clean));
+        postTranslate(clean, true);
+      } else {
+        if (DEBUG) console.log('[FE][final][clause][no-http]', clip(clean));
+      }
+
+      lastPreviewSentRef.current = '';
+      triggerFinalize('clause complete');
+    },
+    [postTranslate, sendPreview, triggerFinalize]
+  );
+
+  const scheduleFinal = useCallback(() => {
+    if (lingerTimerRef.current) clearTimeout(lingerTimerRef.current);
+    lingerTimerRef.current = setTimeout(() => {
+      const s = clauseRef.current.trim();
+      if (!s) return;
+
+      if (s.length < MIN_FINAL_CHARS && !EOS_RE.test(s)) return;
+      if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
+
+      sendFinalNow(s);
+      clauseRef.current = '';
+    }, LINGER_MS);
+  }, [sendFinalNow]);
+
   // ---------- Clear stale service-workers (helpful for dev HTTPS mixes) ----------
   useEffect(() => {
     if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return
@@ -347,91 +432,6 @@ export default function TranslationBox() {
 
     return () => clearInterval(interval)
   }, [status, triggerFinalize])
-
-  // ---------- HTTP translate (client-driven OFF by default) ----------
-  const postTranslate = useCallback(async (s: string, finalFlag: boolean) => {
-    const body = {
-      text: s,
-      source: (sourceLang || 'ko').split('-')[0],
-      target: (targetLang || 'en').split('-')[0],
-      final: finalFlag
-    };
-
-    console.log(`[FE][HTTP][${finalFlag ? 'final' : 'preview'}] → /api/translate`, {
-      source: body.source,
-      target: body.target,
-      in: clip(s)
-    });
-
-    try {
-      const res = await fetch(`${API_URL}/api/translate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const txt = await res.text().catch(() => '');
-      console.log('[FE][HTTP][res]', res.status, res.ok, clip(txt));
-    } catch (e) {
-      console.warn('[FE][HTTP][error]', e);
-    }
-  }, [sourceLang, targetLang]);
-
-  const sendPreview = useMemo(
-    () =>
-      throttle((fullClause: string) => {
-        if (!CLIENT_DRIVEN) return;
-
-        const s = (fullClause || '').trim();
-        if (!s) return;
-
-        if (s.length < MIN_PREVIEW_CHARS && !EOS_RE.test(s)) return;
-        if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
-
-        if (!EOS_RE.test(s)) {
-          if (s === lastPreviewSentRef.current) return;
-          if (Math.abs(s.length - lastPreviewSentRef.current.length) < 2) return;
-        }
-
-        if (DEBUG) console.log('[FE][preview][clause]', clip(s));
-        lastPreviewSentRef.current = s;
-        postTranslate(s, false);
-      }, PREVIEW_THROTTLE_MS),
-    [postTranslate]
-  );
-
-  const sendFinalNow = useCallback(
-    (s: string) => {
-      const clean = (s || '').trim();
-      if (!clean) return;
-
-      sendPreview.cancel();
-
-      if (CLIENT_DRIVEN) {
-        if (DEBUG) console.log('[FE][final][clause]', clip(clean));
-        postTranslate(clean, true);
-      } else {
-        if (DEBUG) console.log('[FE][final][clause][no-http]', clip(clean));
-      }
-
-      lastPreviewSentRef.current = '';
-      triggerFinalize('clause complete');
-    },
-    [postTranslate, sendPreview, triggerFinalize]
-  );
-
-  const scheduleFinal = useCallback(() => {
-    if (lingerTimerRef.current) clearTimeout(lingerTimerRef.current);
-    lingerTimerRef.current = setTimeout(() => {
-      const s = clauseRef.current.trim();
-      if (!s) return;
-
-      if (s.length < MIN_FINAL_CHARS && !EOS_RE.test(s)) return;
-      if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
-
-      sendFinalNow(s);
-      clauseRef.current = '';
-    }, LINGER_MS);
-  }, [sendFinalNow]);
 
   // ---------- Start/Stop mic ----------
   const handleStartListening = async () => {
