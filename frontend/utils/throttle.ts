@@ -1,10 +1,10 @@
 // components/utils/throttle.ts
 
-export type ThrottledFn<T extends (...args: unknown[]) => void> = ((
+export type ThrottledFn<T extends (...args: any[]) => void> = ((
   ...args: Parameters<T>
 ) => void) & { cancel: () => void };
 
-export function throttle<T extends (...args: unknown[]) => void>(
+export function throttle<T extends (...args: any[]) => void>(
   func: T,
   delay: number
 ): ThrottledFn<T> {
