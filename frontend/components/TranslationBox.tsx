@@ -30,7 +30,7 @@ const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
 
-type CancelableFn<T extends (...args: unknown[]) => void> = ((...args: Parameters<T>) => void) & {
+type CancelableFn<Args extends unknown[] = unknown[]> = ((...args: Args) => void) & {
   cancel: () => void
 }
 
@@ -133,7 +133,7 @@ export default function TranslationBox() {
         lastPreviewSentRef.current = s;
         postTranslate(s, false);
       }, PREVIEW_THROTTLE_MS)
-  , [postTranslate]) as CancelableFn<(fullClause: string) => void>
+  , [postTranslate]) as CancelableFn<[string]>
 
   const sendFinalNow = useCallback(
     (s: string) => {
