@@ -10,8 +10,8 @@ export default function ProducerBox() {
 
   const buffer = useSentenceBuffer(
     (sentence) => {
-      // When a full sentence is ready, send to backend
-      sendProducerText(sentence, "ko", "en");
+      // When a full sentence is ready, send to backend as a final commit
+      sendProducerText(sentence, "ko", "en", false, undefined, undefined, true);
       setDebugBuf(""); // cleared after sending
     },
     { timeoutMs: 1200, minLength: 4 } // tweak as you like
