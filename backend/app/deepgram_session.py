@@ -30,7 +30,42 @@ DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 3500, min_value=200, max_value=6000)
 DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 1800, min_value=500, max_value=6000)
 ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
+DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 60, min_value=0, max_value=200)
 DG_DEBUG    = os.getenv("DEEPGRAM_DEBUG", "0") not in ("0", "", "false", "False")
+
+
+def _normalize_keyword_entries(raw: Optional[List[str]]) -> List[Tuple[str, Optional[str]]]:
+    """Split optional boost values (term:boost) and deduplicate terms."""
+    if not raw:
+        return []
+
+    normalized: List[Tuple[str, Optional[str]]] = []
+    seen: set[str] = set()
+
+    for entry in raw:
+        token = (entry or "").strip()
+        if not token:
+            continue
+
+        term, _, boost = token.partition(":")
+        term = term.strip()
+        if not term:
+            continue
+
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        boost = boost.strip()
+        if boost:
+            try:
+                float(boost)
+            except ValueError:
+                boost = ""
+        normalized.append((term, boost or None))
+
+    return normalized
 
 def _qs(
     model: str,
@@ -55,14 +90,21 @@ def _qs(
     if utter_end_ms and utter_end_ms > 0:
         params.append(("utterance_end_ms", str(utter_end_ms)))
 
+    normalized_keywords = _normalize_keyword_entries(keywords)
+    if DG_KEYWORDS_LIMIT and len(normalized_keywords) > DG_KEYWORDS_LIMIT:
+        if DG_DEBUG:
+            print(f"[DG] trimming keywords {len(normalized_keywords)} → {DG_KEYWORDS_LIMIT}")
+        normalized_keywords = normalized_keywords[:DG_KEYWORDS_LIMIT]
+
     # Repeated 'keywords' with a boost works on nova-2/enhanced/base
-    if keywords and model in ("nova-2", "enhanced", "base"):
-        for term in keywords:
-            params.append(("keywords", f"{term}:3"))
+    if normalized_keywords and model in ("nova-2", "enhanced", "base"):
+        for term, boost in normalized_keywords:
+            bias = boost or "3"
+            params.append(("keywords", f"{term}:{bias}"))
 
     # If someone flips to nova-3 later, map keywords -> keyterm (nova-3 style)
-    if model.startswith("nova-3") and keywords:
-        for term in keywords:
+    if model.startswith("nova-3") and normalized_keywords:
+        for term, _ in normalized_keywords:
             params.append(("keyterm", term))
 
     return urlencode(params, doseq=True)

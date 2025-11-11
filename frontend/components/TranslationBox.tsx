@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState, useEffect, useRef } from 'react'
+import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
 import { API_URL } from '../utils/urls'
@@ -50,9 +50,11 @@ export default function TranslationBox() {
   const clauseRef = useRef('')
   const lingerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastInterimRef = useRef('')
-
+  const lastFinalizeAtRef = useRef(0)
   const LINGER_MS = 300
   const MIN_FINAL_CHARS = 10
+  const FINALIZE_PULSE_MS = 2600
+  const MIN_FORCE_FINALIZE_CHARS = 8
   const introHoldRe = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
   const eosRe = /[.!?。！？]$|(?:습니다|입니다|할까요|했어요|했지요|했네요)$/
 
@@ -62,6 +64,21 @@ export default function TranslationBox() {
 
   // Track stability of non-final WS lines per seq (for soft-final fallback)
   const softMapRef = useRef<Map<number, { text: string; count: number; first: number; last: number }>>(new Map())
+
+
+  const triggerFinalize = useCallback(
+    (reason?: string) => {
+      if (!dgFinalize) return
+      try {
+        dgFinalize()
+        lastFinalizeAtRef.current = Date.now()
+        if (DEBUG && reason) console.log('[FE][finalize][pulse]', reason)
+      } catch (err) {
+        if (DEBUG) console.warn('[FE][finalize][pulse][error]', err)
+      }
+    },
+    [dgFinalize]
+  )
 
   // ---------- Clear stale service-workers (helpful for dev HTTPS mixes) ----------
   useEffect(() => {
@@ -312,11 +329,31 @@ export default function TranslationBox() {
   // ---------- Keep isListening in sync with Deepgram ----------
   useEffect(() => {
     setIsListening(status === 'streaming')
+    if (status !== 'streaming') {
+      lastFinalizeAtRef.current = 0
+    }
     if (status !== 'streaming' && clauseRef.current.trim()) {
       sendFinalNow(clauseRef.current)
       clauseRef.current = ''
     }
   }, [status])
+
+  useEffect(() => {
+    if (status !== 'streaming') return
+
+    const interval = setInterval(() => {
+      const clause = clauseRef.current.trim()
+      if (!clause) return
+      if (clause.length < MIN_FORCE_FINALIZE_CHARS && !eosRe.test(clause)) return
+
+      const now = Date.now()
+      if (now - lastFinalizeAtRef.current < FINALIZE_PULSE_MS * 0.8) return
+
+      triggerFinalize('interval pulse')
+    }, FINALIZE_PULSE_MS)
+
+    return () => clearInterval(interval)
+  }, [status, triggerFinalize])
 
   // ---------- HTTP translate (client-driven OFF by default) ----------
   async function postTranslate(s: string, finalFlag: boolean) {
@@ -385,7 +422,7 @@ export default function TranslationBox() {
     }
 
     lastPreviewSentRef.current = '';
-    dgFinalize?.();
+    triggerFinalize('clause complete');
   }
 
   function scheduleFinal() {
