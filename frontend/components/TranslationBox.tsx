@@ -106,9 +106,8 @@ export default function TranslationBox() {
     }
   }, [sourceLang, targetLang]);
 
-  const sendPreview = useMemo(
-    () =>
-      throttle((fullClause: string) => {
+  const sendPreview = useMemo(() =>
+    throttle((fullClause: string) => {
         if (!CLIENT_DRIVEN) return;
 
         const s = (fullClause || '').trim();
@@ -125,9 +124,8 @@ export default function TranslationBox() {
         if (DEBUG) console.log('[FE][preview][clause]', clip(s));
         lastPreviewSentRef.current = s;
         postTranslate(s, false);
-      }, PREVIEW_THROTTLE_MS),
-    [postTranslate]
-  );
+      }, PREVIEW_THROTTLE_MS)
+  , [postTranslate]);
 
   const sendFinalNow = useCallback(
     (s: string) => {
