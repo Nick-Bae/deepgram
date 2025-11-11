@@ -14,6 +14,7 @@ type Meta = {
   segment_id?: string | number;
   rev?: number;
   seq?: number;
+  is_final?: boolean;
 };
 
 type ServerBroadcast = {
@@ -52,6 +53,7 @@ export type LastState = {
   seq: number;               // <- make non-optional for simpler logic
   srcText?: string;
   srcLang?: string;
+  meta?: Meta;
 };
 
 export function useTranslationSocket({ isProducer = false }: { isProducer?: boolean } = {}) {
@@ -64,6 +66,7 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     matchScore: 0,
     matchedSource: null,
     seq: 0,                  // <- start at 0
+    meta: undefined,
   });
 
   const retryRef = useRef(0);
@@ -129,6 +132,12 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
           const seq = typeof raw.seq === 'number' ? raw.seq : nextSeq();
           const srcText = typeof raw?.src?.text === 'string' ? raw.src.text : undefined;
           const srcLang = typeof raw?.src?.lang === 'string' ? raw.src.lang : undefined;
+          const liveMeta: Meta = typeof raw.meta === 'object' && raw.meta
+            ? { ...raw.meta }
+            : {};
+          if (typeof liveMeta.is_final !== 'boolean') {
+            liveMeta.is_final = raw.mode === 'live';
+          }
 
           setLast({
             text: raw.text,
@@ -142,6 +151,7 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
             seq,
             srcText,
             srcLang,
+            meta: liveMeta,
           });
           return;
         }
@@ -162,6 +172,7 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
               segmentId: segId,
               rev,
               seq,     // track latest seq even on partials (safe)
+              meta: { ...(prev.meta ?? {}), ...meta },
             }));
           } else {
             setLast({
@@ -174,6 +185,7 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
               segmentId: segId,
               rev,
               seq,
+              meta,
             });
           }
           return;
@@ -192,6 +204,7 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
             segmentId: undefined,
             rev: 0,
             seq: nextSeq(),
+            meta: undefined,
           });
           return;
         }

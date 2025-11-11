@@ -16,6 +16,61 @@ function wsDeepgramURL() {
   return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram`;
 }
 
+const PCM_WORKLET_INLINE = `
+class PCMWorkletProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    const samples = input[0];
+    const buffer = new ArrayBuffer(samples.length * 2);
+    const view = new DataView(buffer);
+    for (let i = 0; i < samples.length; i++) {
+      const clamped = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(i * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+    }
+    this.port.postMessage(buffer, [buffer]);
+    return true;
+  }
+}
+registerProcessor('pcm-worklet', PCMWorkletProcessor);
+`;
+
+function resolveWorkletUrl(base: string): string {
+  if (/^https?:\/\//i.test(base)) return base;
+  if (typeof window === 'undefined') return base;
+  const url = new URL(base, window.location.origin);
+  if (window.location.protocol === 'https:' && url.protocol === 'http:') {
+    url.protocol = 'https:';
+  }
+  return url.toString();
+}
+
+async function addInlineWorklet(ctx: AudioContext) {
+  const blob = new Blob([PCM_WORKLET_INLINE], { type: 'application/javascript' });
+  const blobUrl = URL.createObjectURL(blob);
+  try {
+    await ctx.audioWorklet.addModule(blobUrl);
+  } finally {
+    URL.revokeObjectURL(blobUrl);
+  }
+}
+
+async function ensurePcmWorklet(ctx: AudioContext) {
+  const override = process.env.NEXT_PUBLIC_PCM_WORKLET_URL;
+  if (!override) {
+    await addInlineWorklet(ctx);
+    return;
+  }
+
+  const target = resolveWorkletUrl(override);
+  try {
+    await ctx.audioWorklet.addModule(target);
+  } catch (err) {
+    console.warn('[DG] audio worklet load failed, falling back to inline blob', err);
+    await addInlineWorklet(ctx);
+  }
+}
+
 export function useDeepgramProducer() {
   const [status, setStatus] = useState<"idle" | "starting" | "streaming" | "stopped" | "error">("idle");
   const [partial, setPartial] = useState("");
@@ -34,7 +89,7 @@ export function useDeepgramProducer() {
 
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
       ctxRef.current = ctx;
-      await ctx.audioWorklet.addModule("/workers/pcm-worklet-processor.js");
+      await ensurePcmWorklet(ctx);
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -90,5 +145,13 @@ export function useDeepgramProducer() {
     }
   }
 
-  return { status, partial, lastCommit, errorMsg, start, stop };
+  function finalizeCurrentUtterance() {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: "finalize" }));
+    } catch {}
+  }
+
+  return { status, partial, lastCommit, errorMsg, start, stop, finalize: finalizeCurrentUtterance };
 }

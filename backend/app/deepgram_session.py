@@ -25,7 +25,7 @@ def _int_env(name: str, default: int, *, min_value: Optional[int] = None, max_va
 
 DG_ENDPOINT = os.getenv("DEEPGRAM_ENDPOINT", "wss://api.deepgram.com/v1/listen")
 DG_KEY      = os.getenv("DEEPGRAM_API_KEY")
-DG_MODEL    = os.getenv("DEEPGRAM_MODEL", "nova-2")   # Korean supported
+DG_MODEL    = os.getenv("DEEPGRAM_MODEL", "nova-3")   # Korean supported
 DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 3500, min_value=200, max_value=6000)
 DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 1800, min_value=500, max_value=6000)

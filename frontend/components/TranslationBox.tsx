@@ -34,8 +34,10 @@ export default function TranslationBox() {
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
 
   // Deepgram mic producer
-  const { start: dgStart, stop: dgStop, status, partial, errorMsg } =
-    useDeepgramProducer ? useDeepgramProducer() : { start: async () => { }, stop: () => { }, status: 'idle', partial: '', errorMsg: '' }
+  const { start: dgStart, stop: dgStop, finalize: dgFinalize, status, partial, errorMsg } =
+    useDeepgramProducer
+      ? useDeepgramProducer()
+      : { start: async () => { }, stop: () => { }, finalize: () => { }, status: 'idle', partial: '', errorMsg: '' }
 
   // TTS refs
   const synthRef = useRef<SpeechSynthesis | null>(null)
@@ -60,6 +62,31 @@ export default function TranslationBox() {
 
   // Track stability of non-final WS lines per seq (for soft-final fallback)
   const softMapRef = useRef<Map<number, { text: string; count: number; first: number; last: number }>>(new Map())
+
+  // ---------- Clear stale service-workers (helpful for dev HTTPS mixes) ----------
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return
+
+    const cleanup = async () => {
+      try {
+        const regs = await navigator.serviceWorker.getRegistrations()
+        await Promise.all(regs.map(reg => reg.unregister().catch(() => undefined)))
+      } catch (err) {
+        console.warn('[FE][SW][cleanup-failed]', err)
+      }
+
+      if ('caches' in window) {
+        try {
+          const keys = await caches.keys()
+          await Promise.all(keys.map(key => caches.delete(key).catch(() => false)))
+        } catch (err) {
+          console.warn('[FE][SW][cache-clear-failed]', err)
+        }
+      }
+    }
+
+    cleanup()
+  }, [])
 
   // ---------- TTS helpers ----------
   function mapToTTSLocale(code: string) {
@@ -173,6 +200,11 @@ export default function TranslationBox() {
     const incoming = String((last as any)?.text || '').trim();
     const meta = (last as any)?.meta;
     const isFinal = typeof meta?.is_final === 'boolean' ? meta.is_final : false;
+    const committedSrc = typeof (last as any)?.srcText === 'string'
+      ? String((last as any)?.srcText).trim()
+      : typeof (last as any)?.src?.text === 'string'
+        ? String((last as any)?.src?.text).trim()
+        : '';
 
     if (!incoming) return;
 
@@ -194,6 +226,12 @@ export default function TranslationBox() {
       }
       // We handled a real final; clear any soft cache for this seq
       softMapRef.current.delete(seq);
+
+      if (committedSrc) {
+        setText(committedSrc);
+        clauseRef.current = '';
+        lastInterimRef.current = '';
+      }
       return;
     }
 
@@ -347,6 +385,7 @@ export default function TranslationBox() {
     }
 
     lastPreviewSentRef.current = '';
+    dgFinalize?.();
   }
 
   function scheduleFinal() {

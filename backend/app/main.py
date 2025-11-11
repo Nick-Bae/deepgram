@@ -613,6 +613,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     seq = 0
     closed = asyncio.Event()
+    finalize_event = asyncio.Event()
 
     async def from_client_to_deepgram():
         try:
@@ -632,7 +633,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     try:
                         payload = json.loads(t)
                         if payload.get("type") == "finalize":
-                            await dg.send(json.dumps({"type": "CloseStream"}))
+                            finalize_event.set()
+                            continue
                     except:
                         pass
         finally:
@@ -648,6 +650,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         """
         SENTENCE_PUNCT = tuple(".?!。？！…")
         COMMIT_WAIT_MS = 500
+        MIN_CONFIDENT_CHARS = 18
 
         pending_kr: str | None = None
         pending_task: asyncio.Task | None = None
@@ -658,6 +661,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
         def norm_ws(s: str) -> str:
             return " ".join((s or "").split())
+
+        def looks_complete(text: str) -> bool:
+            clean = norm_ws(text)
+            return len(clean) >= MIN_CONFIDENT_CHARS or ends_like_sentence(clean)
 
         async def commit_now(kr_text: str):
             nonlocal seq, pending_kr, pending_task
@@ -732,6 +739,21 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
             pending_task = asyncio.create_task(_wait_and_commit(pending_kr or ""))
 
+        async def flush_on_finalize():
+            while True:
+                try:
+                    await finalize_event.wait()
+                except asyncio.CancelledError:
+                    break
+                finalize_event.clear()
+                if pending_kr:
+                    try:
+                        await commit_now(pending_kr)
+                    except Exception:
+                        pass
+
+        finalize_task = asyncio.create_task(flush_on_finalize())
+
         try:
             async for raw in dg:  # <-- dg is in scope (captured from outer function)
                 try:
@@ -768,7 +790,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print(f"[DG][A] final: speech_final={speech_final} KR='{pending_kr or ''}'")
 
                 if speech_final and pending_kr:
-                    await commit_now(pending_kr)
+                    if looks_complete(pending_kr):
+                        await commit_now(pending_kr)
+                    else:
+                        await arm_timer()
                     continue
 
                 if pending_kr and ends_like_sentence(pending_kr):
@@ -779,6 +804,11 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     await arm_timer()
 
         finally:
+            finalize_task.cancel()
+            try:
+                await finalize_task
+            except asyncio.CancelledError:
+                pass
             # best-effort flush on shutdown
             if pending_kr:
                 try:
