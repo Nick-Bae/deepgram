@@ -63,11 +63,35 @@ async def ws_translate(ws: WebSocket):
 #  - On Deepgram is_final=True, we translate and broadcast to all consumers
 # ------------------------------------------------------------------------------
 # ---- replace your entire ws_stt_deepgram with this ----
+
+def _clean_lang(raw: Optional[str], default: str) -> str:
+    if raw is None:
+        return default
+    cleaned = raw.strip().lower()
+    return cleaned or default
+
+
+def _normalize_lang(raw: Optional[str], default: str) -> str:
+    if not raw:
+        return default
+    cleaned = raw.strip().lower()
+    if not cleaned:
+        return default
+    primary = cleaned.split("-")[0]
+    return primary or default
+
+
 @app.websocket("/ws/stt/deepgram")
 async def ws_stt_deepgram(websocket: WebSocket):
+    src_lang_full = _clean_lang(websocket.query_params.get("source"), "ko")
+    tgt_lang_full = _clean_lang(websocket.query_params.get("target"), "en")
+    src_lang = _normalize_lang(src_lang_full, "ko")
+    tgt_lang = _normalize_lang(tgt_lang_full, "en")
+    dg_language = _deepgram_language_preference(src_lang_full)
+    dg_keywords = None if src_lang.startswith("ko") else []
     await websocket.accept()
     try:
-        dg = await connect_to_deepgram()  # <-- dg is created here
+        dg = await connect_to_deepgram(language=dg_language, keywords=dg_keywords)  # <-- dg is created here
     except Exception as e:
         await websocket.send_json({"type": "error", "message": f"Deepgram connect failed: {e}"})
         await websocket.close()
@@ -114,7 +138,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         COMMIT_WAIT_MS = 250
         MIN_CONFIDENT_CHARS = 10
 
-        pending_kr: str | None = None
+        pending_src: str | None = None
         pending_task: asyncio.Task | None = None
 
         def ends_like_sentence(t: str) -> bool:
@@ -128,37 +152,40 @@ async def ws_stt_deepgram(websocket: WebSocket):
             clean = norm_ws(text)
             return len(clean) >= MIN_CONFIDENT_CHARS or ends_like_sentence(clean)
 
-        async def commit_now(kr_text: str):
-            nonlocal seq, pending_kr, pending_task
-            if not kr_text or not kr_text.strip():
+        async def commit_now(src_text_raw: str):
+            nonlocal seq, pending_src, pending_task
+            if not src_text_raw or not src_text_raw.strip():
                 return
             # de-dup repeated finals
-            if norm_ws(kr_text) == norm_ws(getattr(commit_now, "_last_kr", "")):
+            if norm_ws(src_text_raw) == norm_ws(getattr(commit_now, "_last_src", "")):
                 return
-            setattr(commit_now, "_last_kr", kr_text)
+            setattr(commit_now, "_last_src", src_text_raw)
 
             seq += 1
-            src_text = kr_text
-            try:
-                en = await translate_text(src_text, "ko", "en")
-            except Exception as e:
-                print("[TX] error:", e)
-                en = src_text  # fail-open
+            src_text = src_text_raw
+            if src_lang == tgt_lang and src_lang_full == tgt_lang_full:
+                translated = src_text
+            else:
+                try:
+                    translated = await translate_text(src_text, src_lang_full, tgt_lang_full)
+                except Exception as e:
+                    print("[TX] error:", e)
+                    translated = src_text  # fail-open
 
-            print(f"[A] FINAL seq={seq} KR='{src_text}' → EN='{en}'")
+            print(f"[A] FINAL seq={seq} {src_lang_full}->{tgt_lang_full} src='{src_text}' → tgt='{translated}'")
 
             # shape your client already supports
             live_msg_new = {
                 "mode": "live",
-                "text": en,
+                "text": translated,
                 "seq": seq,
-                "src": {"text": src_text, "lang": "ko"},
-                "tgt": {"lang": "en"},
+                "src": {"text": src_text, "lang": src_lang_full},
+                "tgt": {"lang": tgt_lang_full},
             }
             live_msg_legacy = {
                 "type": "translation",
-                "payload": en,
-                "lang": "en",
+                "payload": translated,
+                "lang": tgt_lang_full,
                 "meta": {
                     "mode": "realtime",
                     "partial": False,
@@ -177,11 +204,11 @@ async def ws_stt_deepgram(websocket: WebSocket):
             try:
                 await manager.broadcast(live_msg_new)
                 await manager.broadcast(live_msg_legacy)
-                print(f"[BROADCAST] seq={seq} '{en[:60]}'")
+                print(f"[BROADCAST] seq={seq} '{translated[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
 
-            pending_kr = None
+            pending_src = None
             if pending_task and not pending_task.done():
                 pending_task.cancel()
             pending_task = None
@@ -194,12 +221,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
             async def _wait_and_commit(snap: str):
                 try:
                     await asyncio.sleep(COMMIT_WAIT_MS / 1000.0)
-                    if pending_kr and norm_ws(pending_kr) == norm_ws(snap):
-                        await commit_now(pending_kr)
+                    if pending_src and norm_ws(pending_src) == norm_ws(snap):
+                        await commit_now(pending_src)
                 except asyncio.CancelledError:
                     pass
 
-            pending_task = asyncio.create_task(_wait_and_commit(pending_kr or ""))
+            pending_task = asyncio.create_task(_wait_and_commit(pending_src or ""))
 
         async def flush_on_finalize():
             while True:
@@ -208,9 +235,9 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 except asyncio.CancelledError:
                     break
                 finalize_event.clear()
-                if pending_kr:
+                if pending_src:
                     try:
-                        await commit_now(pending_kr)
+                        await commit_now(pending_src)
                     except Exception:
                         pass
 
@@ -247,22 +274,22 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     continue
 
                 if transcript:
-                    pending_kr = transcript
+                    pending_src = transcript
 
-                print(f"[DG][A] final: speech_final={speech_final} KR='{pending_kr or ''}'")
+                print(f"[DG][A] final: speech_final={speech_final} src='{pending_src or ''}'")
 
-                if speech_final and pending_kr:
-                    if looks_complete(pending_kr):
-                        await commit_now(pending_kr)
+                if speech_final and pending_src:
+                    if looks_complete(pending_src):
+                        await commit_now(pending_src)
                     else:
                         await arm_timer()
                     continue
 
-                if pending_kr and ends_like_sentence(pending_kr):
-                    await commit_now(pending_kr)
+                if pending_src and ends_like_sentence(pending_src):
+                    await commit_now(pending_src)
                     continue
 
-                if pending_kr:
+                if pending_src:
                     await arm_timer()
 
         finally:
@@ -272,9 +299,9 @@ async def ws_stt_deepgram(websocket: WebSocket):
             except asyncio.CancelledError:
                 pass
             # best-effort flush on shutdown
-            if pending_kr:
+            if pending_src:
                 try:
-                    await commit_now(pending_kr)
+                    await commit_now(pending_src)
                 except Exception:
                     pass
 
@@ -302,3 +329,39 @@ async def debug_broadcast():
     await manager.broadcast(msg_new)
     await manager.broadcast(msg_legacy)
     return {"ok": True}
+DEFAULT_DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
+
+
+def _deepgram_language_preference(raw: Optional[str]) -> str:
+    """
+    Map UI language codes to Deepgram's expected identifiers.
+    Falls back to the configured default if nothing matches.
+    """
+    if not raw:
+        return DEFAULT_DG_LANGUAGE
+    token = raw.strip().lower()
+    if not token:
+        return DEFAULT_DG_LANGUAGE
+
+    overrides = {
+        "en": "en",
+        "en-us": "en",
+        "en-gb": "en",
+        "ko": "ko",
+        "ko-kr": "ko",
+        "es": "es",
+        "es-es": "es",
+        "zh": "zh",
+        "zh-cn": "zh",
+        "zh-hans": "zh",
+        "zh-tw": "zh",
+        "zh-hant": "zh",
+    }
+    if token in overrides:
+        return overrides[token]
+
+    primary = token.split("-")[0]
+    if primary in overrides:
+        return overrides[primary]
+
+    return primary or DEFAULT_DG_LANGUAGE

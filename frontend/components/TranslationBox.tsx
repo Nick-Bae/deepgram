@@ -20,6 +20,18 @@ const availableLanguages = [
   { code: 'es', name: 'Spanish' },
 ]
 
+function languageName(code: string) {
+  const raw = (code || '').trim()
+  if (!raw) return 'Unknown language'
+  const lower = raw.toLowerCase()
+  const exact = availableLanguages.find(l => l.code.toLowerCase() === lower)
+  if (exact) return exact.name
+  const base = lower.split('-')[0]
+  const baseMatch = availableLanguages.find(l => l.code.toLowerCase() === base)
+  if (baseMatch) return baseMatch.name
+  return raw.toUpperCase()
+}
+
 const LINGER_MS = 300
 const MIN_FINAL_CHARS = 10
 const FINALIZE_PULSE_MS = 2600
@@ -47,6 +59,8 @@ export default function TranslationBox() {
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
+  const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
+  const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
 
   // Deepgram mic producer
   const dgController = useDeepgramProducer() as ReturnType<typeof useDeepgramProducer> & {
@@ -494,7 +508,7 @@ export default function TranslationBox() {
     ensureTTSReady()
 
     try {
-      await dgStart()
+      await dgStart({ sourceLang, targetLang })
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e)
       alert(`Mic start failed: ${message}`)
@@ -563,7 +577,7 @@ export default function TranslationBox() {
                 <div className="flex items-center justify-between mb-3">
                   <div>
                     <p className="text-xs uppercase tracking-wide text-slate-500">Live transcript</p>
-                    <p className="text-sm font-medium text-slate-700">Korean input</p>
+                    <p className="text-sm font-medium text-slate-700">{sourceLabel} input</p>
                   </div>
                   <span className="text-xs text-slate-400">Auto-updated</span>
                 </div>
@@ -579,7 +593,7 @@ export default function TranslationBox() {
                 <div className="flex items-center justify-between mb-4">
                   <div>
                     <p className="text-xs uppercase tracking-[0.3em] text-slate-400">Translation</p>
-                    <p className="text-lg font-semibold">English output</p>
+                    <p className="text-lg font-semibold">{targetLabel} output</p>
                   </div>
                   <span className="text-xs text-slate-400">Broadcast ready</span>
                 </div>

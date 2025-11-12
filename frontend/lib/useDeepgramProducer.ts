@@ -1,29 +1,46 @@
 // frontend/lib/useDeepgramProducer.ts
 import { useRef, useState } from "react";
 
+type StartOptions = {
+  sourceLang?: string;
+  targetLang?: string;
+};
+
 export type DeepgramProducerController = {
   status: "idle" | "starting" | "streaming" | "stopped" | "error";
   partial: string;
   lastCommit: string;
   errorMsg: string | null;
-  start: () => Promise<void>;
+  start: (options?: StartOptions) => Promise<void>;
   stop: () => void;
   finalize: () => void;
 };
 
-function wsDeepgramURL() {
+function sanitizeLang(code?: string) {
+  if (!code) return "";
+  return code.trim().toLowerCase();
+}
+
+function wsDeepgramURL(opts?: StartOptions) {
   const env = process.env.NEXT_PUBLIC_WS_URL || "";
+  const params = new URLSearchParams();
+  const src = sanitizeLang(opts?.sourceLang);
+  const tgt = sanitizeLang(opts?.targetLang);
+  if (src) params.set("source", src);
+  if (tgt) params.set("target", tgt);
+
+  const suffix = params.toString() ? `?${params.toString()}` : "";
   try {
     if (env.startsWith("ws")) {
       const u = new URL(env);
       u.pathname = ""; u.search = ""; u.hash = "";
-      return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram`;
+      return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram${suffix}`;
     }
   } catch { }
   const u = new URL(window.location.href);
   u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
   u.pathname = ""; u.search = ""; u.hash = "";
-  return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram`;
+  return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram${suffix}`;
 }
 
 const PCM_WORKLET_INLINE = `
@@ -92,7 +109,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
   const ctxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  async function start() {
+  async function start(options?: StartOptions) {
     try {
       if (status === "streaming") return;
       setStatus("starting"); setErrorMsg(null);
@@ -125,7 +142,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
       src.connect(worklet);
       portRef.current = worklet.port;
 
-      const url = wsDeepgramURL();
+      const url = wsDeepgramURL(options);
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       ws.onopen = () => setStatus("streaming");
