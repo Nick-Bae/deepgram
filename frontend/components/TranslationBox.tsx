@@ -29,6 +29,7 @@ const EOS_RE = /[.!?。！？]$|(?:습니다|입니다|할까요|했어요|했�
 const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
+const HANGUL_CHAR_RE = /[\uac00-\ud7a3]/
 
 type CancelableFn<Args extends unknown[] = unknown[]> = ((...args: Args) => void) & {
   cancel: () => void
@@ -70,6 +71,41 @@ export default function TranslationBox() {
 
   // Track stability of non-final WS lines per seq (for soft-final fallback)
   const softMapRef = useRef<Map<number, { text: string; count: number; first: number; last: number }>>(new Map())
+  const segmenterCacheRef = useRef<Record<string, Intl.Segmenter | undefined>>({})
+
+  const formatSourceForDisplay = useCallback((raw: string) => {
+    if (typeof raw !== 'string') return ''
+    const trimmed = raw.trim()
+    if (!trimmed) return ''
+
+    const lang = (sourceLang || '').toLowerCase()
+    if (!lang.startsWith('ko')) return trimmed
+    if (!HANGUL_CHAR_RE.test(trimmed)) return trimmed
+    if (trimmed.includes(' ')) return trimmed
+    if (typeof Intl === 'undefined' || typeof Intl.Segmenter !== 'function') return trimmed
+
+    const cacheKey = 'ko'
+    let segmenter = segmenterCacheRef.current[cacheKey]
+    if (!segmenter) {
+      segmenter = new Intl.Segmenter(cacheKey, { granularity: 'word' })
+      segmenterCacheRef.current[cacheKey] = segmenter
+    }
+
+    try {
+      let formatted = ''
+      let previousWasWord = false
+      for (const part of segmenter.segment(trimmed)) {
+        const chunk = part.segment.trim()
+        if (!chunk) continue
+        if (previousWasWord && part.isWordLike) formatted += ' '
+        formatted += chunk
+        previousWasWord = !!part.isWordLike
+      }
+      return formatted || trimmed
+    } catch {
+      return trimmed
+    }
+  }, [sourceLang])
 
 
   const triggerFinalize = useCallback(
@@ -329,11 +365,14 @@ export default function TranslationBox() {
       // We handled a real final; clear any soft cache for this seq
       softMapRef.current.delete(seq);
 
-      if (committedSrc) {
-        setText(committedSrc);
-        clauseRef.current = '';
-        lastInterimRef.current = '';
+      const clauseSnapshot = clauseRef.current.trim();
+      const interimSnapshot = lastInterimRef.current.trim();
+      const bestSource = committedSrc || clauseSnapshot || interimSnapshot;
+      if (bestSource) {
+        setText(formatSourceForDisplay(bestSource));
       }
+      clauseRef.current = '';
+      lastInterimRef.current = '';
       return;
     }
 
@@ -363,7 +402,7 @@ export default function TranslationBox() {
         }
       }
     }
-  }, [enqueueFinalTTS, isMuted, last]);
+  }, [enqueueFinalTTS, formatSourceForDisplay, isMuted, last]);
 
   // ---------- Deepgram partials → clause buffer ----------
   useEffect(() => {
@@ -408,8 +447,9 @@ export default function TranslationBox() {
     }
 
     lastInterimRef.current = cur;
-    setText(cur);
-  }, [partial, scheduleFinal, sendFinalNow, sendPreview]);
+    const formatted = formatSourceForDisplay(cur);
+    setText(formatted || cur);
+  }, [formatSourceForDisplay, partial, scheduleFinal, sendFinalNow, sendPreview]);
 
   // ---------- Keep isListening in sync with Deepgram ----------
   useEffect(() => {
