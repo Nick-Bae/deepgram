@@ -14,6 +14,17 @@ function clip(s: string, n = 120) {
   return t.length > n ? t.slice(0, n) + '…' : t;
 }
 
+function languageFlag(code: string) {
+  const base = (code || '').split('-')[0];
+  switch (base) {
+    case 'ko': return '🇰🇷';
+    case 'en': return '🇺🇸';
+    case 'zh': return '🇨🇳';
+    case 'es': return '🇪🇸';
+    default: return '🌐';
+  }
+}
+
 const availableLanguages = [
   { code: 'ko', name: 'Korean' },
   { code: 'zh-CN', name: 'Chinese (Simplified)' },
@@ -60,6 +71,10 @@ export default function TranslationBox() {
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
+  const [isBroadcasting, setIsBroadcasting] = useState(true)
+  const [aiAssistEnabled, setAiAssistEnabled] = useState(true)
+  const [displayOnAir, setDisplayOnAir] = useState(true)
+  const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
 
@@ -85,6 +100,7 @@ export default function TranslationBox() {
   const lastInterimRef = useRef('')
   const lastFinalizeAtRef = useRef(0)
   const lastPreviewSentRef = useRef('')
+  const lastSourceUpdateRef = useRef(0)
 
   // Track stability of non-final WS lines per seq (for soft-final fallback)
   const softMapRef = useRef<Map<number, { text: string; count: number; first: number; last: number }>>(new Map())
@@ -367,7 +383,6 @@ export default function TranslationBox() {
     setTranslated(incoming);
 
     if (isFinal) {
-      // Only handle first true-final per seq
       if (seq && seq <= lastHandledSeqRef.current) {
         console.log('[FE][WS][final][skip-already-handled]', seq);
         return;
@@ -379,7 +394,6 @@ export default function TranslationBox() {
       } else {
         console.log('[FE][TTS][skip]', { isMuted, sameAsCurrent: incoming === currentSpokenRef.current });
       }
-      // We handled a real final; clear any soft cache for this seq
       softMapRef.current.delete(seq);
 
       const clauseSnapshot = clauseRef.current.trim();
@@ -390,11 +404,13 @@ export default function TranslationBox() {
       }
       clauseRef.current = '';
       lastInterimRef.current = '';
+      if (lastSourceUpdateRef.current) {
+        setLatencyMs(Date.now() - lastSourceUpdateRef.current);
+      }
       return;
     }
 
-    // Soft-final fallback: when finals aren’t flagged by backend
-    if (!seq) return; // require seq to avoid accidental repeats
+    if (!seq) return;
     const now = Date.now();
     const prev = softMapRef.current.get(seq);
     if (!prev) {
@@ -408,8 +424,6 @@ export default function TranslationBox() {
         last: now,
       };
       softMapRef.current.set(seq, entry);
-
-      // Consider it "stable enough" if repeated at least twice, OR lingered > 900ms
       const stable = entry.count >= 2 || (now - entry.first) > 900;
       if (stable && EOS_RE.test(incoming) && seq > lastHandledSeqRef.current) {
         console.log('[FE][WS][soft-final]', { seq, out: clip(incoming) });
@@ -425,6 +439,7 @@ export default function TranslationBox() {
   useEffect(() => {
     const cur = (partial || '').trim();
     if (!cur) return;
+    lastSourceUpdateRef.current = Date.now();
 
     console.log('[FE][DG][partial]', clip(cur));
 
@@ -522,151 +537,292 @@ export default function TranslationBox() {
     dgStop()
   }
 
+  const previewSnippet = clip((last.preview || ''), 100)
+  const ttsAudienceEnabled = !isMuted
+  const latencyLabel = latencyMs !== null ? `${Math.max(latencyMs, 0).toFixed(0)} ms` : 'Calibrating…'
+  const micActive = isListening && status === 'streaming'
+  const waveformBars = Array.from({ length: 5 }, (_, idx) => (
+    <span
+      key={idx}
+      className="inline-flex w-1 rounded-full bg-cyan-300/80 animate-[pulse_1.2s_ease-in-out_infinite]"
+      style={{
+        animationDelay: `${idx * 0.12}s`,
+        height: micActive ? `${8 + idx * 6}px` : '8px'
+      }}
+    />
+  ))
+
   return (
-    <section className="w-full">
-      <div className="relative overflow-hidden rounded-3xl border border-white/60 bg-white shadow-[0_25px_60px_rgba(15,23,42,0.18)]">
-        <div className="pointer-events-none absolute inset-0 opacity-70" style={{ background: 'radial-gradient(circle at 20% 20%, rgba(56,189,248,0.18), transparent 50%)' }} />
-        <div className="pointer-events-none absolute -right-32 top-0 h-64 w-64 rounded-full bg-cyan-200/30 blur-3xl" />
-        <div className="relative p-6 md:p-10 space-y-8">
-          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+    <section className="w-full space-y-8 text-slate-100">
+      <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-[#10172a] shadow-[0_30px_110px_rgba(0,0,0,0.55)]">
+        <div className="pointer-events-none absolute inset-0 opacity-70" style={{ background: 'radial-gradient(circle at 18% 25%, rgba(0,255,255,0.08), transparent 55%)' }} />
+        <div className="pointer-events-none absolute -right-28 top-8 h-72 w-72 rounded-full bg-cyan-400/15 blur-3xl" />
+        <div className="relative space-y-8 p-6 md:p-10">
+          <header className="flex flex-wrap items-center justify-between gap-6 border-b border-white/10 pb-6">
             <div>
-              <p className="text-sm uppercase tracking-widest text-slate-400">Live producer console</p>
-              <h2 className="text-2xl md:text-3xl font-bold text-slate-900">Translation &amp; Broadcast Hub</h2>
+              <p className="flex items-center gap-2 text-xs uppercase tracking-[0.35em] text-cyan-200">
+                <span className={`inline-flex h-2 w-2 rounded-full ${isBroadcasting ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
+                Live
+              </p>
+              <h2 className="mt-2 text-2xl font-bold leading-tight text-white md:text-3xl">Real-Time Sermon Translation</h2>
+              <p className="text-sm text-slate-300">Monitor, refine, and broadcast translations without leaving this console.</p>
             </div>
-            <div className="flex flex-wrap gap-3">
-              <span className={`inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-sm font-semibold ${connected ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-600'}`}>
-                <span className={`h-2 w-2 rounded-full ${connected ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`} />
+            <div className="flex flex-col items-start gap-3 text-sm md:flex-row md:items-center md:gap-4">
+              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 ${connected ? 'border-emerald-400/40 text-emerald-200' : 'border-rose-400/40 text-rose-200'}`}>
+                <span className={`h-2 w-2 rounded-full ${connected ? 'bg-emerald-400 animate-ping' : 'bg-rose-400'}`} />
                 WebSocket {connected ? 'Connected' : 'Offline'}
               </span>
-              <span className={`inline-flex items-center gap-2 rounded-full px-4 py-1.5 text-sm font-semibold ${status === 'streaming' ? 'bg-sky-100 text-sky-700' : 'bg-amber-100 text-amber-700'}`}>
-                <span className={`h-2 w-2 rounded-full ${status === 'streaming' ? 'bg-sky-500 animate-pulse' : 'bg-amber-500'}`} />
-                Deepgram: {status}
+              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 ${status === 'streaming' ? 'border-cyan-400/40 text-cyan-100' : 'border-amber-400/40 text-amber-100'}`}>
+                <span className={`h-2 w-2 rounded-full ${status === 'streaming' ? 'bg-cyan-300 animate-pulse' : 'bg-amber-400'}`} />
+                Deepgram · {status}
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-slate-200">
+                <span className="text-xs uppercase tracking-wide text-slate-400">Latency</span>
+                <strong className="text-sm text-white">{latencyLabel}</strong>
               </span>
             </div>
-          </div>
+          </header>
 
           {errorMsg && (
-            <div className="rounded-2xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            <div className="rounded-2xl border border-rose-500/60 bg-rose-500/20 px-4 py-3 text-sm text-rose-100">
               {errorMsg}
             </div>
           )}
 
           <div className="grid gap-6 md:grid-cols-2">
             <div className="flex flex-col gap-2">
-              <label className="text-sm font-semibold text-slate-600">Source language</label>
-              <select
-                value={sourceLang}
-                onChange={e => setSourceLang(e.target.value)}
-                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-slate-800 shadow-sm focus:border-slate-400 focus:outline-none"
-              >
-                {availableLanguages.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
-              </select>
+              <label className="text-xs uppercase tracking-wide text-slate-400">Source language</label>
+              <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-white">
+                <span className="text-2xl">{languageFlag(sourceLang)}</span>
+                <select
+                  value={sourceLang}
+                  onChange={e => setSourceLang(e.target.value)}
+                  className="w-full bg-transparent text-base font-semibold focus:outline-none"
+                >
+                  {availableLanguages.map(l => <option key={l.code} value={l.code} className="text-slate-900">{l.name}</option>)}
+                </select>
+              </div>
             </div>
             <div className="flex flex-col gap-2">
-              <label className="text-sm font-semibold text-slate-600">Target language</label>
-              <select
-                value={targetLang}
-                onChange={e => setTargetLang(e.target.value)}
-                className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-slate-800 shadow-sm focus:border-slate-400 focus:outline-none"
-              >
-                {availableLanguages.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
-              </select>
+              <label className="text-xs uppercase tracking-wide text-slate-400">Target language</label>
+              <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-white">
+                <span className="text-2xl">{languageFlag(targetLang)}</span>
+                <select
+                  value={targetLang}
+                  onChange={e => setTargetLang(e.target.value)}
+                  className="w-full bg-transparent text-base font-semibold focus:outline-none"
+                >
+                  {availableLanguages.map(l => <option key={l.code} value={l.code} className="text-slate-900">{l.name}</option>)}
+                </select>
+              </div>
             </div>
           </div>
 
-          <div className="grid gap-6 lg:grid-cols-[1.15fr,0.85fr]">
+          <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
             <div className="space-y-6">
-              <div className="rounded-2xl border border-slate-100 bg-slate-50/60 p-4 shadow-inner">
-                <div className="flex items-center justify-between mb-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-wide text-slate-500">Live transcript</p>
-                    <p className="text-sm font-medium text-slate-700">{sourceLabel} input</p>
+              <div className="rounded-3xl border border-white/10 bg-white/5 p-5 lg:p-6">
+                <div className="grid gap-6 lg:grid-cols-2">
+                  <div className="space-y-4 rounded-2xl border border-white/10 bg-[#0d1424] p-5">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.35em] text-slate-500">Live Source</p>
+                        <p className="text-lg font-semibold text-white">{languageFlag(sourceLang)} {sourceLabel}</p>
+                      </div>
+                      <div className="flex items-center gap-3 text-sm text-slate-300">
+                        <span className={`relative inline-flex h-12 w-12 items-center justify-center rounded-full border ${micActive ? 'border-cyan-400/60 bg-cyan-400/10 text-cyan-100' : 'border-slate-400/40 bg-slate-500/10 text-slate-300'}`}>
+                          <span className="text-xl">🎙️</span>
+                          {micActive && <span className="absolute inset-0 rounded-full border border-cyan-300/40 animate-ping" />}
+                        </span>
+                        <div className="flex h-10 items-end gap-1">{waveformBars}</div>
+                      </div>
+                    </div>
+                    <textarea
+                      value={text}
+                      onChange={e => setText(e.target.value)}
+                      placeholder="Speak into the mic or type here…"
+                      className="min-h-[170px] w-full resize-none rounded-2xl border border-white/5 bg-black/30 px-4 py-3 text-base text-white placeholder:text-slate-500 focus:border-cyan-400/60 focus:outline-none"
+                    />
                   </div>
-                  <span className="text-xs text-slate-400">Auto-updated</span>
+
+                  <div className="space-y-4 rounded-2xl border border-cyan-400/30 bg-gradient-to-br from-[#0b2135] via-[#0f2c44] to-[#0b162a] p-5 text-slate-100">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.35em] text-cyan-200">Translation Output</p>
+                        <p className="text-lg font-semibold text-white">{languageFlag(targetLang)} {targetLabel}</p>
+                      </div>
+                      <span className="rounded-full border border-white/10 bg-white/10 px-3 py-1 text-xs uppercase tracking-wide text-white/80">Broadcast ready</span>
+                    </div>
+                    <p className="min-h-[170px] whitespace-pre-wrap text-xl leading-relaxed">
+                      {translated || 'Waiting for the next sentence…'}
+                    </p>
+                    <div className="rounded-2xl border border-white/5 bg-black/20 px-4 py-3 text-sm text-slate-300">
+                      <p className="text-xs uppercase tracking-[0.35em] text-slate-400">Next sentence preview</p>
+                      <p className="mt-1 text-base text-white">{previewSnippet || 'Listening for the next clause…'}</p>
+                    </div>
+                  </div>
                 </div>
-                <textarea
-                  value={text}
-                  onChange={(e) => setText(e.target.value)}
-                  className="h-40 w-full resize-none rounded-xl border border-slate-200 bg-white px-4 py-3 text-slate-800 shadow-sm focus:border-slate-400 focus:outline-none"
-                  placeholder="Speak into the mic or type here..."
-                />
               </div>
 
-              <div className="rounded-2xl border border-slate-100 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-5 text-slate-100 shadow-lg">
-                <div className="flex items-center justify-between mb-4">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.3em] text-slate-400">Translation</p>
-                    <p className="text-lg font-semibold">{targetLabel} output</p>
-                  </div>
-                  <span className="text-xs text-slate-400">Broadcast ready</span>
-                </div>
-                <p className="min-h-[110px] whitespace-pre-wrap text-lg leading-relaxed">
-                  {translated || 'Waiting for the next sentence...'}
-                </p>
-              </div>
-            </div>
-
-            <div className="space-y-6">
-              <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
-                <p className="text-sm font-semibold text-slate-700 mb-4">Session controls</p>
-                <div className="flex flex-wrap gap-3">
+              <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
+                <div className="flex flex-wrap items-center gap-4">
                   <button
                     onClick={isListening ? handleStopListening : handleStartListening}
-                    className={`flex-1 min-w-[160px] rounded-2xl px-5 py-3.5 text-base font-semibold text-white shadow-lg transition ${isListening ? 'bg-rose-500 hover:bg-rose-600' : 'bg-sky-600 hover:bg-sky-500'}`}
+                    className={`flex-1 min-w-[200px] rounded-2xl px-6 py-3 text-lg font-semibold text-white shadow-lg transition ${isListening ? 'bg-rose-500 hover:bg-rose-600' : 'bg-cyan-500 hover:bg-cyan-400'}`}
                   >
-                    {isListening ? '🛑 Stop Listening' : '🎤 Start Listening'}
+                    {isListening ? 'Stop translation' : 'Start translation'}
+                  </button>
+                  <button
+                    onClick={() => triggerFinalize('manual operator button')}
+                    className="rounded-2xl border border-white/20 px-5 py-3 text-sm font-semibold text-white/90 hover:border-cyan-400/50"
+                  >
+                    Pulse finalize
                   </button>
                   <button
                     onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')}
-                    className="flex-1 min-w-[150px] rounded-2xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700 hover:border-slate-300"
+                    className="rounded-2xl border border-white/20 px-5 py-3 text-sm font-semibold text-white/90 hover:border-cyan-400/50"
                   >
-                    🔊 Test TTS
+                    Test TTS
                   </button>
-                </div>
-                <div className="mt-4 flex flex-wrap gap-4 text-sm text-slate-500">
-                  <div className="flex items-center gap-2">
-                    <span className="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-slate-100 text-base">{isMuted ? '🔇' : '🔈'}</span>
-                    <button
-                      onClick={() => setIsMuted(m => !m)}
-                      className="font-medium text-slate-700 underline-offset-4 hover:underline"
-                    >
-                      {isMuted ? 'Unmute monitoring' : 'Mute monitoring'}
-                    </button>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Volume</span>
+                  <div className="ml-auto flex items-center gap-3 text-sm text-slate-300">
+                    <span className="text-xs uppercase tracking-wide text-slate-400">Monitor volume</span>
                     <input
                       type="range"
                       min={0}
                       max={1}
-                      step={0.1}
+                      step={0.05}
                       value={volume}
                       onChange={(e) => setVolume(parseFloat(e.target.value))}
-                      className="h-1 w-32 rounded-full accent-sky-500"
+                      className="accent-cyan-400"
                     />
+                    <span className="text-white">{Math.round(volume * 100)}%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <aside className="space-y-6 rounded-3xl border border-white/10 bg-[#0b1324] p-5">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-semibold text-white">Go Live broadcast</p>
+                    <p className="text-xs text-slate-400">Send translations to foyer &amp; stream overlays.</p>
+                  </div>
+                  <button
+                    onClick={() => setIsBroadcasting(v => !v)}
+                    className={`relative inline-flex h-8 w-14 items-center rounded-full ${isBroadcasting ? 'bg-emerald-500/80' : 'bg-slate-600'}`}
+                    aria-pressed={isBroadcasting}
+                  >
+                    <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${isBroadcasting ? 'translate-x-6' : 'translate-x-1'}`} />
+                  </button>
+                </div>
+                <div className="flex items-center justify-between text-sm text-slate-300">
+                  <span>Display monitors</span>
+                  <button
+                    onClick={() => setDisplayOnAir(v => !v)}
+                    className={`text-xs font-semibold uppercase tracking-wide ${displayOnAir ? 'text-emerald-200' : 'text-slate-400'}`}
+                  >
+                    {displayOnAir ? 'On air' : 'Standby'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-200">
+                <div className="flex items-center justify-between py-2">
+                  <span>AI refinement</span>
+                  <button
+                    onClick={() => setAiAssistEnabled(v => !v)}
+                    className={`relative inline-flex h-7 w-12 items-center rounded-full ${aiAssistEnabled ? 'bg-cyan-500/70' : 'bg-slate-600'}`}
+                    aria-pressed={aiAssistEnabled}
+                  >
+                    <span className={`inline-block h-5 w-5 rounded-full bg-white transition ${aiAssistEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                  </button>
+                </div>
+                <div className="flex items-center justify-between border-t border-white/10 py-2">
+                  <span>Audience TTS</span>
+                  <button
+                    onClick={() => setIsMuted(m => !m)}
+                    className={`relative inline-flex h-7 w-12 items-center rounded-full ${ttsAudienceEnabled ? 'bg-cyan-500/70' : 'bg-slate-600'}`}
+                    aria-pressed={ttsAudienceEnabled}
+                  >
+                    <span className={`inline-block h-5 w-5 rounded-full bg-white transition ${ttsAudienceEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                  </button>
+                </div>
+                <div className="flex items-center justify-between border-t border-white/10 py-2">
+                  <span>Stage display link</span>
+                  <span className={`text-xs font-semibold uppercase tracking-wide ${displayOnAir ? 'text-cyan-200' : 'text-slate-400'}`}>
+                    {displayOnAir ? 'Live' : 'Muted'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm">
+                <p className="mb-3 text-xs uppercase tracking-wide text-slate-400">Connection health</p>
+                <div className="space-y-2 text-slate-200">
+                  <div className="flex items-center justify-between">
+                    <span>Producer socket</span>
+                    <span className="font-semibold">{connected ? 'Stable' : 'Reconnecting'}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Display sync</span>
+                    <span className="font-semibold">{displayOnAir ? 'Mirrored' : 'Off'}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>TTS monitor</span>
+                    <span className="font-semibold">{ttsAudienceEnabled ? 'Audible' : 'Muted'}</span>
                   </div>
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
-                <p className="text-sm font-semibold text-slate-700 mb-3">Voice for speech synthesis</p>
-                <select
-                  value={selectedVoiceName}
-                  onChange={(e) => setSelectedVoiceName(e.target.value)}
-                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-slate-800 shadow-sm focus:border-slate-400 focus:outline-none"
+              <div className="flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-slate-400">Admin console</p>
+                  <p className="text-slate-200">Invite operators, manage monitors, and review transcripts.</p>
+                </div>
+                <a
+                  href="/producer"
+                  target="_blank"
+                  className="inline-flex items-center justify-center rounded-2xl border border-cyan-400/50 bg-cyan-500/20 px-4 py-2 text-center text-sm font-semibold text-white hover:bg-cyan-500/30"
                 >
-                  {synthRef.current && synthRef.current.getVoices().map((v: SpeechSynthesisVoice) => (
-                    <option key={v.name} value={v.name}>
-                      {v.name} ({v.lang})
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-2 text-xs text-slate-400">
-                  Chrome voices refresh automatically when new languages become available.
-                </p>
+                  Launch admin hub
+                </a>
               </div>
-            </div>
+            </aside>
           </div>
+        </div>
+      </div>
+
+      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+        <div className="rounded-2xl border border-white/10 bg-[#10172a] p-5 shadow-lg shadow-black/30">
+          <p className="text-xs uppercase tracking-wide text-cyan-200">Scripted segments</p>
+          <h3 className="mt-2 text-lg font-semibold text-white">Upload-ready workflow</h3>
+          <p className="mt-3 text-sm text-slate-300">
+            Drop sermon manuscripts or announcements to pre-translate, rehearse, and push to displays on cue.
+          </p>
+          <button className="mt-4 inline-flex items-center gap-2 rounded-2xl border border-white/10 px-4 py-2 text-sm font-semibold text-white/90 hover:border-cyan-400/40">
+            📄 Import script
+          </button>
+        </div>
+
+        <div className="rounded-2xl border border-white/10 bg-[#10172a] p-5 shadow-lg shadow-black/30">
+          <p className="text-xs uppercase tracking-wide text-cyan-200">Hybrid workflow</p>
+          <h3 className="mt-2 text-lg font-semibold text-white">Blend live + scripted</h3>
+          <p className="mt-3 text-sm text-slate-300">
+            Pin key phrases, Scriptures, or benedictions so they surface exactly when the speaker nears those cues.
+          </p>
+          <button className="mt-4 inline-flex items-center gap-2 rounded-2xl border border-white/10 px-4 py-2 text-sm font-semibold text-white/90 hover:border-cyan-400/40">
+            📌 Manage cue board
+          </button>
+        </div>
+
+        <div className="rounded-2xl border border-white/10 bg-[#10172a] p-5 shadow-lg shadow-black/30">
+          <p className="text-xs uppercase tracking-wide text-cyan-200">Team ops</p>
+          <h3 className="mt-2 text-lg font-semibold text-white">Admin &amp; monitoring</h3>
+          <p className="mt-3 text-sm text-slate-300">
+            Invite volunteers, assign auditorium channels, and monitor downstream displays from one command center.
+          </p>
+          <button className="mt-4 inline-flex items-center gap-2 rounded-2xl border border-white/10 px-4 py-2 text-sm font-semibold text-white/90 hover:border-cyan-400/40">
+            🛠 Open admin console
+          </button>
         </div>
       </div>
     </section>
