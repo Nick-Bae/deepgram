@@ -5,6 +5,7 @@ import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
 import { API_URL } from '../utils/urls'
 import { useDeepgramProducer } from '../lib/useDeepgramProducer'
+import type { DeepgramProducerController } from '../lib/useDeepgramProducer'
 
 const DEBUG = process.env.NEXT_PUBLIC_DEBUG === '1';
 
@@ -63,10 +64,12 @@ export default function TranslationBox() {
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
 
   // Deepgram mic producer
-  const dgController = useDeepgramProducer() as ReturnType<typeof useDeepgramProducer> & {
-    finalize?: () => void
-  }
+  const dgController: DeepgramProducerController & { finalize?: () => void } = useDeepgramProducer()
   const { start: dgStart, stop: dgStop, status, partial, errorMsg, finalize } = dgController
+  const startProducer = useCallback(async () => {
+    const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string }) => Promise<void>
+    await startWithOptions({ sourceLang, targetLang })
+  }, [dgStart, sourceLang, targetLang])
   const dgFinalize = useMemo(() => finalize ?? (() => {}), [finalize])
 
   // TTS refs
@@ -508,7 +511,7 @@ export default function TranslationBox() {
     ensureTTSReady()
 
     try {
-      await dgStart({ sourceLang, targetLang })
+      await startProducer()
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e)
       alert(`Mic start failed: ${message}`)

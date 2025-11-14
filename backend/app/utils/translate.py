@@ -2,6 +2,9 @@
 import os
 import json
 import pathlib
+from datetime import datetime
+from typing import Iterable, List, Optional
+from collections import deque
 from dotenv import load_dotenv
 
 # OpenAI >= 1.0
@@ -31,6 +34,7 @@ THEOLOGICAL_TERMS: list[tuple[str, str]] = [
 # Load Bible names map (Korean -> English) from JSON
 _DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data"
 _BIBLE_NAMES_PATH = _DATA_DIR / "bible_names.json"
+_TRANSLATION_LOG_PATH = _DATA_DIR / "translation_examples.jsonl"
 
 try:
     with open(_BIBLE_NAMES_PATH, encoding="utf-8") as f:
@@ -39,6 +43,134 @@ try:
 except FileNotFoundError:
     print(f"[TX] bible_names.json not found at {_BIBLE_NAMES_PATH}; continuing without Bible name map")
     BIBLE_NAMES = {}
+
+
+def _ensure_data_dir() -> None:
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(f"[TX] failed to ensure data dir {_DATA_DIR}: {exc}")
+
+
+def _log_translation_example(
+    *,
+    source_lang: str,
+    target_lang: str,
+    stt_text: str,
+    auto_translation: str,
+    final_translation: Optional[str] = None,
+) -> None:
+    """
+    Append an example to translation_examples.jsonl so we can reuse it later.
+    """
+    if not stt_text or not auto_translation:
+        return
+
+    record = {
+        "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "stt_text": stt_text,
+        "auto_translation": auto_translation,
+        "final_translation": final_translation or auto_translation,
+        "corrected": final_translation is not None,
+    }
+
+    try:
+        _ensure_data_dir()
+        with open(_TRANSLATION_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[TX] Failed to log translation example: {exc}")
+
+
+def log_corrected_translation(
+    *,
+    source_lang: str,
+    target_lang: str,
+    stt_text: str,
+    auto_translation: str,
+    final_translation: str,
+) -> None:
+    """
+    Public helper for other modules to log manual corrections.
+    """
+    _log_translation_example(
+        source_lang=source_lang,
+        target_lang=target_lang,
+        stt_text=stt_text,
+        auto_translation=auto_translation,
+        final_translation=final_translation,
+    )
+
+
+def _load_fewshot_examples(
+    source_lang: str,
+    target_lang: str,
+    *,
+    max_examples: int = 4,
+) -> List[dict[str, str]]:
+    if not _TRANSLATION_LOG_PATH.exists() or max_examples <= 0:
+        return []
+
+    corrected: deque[dict[str, str]] = deque(maxlen=max_examples)
+    fallback: deque[dict[str, str]] = deque(maxlen=max_examples)
+
+    try:
+        with open(_TRANSLATION_LOG_PATH, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if record.get("source_lang") != source_lang or record.get("target_lang") != target_lang:
+                    continue
+
+                source_text = (record.get("stt_text") or "").strip()
+                final_text = (record.get("final_translation") or record.get("auto_translation") or "").strip()
+                if not source_text or not final_text:
+                    continue
+
+                pair = {"source": source_text, "target": final_text}
+                if record.get("corrected"):
+                    corrected.append(pair)
+                else:
+                    fallback.append(pair)
+    except Exception as exc:
+        print(f"[TX] Failed to read translation examples: {exc}")
+        return []
+
+    examples = list(corrected)
+    if len(examples) < max_examples:
+        needed = max_examples - len(examples)
+        examples.extend(list(fallback)[-needed:])
+
+    return examples[-max_examples:]
+
+
+def _build_fewshot_block(source: str, target: str) -> str:
+    examples = _load_fewshot_examples(source, target, max_examples=4)
+    if not examples:
+        return ""
+
+    source_name = _language_name(source)
+    target_name = _language_name(target)
+    formatted: list[str] = []
+    for ex in examples:
+        formatted.append(
+            f"{source_name}: {ex['source']}\n"
+            f"Preferred {target_name}: {ex['target']}"
+        )
+
+    return (
+        "\nHere are recent corrections that show the desired style:\n\n"
+        + "\n\n".join(formatted)
+        + "\n"
+    )
 
 
 def _get_client() -> AsyncOpenAI:
@@ -90,6 +222,7 @@ def _build_system_prompt(source: str, target: str) -> str:
     - light STT error correction
     - theological term preferences
     - Biblical names recovery
+    - church-safe, cautious language
     """
     source_name = _language_name(source)
     target_name = _language_name(target)
@@ -120,6 +253,8 @@ def _build_system_prompt(source: str, target: str) -> str:
             + "\n"
         )
 
+    fewshot_block = _build_fewshot_block(source, target)
+
     system = (
         "You are a professional translator specializing in Christian theology and sermons.\n"
         f"Your task is to translate from {source_name} to {target_name}.\n"
@@ -131,21 +266,32 @@ def _build_system_prompt(source: str, target: str) -> str:
         "silently infer the most likely intended original wording or name and translate that intended meaning.\n"
         "Do NOT mention that you corrected anything; just translate as if the input were already correct.\n"
         + bible_names_block
-        + glossary_block +
+        + glossary_block
+        + fewshot_block +
         "\n"
         "Context:\n"
         "- The input text is usually a spoken sermon, Bible teaching, or church-related script.\n"
-        "- The translation will often be read aloud or shown as subtitles or slides during worship.\n"
+        "- The translation will often be read aloud or shown as subtitles or slides during worship, "
+        "including with children and families present.\n"
         "\n"
-        "Requirements:\n"
-        "1. Preserve biblical and theological meaning very accurately.\n"
-        f"2. Use clear, natural, contemporary {target_name} that sounds like a native-speaking pastor.\n"
-        "3. Break up very long sentences into shorter, easy-to-follow sentences suitable for listening.\n"
-        "4. Keep all Scripture references, person names, and place names correct (using the Bible name list above when relevant).\n"
-        "5. Preserve paragraph and line-break structure as much as reasonably possible.\n"
-        "6. Perform only light, obvious corrections to STT mistakes; do not rewrite or summarize.\n"
-        "7. Do not add explanations, comments, headings, or brackets.\n"
-        "8. Output ONLY the translated text; no quotes, no extra commentary, no meta text.\n"
+        "Style and safety rules:\n"
+        "1. Use clear, natural, contemporary language that sounds like a respectful, mature pastor.\n"
+        "2. Never use slang, jokes, or expressions that could sound flirtatious, crude, or suggestive.\n"
+        "3. Never use profanity, vulgar language, or sexual slang under any circumstances.\n"
+        "4. When translating phrases about a husband and wife spending time together, "
+        "or people enjoying time together (for example, '아내와 나는 오늘밤 좋은 시간을 보내고 있습니다'), "
+        "avoid ambiguous phrases like 'having a good time tonight' that could sound romantic or sexual. "
+        "Use explicit, wholesome wording that fits a church context, such as "
+        "'My wife and I are spending a good evening together, talking and sharing.'\n"
+        "\n"
+        "General requirements:\n"
+        "5. Preserve biblical and theological meaning very accurately.\n"
+        "6. Break up very long sentences into shorter, easy-to-follow sentences suitable for listening.\n"
+        "7. Keep all Scripture references, person names, and place names correct (using the Bible name list above when relevant).\n"
+        "8. Preserve paragraph and line-break structure as much as reasonably possible.\n"
+        "9. Perform only light, obvious corrections to STT mistakes; do not rewrite or summarize.\n"
+        "10. Do not add explanations, comments, headings, or brackets.\n"
+        "11. Output ONLY the translated text; no quotes, no extra commentary, no meta text.\n"
     )
 
     return system
@@ -173,8 +319,17 @@ async def translate_text(text: str, source: str, target: str) -> str:
             temperature=0.2,
         )
         out = (resp.choices[0].message.content or "").strip()
-        # strip any accidental leading/trailing quotes
-        return out.strip('"\u201c\u201d')
+        out = out.strip('"\u201c\u201d')
+
+        _log_translation_example(
+            source_lang=source,
+            target_lang=target,
+            stt_text=text,
+            auto_translation=out,
+            final_translation=None,
+        )
+
+        return out
     except Exception as e:
         print(f"[TX] OpenAI error: {e}")
         return text
