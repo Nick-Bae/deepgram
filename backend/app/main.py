@@ -1,6 +1,6 @@
 
 # backend/app/main.py
-import os, json, asyncio, logging, time
+import os, json, asyncio, logging, time, re
 from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -136,21 +136,45 @@ async def ws_stt_deepgram(websocket: WebSocket):
         """
         SENTENCE_PUNCT = tuple(".?!。？！…")
         COMMIT_WAIT_MS = 250
+        CJK_PENDING_HOLD_MS = 600
         MIN_CONFIDENT_CHARS = 10
+        KOREAN_EOS_RE = re.compile(
+            r"(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요)$"
+        )
 
         pending_src: str | None = None
         pending_task: asyncio.Task | None = None
 
         def ends_like_sentence(t: str) -> bool:
             t = (t or "").rstrip()
-            return bool(t) and t[-1] in SENTENCE_PUNCT
+            if not t:
+                return False
+            last_char = t[-1]
+            if last_char in SENTENCE_PUNCT:
+                return True
+            if src_lang.startswith("ko"):
+                return bool(KOREAN_EOS_RE.search(t))
+            return False
 
         def norm_ws(s: str) -> str:
             return " ".join((s or "").split())
 
         def looks_complete(text: str) -> bool:
             clean = norm_ws(text)
-            return len(clean) >= MIN_CONFIDENT_CHARS or ends_like_sentence(clean)
+            if not clean:
+                return False
+            if ends_like_sentence(clean):
+                return True
+            if src_lang.startswith(CJK_NO_SPACE_PREFIXES):
+                return False
+            return len(clean) >= MIN_CONFIDENT_CHARS
+
+        def should_apply_cjk_hold(text: str) -> bool:
+            if not text:
+                return False
+            if not src_lang.startswith(CJK_NO_SPACE_PREFIXES):
+                return False
+            return not ends_like_sentence(text)
 
         SUBSET_SUPPRESS_WINDOW_SEC = 4.0
         MIN_SUBSET_DELTA = 6
@@ -241,20 +265,23 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 pending_task.cancel()
             pending_task = None
 
-        async def arm_timer():
+        async def arm_timer(wait_override_ms: int | None = None):
             nonlocal pending_task
             if pending_task and not pending_task.done():
                 pending_task.cancel()
 
-            async def _wait_and_commit(snap: str):
+            snap = pending_src or ""
+            wait_ms = wait_override_ms if wait_override_ms is not None else COMMIT_WAIT_MS
+
+            async def _wait_and_commit(snap: str, delay_ms: int):
                 try:
-                    await asyncio.sleep(COMMIT_WAIT_MS / 1000.0)
+                    await asyncio.sleep(delay_ms / 1000.0)
                     if pending_src and norm_ws(pending_src) == norm_ws(snap):
                         await commit_now(pending_src)
                 except asyncio.CancelledError:
                     pass
 
-            pending_task = asyncio.create_task(_wait_and_commit(pending_src or ""))
+            pending_task = asyncio.create_task(_wait_and_commit(snap, wait_ms))
 
         async def flush_on_finalize():
             while True:
@@ -310,7 +337,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     if looks_complete(pending_src):
                         await commit_now(pending_src)
                     else:
-                        await arm_timer()
+                        hold_ms = CJK_PENDING_HOLD_MS if should_apply_cjk_hold(pending_src) else None
+                        await arm_timer(hold_ms)
                     continue
 
                 if pending_src and ends_like_sentence(pending_src):
@@ -318,7 +346,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     continue
 
                 if pending_src:
-                    await arm_timer()
+                    hold_ms = CJK_PENDING_HOLD_MS if should_apply_cjk_hold(pending_src) else None
+                    await arm_timer(hold_ms)
 
         finally:
             finalize_task.cancel()
