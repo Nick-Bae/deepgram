@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 import websockets
 from websockets import legacy as ws_legacy  # fallback for websockets<=13
 
+from app.config.deepgram_keywords import DEFAULT_DEEPGRAM_KEYWORDS
+
 load_dotenv()
 
 def _int_env(name: str, default: int, *, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
@@ -35,11 +37,14 @@ _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(","
 DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 60, min_value=0, max_value=200)
 DG_DEBUG    = os.getenv("DEEPGRAM_DEBUG", "0") not in ("0", "", "false", "False")
 
-_DEFAULT_KEYWORD_FILE = Path(__file__).resolve().parent / "data" / "deepgram_keywords.txt"
 _KEYWORD_FILE_ENV = os.getenv("DEEPGRAM_KEYWORDS_FILE")
-DG_KEYWORDS_FILE = Path(_KEYWORD_FILE_ENV).expanduser() if _KEYWORD_FILE_ENV else _DEFAULT_KEYWORD_FILE
+DG_KEYWORDS_FILE = Path(_KEYWORD_FILE_ENV).expanduser() if _KEYWORD_FILE_ENV else None
 _KEYWORD_CACHE: Optional[List[str]] = None
 _KEYWORD_MTIME: Optional[float] = None
+
+
+def _inline_keywords() -> List[str]:
+    return list(_ENV_KEYWORDS or DEFAULT_DEEPGRAM_KEYWORDS)
 
 
 def _normalize_keyword_entries(raw: Optional[List[str]]) -> List[Tuple[str, Optional[str]]]:
@@ -77,6 +82,8 @@ def _normalize_keyword_entries(raw: Optional[List[str]]) -> List[Tuple[str, Opti
 
 def _load_keywords_from_file() -> Optional[List[str]]:
     global _KEYWORD_CACHE, _KEYWORD_MTIME
+    if DG_KEYWORDS_FILE is None:
+        return None
     if not DG_KEYWORDS_FILE.exists() or DG_KEYWORDS_FILE.is_dir():
         return None
     try:
@@ -102,7 +109,7 @@ def _current_keywords() -> List[str]:
     if file_keywords is not None:
         items = file_keywords
     else:
-        items = _ENV_KEYWORDS
+        items = _inline_keywords()
 
     if DG_KEYWORDS_LIMIT and len(items) > DG_KEYWORDS_LIMIT:
         if DG_DEBUG:

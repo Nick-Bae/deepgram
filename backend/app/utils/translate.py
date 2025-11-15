@@ -299,6 +299,7 @@ def _build_system_prompt(source: str, target: str) -> str:
         "14. Perform only light, obvious corrections to STT mistakes; do not rewrite or summarize.\n"
         "15. Do not add explanations, comments, headings, or brackets.\n"
         "16. Output ONLY the translated text; no quotes, no extra commentary, no meta text.\n"
+        "17. If the input seems incomplete or ends abruptly (common with STT pauses), translate only what was actually said and do not invent endings or extra sentences.\n"
     )
 
     return system
