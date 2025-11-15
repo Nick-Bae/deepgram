@@ -673,7 +673,7 @@ export default function TranslationBox() {
                 <div className="flex flex-wrap items-center gap-4">
                   <button
                     onClick={isListening ? handleStopListening : handleStartListening}
-                    className={`flex-1 min-w-[200px] rounded-2xl px-6 py-3 text-lg font-semibold shadow-lg transition ${isListening ? 'bg-[#393f4d] text-[#f2f5e3] hover:bg-[#454543]' : 'bg-[#feda6a] text-[#1d1e22] shadow-[0_15px_45px_rgba(254,218,106,0.35)] hover:bg-[#f2c53d]'}`}
+                    className={`flex-1 min-w-[200px] rounded-2xl px-6 py-3 text-lg font-semibold shadow-lg transition ${isListening ? 'bg-[#00837e] text-[#f2f5e3] hover:bg-[#454543]' : 'bg-[#feda6a] text-[#1d1e22] shadow-[0_15px_45px_rgba(254,218,106,0.35)] hover:bg-[#f2c53d]'}`}
                   >
                     {isListening ? 'Stop translation' : 'Start translation'}
                   </button>

@@ -1,6 +1,6 @@
 
 # backend/app/main.py
-import os, json, asyncio, logging
+import os, json, asyncio, logging, time
 from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -152,13 +152,41 @@ async def ws_stt_deepgram(websocket: WebSocket):
             clean = norm_ws(text)
             return len(clean) >= MIN_CONFIDENT_CHARS or ends_like_sentence(clean)
 
+        SUBSET_SUPPRESS_WINDOW_SEC = 4.0
+        MIN_SUBSET_DELTA = 6
+        CJK_NO_SPACE_PREFIXES = ("ko", "zh", "ja")
+
         async def commit_now(src_text_raw: str):
             nonlocal seq, pending_src, pending_task
             if not src_text_raw or not src_text_raw.strip():
                 return
-            # de-dup repeated finals
-            if norm_ws(src_text_raw) == norm_ws(getattr(commit_now, "_last_src", "")):
+
+            normalized = norm_ws(src_text_raw)
+            if not normalized:
                 return
+
+            last_norm = getattr(commit_now, "_last_norm", "")
+            last_ts = getattr(commit_now, "_last_commit_ts", 0.0)
+            if normalized == last_norm:
+                return
+
+            if last_norm and len(normalized) < len(last_norm):
+                delta = len(last_norm) - len(normalized)
+                subset_lang = src_lang.startswith(CJK_NO_SPACE_PREFIXES)
+                no_space = " " not in normalized and " " not in last_norm
+                if subset_lang and no_space and delta >= MIN_SUBSET_DELTA:
+                    is_edge_subset = last_norm.startswith(normalized) or last_norm.endswith(normalized)
+                    recent_commit = (time.time() - last_ts) < SUBSET_SUPPRESS_WINDOW_SEC
+                    if is_edge_subset and recent_commit:
+                        print("[A][skip][subset]", normalized)
+                        pending_src = None
+                        if pending_task and not pending_task.done():
+                            pending_task.cancel()
+                        pending_task = None
+                        return
+
+            setattr(commit_now, "_last_norm", normalized)
+            setattr(commit_now, "_last_commit_ts", time.time())
             setattr(commit_now, "_last_src", src_text_raw)
 
             seq += 1
