@@ -15,6 +15,18 @@ type Meta = {
   rev?: number;
   seq?: number;
   is_final?: boolean;
+  kind?: string;
+  reference?: string;
+  reference_en?: string;
+  reference_ko?: string;
+  version?: string;
+  source_version?: string;
+  book?: string;
+  book_en?: string;
+  chapter?: number;
+  verse?: number;
+  end_verse?: number;
+  source_text?: string;
 };
 
 type ServerBroadcast = {

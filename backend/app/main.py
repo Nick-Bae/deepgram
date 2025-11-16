@@ -12,6 +12,7 @@ load_dotenv()
 from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram
 from app.utils.translate import translate_text  # async wrapper you already have
+from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 
 # ------------------------------------------------------------------------------
@@ -215,7 +216,42 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
             seq += 1
             src_text = src_text_raw
-            if src_lang == tgt_lang and src_lang_full == tgt_lang_full:
+            meta_payload = {
+                "mode": "realtime",
+                "partial": False,
+                "segment_id": seq,
+                "rev": 0,
+                "seq": seq,
+                "is_final": True,
+            }
+
+            scripture_hit = None
+            if src_lang.startswith("ko"):
+                try:
+                    scripture_hit = detect_scripture_verse(src_text)
+                except Exception as exc:
+                    print("[SCRIPTURE][error]", exc)
+
+            if scripture_hit:
+                translated = scripture_hit.text
+                meta_payload.update(
+                    {
+                        "kind": "scripture",
+                        "reference": scripture_hit.reference,
+                        "reference_ko": scripture_hit.source_reference,
+                        "reference_en": scripture_hit.reference_en or scripture_hit.reference,
+                        "version": scripture_hit.version,
+                        "source_version": scripture_hit.source_version,
+                        "book": scripture_hit.book,
+                        "book_en": scripture_hit.book_en or scripture_hit.book,
+                        "chapter": scripture_hit.chapter,
+                        "verse": scripture_hit.verse,
+                        "end_verse": scripture_hit.end_verse,
+                        "source_text": scripture_hit.source_text,
+                    }
+                )
+                print(f"[SCRIPTURE] matched {scripture_hit.reference}")
+            elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
                 translated = src_text
             else:
                 try:
@@ -233,18 +269,13 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 "seq": seq,
                 "src": {"text": src_text, "lang": src_lang_full},
                 "tgt": {"lang": tgt_lang_full},
+                "meta": meta_payload.copy(),
             }
             live_msg_legacy = {
                 "type": "translation",
                 "payload": translated,
                 "lang": tgt_lang_full,
-                "meta": {
-                    "mode": "realtime",
-                    "partial": False,
-                    "segment_id": seq,
-                    "rev": 0,
-                    "seq": seq,
-                },
+                "meta": meta_payload.copy(),
             }
 
             try:

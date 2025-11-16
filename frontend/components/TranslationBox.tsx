@@ -44,6 +44,20 @@ function languageName(code: string) {
   return raw.toUpperCase()
 }
 
+function extractVersionBadge(label?: string | null) {
+  if (!label) return undefined
+  const match = label.match(/\(([^)]+)\)/)
+  if (match?.[1]) {
+    const trimmed = match[1].trim()
+    return trimmed || undefined
+  }
+  const compact = label.trim()
+  if (compact && compact.length <= 8 && !/\s/.test(compact)) {
+    return compact
+  }
+  return undefined
+}
+
 const LINGER_MS = 300
 const MIN_FINAL_CHARS = 10
 const FINALIZE_PULSE_MS = 2600
@@ -77,6 +91,35 @@ export default function TranslationBox() {
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
+  const scriptureMeta = useMemo(() => {
+    const meta = last?.meta
+    if (!meta || meta.kind !== 'scripture') return null
+
+    const referenceEn = typeof meta.reference_en === 'string' ? meta.reference_en : undefined
+    const referenceDefault = typeof meta.reference === 'string' ? meta.reference : undefined
+    const referenceKo = typeof meta.reference_ko === 'string' ? meta.reference_ko : undefined
+    const displayReference = referenceEn || referenceDefault || referenceKo || 'Scripture'
+
+    const versionFull = typeof meta.version === 'string' ? meta.version : undefined
+    const versionShort = extractVersionBadge(versionFull)
+    const header = versionShort ? `${displayReference} (${versionShort})` : displayReference
+
+    const sourceText = typeof meta.source_text === 'string' ? meta.source_text : undefined
+    const sourceVersionFull = typeof meta.source_version === 'string' ? meta.source_version : undefined
+    const sourceVersionShort = extractVersionBadge(sourceVersionFull)
+    const sourceReference = referenceKo || referenceDefault
+    const sourceParts: string[] = []
+    if (sourceReference) sourceParts.push(sourceReference)
+    const sourceBadge = sourceVersionShort || sourceVersionFull
+    if (sourceBadge) sourceParts.push(sourceBadge)
+
+    return {
+      header,
+      versionFull,
+      sourceText,
+      sourceLabel: sourceParts.join(' · ') || undefined,
+    }
+  }, [last])
 
   // Deepgram mic producer
   const dgController: DeepgramProducerController & { finalize?: () => void } = useDeepgramProducer()
@@ -661,6 +704,29 @@ export default function TranslationBox() {
                     <p className="min-h-[170px] whitespace-pre-wrap text-xl leading-relaxed">
                       {translated || 'Waiting for the next sentence…'}
                     </p>
+                    {scriptureMeta && (
+                      <div className="rounded-2xl border border-[#feda6a]/40 bg-[#1d1e22]/80 px-4 py-4 text-[#f2f5e3]">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p className="text-xs uppercase tracking-[0.35em] text-[#feda6a]">Scripture Reference</p>
+                            <p className="text-lg font-semibold text-[#f2f5e3]" title={scriptureMeta.versionFull || undefined}>
+                              {scriptureMeta.header}
+                            </p>
+                          </div>
+                          <span className="rounded-full border border-[#feda6a]/30 bg-[#feda6a]/10 px-3 py-1 text-xs uppercase tracking-wide text-[#feda6a]">
+                            Exact verse
+                          </span>
+                        </div>
+                        {scriptureMeta.sourceText && (
+                          <div className="mt-3 rounded-2xl border border-[#454543] bg-[#0f1012]/60 px-3 py-2 text-sm text-[#d4d4dc]">
+                            <p className="text-xs uppercase tracking-[0.25em] text-[#b1b1ac]">
+                              {scriptureMeta.sourceLabel || 'Korean Source'}
+                            </p>
+                            <p className="mt-1 text-base text-[#f2f5e3]">{scriptureMeta.sourceText}</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <div className="rounded-2xl border border-[#454543] bg-[#1d1e22]/70 px-4 py-3 text-sm text-[#d4d4dc]">
                       <p className="text-xs uppercase tracking-[0.35em] text-[#b1b1ac]">Next sentence preview</p>
                       <p className="mt-1 text-base text-[#f2f5e3]">{previewSnippet || 'Listening for the next clause…'}</p>
