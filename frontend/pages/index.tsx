@@ -38,7 +38,10 @@ const palette = {
 export default function Home() {
   const scrollToConsole = () => {
     if (typeof window === 'undefined') return
-    document.getElementById('live-console')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    const target = document.getElementById('live-console')
+    if (!target) return
+    const y = target.getBoundingClientRect().top + window.scrollY + 20
+    window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' })
   }
 
   return (
