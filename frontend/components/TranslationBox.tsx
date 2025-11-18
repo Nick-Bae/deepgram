@@ -32,6 +32,50 @@ const availableLanguages = [
   { code: 'es', name: 'Spanish' },
 ]
 
+type TTSVoiceOption = { value: string; label: string }
+type TTSVoicePresetMap = Record<string, TTSVoiceOption[]>
+
+const GOOGLE_TTS_PRESETS: TTSVoicePresetMap = {
+  en: [
+    { value: 'en-US-Neural2-F', label: 'Neural2 F · warm' },
+    { value: 'en-US-Neural2-G', label: 'Neural2 G · broadcast' },
+    { value: 'en-US-Journey-D', label: 'Journey D · storyteller' },
+  ],
+  ko: [
+    { value: 'ko-KR-Neural2-A', label: 'Neural2 A · standard' },
+    { value: 'ko-KR-Neural2-C', label: 'Neural2 C · bright female' },
+  ],
+  es: [
+    { value: 'es-US-Neural2-A', label: 'Neural2 A · US Spanish' },
+    { value: 'es-ES-Neural2-B', label: 'Neural2 B · Castilian' },
+  ],
+  zh: [
+    { value: 'cmn-CN-Wavenet-A', label: 'Wavenet A · Mandarin' },
+    { value: 'cmn-CN-Wavenet-D', label: 'Wavenet D · newsy' },
+  ],
+  default: [
+    { value: 'en-US-Neural2-F', label: 'Neural2 F · English' },
+  ],
+}
+
+const GEMINI_TTS_PRESETS: TTSVoicePresetMap = {
+  en: [
+    { value: 'Enceladus', label: 'Enceladus · cinematic (Gemini)' },
+    { value: 'Kore', label: 'Kore · crisp (Gemini)' },
+    { value: 'Zephyr', label: 'Zephyr · airy (Gemini)' },
+  ],
+  default: [
+    { value: 'Enceladus', label: 'Enceladus · cinematic (Gemini)' },
+  ],
+}
+
+const TTS_PROVIDER_OPTIONS = [
+  { value: 'google', label: 'Google Cloud TTS · low latency' },
+  { value: 'gemini_flash', label: 'Gemini Flash TTS · expressive' },
+] as const
+
+type TTSProvider = (typeof TTS_PROVIDER_OPTIONS)[number]['value']
+
 function languageName(code: string) {
   const raw = (code || '').trim()
   if (!raw) return 'Unknown language'
@@ -68,6 +112,9 @@ const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
 const HANGUL_CHAR_RE = /[\uac00-\ud7a3]/
+const SILENT_AUDIO_DATA_URL = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AACJWAAACABAAZGF0YQAAAAA='
+
+type QueuedTTS = { id: number; text: string; url: string }
 
 type CancelableFn<Args extends unknown[] = unknown[]> = ((...args: Args) => void) & {
   cancel: () => void
@@ -84,13 +131,19 @@ export default function TranslationBox() {
   const [targetLang, setTargetLang] = useState('en')
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
-  const [selectedVoiceName, setSelectedVoiceName] = useState('')
+  const [voicePreference, setVoicePreference] = useState('auto')
+  const [ttsProvider, setTtsProvider] = useState<TTSProvider>('google')
   const [isBroadcasting, setIsBroadcasting] = useState(true)
   const [aiAssistEnabled, setAiAssistEnabled] = useState(true)
   const [displayOnAir, setDisplayOnAir] = useState(true)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
+  const targetBaseLang = (targetLang || 'en').split('-')[0]
+  const voiceOptions = useMemo(() => {
+    const presets = ttsProvider === 'gemini_flash' ? GEMINI_TTS_PRESETS : GOOGLE_TTS_PRESETS
+    return presets[targetBaseLang] ?? presets.default
+  }, [targetBaseLang, ttsProvider])
   const scriptureMeta = useMemo(() => {
     const meta = last?.meta
     if (!meta || meta.kind !== 'scripture') return null
@@ -131,11 +184,18 @@ export default function TranslationBox() {
   const dgFinalize = useMemo(() => finalize ?? (() => {}), [finalize])
 
   // TTS refs
-  const synthRef = useRef<SpeechSynthesis | null>(null)
-  const ttsQueueRef = useRef<string[]>([])
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const ttsQueueRef = useRef<QueuedTTS[]>([])
   const speakingRef = useRef(false)
   const lastHandledSeqRef = useRef(0)       // gate: handle each seq once (final or soft-final)
   const currentSpokenRef = useRef('')
+  const pendingControllersRef = useRef<Set<AbortController>>(new Set())
+  const pendingRequestsRef = useRef<Map<string, Promise<string>>>(new Map())
+  const audioUnlockedRef = useRef(false)
+  const ttsIdRef = useRef(0)
+  const ttsEffectBootRef = useRef(false)
+  const lastClauseSentRef = useRef('')
+  const lastKRFromServerRef = useRef('')
 
   // Clause buffer + timing
   const clauseRef = useRef('')
@@ -247,10 +307,21 @@ export default function TranslationBox() {
       }, PREVIEW_THROTTLE_MS)
   , [postTranslate]) as CancelableFn<[string]>
 
+  const shouldEmitClause = useCallback((clean: string) => {
+    const prev = lastClauseSentRef.current
+    if (prev && prev.length > clean.length && prev.endsWith(clean)) {
+      if (DEBUG) console.log('[FE][final][clause][skip-suffix]', clip(clean))
+      return false
+    }
+    lastClauseSentRef.current = clean
+    return true
+  }, [])
+
   const sendFinalNow = useCallback(
     (s: string) => {
       const clean = (s || '').trim();
       if (!clean) return;
+      if (!shouldEmitClause(clean)) return;
 
       sendPreview.cancel();
 
@@ -264,7 +335,7 @@ export default function TranslationBox() {
       lastPreviewSentRef.current = '';
       triggerFinalize('clause complete');
     },
-    [postTranslate, sendPreview, triggerFinalize]
+    [postTranslate, sendPreview, shouldEmitClause, triggerFinalize]
   );
 
   const scheduleFinal = useCallback(() => {
@@ -316,101 +387,214 @@ export default function TranslationBox() {
     return code || 'en-US';
   }
 
-  function ensureTTSReady() {
-    try {
-      if (!synthRef.current) return;
-      // Kick the engine so Chrome actually speaks later
-      const u = new SpeechSynthesisUtterance(' ');
-      u.volume = 0;
-      synthRef.current.cancel();
-      synthRef.current.speak(u);
-      synthRef.current.resume?.();
-    } catch {}
-  }
+  const ensureAudioElement = useCallback(() => {
+    if (typeof window === 'undefined' || typeof Audio === 'undefined') return null;
+    if (!audioRef.current) {
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audioRef.current = audio;
+    }
+    if (audioRef.current) {
+      audioRef.current.volume = Math.max(0, Math.min(1, volume));
+    }
+    return audioRef.current;
+  }, [volume]);
+
+  const unlockAudio = useCallback(() => {
+    if (audioUnlockedRef.current) return;
+    const audio = ensureAudioElement();
+    if (!audio) return;
+    audioUnlockedRef.current = true;
+    const prevMuted = audio.muted;
+    audio.muted = true;
+    audio.src = SILENT_AUDIO_DATA_URL;
+    const attempt = audio.play();
+    const reset = () => {
+      try {
+        audio.pause();
+        audio.currentTime = 0;
+      } catch {}
+      audio.src = '';
+      audio.muted = prevMuted || isMuted;
+    };
+    if (attempt && typeof attempt.finally === 'function') {
+      attempt.then(reset).catch(err => {
+        console.warn('[FE][TTS][unlock-failed]', err);
+        audioUnlockedRef.current = false;
+        reset();
+      });
+    } else {
+      reset();
+    }
+  }, [ensureAudioElement, isMuted]);
+
+  const flushTTSQueue = useCallback(() => {
+    pendingControllersRef.current.forEach(ctrl => ctrl.abort());
+    pendingControllersRef.current.clear();
+    ttsQueueRef.current.forEach(chunk => URL.revokeObjectURL(chunk.url));
+    ttsQueueRef.current = [];
+    speakingRef.current = false;
+    currentSpokenRef.current = '';
+    const audio = audioRef.current;
+    if (audio) {
+      try {
+        audio.pause();
+        audio.currentTime = 0;
+        audio.src = '';
+      } catch {}
+    }
+  }, []);
+
+  const fetchTTSAudio = useCallback((sentence: string) => {
+    const trimmed = sentence.trim();
+    if (!trimmed) return Promise.reject(new Error('TTS text missing'));
+
+    const langPref = mapToTTSLocale(targetLang);
+    const cacheKey = [ttsProvider, voicePreference || 'auto', langPref, trimmed].join('::');
+
+    const cached = pendingRequestsRef.current.get(cacheKey);
+    if (cached) return cached;
+
+    const request = (async () => {
+      const controller = new AbortController();
+      pendingControllersRef.current.add(controller);
+      try {
+        const body: Record<string, unknown> = {
+          text: trimmed,
+          lang: langPref,
+          provider: ttsProvider,
+        }
+        if (voicePreference !== 'auto') {
+          body.voice = voicePreference
+        }
+
+        const response = await fetch(`${API_URL}/api/tts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          const detail = await response.text().catch(() => '');
+          throw new Error(detail || `TTS failed (${response.status})`);
+        }
+        const buffer = await response.arrayBuffer();
+        const mime = response.headers.get('content-type') || 'audio/mpeg';
+        const blob = new Blob([buffer], { type: mime });
+        return URL.createObjectURL(blob);
+      } finally {
+        pendingControllersRef.current.delete(controller);
+      }
+    })().finally(() => {
+      pendingRequestsRef.current.delete(cacheKey);
+    });
+
+    pendingRequestsRef.current.set(cacheKey, request);
+    return request;
+  }, [targetLang, ttsProvider, voicePreference]);
 
   const playNext = useCallback(() => {
-    if (speakingRef.current || !synthRef.current || isMuted) return;
-
-    const next = ttsQueueRef.current.shift();
+    if (speakingRef.current || isMuted) return;
+    const next = ttsQueueRef.current[0];
     if (!next) return;
 
-    const utter = new SpeechSynthesisUtterance(next);
-    utter.lang = mapToTTSLocale(targetLang);
-    utter.volume = volume;
-
-    const voices = synthRef.current.getVoices();
-    const sel =
-      voices.find(v => v.name === selectedVoiceName) ||
-      voices.find(v => v.lang === utter.lang) ||
-      voices[0];
-
-    if (sel) utter.voice = sel;
+    const audio = ensureAudioElement();
+    if (!audio) return;
 
     speakingRef.current = true;
-    currentSpokenRef.current = next;
+    currentSpokenRef.current = next.text;
 
-    console.log('[FE][TTS][start]', { text: clip(next), voice: sel?.name, lang: utter.lang });
-
-    utter.onend = () => {
+    const finalize = () => {
+      const finished = ttsQueueRef.current.shift();
+      if (finished) {
+        URL.revokeObjectURL(finished.url);
+      }
       speakingRef.current = false;
-      console.log('[FE][TTS][end]');
-      if (ttsQueueRef.current.length) setTimeout(playNext, 300);
-    };
-    utter.onerror = (e) => {
-      speakingRef.current = false;
-      console.warn('[FE][TTS][error]', e);
-      if (ttsQueueRef.current.length) setTimeout(playNext, 300);
+      currentSpokenRef.current = '';
+      if (!isMuted && ttsQueueRef.current.length) {
+        setTimeout(() => playNext(), 200);
+      }
     };
 
-    synthRef.current.speak(utter);
-  }, [isMuted, selectedVoiceName, targetLang, volume]);
+    audio.onended = finalize;
+    audio.onerror = (err) => {
+      console.warn('[FE][TTS][error]', err);
+      finalize();
+    };
+    audio.src = next.url;
+    audio.currentTime = 0;
+    const attempt = audio.play();
+    if (attempt && typeof attempt.catch === 'function') {
+      attempt
+        .then(() => {
+          console.log('[FE][TTS][start]', { text: clip(next.text) });
+        })
+        .catch(err => {
+          console.warn('[FE][TTS][play-rejected]', err);
+          finalize();
+        });
+    }
+  }, [ensureAudioElement, isMuted]);
 
   const enqueueFinalTTS = useCallback((s: string) => {
     const t = s.trim();
-    if (!t) return;
+    if (!t || isMuted) return;
 
     if (currentSpokenRef.current === t) {
       console.log('[FE][TTS][drop-current-dup]', clip(t));
       return;
     }
     const tail = ttsQueueRef.current[ttsQueueRef.current.length - 1];
-    if (tail === t) {
+    if (tail?.text === t) {
       console.log('[FE][TTS][drop-tail-dup]', clip(t));
       return;
     }
 
-    console.log('[FE][TTS][enqueue]', clip(t));
-    ttsQueueRef.current.push(t);
-    playNext();
-  }, [playNext]);
+    unlockAudio();
+    fetchTTSAudio(t)
+      .then((url) => {
+        const chunk: QueuedTTS = { id: ++ttsIdRef.current, text: t, url };
+        ttsQueueRef.current.push(chunk);
+        console.log('[FE][TTS][enqueue]', clip(t));
+        if (!speakingRef.current) {
+          playNext();
+        }
+      })
+      .catch((err) => {
+        console.warn('[FE][TTS][fetch-error]', err);
+      });
+  }, [fetchTTSAudio, isMuted, playNext, unlockAudio]);
 
-  // ---------- Speech Synthesis init ----------
+  useEffect(() => () => flushTTSQueue(), [flushTTSQueue]);
+
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    synthRef.current = window.speechSynthesis;
+    if (audioRef.current) {
+      audioRef.current.volume = Math.max(0, Math.min(1, volume));
+    }
+  }, [volume]);
 
-    const onVoices = () => {
-      const vs = synthRef.current?.getVoices() || [];
-      // console.log('[FE][TTS][voices]', vs.map(v => `${v.name} (${v.lang})`));
-      // Prefer a voice that matches targetLang if possible
-      if (!selectedVoiceName && vs.length) {
-        const want = mapToTTSLocale(targetLang);
-        const byLang = vs.find(v => v.lang === want);
-        setSelectedVoiceName((byLang || vs[0]).name);
-      }
-    };
+  useEffect(() => {
+    if (voicePreference !== 'auto' && !voiceOptions.some(v => v.value === voicePreference)) {
+      setVoicePreference('auto')
+    }
+  }, [voiceOptions, voicePreference])
 
-    onVoices();
-    window.speechSynthesis.onvoiceschanged = onVoices;
+  useEffect(() => {
+    if (!ttsEffectBootRef.current) {
+      ttsEffectBootRef.current = true;
+      return;
+    }
+    if (isMuted) {
+      flushTTSQueue();
+    } else {
+      unlockAudio();
+      playNext();
+    }
+  }, [flushTTSQueue, isMuted, playNext, unlockAudio]);
 
-    // Warm-up once on mount
-    ensureTTSReady();
-
-    // Keep engine alive when tab regains focus (some browsers pause it)
-    const vis = () => { try { synthRef.current?.resume?.(); } catch {} };
-    document.addEventListener('visibilitychange', vis);
-    return () => document.removeEventListener('visibilitychange', vis);
-  }, [selectedVoiceName, targetLang]);
+  useEffect(() => {
+    flushTTSQueue();
+  }, [flushTTSQueue, targetLang, ttsProvider, voicePreference]);
 
   // ---------- WS: consume broadcasts (single effect, with soft-final fallback) ----------
   useEffect(() => {
@@ -432,10 +616,23 @@ export default function TranslationBox() {
       }
       if (seq) lastHandledSeqRef.current = seq;
 
-      if (!isMuted && incoming !== currentSpokenRef.current) {
-        enqueueFinalTTS(incoming);
+      const isDuplicateKR =
+        !!committedSrc &&
+        !!lastKRFromServerRef.current &&
+        lastKRFromServerRef.current.length > committedSrc.length &&
+        lastKRFromServerRef.current.endsWith(committedSrc);
+
+      if (isDuplicateKR) {
+        console.log('[FE][WS][dedupe-kr]', clip(committedSrc));
       } else {
-        console.log('[FE][TTS][skip]', { isMuted, sameAsCurrent: incoming === currentSpokenRef.current });
+        if (committedSrc) {
+          lastKRFromServerRef.current = committedSrc;
+        }
+        if (!isMuted && incoming !== currentSpokenRef.current) {
+          enqueueFinalTTS(incoming);
+        } else {
+          console.log('[FE][TTS][skip]', { isMuted, sameAsCurrent: incoming === currentSpokenRef.current });
+        }
       }
       softMapRef.current.delete(seq);
 
@@ -559,14 +756,12 @@ export default function TranslationBox() {
   const handleStartListening = async () => {
     lastInterimRef.current = ''
     clauseRef.current = ''
+    lastClauseSentRef.current = ''
+    lastKRFromServerRef.current = ''
     setText('')
     setTranslated('')
-    ttsQueueRef.current = []
-    synthRef.current?.cancel()
-    speakingRef.current = false
-
-    // Warm up TTS right before we expect to speak
-    ensureTTSReady()
+    flushTTSQueue()
+    unlockAudio()
 
     try {
       await startProducer()
@@ -818,6 +1013,35 @@ export default function TranslationBox() {
                   >
                     <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${ttsAudienceEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
                   </button>
+                </div>
+                <div className="flex flex-col gap-2 border-t border-[#454543] py-2">
+                  <label className="text-xs uppercase tracking-wide text-[#b1b1ac]">Voice engine</label>
+                  <select
+                    value={ttsProvider}
+                    onChange={(e) => setTtsProvider(e.target.value as TTSProvider)}
+                    className="rounded-2xl border border-[#454543] bg-[#0f1012] px-3 py-2 text-sm text-[#f2f5e3] focus:border-[#feda6a] focus:outline-none"
+                  >
+                    {TTS_PROVIDER_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex flex-col gap-2 border-t border-[#454543] py-2">
+                  <label className="text-xs uppercase tracking-wide text-[#b1b1ac]">Voice preset</label>
+                  <select
+                    value={voicePreference}
+                    onChange={(e) => setVoicePreference(e.target.value)}
+                    className="rounded-2xl border border-[#454543] bg-[#0f1012] px-3 py-2 text-sm text-[#f2f5e3] focus:border-[#feda6a] focus:outline-none"
+                  >
+                    <option value="auto">Auto · match language</option>
+                    {voiceOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
                 </div>
                 <div className="flex items-center justify-between border-t border-[#454543] py-2">
                   <span>Stage display link</span>

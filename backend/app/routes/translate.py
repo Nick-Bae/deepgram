@@ -1,9 +1,16 @@
-from fastapi import APIRouter, HTTPException
-from app.utils.translate import translate_text
-from app.socket_manager import manager
 import inspect
+import io
 import logging
 from time import perf_counter
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from app.services.google_tts import synthesize_async as synthesize_google_tts
+from app.services.gemini_flash_tts import synthesize_async as synthesize_gemini_tts
+from app.socket_manager import manager
+from app.utils.translate import translate_text
 
 logger = logging.getLogger("app.translate")
 
@@ -11,6 +18,15 @@ router = APIRouter()
 
 async def _resolve(maybe_awaitable):
     return await maybe_awaitable if inspect.isawaitable(maybe_awaitable) else maybe_awaitable
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000)
+    lang: str | None = Field(default="en")
+    voice: str | None = Field(default=None)
+    speaking_rate: float | None = Field(default=None, ge=0.25, le=4.0)
+    pitch: float | None = Field(default=None, ge=-20.0, le=20.0)
+    provider: str | None = Field(default="google", description="google | gemini_flash")
 
 @router.post("/translate")
 async def translate(data: dict):
@@ -60,3 +76,37 @@ async def translate(data: dict):
     })
 
     return {"translated": translated, "final": is_final}
+
+
+@router.post("/tts")
+async def synthesize_tts(payload: TTSRequest):
+    provider = (payload.provider or "google").strip().lower()
+    if provider in {"google", "google_cloud", "gcp"}:
+        synthesize = synthesize_google_tts
+    elif provider in {"gemini_flash", "gemini", "gemini_flash_tts"}:
+        synthesize = synthesize_gemini_tts
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported TTS provider: {provider}")
+
+    try:
+        audio_bytes, meta = await synthesize(
+            payload.text,
+            language=payload.lang,
+            voice=payload.voice,
+            speaking_rate=payload.speaking_rate,
+            pitch=payload.pitch,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover - log + hide details from client
+        logger.exception("tts synth failed")
+        raise HTTPException(status_code=502, detail="tts_failed") from exc
+
+    headers = {
+        "Cache-Control": "no-store",
+        "X-TTS-Voice": meta.get("voice_name", ""),
+        "X-TTS-Language": meta.get("language_code", ""),
+        "X-TTS-Provider": provider,
+        "Content-Length": str(len(audio_bytes)),
+    }
+    return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg", headers=headers)
