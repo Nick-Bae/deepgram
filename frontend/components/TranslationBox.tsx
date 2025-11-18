@@ -107,7 +107,9 @@ const MIN_FINAL_CHARS = 10
 const FINALIZE_PULSE_MS = 2600
 const MIN_FORCE_FINALIZE_CHARS = 8
 const INTRO_HOLD_RE = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
-const EOS_RE = /[.!?。！？]$|(?:습니다|입니다|할까요|했어요|했지요|했네요)$/
+const EOS_PUNCT_RE = /[.!?。！？…]$/
+const STRIP_EOS_PUNCT_RE = /[.!?。！？…]+$/
+const KOREAN_EOS_RE = /(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요|다|아요|어요|에요)$/
 const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
@@ -243,6 +245,18 @@ export default function TranslationBox() {
     }
   }, [sourceLang])
 
+  const endsWithSentenceBoundary = useCallback((raw: string) => {
+    const trimmed = (raw || '').trim()
+    if (!trimmed) return false
+    const base = (sourceLang || '').split('-')[0].toLowerCase()
+    if (base === 'ko') {
+      const withoutPunct = trimmed.replace(STRIP_EOS_PUNCT_RE, '')
+      if (!withoutPunct) return false
+      return KOREAN_EOS_RE.test(withoutPunct)
+    }
+    return EOS_PUNCT_RE.test(trimmed)
+  }, [sourceLang])
+
 
   const triggerFinalize = useCallback(
     (reason?: string) => {
@@ -293,10 +307,10 @@ export default function TranslationBox() {
         const s = (fullClause || '').trim();
         if (!s) return;
 
-        if (s.length < MIN_PREVIEW_CHARS && !EOS_RE.test(s)) return;
+        if (s.length < MIN_PREVIEW_CHARS && !endsWithSentenceBoundary(s)) return;
         if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
 
-        if (!EOS_RE.test(s)) {
+        if (!endsWithSentenceBoundary(s)) {
           if (s === lastPreviewSentRef.current) return;
           if (Math.abs(s.length - lastPreviewSentRef.current.length) < 2) return;
         }
@@ -305,7 +319,7 @@ export default function TranslationBox() {
         lastPreviewSentRef.current = s;
         postTranslate(s, false);
       }, PREVIEW_THROTTLE_MS)
-  , [postTranslate]) as CancelableFn<[string]>
+  , [endsWithSentenceBoundary, postTranslate]) as CancelableFn<[string]>
 
   const shouldEmitClause = useCallback((clean: string) => {
     const prev = lastClauseSentRef.current
@@ -344,13 +358,13 @@ export default function TranslationBox() {
       const s = clauseRef.current.trim();
       if (!s) return;
 
-      if (s.length < MIN_FINAL_CHARS && !EOS_RE.test(s)) return;
+      if (s.length < MIN_FINAL_CHARS && !endsWithSentenceBoundary(s)) return;
       if (s.length < MIN_FINAL_CHARS && INTRO_HOLD_RE.test(s)) return;
 
       sendFinalNow(s);
       clauseRef.current = '';
     }, LINGER_MS);
-  }, [sendFinalNow]);
+  }, [endsWithSentenceBoundary, sendFinalNow]);
 
   // ---------- Clear stale service-workers (helpful for dev HTTPS mixes) ----------
   useEffect(() => {
@@ -665,7 +679,7 @@ export default function TranslationBox() {
       };
       softMapRef.current.set(seq, entry);
       const stable = entry.count >= 2 || (now - entry.first) > 900;
-      if (stable && EOS_RE.test(incoming) && seq > lastHandledSeqRef.current) {
+      if (stable && endsWithSentenceBoundary(incoming) && seq > lastHandledSeqRef.current) {
         console.log('[FE][WS][soft-final]', { seq, out: clip(incoming) });
         lastHandledSeqRef.current = seq;
         if (!isMuted && incoming !== currentSpokenRef.current) {
@@ -673,7 +687,7 @@ export default function TranslationBox() {
         }
       }
     }
-  }, [enqueueFinalTTS, formatSourceForDisplay, isMuted, last]);
+  }, [enqueueFinalTTS, endsWithSentenceBoundary, formatSourceForDisplay, isMuted, last]);
 
   // ---------- Deepgram partials → clause buffer ----------
   useEffect(() => {
@@ -692,7 +706,7 @@ export default function TranslationBox() {
       const old = clauseRef.current.trim();
 
       if (old) {
-        const oldLooksComplete = EOS_RE.test(old) || old.length >= MIN_FINAL_CHARS + 10;
+        const oldLooksComplete = endsWithSentenceBoundary(old) || old.length >= MIN_FINAL_CHARS + 10;
         if (oldLooksComplete) {
           console.log('[FE][clause][rebase->final]', clip(old));
           sendFinalNow(old);
@@ -710,7 +724,7 @@ export default function TranslationBox() {
 
       sendPreview(clauseRef.current);
 
-      if (EOS_RE.test(clauseRef.current)) {
+      if (endsWithSentenceBoundary(clauseRef.current)) {
         sendFinalNow(clauseRef.current);
         clauseRef.current = '';
       } else {
@@ -721,7 +735,7 @@ export default function TranslationBox() {
     lastInterimRef.current = cur;
     const formatted = formatSourceForDisplay(cur);
     setText(formatted || cur);
-  }, [formatSourceForDisplay, partial, scheduleFinal, sendFinalNow, sendPreview]);
+  }, [endsWithSentenceBoundary, formatSourceForDisplay, partial, scheduleFinal, sendFinalNow, sendPreview]);
 
   // ---------- Keep isListening in sync with Deepgram ----------
   useEffect(() => {
@@ -741,7 +755,7 @@ export default function TranslationBox() {
     const interval = setInterval(() => {
       const clause = clauseRef.current.trim()
       if (!clause) return
-      if (clause.length < MIN_FORCE_FINALIZE_CHARS && !EOS_RE.test(clause)) return
+      if (clause.length < MIN_FORCE_FINALIZE_CHARS && !endsWithSentenceBoundary(clause)) return
 
       const now = Date.now()
       if (now - lastFinalizeAtRef.current < FINALIZE_PULSE_MS * 0.8) return
@@ -750,7 +764,7 @@ export default function TranslationBox() {
     }, FINALIZE_PULSE_MS)
 
     return () => clearInterval(interval)
-  }, [status, triggerFinalize])
+  }, [endsWithSentenceBoundary, status, triggerFinalize])
 
   // ---------- Start/Stop mic ----------
   const handleStartListening = async () => {

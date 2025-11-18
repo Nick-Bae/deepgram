@@ -136,29 +136,41 @@ async def ws_stt_deepgram(websocket: WebSocket):
           - else start/refresh a ~1.2s timer; on timeout, commit whatever we have
         """
         SENTENCE_PUNCT = tuple(".?!。？！…")
+        SENTENCE_PUNCT_CHARS = "".join(SENTENCE_PUNCT)
         COMMIT_WAIT_MS = 250
         CJK_PENDING_HOLD_MS = 600
         MIN_CONFIDENT_CHARS = 10
+        KOREAN_SHORT_MIN_CHARS = 14
         KOREAN_EOS_RE = re.compile(
-            r"(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요)$"
+            r"(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요|다|아요|어요|에요)$"
         )
 
         pending_src: str | None = None
+        pending_speech_final = False
         pending_task: asyncio.Task | None = None
 
         def ends_like_sentence(t: str) -> bool:
             t = (t or "").rstrip()
             if not t:
                 return False
+            if src_lang.startswith("ko"):
+                stripped = t.rstrip(SENTENCE_PUNCT_CHARS)
+                if not stripped:
+                    return False
+                return bool(KOREAN_EOS_RE.search(stripped))
             last_char = t[-1]
             if last_char in SENTENCE_PUNCT:
                 return True
-            if src_lang.startswith("ko"):
-                return bool(KOREAN_EOS_RE.search(t))
             return False
 
         def norm_ws(s: str) -> str:
             return " ".join((s or "").split())
+
+        def is_short_korean_clause(text: str) -> bool:
+            if not text or not src_lang.startswith("ko"):
+                return False
+            clean = norm_ws(text)
+            return len(clean) < KOREAN_SHORT_MIN_CHARS
 
         def looks_complete(text: str) -> bool:
             clean = norm_ws(text)
@@ -177,12 +189,17 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 return False
             return not ends_like_sentence(text)
 
+        def should_hold_short_korean(text: str, speech_final_flag: bool) -> bool:
+            if speech_final_flag:
+                return False
+            return is_short_korean_clause(text)
+
         SUBSET_SUPPRESS_WINDOW_SEC = 4.0
         MIN_SUBSET_DELTA = 6
         CJK_NO_SPACE_PREFIXES = ("ko", "zh", "ja")
 
         async def commit_now(src_text_raw: str):
-            nonlocal seq, pending_src, pending_task
+            nonlocal seq, pending_src, pending_task, pending_speech_final
             if not src_text_raw or not src_text_raw.strip():
                 return
 
@@ -205,6 +222,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     if is_edge_subset and recent_commit:
                         print("[A][skip][subset]", normalized)
                         pending_src = None
+                        pending_speech_final = False
                         if pending_task and not pending_task.done():
                             pending_task.cancel()
                         pending_task = None
@@ -292,6 +310,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print("[DG] broadcast error:", e)
 
             pending_src = None
+            pending_speech_final = False
             if pending_task and not pending_task.done():
                 pending_task.cancel()
             pending_task = None
@@ -323,7 +342,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 finalize_event.clear()
                 if pending_src:
                     try:
-                        await commit_now(pending_src)
+                        if should_hold_short_korean(pending_src, pending_speech_final):
+                            await arm_timer(CJK_PENDING_HOLD_MS)
+                        else:
+                            await commit_now(pending_src)
                     except Exception:
                         pass
 
@@ -361,6 +383,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 if transcript:
                     pending_src = transcript
+                    pending_speech_final = speech_final
 
                 print(f"[DG][A] final: speech_final={speech_final} src='{pending_src or ''}'")
 
@@ -373,7 +396,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     continue
 
                 if pending_src and ends_like_sentence(pending_src):
-                    await commit_now(pending_src)
+                    if should_hold_short_korean(pending_src, speech_final):
+                        await arm_timer(CJK_PENDING_HOLD_MS)
+                    else:
+                        await commit_now(pending_src)
                     continue
 
                 if pending_src:
