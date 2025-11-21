@@ -11,7 +11,7 @@ load_dotenv()
 # --- local modules (single import each) ---
 from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram
-from app.utils.translate import translate_text  # async wrapper you already have
+from app.utils.translate import translate_text, TranslationContext  # async wrapper you already have
 from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 
@@ -91,6 +91,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     dg_language = _deepgram_language_preference(src_lang_full)
     dg_keywords = None if src_lang.startswith("ko") else []
     await websocket.accept()
+    translation_ctx = TranslationContext()
     try:
         dg = await connect_to_deepgram(language=dg_language, keywords=dg_keywords)  # <-- dg is created here
     except Exception as e:
@@ -273,7 +274,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 translated = src_text
             else:
                 try:
-                    translated = await translate_text(src_text, src_lang_full, tgt_lang_full)
+                    translated = await translate_text(src_text, src_lang_full, tgt_lang_full, ctx=translation_ctx)
+                    translation_ctx.last_english = translated
                 except Exception as e:
                     print("[TX] error:", e)
                     translated = src_text  # fail-open

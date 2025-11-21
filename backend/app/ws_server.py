@@ -5,7 +5,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from .env import ENV
 from .chunker.ko_chunker import KoChunker
-from .translator.openai_translator import translate_ko_to_en_chunk
+from asyncio import Lock
+from .translator.openai_translator import translate_ko_to_en_chunk, TranslationContext
 from .asr_bridge import AsrBridge
 
 router = APIRouter()
@@ -17,6 +18,8 @@ async def ws_handler(ws: WebSocket):
     chunker = KoChunker()
     t_start = int(time.time() * 1000)
     next_id = 1
+    context = TranslationContext()
+    context_lock = Lock()
 
     async def _safe_send(payload: dict[str, Any]):
         if ws.application_state == WebSocketState.CONNECTED:
@@ -24,7 +27,9 @@ async def ws_handler(ws: WebSocket):
 
     async def commit_now(ko: str, t_audio_end: int):
         nonlocal next_id
-        en = await translate_ko_to_en_chunk(ko)
+        async with context_lock:
+            en = await translate_ko_to_en_chunk(ko, context)
+            context.last_english = en
         emit_ts = int(time.time() * 1000)
         await _safe_send({"type":"commit","commit":{
             "id": str(next_id), "ko": ko, "en": en,

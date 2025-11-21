@@ -2,6 +2,8 @@
 import os
 import json
 import pathlib
+import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, List, Optional
 from collections import deque
@@ -9,6 +11,7 @@ from dotenv import load_dotenv
 
 # OpenAI >= 1.0
 from openai import AsyncOpenAI
+from app.env import ENV
 
 load_dotenv()
 
@@ -16,6 +19,13 @@ _MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # fast & good; use gpt-4o if 
 _API_KEY = os.getenv("OPENAI_API_KEY")
 
 _client: AsyncOpenAI | None = None
+
+@dataclass
+class TranslationContext:
+    subject: str = ENV.CONTEXT_SUBJECT
+    pronoun: str = ENV.CONTEXT_PRONOUN
+    narration_mode: str = ENV.CONTEXT_MODE
+    last_english: Optional[str] = None
 
 # Soft glossary for key theological terms (you can expand this)
 THEOLOGICAL_TERMS: list[tuple[str, str]] = [
@@ -42,7 +52,64 @@ try:
     print(f"[TX] Loaded {len(BIBLE_NAMES)} Bible names from {__file__}")
 except FileNotFoundError:
     print(f"[TX] bible_names.json not found at {_BIBLE_NAMES_PATH}; continuing without Bible name map")
-    BIBLE_NAMES = {}
+BIBLE_NAMES = {}
+
+FIRST_PERSON_KO_MARKERS = [
+    "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테",
+    "저는", "전", "제가", "제게", "저를", "저도", "저만", "저와", "저에게", "저한테",
+    "우리", "우리가", "우리는", "우릴", "우리의", "우리도", "우리만", "우리와", "우리에게", "우리한테"
+]
+
+PRONOUN_FORMS = {
+    "he": {
+        "subject": "He",
+        "object": "him",
+        "possessive": "his",
+        "reflexive": "himself",
+        "be_present": "He is",
+        "be_present_contracted": "He's",
+        "be_past": "He was",
+        "have": "He has",
+        "have_contracted": "He's",
+        "will": "He will",
+        "will_contracted": "He'll",
+        "would": "He would",
+        "would_contracted": "He'd",
+        "can": "He can",
+    },
+    "she": {
+        "subject": "She",
+        "object": "her",
+        "possessive": "her",
+        "reflexive": "herself",
+        "be_present": "She is",
+        "be_present_contracted": "She's",
+        "be_past": "She was",
+        "have": "She has",
+        "have_contracted": "She's",
+        "will": "She will",
+        "will_contracted": "She'll",
+        "would": "She would",
+        "would_contracted": "She'd",
+        "can": "She can",
+    },
+    "they": {
+        "subject": "They",
+        "object": "them",
+        "possessive": "their",
+        "reflexive": "themselves",
+        "be_present": "They are",
+        "be_present_contracted": "They're",
+        "be_past": "They were",
+        "have": "They have",
+        "have_contracted": "They've",
+        "will": "They will",
+        "will_contracted": "They'll",
+        "would": "They would",
+        "would_contracted": "They'd",
+        "can": "They can",
+    },
+}
 
 
 def _ensure_data_dir() -> None:
@@ -216,7 +283,54 @@ def _language_name(code_or_name: str) -> str:
     return mapping.get(key, code_or_name)
 
 
-def _build_system_prompt(source: str, target: str) -> str:
+def _normalize_pronoun(ctx: Optional[TranslationContext]) -> Optional[str]:
+    if not ctx:
+        return None
+    raw = (ctx.pronoun or ENV.CONTEXT_PRONOUN or "").strip().lower()
+    if raw.startswith("he"):
+        return "he"
+    if raw.startswith("she"):
+        return "she"
+    if raw.startswith("they"):
+        return "they"
+    return None
+
+
+def _contains_first_person_markers(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return any(marker in compact for marker in FIRST_PERSON_KO_MARKERS)
+
+
+def _format_replacement(match: re.Match, replacement: str) -> str:
+    string = match.string
+    idx = match.start()
+    while idx > 0 and string[idx - 1].isspace():
+        idx -= 1
+    sentence_start = idx == 0 or string[idx - 1] in ".!?“”\"'‘’("
+    if sentence_start:
+        return replacement
+    if replacement:
+        return replacement[0].lower() + replacement[1:]
+    return replacement
+
+
+def _build_context_block(ctx: Optional[TranslationContext]) -> str:
+    if not ctx:
+        return ""
+    subject = ctx.subject or ENV.CONTEXT_SUBJECT
+    pronoun = ctx.pronoun or ENV.CONTEXT_PRONOUN
+    narration = ctx.narration_mode or ENV.CONTEXT_MODE
+
+    return (
+        "\nSubject continuity:\n"
+        f"- Main character: {subject} ({pronoun}). Keep dropped subjects anchored here.\n"
+        f"- Narration mode: {narration}. Do not switch to first-person narration unless the Korean clause "
+        "explicitly contains first-person markers (나/저/우리 variants).\n"
+        "- When translating 스스로 or similar reflexives, use himself/herself/themselves matching the subject.\n"
+    )
+
+
+def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationContext]) -> str:
     """
     Sermon translator with:
     - light STT error correction
@@ -302,10 +416,47 @@ def _build_system_prompt(source: str, target: str) -> str:
         "17. If the input seems incomplete or ends abruptly (common with STT pauses), translate only what was actually said and do not invent endings or extra sentences.\n"
     )
 
-    return system
+    return system + _build_context_block(ctx)
 
 
-async def translate_text(text: str, source: str, target: str) -> str:
+def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
+    pronoun_key = _normalize_pronoun(ctx)
+    if not pronoun_key:
+        return en
+    forms = PRONOUN_FORMS.get(pronoun_key)
+    if not forms:
+        return en
+    if _contains_first_person_markers(source_text):
+        return en
+
+    updated = en
+    replacements = [
+        (r"\bI['’]m\b", forms.get("be_present_contracted") or forms.get("be_present")),
+        (r"\bI am\b", forms.get("be_present")),
+        (r"\bI was\b", forms.get("be_past")),
+        (r"\bI['’]ve\b", forms.get("have_contracted") or forms.get("have")),
+        (r"\bI have\b", forms.get("have")),
+        (r"\bI['’]ll\b", forms.get("will_contracted") or forms.get("will")),
+        (r"\bI will\b", forms.get("will")),
+        (r"\bI['’]d\b", forms.get("would_contracted") or forms.get("would")),
+        (r"\bI would\b", forms.get("would")),
+        (r"\bI can\b", forms.get("can")),
+        (r"\bI\b", forms.get("subject")),
+        (r"\bme\b", forms.get("object")),
+        (r"\bmy\b", forms.get("possessive")),
+        (r"\bmyself\b", forms.get("reflexive")),
+        (r"\bfor myself\b", f"for {forms['reflexive']}"),
+        (r"\bby myself\b", f"by {forms['reflexive']}"),
+        (r"\bon my own\b", f"on {forms['possessive']} own"),
+    ]
+    for pattern, repl in replacements:
+        if not repl:
+            continue
+        updated = re.sub(pattern, lambda m: _format_replacement(m, repl), updated, flags=re.IGNORECASE)
+    return updated
+
+
+async def translate_text(text: str, source: str, target: str, ctx: Optional[TranslationContext] = None) -> str:
     """
     Async translator. Returns ONLY the translated text (no quotes/explanations).
     On any API error, it fails open by returning the original text.
@@ -315,19 +466,31 @@ async def translate_text(text: str, source: str, target: str) -> str:
         return ""
 
     client = _get_client()
-    system = _build_system_prompt(source, target)
+    system = _build_system_prompt(source, target, ctx)
+    user_content = text
+    if ctx:
+        prev = ctx.last_english or "(none yet)"
+        subject_hint = ctx.subject or ENV.CONTEXT_SUBJECT
+        pronoun_hint = ctx.pronoun or ENV.CONTEXT_PRONOUN
+        user_content = (
+            f"Previous English sentence: {prev}\n"
+            f"Subject hint: continue referring to {subject_hint} ({pronoun_hint}).\n\n"
+            f"Current text:\n{text}"
+        )
 
     try:
         resp = await client.chat.completions.create(
             model=_MODEL,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": text}
+                {"role": "user", "content": user_content}
             ],
             temperature=0.2,
         )
         out = (resp.choices[0].message.content or "").strip()
         out = out.strip('"\u201c\u201d')
+        if ctx and source.lower().startswith("ko"):
+            out = _enforce_subject_guardrails(out, text, ctx)
 
         _log_translation_example(
             source_lang=source,
