@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 # OpenAI >= 1.0
 from openai import AsyncOpenAI
 from app.env import ENV
+from app.utils.spacing import apply_ko_spacing
 
 load_dotenv()
 
@@ -58,6 +59,10 @@ FIRST_PERSON_KO_MARKERS = [
     "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테",
     "저는", "전", "제가", "제게", "저를", "저도", "저만", "저와", "저에게", "저한테",
     "우리", "우리가", "우리는", "우릴", "우리의", "우리도", "우리만", "우리와", "우리에게", "우리한테"
+]
+
+WE_KO_MARKERS = [
+    "우리", "우리가", "우리는", "우릴", "우리의", "우리도", "우리만", "우리와", "우리에게", "우리한테",
 ]
 
 PRONOUN_FORMS = {
@@ -109,6 +114,22 @@ PRONOUN_FORMS = {
         "would_contracted": "They'd",
         "can": "They can",
     },
+    "we": {
+        "subject": "We",
+        "object": "us",
+        "possessive": "our",
+        "reflexive": "ourselves",
+        "be_present": "We are",
+        "be_present_contracted": "We're",
+        "be_past": "We were",
+        "have": "We have",
+        "have_contracted": "We've",
+        "will": "We will",
+        "will_contracted": "We'll",
+        "would": "We would",
+        "would_contracted": "We'd",
+        "can": "We can",
+    },
 }
 
 
@@ -117,6 +138,33 @@ def _ensure_data_dir() -> None:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         print(f"[TX] failed to ensure data dir {_DATA_DIR}: {exc}")
+
+
+def _preprocess_source_text(text: str, source_lang: str) -> str:
+    """Light, safe fixes for common Korean STT glitches that hurt translation.
+
+    Keep this conservative: only normalize patterns we are confident about.
+    """
+    if not text or not source_lang.lower().startswith("ko"):
+        return text
+
+    cleaned = text
+    replacements: list[tuple[str, str]] = [
+        # Frequent STT slips during liturgy
+        (r"사도신명", "사도신경"),
+        (r"사도신병", "사도신경"),
+        (r"이\\s*시간다", "이 시간 다"),
+        (r"예배하며나갈때", "예배하며 나갈 때"),
+        (r"함께예배하며나갈때", "함께 예배하며 나갈 때"),
+        (r"하나님이계시기에", "하나님이 계시기에"),
+    ]
+
+    for pattern, repl in replacements:
+        cleaned = re.sub(pattern, repl, cleaned)
+
+    # Normalize missing space in "이시간" when it appears at the start
+    cleaned = re.sub(r"^이시간", "이 시간", cleaned)
+    return cleaned
 
 
 def _log_translation_example(
@@ -293,12 +341,19 @@ def _normalize_pronoun(ctx: Optional[TranslationContext]) -> Optional[str]:
         return "she"
     if raw.startswith("they"):
         return "they"
+    if raw.startswith("we"):
+        return "we"
     return None
 
 
 def _contains_first_person_markers(text: str) -> bool:
     compact = re.sub(r"\s+", "", text or "")
     return any(marker in compact for marker in FIRST_PERSON_KO_MARKERS)
+
+
+def _contains_we_markers(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return any(marker in compact for marker in WE_KO_MARKERS)
 
 
 def _format_replacement(match: re.Match, replacement: str) -> str:
@@ -404,6 +459,10 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
         "7. Do not exaggerate or dramatize emotions beyond what the Korean clearly expresses; keep the tone steady and pastoral.\n"
         "8. When the Korean is general or ambiguous, keep a similar level of generality in the translation and do not add specific details.\n"
         "9. Always choose wording that is completely appropriate to say in a mixed-age worship service with children, teens, and adults.\n"
+        "Spacing reliability: Korean STT often omits spaces; mentally restore natural spacing before translating so words are not merged or dropped.\n"
+        "Congregation cues: If the Korean clause uses 일어나/일어나서/일어나셔서/자리에서 일어나 without an explicit subject, "
+        "assume the speaker is inviting the congregation. Translate with an invitation like 'let's stand' or 'please stand' "
+        "instead of 'he stood up.' Preserve timing phrases such as '이 시간' (e.g., '이 시간 다 같이 일어나셔서' → 'At this time, let's stand together').\n"
         "\n"
         "General requirements:\n"
         "10. Preserve biblical and theological meaning very accurately.\n"
@@ -456,12 +515,58 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
     return updated
 
 
+def _enforce_we_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
+    """Keep congregational tone in first-person plural when appropriate.
+
+    Trigger if:
+      - Korean contains 우리/우리의 markers, OR
+      - Context pronoun is set to "we".
+    Converts stray third-person pronouns to inclusive "we/our/us" and prefers "let us" invitations.
+    """
+    pronoun_pref = _normalize_pronoun(ctx)
+    if not _contains_we_markers(source_text) and pronoun_pref != "we":
+        return en
+
+    updated = en
+    replacements = [
+        (r"\bHe\s+encourages\b", "Let us"),
+        (r"\bShe\s+encourages\b", "Let us"),
+        (r"\bThey\s+encourage\b", "Let us"),
+        (r"\bhe\b", "we"),
+        (r"\bshe\b", "we"),
+        (r"\bthey\b", "we"),
+        (r"\bhim\b", "us"),
+        (r"\bher\b", "us"),
+        (r"\bthem\b", "us"),
+        (r"\bhis\b", "our"),
+        (r"\bher\b", "our"),
+        (r"\btheir\b", "our"),
+        (r"\bhe is\b", "we are"),
+        (r"\bshe is\b", "we are"),
+        (r"\bthey are\b", "we are"),
+        (r"\bhe was\b", "we were"),
+        (r"\bshe was\b", "we were"),
+        (r"\bthey were\b", "we were"),
+    ]
+
+    for pattern, repl in replacements:
+        updated = re.sub(pattern, lambda m: _format_replacement(m, repl), updated, flags=re.IGNORECASE)
+
+    # Prefer invitation tone
+    updated = re.sub(r"\b(he|she|they)\s+should\s+go\b", "let us go", updated, flags=re.IGNORECASE)
+    updated = re.sub(r"\b(he|she|they)\s+encourage[s]?\s+\w+\b", "let us", updated, flags=re.IGNORECASE)
+    return updated
+
+
 async def translate_text(text: str, source: str, target: str, ctx: Optional[TranslationContext] = None) -> str:
     """
     Async translator. Returns ONLY the translated text (no quotes/explanations).
     On any API error, it fails open by returning the original text.
     """
     text = (text or "").strip()
+    text = _preprocess_source_text(text, source)
+    if source.lower().startswith("ko"):
+        text = apply_ko_spacing(text)
     if not text:
         return ""
 
@@ -491,6 +596,8 @@ async def translate_text(text: str, source: str, target: str, ctx: Optional[Tran
         out = out.strip('"\u201c\u201d')
         if ctx and source.lower().startswith("ko"):
             out = _enforce_subject_guardrails(out, text, ctx)
+        if source.lower().startswith("ko"):
+            out = _enforce_we_guardrails(out, text, ctx)
 
         _log_translation_example(
             source_lang=source,

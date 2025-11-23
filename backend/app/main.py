@@ -369,6 +369,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 best = alts[0]
                 transcript = (best.get("transcript") or "").strip()
+                words = best.get("words") or []
+
+                # Prefer word-level reconstruction to recover Korean spacing in partials/finals
+                if src_lang.startswith("ko") and words:
+                    joined_words = " ".join(
+                        (w.get("punctuated_word") or w.get("word") or "").strip()
+                        for w in words
+                        if (w.get("word") or "").strip()
+                    ).strip()
+                    if joined_words:
+                        if (" " not in transcript) or (len(joined_words) >= len(transcript) - 2):
+                            transcript = joined_words
+
                 is_final = bool(evt.get("is_final"))
                 speech_final = bool(evt.get("speech_final") or False)
 
