@@ -245,6 +245,15 @@ export default function TranslationBox() {
     }
   }, [sourceLang])
 
+  const previewSource = useMemo(() => {
+    const rawPreview = typeof last?.preview === 'string' ? last.preview.trim() : ''
+    if (!rawPreview) return ''
+
+    const formatted = formatSourceForDisplay(rawPreview)
+    return formatted || rawPreview
+  }, [formatSourceForDisplay, last])
+  const previewSnippet = clip(previewSource, 100)
+
   const endsWithSentenceBoundary = useCallback((raw: string) => {
     const trimmed = (raw || '').trim()
     if (!trimmed) return false
@@ -789,7 +798,6 @@ export default function TranslationBox() {
     dgStop()
   }
 
-  const previewSnippet = clip((last.preview || ''), 100)
   const ttsAudienceEnabled = !isMuted
   const latencyLabel = latencyMs !== null ? `${Math.max(latencyMs, 0).toFixed(0)} ms` : 'Calibrating…'
   const micActive = isListening && status === 'streaming'

@@ -14,6 +14,7 @@ from app.deepgram_session import connect_to_deepgram
 from app.utils.translate import translate_text, TranslationContext  # async wrapper you already have
 from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
+from app.routes import examples as examples_routes
 
 # ------------------------------------------------------------------------------
 # ONE app only
@@ -29,6 +30,7 @@ app.add_middleware(
 
 # Keep your existing HTTP routes under /api
 app.include_router(translate_routes.router, prefix="/api")
+app.include_router(examples_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
