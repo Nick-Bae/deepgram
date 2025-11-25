@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, ChangeEvent } from "react";
 import { API_URL } from "../../utils/urls";
 
 type Example = {
@@ -19,6 +19,15 @@ type ListResponse = {
 };
 
 const PAGE_SIZE = 50;
+const toMessage = (err: unknown) => {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return "Unknown error";
+  }
+};
 
 export default function ExamplesAdmin() {
   const [source, setSource] = useState("ko");
@@ -53,8 +62,8 @@ export default function ExamplesAdmin() {
       const json = await res.json();
       setData(json);
       setItems(json.items || []);
-    } catch (err: any) {
-      setMessage(err.message || "Failed to load");
+    } catch (err: unknown) {
+      setMessage(toMessage(err) || "Failed to load");
     } finally {
       setLoading(false);
     }
@@ -82,8 +91,8 @@ export default function ExamplesAdmin() {
       if (!res.ok) throw new Error(await res.text());
       setMessage("Saved");
       load();
-    } catch (err: any) {
-      setMessage(err.message || "Save failed");
+    } catch (err: unknown) {
+      setMessage(toMessage(err) || "Save failed");
     }
   };
 
@@ -99,8 +108,8 @@ export default function ExamplesAdmin() {
       if (!res.ok) throw new Error(await res.text());
       setMessage("Deleted");
       load();
-    } catch (err: any) {
-      setMessage(err.message || "Delete failed");
+    } catch (err: unknown) {
+      setMessage(toMessage(err) || "Delete failed");
     }
   };
 
@@ -116,8 +125,8 @@ export default function ExamplesAdmin() {
       const j = await res.json();
       setMessage(`Cleaned: ${j.before} → ${j.after}`);
       load();
-    } catch (err: any) {
-      setMessage(err.message || "Clean failed");
+    } catch (err: unknown) {
+      setMessage(toMessage(err) || "Clean failed");
     }
   };
 
@@ -132,8 +141,8 @@ export default function ExamplesAdmin() {
       if (!res.ok) throw new Error(await res.text());
       const j = await res.json();
       setMessage(`Exported ${j.exported} → ${j.output}`);
-    } catch (err: any) {
-      setMessage(err.message || "Export failed");
+    } catch (err: unknown) {
+      setMessage(toMessage(err) || "Export failed");
     }
   };
 
@@ -163,7 +172,9 @@ export default function ExamplesAdmin() {
           Corrected
           <select
             value={corrected}
-            onChange={(e) => setCorrected(e.target.value as any)}
+            onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+              setCorrected(e.target.value as "all" | "true" | "false")
+            }
             style={styles.input}
           >
             <option value="all">All</option>
@@ -175,7 +186,7 @@ export default function ExamplesAdmin() {
           Sort
           <select
             value={sort}
-            onChange={(e) => setSort(e.target.value as any)}
+            onChange={(e: ChangeEvent<HTMLSelectElement>) => setSort(e.target.value as "desc" | "asc")}
             style={styles.input}
           >
             <option value="desc">Newest first</option>
