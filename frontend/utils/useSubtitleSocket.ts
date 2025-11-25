@@ -80,18 +80,113 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     return [normalized];
   }
 
+  // --- English display pacing state ---
+  type DisplayEntry = { id: number; seq: number | null; text: string; addedAt: number };
+  const enQueueRef = useRef<DisplayEntry[]>([]);
+  const enDisplayRef = useRef<DisplayEntry[]>([]);
+  const nextSlotAtRef = useRef(0);
+  const timerRef = useRef<number | null>(null);
+  const idCounterRef = useRef(0);
+
   function pushLine(setter: React.Dispatch<React.SetStateAction<string[]>>, text: string) {
     setter((prev) => prev.concat(text).slice(-maxLines));
   }
 
-  function appendLines(setter: React.Dispatch<React.SetStateAction<string[]>>, lines: string[]) {
+  function computeLingerMs(text: string) {
+    const len = text.length;
+    const base = 900;            // short sentences get ~1.4s
+    const perChar = 55;          // scale with length so long sentences stay longer
+    const minMs = 1400;
+    const maxMs = 4200;
+    return Math.max(minMs, Math.min(maxMs, base + len * perChar));
+  }
+
+  function scheduleDrain() {
+    if (timerRef.current !== null) return;
+    const delay = Math.max(0, nextSlotAtRef.current - Date.now());
+    timerRef.current = window.setTimeout(drainQueue, delay);
+  }
+
+  function replaceSeq(seq: number | null, entries: DisplayEntry[]): boolean {
+    // Try replacing in the pending queue first (latest block with this seq).
+    for (let i = enQueueRef.current.length - 1; i >= 0; i--) {
+      if (enQueueRef.current[i].seq === seq) {
+        let start = i;
+        while (start > 0 && enQueueRef.current[start - 1].seq === seq) start--;
+        enQueueRef.current.splice(start, enQueueRef.current.length - start, ...entries);
+        return true;
+      }
+      if (enQueueRef.current[i].seq !== seq) break;
+    }
+
+    // Otherwise, replace the tail block already on screen.
+    for (let i = enDisplayRef.current.length - 1; i >= 0; i--) {
+      if (enDisplayRef.current[i].seq === seq) {
+        let start = i;
+        while (start > 0 && enDisplayRef.current[start - 1].seq === seq) start--;
+        let end = i + 1;
+        while (end < enDisplayRef.current.length && enDisplayRef.current[end].seq === seq) end++;
+        const preservedAddedAt = enDisplayRef.current[start]?.addedAt ?? Date.now();
+        const stamped = entries.map((e) => ({ ...e, addedAt: preservedAddedAt }));
+        enDisplayRef.current.splice(start, end - start, ...stamped);
+        enDisplayRef.current = enDisplayRef.current.slice(-maxLines);
+        setEnLines(enDisplayRef.current.map((e) => e.text));
+        return true;
+      }
+      if (enDisplayRef.current[i].seq !== seq) break;
+    }
+    return false;
+  }
+
+  function drainQueue() {
+    timerRef.current = null;
+    const now = Date.now();
+    if (now < nextSlotAtRef.current - 5) {
+      scheduleDrain();
+      return;
+    }
+    const next = enQueueRef.current.shift();
+    if (!next) return;
+
+    const entry = { ...next, addedAt: now };
+    enDisplayRef.current = enDisplayRef.current.concat(entry).slice(-maxLines);
+    setEnLines(enDisplayRef.current.map((e) => e.text));
+
+    const dwell = computeLingerMs(entry.text);
+    nextSlotAtRef.current = now + dwell;
+    scheduleDrain();
+  }
+
+  function enqueueEnglish(seq: number | null, lines: string[]) {
     if (!lines.length) return;
-    setter((prev) => prev.concat(lines).slice(-maxLines));
+    const entries = lines.map((text) => ({
+      id: idCounterRef.current++,
+      seq,
+      text,
+      addedAt: 0,
+    }));
+
+    if (replaceSeq(seq, entries)) {
+      // Updated content for the same segment; no need to change pacing.
+      return;
+    }
+
+    enQueueRef.current.push(...entries);
+    scheduleDrain();
   }
 
   useEffect(() => {
     if (!resolvedUrl) return;
     stopFlag.current = false;
+    enQueueRef.current = [];
+    enDisplayRef.current = [];
+    nextSlotAtRef.current = 0;
+    if (timerRef.current !== null) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    setEnLines([]);
+    setKrLines([]);
 
     function scheduleReconnect() {
       if (stopFlag.current) return;
@@ -153,7 +248,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
               const t = text.trim();
               if (!t) return;
               setEnFinal(t);
-              if (track === "en" || track === "both") appendLines(setEnLines, splitSentences(t));
+              if (track === "en" || track === "both") enqueueEnglish(seq, splitSentences(t));
               return;
             }
 
@@ -172,6 +267,10 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     return () => {
       stopFlag.current = true;
       if (rafId.current) cancelAnimationFrame(rafId.current);
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
       try { wsRef.current?.close(); } catch {}
       wsRef.current = null;
     };

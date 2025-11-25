@@ -34,7 +34,7 @@ export default function Display() {
     process.env.NEXT_PUBLIC_WS_URL
       ? `${process.env.NEXT_PUBLIC_WS_URL}?role=viewer`
       : undefined,
-    { maxLines: 3, track: "en" } // "en" | "kr" | "both"
+    { maxLines: 4, track: "en" } // "en" | "kr" | "both"
   );
 
   const lastKr = krLines[krLines.length - 1] || "";
