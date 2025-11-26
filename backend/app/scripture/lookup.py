@@ -474,9 +474,14 @@ def _build_regex(aliases: Iterable[str]) -> re.Pattern[str]:
     escaped = sorted({re.escape(alias) for alias in aliases}, key=len, reverse=True)
     pattern = "|".join(escaped)
     # Accept formats like "요한복음 3장 16절", "요한복음3:16", or "요한복음3장16-18절".
+    # Enforce a boundary after the verse to avoid mis-parsing a long chapter number
+    # into chapter+verse (e.g., "시편 105편" should not become 10:5).
     regex = re.compile(
-        rf"(?P<book>{pattern})\s*(?P<chapter>\d{{1,3}})\s*(?:장|편)?\s*(?:[:\.\s]?\s*)?"
-        rf"(?P<verse>\d{{1,3}})\s*(?:절)?(?:\s*(?:-|~|부터|에서)\s*(?P<endverse>\d{{1,3}})\s*(?:절)?(?:\s*까지)?)?",
+        rf"(?P<book>{pattern})\s*(?P<chapter>\d{{1,3}})\s*(?:장|편)?\s*"
+        rf"(?:[:\.\s]?\s*)?(?P<verse>\d{{1,3}})\s*(?:절)?"
+        rf"(?:\s*(?:-|~|부터|에서)\s*(?P<endverse>\d{{1,3}})\s*(?:절)?(?:\s*까지)?)?"
+        rf"(?:\s*(?:입니다|입니다요|이에요|예요|라|라고|입니다\.)?)?"
+        rf"(?![0-9가-힣])",
         re.UNICODE,
     )
     return regex
