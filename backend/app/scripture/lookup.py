@@ -56,6 +56,34 @@ _HANGUL_UNIT_MAP = {
     "천": 1000,
 }
 
+# Native Korean number words often used in spoken references (e.g., "다섯 장" for chapter 5).
+_NATIVE_NUM_WORDS = {
+    "스무": 20,
+    "열아홉": 19,
+    "열여덟": 18,
+    "열일곱": 17,
+    "열여섯": 16,
+    "열다섯": 15,
+    "열네": 14,
+    "열세": 13,
+    "열두": 12,
+    "열한": 11,
+    "열": 10,
+    "아홉": 9,
+    "여덟": 8,
+    "일곱": 7,
+    "여섯": 6,
+    "다섯": 5,
+    "넷": 4,
+    "네": 4,
+    "셋": 3,
+    "세": 3,
+    "둘": 2,
+    "두": 2,
+    "하나": 1,
+    "한": 1,
+}
+
 # Hand-tuned aliases for the few books whose spoken names rarely match the JSON key exactly.
 _MANUAL_ALIAS_OVERRIDES = {
     "요한일서": "요한1서",
@@ -192,6 +220,10 @@ def detect_scripture_verse(text: str) -> Optional[ScriptureResult]:
 
     try:
         chapter = int(match.group("chapter"))
+    except (TypeError, ValueError):
+        return None
+
+    try:
         verse = int(match.group("verse"))
     except (TypeError, ValueError):
         return None
@@ -380,12 +412,28 @@ def _slice_esv(
 
 
 _HANGUL_NUM_CHARS = "".join(sorted({*"".join(_HANGUL_DIGIT_MAP.keys()), *"".join(_HANGUL_UNIT_MAP.keys())}))
-_HANGUL_NUM_PATTERN = re.compile(rf"(?P<num>[{_HANGUL_NUM_CHARS}]+)\s*(?P<unit>장|절)")
+_HANGUL_NUM_PATTERN = re.compile(rf"(?P<num>[{_HANGUL_NUM_CHARS}]+)\s*(?P<unit>장|절|편)")
+_NATIVE_NUM_PATTERN = re.compile(
+    rf"(?P<word>{'|'.join(sorted(_NATIVE_NUM_WORDS, key=len, reverse=True))})\s*(?P<unit>장|절|편)",
+    re.UNICODE,
+)
 
 
 def _normalize_hangul_reference_text(text: str) -> str:
     if not text:
         return text
+
+    # First handle native number words like "다섯 장", converting them to Arabic digits
+    # before the more general Sino-Korean digit normalization runs.
+    def native_repl(match: re.Match[str]) -> str:
+        word = match.group("word")
+        unit = match.group("unit")
+        value = _NATIVE_NUM_WORDS.get(word)
+        if value is None:
+            return match.group(0)
+        return f"{value}{unit}"
+
+    text = _NATIVE_NUM_PATTERN.sub(native_repl, text)
 
     def repl(match: re.Match[str]) -> str:
         raw = match.group("num")
@@ -427,7 +475,7 @@ def _build_regex(aliases: Iterable[str]) -> re.Pattern[str]:
     pattern = "|".join(escaped)
     # Accept formats like "요한복음 3장 16절", "요한복음3:16", or "요한복음3장16-18절".
     regex = re.compile(
-        rf"(?P<book>{pattern})\s*(?P<chapter>\d{{1,3}})\s*(?:장)?\s*(?:[:\.\s]?\s*)?"
+        rf"(?P<book>{pattern})\s*(?P<chapter>\d{{1,3}})\s*(?:장|편)?\s*(?:[:\.\s]?\s*)?"
         rf"(?P<verse>\d{{1,3}})\s*(?:절)?(?:\s*(?:-|~|부터|에서)\s*(?P<endverse>\d{{1,3}})\s*(?:절)?(?:\s*까지)?)?",
         re.UNICODE,
     )
