@@ -4,6 +4,7 @@
 import Head from "next/head";
 import ScriptUpload from "../components/ScriptUpload";
 import ProducerBox from "../components/ProducerBox";
+import SermonPrep from "../components/SermonPrep";
 import { useTranslationSocket } from "../utils/useTranslationSocket";
 
 export default function AdminHybrid() {
@@ -35,21 +36,15 @@ export default function AdminHybrid() {
       <Head>
         <title>Hybrid Admin Console</title>
       </Head>
-      <main className="relative min-h-screen bg-[#070c16] text-slate-100">
-        <div className="pointer-events-none absolute inset-0" aria-hidden>
-          <div className="absolute -left-24 top-12 h-64 w-64 rounded-full bg-[#22d3ee]/30 blur-[140px]" />
-          <div className="absolute bottom-0 right-0 h-72 w-72 rounded-full bg-[#00ffff]/10 blur-[180px]" />
-        </div>
-
-        <div className="relative z-10 mx-auto flex max-w-6xl flex-col gap-10 px-6 py-12">
+      <main className="min-h-screen bg-gradient-to-b from-[#0b1220] via-[#0f172a] to-[#0b1220] text-slate-100">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 px-5 py-10">
           <header className="flex flex-col gap-6">
             <div className="flex flex-wrap items-start justify-between gap-6">
               <div className="space-y-3">
-                <p className="text-xs uppercase tracking-[0.35em] text-[#94a3b8]">Hybrid Ops</p>
+                <p className="text-xs uppercase tracking-[0.3em] text-[#94a3b8]">Hybrid Ops</p>
                 <h1 className="text-3xl font-semibold text-white md:text-4xl">Hybrid Translation Admin</h1>
                 <p className="text-base text-white/70 md:max-w-2xl">
-                  Stage bilingual pre-scripts, stream real-time corrections, and keep the translation feed synced across
-                  listeners.
+                  Prep bilingual lines, tweak translations, and push them live without interrupting the realtime feed.
                 </p>
               </div>
               <div
@@ -86,13 +81,15 @@ export default function AdminHybrid() {
             </div>
           </header>
 
-          <section className="grid gap-8 lg:grid-cols-[1.15fr_0.85fr]">
-            <ScriptUpload />
-
+          <section className="grid gap-8 lg:grid-cols-2 items-start">
             <div className="flex flex-col gap-6">
+              <ScriptUpload />
+            </div>
+
+            <div className="flex flex-col gap-6 h-full">
               <ProducerBox />
 
-              <div className="rounded-[32px] border border-white/10 bg-[#050910]/90 p-6 shadow-[0_25px_65px_rgba(0,0,0,0.55)] backdrop-blur">
+              <div className="rounded-[32px] border border-white/10 bg-[#050910]/90 p-6 shadow-[0_25px_65px_rgba(0,0,0,0.55)] backdrop-blur h-full">
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div className="space-y-1">
                     <p className="text-xs uppercase tracking-[0.35em] text-white/60">Monitor</p>
@@ -128,15 +125,19 @@ export default function AdminHybrid() {
                     ))}
                   </dl>
 
-                  <details className="rounded-2xl border border-white/10 bg-black/60 p-4" open>
+                  <details className="rounded-2xl border border-white/10 bg-black/60 p-4">
                     <summary className="cursor-pointer text-sm font-medium text-white/80">Raw payload</summary>
-                    <pre className="mt-3 max-h-60 overflow-auto rounded-xl bg-black/70 p-4 text-xs text-[#0f0]">
+                    <pre className="mt-3 max-h-64 overflow-auto rounded-xl bg-black/70 p-4 text-xs text-[#0f0] whitespace-pre-wrap">
 {JSON.stringify(last, null, 2)}
                     </pre>
                   </details>
                 </div>
               </div>
             </div>
+          </section>
+
+          <section className="mt-2">
+            <SermonPrep />
           </section>
         </div>
       </main>

@@ -11,10 +11,12 @@ load_dotenv()
 # --- local modules (single import each) ---
 from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram
+from app.services.script_store import script_store
 from app.utils.translate import translate_text, TranslationContext  # async wrapper you already have
 from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 from app.routes import examples as examples_routes
+from app.routes import script as script_routes
 
 # ------------------------------------------------------------------------------
 # ONE app only
@@ -31,6 +33,7 @@ app.add_middleware(
 # Keep your existing HTTP routes under /api
 app.include_router(translate_routes.router, prefix="/api")
 app.include_router(examples_routes.router, prefix="/api")
+app.include_router(script_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
@@ -44,6 +47,85 @@ def root():
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
     await manager.connect(ws)
+    translation_ctx = TranslationContext()
+    seq = 0
+
+    async def handle_commit(payload: dict, is_partial: bool = False):
+        nonlocal seq
+        src_text = (payload.get("text") or "").strip()
+        if not src_text:
+            return
+
+        src_lang_full = _clean_lang(payload.get("source"), "ko")
+        tgt_lang_full = _clean_lang(payload.get("target"), "en")
+        src_lang = _normalize_lang(src_lang_full, "ko")
+        tgt_lang = _normalize_lang(tgt_lang_full, "en")
+
+        seq += 1
+        meta_payload = {
+            "mode": "realtime",
+            "partial": is_partial,
+            "segment_id": payload.get("id") or seq,
+            "rev": payload.get("rev") or 0,
+            "seq": seq,
+            "is_final": not is_partial and bool(payload.get("final", True)),
+            "producer": True,
+        }
+
+        script_match, match_score, script_version, script_threshold = script_store.match(src_text)
+        live_mode = "live"
+
+        if script_match:
+            translated = script_match.target
+            live_mode = "pre"
+            meta_payload.update(
+                {
+                    "mode": "pre",
+                    "match_score": round(match_score, 4),
+                    "matched_source": script_match.source,
+                    "source_text": script_match.source,
+                    "source_version": f"pre-script@{script_version}",
+                    "threshold": script_threshold,
+                }
+            )
+            translation_ctx.last_english = translated
+        elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
+            translated = src_text
+        else:
+            try:
+                translated = await translate_text(src_text, src_lang_full, tgt_lang_full, ctx=translation_ctx)
+                translation_ctx.last_english = translated
+            except Exception as exc:
+                print("[WS translate][producer_commit][error]", exc)
+                translated = src_text
+
+        live_msg_new = {
+            "mode": live_mode if not is_partial else "realtime",
+            "text": translated,
+            "seq": seq,
+            "src": {"text": src_text, "lang": src_lang_full},
+            "tgt": {"lang": tgt_lang_full},
+            "meta": meta_payload.copy(),
+        }
+        live_msg_legacy = {
+            "type": "translation",
+            "payload": translated,
+            "lang": tgt_lang_full,
+            "meta": meta_payload.copy(),
+        }
+
+        try:
+            await manager.broadcast(live_msg_new)
+            await manager.broadcast(live_msg_legacy)
+        except Exception as exc:
+            print("[WS translate][broadcast][error]", exc)
+
+        # Acknowledge back to producer connection
+        try:
+            await ws.send_json(live_msg_legacy)
+        except Exception:
+            pass
+
     try:
         while True:
             # Keep the socket alive; most consumers won't send anything after join.
@@ -54,8 +136,24 @@ async def ws_translate(ws: WebSocket):
             except Exception:
                 # Ignore weird frames so the connection persists
                 continue
-            # Optionally ignore a consumer_join message; nothing else to do here.
-            # We don't require source/target here.
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+
+            if not isinstance(msg, dict):
+                continue
+
+            mtype = msg.get("type")
+            if mtype == "consumer_join":
+                continue  # keepalive
+            if mtype == "producer_commit":
+                await handle_commit(msg, is_partial=False)
+                continue
+            if mtype == "producer_partial":
+                await handle_commit(msg, is_partial=True)
+                continue
+            # ignore everything else to keep socket stable
     finally:
         manager.disconnect(ws)
 
@@ -237,6 +335,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
             seq += 1
             src_text = src_text_raw
+            live_mode = "live"
             meta_payload = {
                 "mode": "realtime",
                 "partial": False,
@@ -246,6 +345,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 "is_final": True,
             }
 
+            script_match, match_score, script_version, script_threshold = script_store.match(src_text)
             scripture_hit = None
             if src_lang.startswith("ko"):
                 try:
@@ -255,6 +355,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
             if scripture_hit:
                 translated = scripture_hit.text
+                live_mode = "live"
                 meta_payload.update(
                     {
                         "kind": "scripture",
@@ -272,6 +373,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     }
                 )
                 print(f"[SCRIPTURE] matched {scripture_hit.reference}")
+            elif script_match:
+                translated = script_match.target
+                live_mode = "pre"
+                meta_payload.update(
+                    {
+                        "mode": "pre",
+                        "match_score": round(match_score, 4),
+                        "matched_source": script_match.source,
+                        "source_text": script_match.source,
+                        "source_version": f"pre-script@{script_version}",
+                        "threshold": script_threshold,
+                    }
+                )
+                translation_ctx.last_english = translated
             elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
                 translated = src_text
             else:
@@ -286,7 +401,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
             # shape your client already supports
             live_msg_new = {
-                "mode": "live",
+                "mode": live_mode,
                 "text": translated,
                 "seq": seq,
                 "src": {"text": src_text, "lang": src_lang_full},
