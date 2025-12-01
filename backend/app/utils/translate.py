@@ -20,6 +20,7 @@ _MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # fast & good; use gpt-4o if 
 _API_KEY = os.getenv("OPENAI_API_KEY")
 
 _client: AsyncOpenAI | None = None
+_CUSTOM_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
 
 @dataclass
 class TranslationContext:
@@ -46,6 +47,7 @@ THEOLOGICAL_TERMS: list[tuple[str, str]] = [
 _DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data"
 _BIBLE_NAMES_PATH = _DATA_DIR / "bible_names.json"
 _TRANSLATION_LOG_PATH = _DATA_DIR / "translation_examples.jsonl"
+_CUSTOM_PROMPT_PATH = _DATA_DIR / "custom_prompt.txt"
 
 try:
     with open(_BIBLE_NAMES_PATH, encoding="utf-8") as f:
@@ -140,6 +142,26 @@ def _ensure_data_dir() -> None:
         print(f"[TX] failed to ensure data dir {_DATA_DIR}: {exc}")
 
 
+def _get_custom_prompt() -> str:
+    """Read admin-provided custom prompt text with mtime caching."""
+    global _CUSTOM_PROMPT_CACHE
+    try:
+        stat = _CUSTOM_PROMPT_PATH.stat()
+    except FileNotFoundError:
+        _CUSTOM_PROMPT_CACHE = {"mtime": None, "text": ""}
+        return ""
+    mtime = stat.st_mtime
+    if _CUSTOM_PROMPT_CACHE.get("mtime") == mtime:
+        return str(_CUSTOM_PROMPT_CACHE.get("text", ""))
+
+    try:
+        text = _CUSTOM_PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception:
+        text = ""
+    _CUSTOM_PROMPT_CACHE = {"mtime": mtime, "text": text}
+    return text
+
+
 def _preprocess_source_text(text: str, source_lang: str) -> str:
     """Light, safe fixes for common Korean STT glitches that hurt translation.
 
@@ -219,17 +241,29 @@ def log_corrected_translation(
     )
 
 
+def _token_set(text: str) -> set[str]:
+    # Light tokenization for overlap checks; ignores very short fragments.
+    tokens = re.findall(r"[가-힣A-Za-z']+", text or "")
+    return {t for t in tokens if len(t) >= 2}
+
+
 def _load_fewshot_examples(
     source_lang: str,
     target_lang: str,
     *,
-    max_examples: int = 4,
+    max_examples: int = 3,
+    current_source_text: Optional[str] = None,
 ) -> List[dict[str, str]]:
+    """Return up to N on-topic, corrected examples.
+
+    Filters to corrected rows only and requires minimal lexical overlap with the
+    current source clause (if provided) to avoid off-topic bias.
+    """
     if not _TRANSLATION_LOG_PATH.exists() or max_examples <= 0:
         return []
 
     corrected: deque[dict[str, str]] = deque(maxlen=max_examples)
-    fallback: deque[dict[str, str]] = deque(maxlen=max_examples)
+    overlap_ref = _token_set(current_source_text) if current_source_text else None
 
     try:
         with open(_TRANSLATION_LOG_PATH, encoding="utf-8") as fh:
@@ -244,31 +278,28 @@ def _load_fewshot_examples(
 
                 if record.get("source_lang") != source_lang or record.get("target_lang") != target_lang:
                     continue
+                if not record.get("corrected"):
+                    continue  # use only curated rows
 
                 source_text = (record.get("stt_text") or "").strip()
                 final_text = (record.get("final_translation") or record.get("auto_translation") or "").strip()
                 if not source_text or not final_text:
                     continue
 
-                pair = {"source": source_text, "target": final_text}
-                if record.get("corrected"):
-                    corrected.append(pair)
-                else:
-                    fallback.append(pair)
+                if overlap_ref is not None:
+                    if not _token_set(source_text) & overlap_ref:
+                        continue  # skip off-topic examples
+
+                corrected.append({"source": source_text, "target": final_text})
     except Exception as exc:
         print(f"[TX] Failed to read translation examples: {exc}")
         return []
 
-    examples = list(corrected)
-    if len(examples) < max_examples:
-        needed = max_examples - len(examples)
-        examples.extend(list(fallback)[-needed:])
-
-    return examples[-max_examples:]
+    return list(corrected)[-max_examples:]
 
 
-def _build_fewshot_block(source: str, target: str) -> str:
-    examples = _load_fewshot_examples(source, target, max_examples=4)
+def _build_fewshot_block(source: str, target: str, *, current_source_text: Optional[str] = None) -> str:
+    examples = _load_fewshot_examples(source, target, max_examples=3, current_source_text=current_source_text)
     if not examples:
         return ""
 
@@ -282,7 +313,7 @@ def _build_fewshot_block(source: str, target: str) -> str:
         )
 
     return (
-        "\nHere are recent corrections that show the desired style:\n\n"
+        "\nHere are recent on-topic corrections that show the desired style:\n\n"
         + "\n\n".join(formatted)
         + "\n"
     )
@@ -385,7 +416,7 @@ def _build_context_block(ctx: Optional[TranslationContext]) -> str:
     )
 
 
-def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationContext]) -> str:
+def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationContext], *, current_source_text: Optional[str] = None) -> str:
     """
     Sermon translator with:
     - light STT error correction
@@ -422,7 +453,15 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
             + "\n"
         )
 
-    fewshot_block = _build_fewshot_block(source, target)
+    fewshot_block = _build_fewshot_block(source, target, current_source_text=current_source_text)
+    custom_prompt = (_get_custom_prompt() or "").strip()
+    custom_block = ""
+    if custom_prompt:
+        custom_block = (
+            "\nCustom guidance (set by admins):\n"
+            + custom_prompt
+            + "\n"
+        )
 
     system = (
         "You are a professional translator specializing in Christian theology and sermons.\n"
@@ -436,7 +475,8 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
         "Do NOT mention that you corrected anything; just translate as if the input were already correct.\n"
         + bible_names_block
         + glossary_block
-        + fewshot_block +
+        + fewshot_block
+        + custom_block +
         "\n"
         "Context:\n"
         "- The input text is usually a spoken sermon, Bible teaching, or church-related script.\n"
@@ -459,20 +499,21 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
         "7. Do not exaggerate or dramatize emotions beyond what the Korean clearly expresses; keep the tone steady and pastoral.\n"
         "8. When the Korean is general or ambiguous, keep a similar level of generality in the translation and do not add specific details.\n"
         "9. Always choose wording that is completely appropriate to say in a mixed-age worship service with children, teens, and adults.\n"
+        "10. Do not introduce people or place names (e.g., Bible figures) unless that name is explicitly present in the Korean source clause.\n"
         "Spacing reliability: Korean STT often omits spaces; mentally restore natural spacing before translating so words are not merged or dropped.\n"
         "Congregation cues: If the Korean clause uses 일어나/일어나서/일어나셔서/자리에서 일어나 without an explicit subject, "
         "assume the speaker is inviting the congregation. Translate with an invitation like 'let's stand' or 'please stand' "
         "instead of 'he stood up.' Preserve timing phrases such as '이 시간' (e.g., '이 시간 다 같이 일어나셔서' → 'At this time, let's stand together').\n"
         "\n"
         "General requirements:\n"
-        "10. Preserve biblical and theological meaning very accurately.\n"
-        "11. Break up very long sentences into shorter, easy-to-follow sentences suitable for listening.\n"
-        "12. Keep all Scripture references, person names, and place names correct (using the Bible name list above when relevant).\n"
-        "13. Preserve paragraph and line-break structure as much as reasonably possible.\n"
-        "14. Perform only light, obvious corrections to STT mistakes; do not rewrite or summarize.\n"
-        "15. Do not add explanations, comments, headings, or brackets.\n"
-        "16. Output ONLY the translated text; no quotes, no extra commentary, no meta text.\n"
-        "17. If the input seems incomplete or ends abruptly (common with STT pauses), translate only what was actually said and do not invent endings or extra sentences.\n"
+        "11. Preserve biblical and theological meaning very accurately.\n"
+        "12. Break up very long sentences into shorter, easy-to-follow sentences suitable for listening.\n"
+        "13. Keep all Scripture references, person names, and place names correct (using the Bible name list above when relevant).\n"
+        "14. Preserve paragraph and line-break structure as much as reasonably possible.\n"
+        "15. Perform only light, obvious corrections to STT mistakes; do not rewrite or summarize.\n"
+        "16. Do not add explanations, comments, headings, or brackets.\n"
+        "17. Output ONLY the translated text; no quotes, no extra commentary, no meta text.\n"
+        "18. If the input seems incomplete or ends abruptly (common with STT pauses), translate only what was actually said and do not invent endings or extra sentences.\n"
     )
 
     return system + _build_context_block(ctx)
@@ -570,13 +611,16 @@ async def translate_text(text: str, source: str, target: str, ctx: Optional[Tran
     if not text:
         return ""
 
+    explicit_first_person = _contains_first_person_markers(text)
+    ctx_for_prompt = None if explicit_first_person else ctx
+
     client = _get_client()
-    system = _build_system_prompt(source, target, ctx)
+    system = _build_system_prompt(source, target, ctx_for_prompt, current_source_text=text)
     user_content = text
-    if ctx:
-        prev = ctx.last_english or "(none yet)"
-        subject_hint = ctx.subject or ENV.CONTEXT_SUBJECT
-        pronoun_hint = ctx.pronoun or ENV.CONTEXT_PRONOUN
+    if ctx_for_prompt:
+        prev = ctx_for_prompt.last_english or "(none yet)"
+        subject_hint = ctx_for_prompt.subject or ENV.CONTEXT_SUBJECT
+        pronoun_hint = ctx_for_prompt.pronoun or ENV.CONTEXT_PRONOUN
         user_content = (
             f"Previous English sentence: {prev}\n"
             f"Subject hint: continue referring to {subject_hint} ({pronoun_hint}).\n\n"

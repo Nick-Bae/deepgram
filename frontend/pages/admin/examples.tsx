@@ -146,6 +146,26 @@ export default function ExamplesAdmin() {
     }
   };
 
+  const downloadLog = async () => {
+    setMessage("Preparing download…");
+    try {
+      const res = await fetch(`${API_URL}/api/examples/download`);
+      if (!res.ok) throw new Error(await res.text());
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "translation_examples.jsonl";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setMessage("Download started");
+    } catch (err: unknown) {
+      setMessage(toMessage(err) || "Download failed");
+    }
+  };
+
   const handleEdit = (timestamp: string, value: string) => {
     setItems((prev) => prev.map((it) => (it.timestamp === timestamp ? { ...it, final_translation: value } : it)));
   };
@@ -207,6 +227,7 @@ export default function ExamplesAdmin() {
         </button>
         <button onClick={cleanLog} style={styles.button}>Clean (dedupe + keep 400)</button>
         <button onClick={exportFewshot} style={styles.button}>Export few-shot</button>
+        <button onClick={downloadLog} style={styles.button}>Download log</button>
       </div>
 
       <div style={styles.pagination}>

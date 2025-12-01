@@ -11,6 +11,10 @@ export default function AdminHome() {
           <Link href="/admin/examples" style={styles.link}>Translation Examples</Link>
           <span style={styles.note}>Review, correct, dedupe, trim, export few-shots.</span>
         </li>
+        <li style={styles.item}>
+          <Link href="/admin/prompt" style={styles.link}>Custom Prompt</Link>
+          <span style={styles.note}>Edit admin guidance appended to the translator prompt.</span>
+        </li>
       </ul>
     </div>
   );

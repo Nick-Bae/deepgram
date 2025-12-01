@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -208,3 +209,15 @@ def clean_examples(payload: CleanPayload):
         "deduped": payload.dedupe,
         "kept": payload.keep,
     }
+
+
+@router.get("/download")
+def download_examples():
+    if not LOG_PATH.exists():
+        raise HTTPException(status_code=404, detail="translation_examples.jsonl not found")
+
+    return FileResponse(
+        LOG_PATH,
+        media_type="application/jsonl",
+        filename="translation_examples.jsonl",
+    )

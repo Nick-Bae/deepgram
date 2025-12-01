@@ -17,6 +17,7 @@ from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 from app.routes import examples as examples_routes
 from app.routes import script as script_routes
+from app.routes import prompt as prompt_routes
 
 # ------------------------------------------------------------------------------
 # ONE app only
@@ -34,6 +35,7 @@ app.add_middleware(
 app.include_router(translate_routes.router, prefix="/api")
 app.include_router(examples_routes.router, prefix="/api")
 app.include_router(script_routes.router, prefix="/api")
+app.include_router(prompt_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
