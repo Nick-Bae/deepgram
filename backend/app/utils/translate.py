@@ -387,6 +387,62 @@ def _contains_we_markers(text: str) -> bool:
     return any(marker in compact for marker in WE_KO_MARKERS)
 
 
+def _clause_head(en: str) -> str:
+    """
+    Return the leading clause (up to the first sentence delimiter) so we can
+    peek at the apparent subject without pulling in the whole paragraph.
+    """
+    clean = " ".join((en or "").split())
+    if not clean:
+        return ""
+    head = re.split(r"[.!?;:\n]", clean, 1)[0]
+    return head.strip()
+
+
+def _infer_subject_from_english(
+    en: str,
+    default_subject: str,
+    default_pronoun: str,
+) -> tuple[str, str]:
+    """
+    Heuristic subject/pronoun detector from the previous English sentence.
+
+    Goal: if the prior line already established a third-person subject
+    (e.g., “those who…”, “they…”, “he…”) and the next Korean clause drops the
+    subject, we want to keep using that subject instead of falling back to the
+    default congregational “we”.
+    """
+    head = _clause_head(en)
+    if not head:
+        return default_subject, default_pronoun
+
+    low = head.lower()
+    if re.match(r"^(let's|let us)\b", low):
+        return default_subject or ENV.CONTEXT_SUBJECT, "we"
+    if re.match(r"^(we|our|us|ourselves)\b", low):
+        return default_subject or ENV.CONTEXT_SUBJECT, "we"
+    if re.match(r"^(they|those|these)\b", low):
+        return head, "they"
+    if re.match(r"^(he|his|him)\b", low):
+        return head, "he"
+    if re.match(r"^(she|her)\b", low):
+        return head, "she"
+    if re.match(r"^(jesus|christ|lord|god)\b", low):
+        return head, "he"
+
+    # Plural noun phrase (e.g., "the Levites", "the Pharisees") anywhere in the head
+    plural_match = re.search(r"\b(the\s+[a-z][\w-]*s)\b", low)
+    if plural_match:
+        subj = head[plural_match.start():plural_match.end()]
+        return subj.strip(), "they"
+
+    if re.search(r"\blevites\b", low):
+        return "the Levites", "they"
+
+    # No strong signal: keep existing defaults.
+    return default_subject, default_pronoun
+
+
 def _format_replacement(match: re.Match, replacement: str) -> str:
     string = match.string
     idx = match.start()
@@ -521,6 +577,19 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
 
 def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
     pronoun_key = _normalize_pronoun(ctx)
+
+    # If the current English clause clearly has a third-person subject (e.g., "the Levites")
+    # but our context is still the congregational "we", switch to that subject unless the
+    # Korean source explicitly contained first-person markers.
+    if (not _contains_we_markers(source_text)) and (not _contains_first_person_markers(source_text)):
+        inferred_subj, inferred_pronoun = _infer_subject_from_english(en, "", "")
+        if inferred_pronoun and (not pronoun_key or pronoun_key == "we"):
+            pronoun_key = inferred_pronoun
+            if ctx:
+                ctx.pronoun = inferred_pronoun
+                if inferred_subj:
+                    ctx.subject = inferred_subj
+
     if not pronoun_key:
         return en
     forms = PRONOUN_FORMS.get(pronoun_key)
@@ -531,6 +600,24 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
 
     updated = en
     replacements = [
+        # First-person plural (we → they, etc.) to enforce third-person continuity
+        (r"\bwe['’]re\b", forms.get("be_present_contracted") or forms.get("be_present")),
+        (r"\bwe are\b", forms.get("be_present")),
+        (r"\bwe were\b", forms.get("be_past")),
+        (r"\bwe['’]ve\b", forms.get("have_contracted") or forms.get("have")),
+        (r"\bwe have\b", forms.get("have")),
+        (r"\bwe['’]ll\b", forms.get("will_contracted") or forms.get("will")),
+        (r"\bwe will\b", forms.get("will")),
+        (r"\bwe['’]d\b", forms.get("would_contracted") or forms.get("would")),
+        (r"\bwe would\b", forms.get("would")),
+        (r"\bwe can\b", forms.get("can")),
+        (r"\bwe\b", forms.get("subject")),
+        (r"\bus\b", forms.get("object")),
+        (r"\bour\b", forms.get("possessive")),
+        (r"\bourselves\b", forms.get("reflexive")),
+        (r"\bfor ourselves\b", f"for {forms['reflexive']}"),
+        (r"\bby ourselves\b", f"by {forms['reflexive']}"),
+        (r"\bon our own\b", f"on {forms['possessive']} own"),
         (r"\bI['’]m\b", forms.get("be_present_contracted") or forms.get("be_present")),
         (r"\bI am\b", forms.get("be_present")),
         (r"\bI was\b", forms.get("be_past")),
@@ -599,7 +686,14 @@ def _enforce_we_guardrails(en: str, source_text: str, ctx: Optional[TranslationC
     return updated
 
 
-async def translate_text(text: str, source: str, target: str, ctx: Optional[TranslationContext] = None) -> str:
+async def translate_text(
+    text: str,
+    source: str,
+    target: str,
+    ctx: Optional[TranslationContext] = None,
+    *,
+    update_ctx: bool = True,
+) -> str:
     """
     Async translator. Returns ONLY the translated text (no quotes/explanations).
     On any API error, it fails open by returning the original text.
@@ -612,6 +706,17 @@ async def translate_text(text: str, source: str, target: str, ctx: Optional[Tran
         return ""
 
     explicit_first_person = _contains_first_person_markers(text)
+
+    if ctx:
+        # Use the most recent English line to shape the subject/pronoun hint.
+        subj_hint, pronoun_hint = _infer_subject_from_english(
+            ctx.last_english or "",
+            ctx.subject or ENV.CONTEXT_SUBJECT,
+            ctx.pronoun or ENV.CONTEXT_PRONOUN,
+        )
+        ctx.subject = subj_hint
+        ctx.pronoun = pronoun_hint
+
     ctx_for_prompt = None if explicit_first_person else ctx
 
     client = _get_client()
@@ -642,6 +747,16 @@ async def translate_text(text: str, source: str, target: str, ctx: Optional[Tran
             out = _enforce_subject_guardrails(out, text, ctx)
         if source.lower().startswith("ko"):
             out = _enforce_we_guardrails(out, text, ctx)
+
+        if ctx and update_ctx:
+            # Update context for the next clause so subject continuity follows
+            # the most recent English output instead of reverting to defaults.
+            ctx.subject, ctx.pronoun = _infer_subject_from_english(
+                out,
+                ctx.subject or ENV.CONTEXT_SUBJECT,
+                ctx.pronoun or ENV.CONTEXT_PRONOUN,
+            )
+            ctx.last_english = out
 
         _log_translation_example(
             source_lang=source,

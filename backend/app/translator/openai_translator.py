@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional
 import httpx
 from ..env import ENV
+from ..utils.translate import _infer_subject_from_english
 import re
 
 FIRST_PERSON_KO_MARKERS = [
@@ -138,6 +139,17 @@ def _format_replacement(match: re.Match, replacement: str) -> str:
 
 def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> str:
     pronoun_key = _normalize_pronoun(ctx)
+
+    # If Korean lacks first-person cues but the English output clearly names a third-person subject
+    # (e.g., "the Levites") and our context is still "we", pivot the pronoun to that subject.
+    if (not _contains_first_person_markers(ko)):
+        subj_hint, pronoun_hint = _infer_subject_from_english(en, "", "")
+        if pronoun_hint and (not pronoun_key or pronoun_key == "we"):
+            pronoun_key = pronoun_hint
+            ctx.pronoun = pronoun_hint
+            if subj_hint:
+                ctx.subject = subj_hint
+
     if not pronoun_key:
         return en
     forms = PRONOUN_FORMS.get(pronoun_key)
@@ -154,6 +166,24 @@ def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> st
     updated = en
 
     replacements = [
+        # First-person plural guardrails
+        (r"\bwe['’]re\b", forms.get("be_present_contracted") or forms.get("be_present")),
+        (r"\bwe are\b", forms.get("be_present")),
+        (r"\bwe were\b", forms.get("be_past")),
+        (r"\bwe['’]ve\b", forms.get("have_contracted") or forms.get("have")),
+        (r"\bwe have\b", forms.get("have")),
+        (r"\bwe['’]ll\b", forms.get("will_contracted") or forms.get("will")),
+        (r"\bwe will\b", forms.get("will")),
+        (r"\bwe['’]d\b", forms.get("would_contracted") or forms.get("would")),
+        (r"\bwe would\b", forms.get("would")),
+        (r"\bwe can\b", forms.get("can")),
+        (r"\bwe\b", forms.get("subject")),
+        (r"\bus\b", forms.get("object")),
+        (r"\bour\b", forms.get("possessive")),
+        (r"\bourselves\b", forms.get("reflexive")),
+        (r"\bfor ourselves\b", f"for {forms['reflexive']}"),
+        (r"\bby ourselves\b", f"by {forms['reflexive']}"),
+        (r"\bon our own\b", f"on {forms['possessive']} own"),
         (r"\bI['’]m\b", forms.get("be_present_contracted") or forms.get("be_present")),
         (r"\bI am\b", forms.get("be_present")),
         (r"\bI was\b", forms.get("be_past")),

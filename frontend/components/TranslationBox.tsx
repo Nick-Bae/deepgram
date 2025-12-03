@@ -137,6 +137,7 @@ export default function TranslationBox() {
   const [ttsProvider, setTtsProvider] = useState<TTSProvider>('google')
   const [isBroadcasting, setIsBroadcasting] = useState(true)
   const [aiAssistEnabled, setAiAssistEnabled] = useState(true)
+  const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
   const [displayOnAir, setDisplayOnAir] = useState(true)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
@@ -180,9 +181,9 @@ export default function TranslationBox() {
   const dgController: DeepgramProducerController & { finalize?: () => void } = useDeepgramProducer()
   const { start: dgStart, stop: dgStop, status, partial, errorMsg, finalize } = dgController
   const startProducer = useCallback(async () => {
-    const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string }) => Promise<void>
-    await startWithOptions({ sourceLang, targetLang })
-  }, [dgStart, sourceLang, targetLang])
+    const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string; earlyCommit?: boolean }) => Promise<void>
+    await startWithOptions({ sourceLang, targetLang, earlyCommit: earlyCommitEnabled })
+  }, [dgStart, earlyCommitEnabled, sourceLang, targetLang])
   const dgFinalize = useMemo(() => finalize ?? (() => {}), [finalize])
 
   // TTS refs
@@ -1024,6 +1025,16 @@ export default function TranslationBox() {
                     aria-pressed={aiAssistEnabled}
                   >
                     <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${aiAssistEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                  </button>
+                </div>
+                <div className="flex items-center justify-between border-t border-[#454543] py-2">
+                  <span>Early commit (preview)</span>
+                  <button
+                    onClick={() => setEarlyCommitEnabled(v => !v)}
+                    className={`relative inline-flex h-7 w-12 items-center rounded-full ${earlyCommitEnabled ? 'bg-[#feda6a]' : 'bg-[#393f4d]'}`}
+                    aria-pressed={earlyCommitEnabled}
+                  >
+                    <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${earlyCommitEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
                   </button>
                 </div>
                 <div className="flex items-center justify-between border-t border-[#454543] py-2">

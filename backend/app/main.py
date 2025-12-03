@@ -1,7 +1,7 @@
 
 # backend/app/main.py
 import os, json, asyncio, logging, time, re
-from typing import Optional
+from typing import Optional, Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +18,7 @@ from app.routes import translate as translate_routes  # your existing REST route
 from app.routes import examples as examples_routes
 from app.routes import script as script_routes
 from app.routes import prompt as prompt_routes
+from app.chunker.ko_chunker import KoChunker
 
 # ------------------------------------------------------------------------------
 # ONE app only
@@ -190,10 +191,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
     tgt_lang_full = _clean_lang(websocket.query_params.get("target"), "en")
     src_lang = _normalize_lang(src_lang_full, "ko")
     tgt_lang = _normalize_lang(tgt_lang_full, "en")
+    early_commit = str(websocket.query_params.get("early") or websocket.query_params.get("early_commit") or "").lower() in {"1", "true", "yes", "on"}
     dg_language = _deepgram_language_preference(src_lang_full)
     dg_keywords = None if src_lang.startswith("ko") else []
     await websocket.accept()
     translation_ctx = TranslationContext()
+    chunker = KoChunker() if early_commit and src_lang.startswith("ko") else None
     try:
         dg = await connect_to_deepgram(language=dg_language, keywords=dg_keywords)  # <-- dg is created here
     except Exception as e:
@@ -251,6 +254,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         pending_src: str | None = None
         pending_speech_final = False
         pending_task: asyncio.Task | None = None
+        last_preview_norm: str = ""
 
         def ends_like_sentence(t: str) -> bool:
             t = (t or "").rstrip()
@@ -300,6 +304,198 @@ async def ws_stt_deepgram(websocket: WebSocket):
         SUBSET_SUPPRESS_WINDOW_SEC = 4.0
         MIN_SUBSET_DELTA = 6
         CJK_NO_SPACE_PREFIXES = ("ko", "zh", "ja")
+
+        async def send_translation(
+            src_text_raw: str,
+            *,
+            partial: bool,
+            live_mode_hint: str | None = None,
+            meta_extra: dict[str, Any] | None = None,
+            update_ctx: bool = True,
+        ) -> None:
+            nonlocal seq
+
+            clean_src = norm_ws(src_text_raw)
+            if not clean_src:
+                return
+
+            seq += 1
+            live_mode = live_mode_hint or ("realtime" if partial else "live")
+            meta_payload: dict[str, Any] = {
+                "mode": "realtime" if partial else "realtime",
+                "partial": partial,
+                "segment_id": seq,
+                "rev": 0,
+                "seq": seq,
+                "is_final": not partial,
+            }
+            if meta_extra:
+                meta_payload.update(meta_extra)
+
+            translated = clean_src
+
+            if not partial:
+                script_match, match_score, script_version, script_threshold = script_store.match(clean_src)
+                scripture_hit = None
+                if src_lang.startswith("ko"):
+                    try:
+                        scripture_hit = detect_scripture_verse(clean_src)
+                    except Exception as exc:
+                        print("[SCRIPTURE][error]", exc)
+
+                if scripture_hit:
+                    translated = scripture_hit.text
+                    live_mode = "live"
+                    meta_payload.update(
+                        {
+                            "kind": "scripture",
+                            "reference": scripture_hit.reference,
+                            "reference_ko": scripture_hit.source_reference,
+                            "reference_en": scripture_hit.reference_en or scripture_hit.reference,
+                            "version": scripture_hit.version,
+                            "source_version": scripture_hit.source_version,
+                            "book": scripture_hit.book,
+                            "book_en": scripture_hit.book_en or scripture_hit.book,
+                            "chapter": scripture_hit.chapter,
+                            "verse": scripture_hit.verse,
+                            "end_verse": scripture_hit.end_verse,
+                            "source_text": scripture_hit.source_text,
+                        }
+                    )
+                    print(f"[SCRIPTURE] matched {scripture_hit.reference}")
+                elif script_match:
+                    translated = script_match.target
+                    live_mode = "pre"
+                    meta_payload.update(
+                        {
+                            "mode": "pre",
+                            "match_score": round(match_score, 4),
+                            "matched_source": script_match.source,
+                            "source_text": script_match.source,
+                            "source_version": f"pre-script@{script_version}",
+                            "threshold": script_threshold,
+                        }
+                    )
+                    if update_ctx:
+                        translation_ctx.last_english = translated
+                elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
+                    translated = clean_src
+                else:
+                    try:
+                        translated = await translate_text(
+                            clean_src,
+                            src_lang_full,
+                            tgt_lang_full,
+                            ctx=translation_ctx,
+                            update_ctx=update_ctx,
+                        )
+                        if update_ctx:
+                            translation_ctx.last_english = translated
+                    except Exception as e:
+                        print("[TX] error:", e)
+                        translated = clean_src
+            else:
+                # previews: skip scripture/script matching for speed
+                if src_lang == tgt_lang and src_lang_full == tgt_lang_full:
+                    translated = clean_src
+                else:
+                    try:
+                        translated = await translate_text(
+                            clean_src,
+                            src_lang_full,
+                            tgt_lang_full,
+                            ctx=translation_ctx,
+                            update_ctx=update_ctx,
+                        )
+                    except Exception as e:
+                        print("[TX][preview] error:", e)
+                        translated = clean_src
+                if update_ctx:
+                    translation_ctx.last_english = translated
+
+            live_msg_new = {
+                "mode": live_mode,
+                "text": translated,
+                "seq": seq,
+                "src": {"text": clean_src, "lang": src_lang_full},
+                "tgt": {"lang": tgt_lang_full},
+                "meta": meta_payload.copy(),
+            }
+            live_msg_legacy = {
+                "type": "translation",
+                "payload": translated,
+                "lang": tgt_lang_full,
+                "meta": meta_payload.copy(),
+            }
+
+            try:
+                await websocket.send_json(live_msg_new)
+                await websocket.send_json(live_msg_legacy)
+            except Exception as e:
+                print("[DG] send back to producer failed:", e)
+
+            try:
+                await manager.broadcast(live_msg_new)
+                await manager.broadcast(live_msg_legacy)
+                print(f"[BROADCAST] seq={seq} '{translated[:60]}'")
+            except Exception as e:
+                print("[DG] broadcast error:", e)
+
+        async def emit_preview(src_text_raw: str):
+            nonlocal last_preview_norm
+            if not early_commit:
+                return
+            clean = norm_ws(src_text_raw)
+            if not clean:
+                return
+            if clean == last_preview_norm:
+                return
+            last_preview_norm = clean
+            await send_translation(src_text_raw, partial=True, live_mode_hint="realtime", update_ctx=False)
+
+        async def commit_now(src_text_raw: str):
+            nonlocal pending_src, pending_task, pending_speech_final, last_preview_norm
+            if not src_text_raw or not src_text_raw.strip():
+                return
+
+            normalized = norm_ws(src_text_raw)
+            if not normalized:
+                return
+
+            last_norm = getattr(commit_now, "_last_norm", "")
+            last_ts = getattr(commit_now, "_last_commit_ts", 0.0)
+            if normalized == last_norm:
+                return
+
+            if last_norm and len(normalized) < len(last_norm):
+                delta = len(last_norm) - len(normalized)
+                subset_lang = src_lang.startswith(CJK_NO_SPACE_PREFIXES)
+                no_space = " " not in normalized and " " not in last_norm
+                if subset_lang and no_space and delta >= MIN_SUBSET_DELTA:
+                    is_edge_subset = last_norm.startswith(normalized) or last_norm.endswith(normalized)
+                    recent_commit = (time.time() - last_ts) < SUBSET_SUPPRESS_WINDOW_SEC
+                    if is_edge_subset and recent_commit:
+                        print("[A][skip][subset]", normalized)
+                        pending_src = None
+                        pending_speech_final = False
+                        if pending_task and not pending_task.done():
+                            pending_task.cancel()
+                        pending_task = None
+                        return
+
+            setattr(commit_now, "_last_norm", normalized)
+            setattr(commit_now, "_last_commit_ts", time.time())
+            setattr(commit_now, "_last_src", src_text_raw)
+
+            print(f"[A] FINAL {src_lang_full}->{tgt_lang_full} src='{src_text_raw}'")
+            await send_translation(src_text_raw, partial=False, live_mode_hint="live", update_ctx=True)
+
+            last_preview_norm = ""
+            pending_src = None
+            pending_speech_final = False
+            if pending_task and not pending_task.done():
+                pending_task.cancel()
+            pending_task = None
 
         async def commit_now(src_text_raw: str):
             nonlocal seq, pending_src, pending_task, pending_speech_final
@@ -461,6 +657,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 except asyncio.CancelledError:
                     break
                 finalize_event.clear()
+
+                if early_commit and chunker:
+                    try:
+                        now_ms = int(time.time() * 1000)
+                        for piece in chunker.finalize(now_ms):
+                            await emit_preview(piece)
+                    except Exception as exc:
+                        print("[EARLY][finalize][error]", exc)
+
                 if pending_src:
                     try:
                         if should_hold_short_korean(pending_src, pending_speech_final):
@@ -504,12 +709,26 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 is_final = bool(evt.get("is_final"))
                 speech_final = bool(evt.get("speech_final") or False)
 
-                # show partial text in the UI, but DO NOT translate yet
+                # show partial text in the UI; optionally emit early preview translations
                 if transcript and not is_final:
                     try:
                         await websocket.send_json({"type": "stt.partial", "text": transcript})
                     except:
                         pass
+
+                    if early_commit:
+                        now_ms = int(time.time() * 1000)
+                        if chunker:
+                            try:
+                                for piece in chunker.push_partial(transcript, now_ms):
+                                    await emit_preview(piece)
+                            except Exception as exc:
+                                print("[EARLY][chunker][error]", exc)
+                        else:
+                            # fallback: only emit when clause looks substantial
+                            if ends_like_sentence(transcript) or len(norm_ws(transcript)) >= MIN_CONFIDENT_CHARS:
+                                await emit_preview(transcript)
+
                     continue
 
                 if not is_final:
@@ -518,6 +737,13 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 if transcript:
                     pending_src = transcript
                     pending_speech_final = speech_final
+                    if early_commit and chunker:
+                        try:
+                            now_ms = int(time.time() * 1000)
+                            for piece in chunker.finalize(now_ms):
+                                await emit_preview(piece)
+                        except Exception as exc:
+                            print("[EARLY][flush-finalize][error]", exc)
 
                 print(f"[DG][A] final: speech_final={speech_final} src='{pending_src or ''}'")
 

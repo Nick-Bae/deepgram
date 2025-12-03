@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 type StartOptions = {
   sourceLang?: string;
   targetLang?: string;
+  earlyCommit?: boolean;
 };
 
 export type DeepgramProducerController = {
@@ -26,8 +27,10 @@ function wsDeepgramURL(opts?: StartOptions) {
   const params = new URLSearchParams();
   const src = sanitizeLang(opts?.sourceLang);
   const tgt = sanitizeLang(opts?.targetLang);
+  const early = opts?.earlyCommit ? "1" : "0";
   if (src) params.set("source", src);
   if (tgt) params.set("target", tgt);
+  if (early === "1") params.set("early", "1");
 
   const suffix = params.toString() ? `?${params.toString()}` : "";
   try {
