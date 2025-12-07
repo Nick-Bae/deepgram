@@ -1,5 +1,8 @@
 name: Maintain Translation Log
 
+permissions:
+  contents: write
+
 on:
   schedule:
     # Every Sunday at 06:00 UTC
