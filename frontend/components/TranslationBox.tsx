@@ -658,13 +658,21 @@ export default function TranslationBox() {
           console.log('[FE][TTS][skip]', { isMuted, sameAsCurrent: incoming === currentSpokenRef.current });
         }
       }
+
+      const bestSourceForLog = committedSrc || clauseRef.current.trim() || lastInterimRef.current.trim()
+      console.log('[FE][WS][final][ko]', { seq, src: clip(bestSourceForLog || '(none)') })
+      console.log('[FE][WS][final][en]', { seq, out: clip(incoming) })
       softMapRef.current.delete(seq);
 
       const clauseSnapshot = clauseRef.current.trim();
       const interimSnapshot = lastInterimRef.current.trim();
       const bestSource = committedSrc || clauseSnapshot || interimSnapshot;
       if (bestSource) {
-        setText(formatSourceForDisplay(bestSource));
+        const displaySource = formatSourceForDisplay(bestSource);
+        setText(displaySource);
+        if (DEBUG) {
+          console.log('[FE][WS][final][src]', { seq, src: clip(displaySource) });
+        }
       }
       clauseRef.current = '';
       lastInterimRef.current = '';
