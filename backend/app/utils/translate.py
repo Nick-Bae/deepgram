@@ -67,6 +67,19 @@ WE_KO_MARKERS = [
     "우리", "우리가", "우리는", "우릴", "우리의", "우리도", "우리만", "우리와", "우리에게", "우리한테",
 ]
 
+HE_KO_MARKERS = [
+    "그는", "그가", "그를", "그의", "그에게", "그한테",
+    "그분은", "그분이", "그분을", "그분의",
+]
+
+SHE_KO_MARKERS = [
+    "그녀는", "그녀가", "그녀를", "그녀의", "그녀에게", "그녀한테",
+]
+
+THEY_KO_MARKERS = [
+    "그들은", "그들이", "그들을", "그들의", "그들에게", "그들한테",
+]
+
 PRONOUN_FORMS = {
     "he": {
         "subject": "He",
@@ -377,14 +390,22 @@ def _normalize_pronoun(ctx: Optional[TranslationContext]) -> Optional[str]:
     return None
 
 
-def _contains_first_person_markers(text: str) -> bool:
+def _contains_marker_list(text: str, markers: list[str]) -> bool:
     compact = re.sub(r"\s+", "", text or "")
-    return any(marker in compact for marker in FIRST_PERSON_KO_MARKERS)
+    for marker in markers:
+        # Match only when the marker is not glued to adjacent Hangul to avoid false positives (e.g., '성전' contains '전').
+        pattern = rf"(?<![가-힣]){re.escape(marker)}(?![가-힣])"
+        if re.search(pattern, compact):
+            return True
+    return False
+
+
+def _contains_first_person_markers(text: str) -> bool:
+    return _contains_marker_list(text, FIRST_PERSON_KO_MARKERS)
 
 
 def _contains_we_markers(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text or "")
-    return any(marker in compact for marker in WE_KO_MARKERS)
+    return _contains_marker_list(text, WE_KO_MARKERS)
 
 
 def _clause_head(en: str) -> str:
@@ -454,6 +475,16 @@ def _format_replacement(match: re.Match, replacement: str) -> str:
     if replacement:
         return replacement[0].lower() + replacement[1:]
     return replacement
+
+def _detect_third_person_pronoun(ko: str) -> str:
+    compact = re.sub(r"\s+", "", ko)
+    if any(marker in compact for marker in SHE_KO_MARKERS):
+        return "she"
+    if any(marker in compact for marker in THEY_KO_MARKERS):
+        return "they"
+    if any(marker in compact for marker in HE_KO_MARKERS):
+        return "he"
+    return ""
 
 
 def _build_context_block(ctx: Optional[TranslationContext]) -> str:
@@ -576,12 +607,22 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
 
 
 def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
+    if _contains_first_person_markers(source_text):
+        return en
+
     pronoun_key = _normalize_pronoun(ctx)
+
+    # If Korean explicitly uses third-person pronouns (그는/그녀는/그들은), honor that.
+    explicit_pronoun = _detect_third_person_pronoun(source_text)
+    if explicit_pronoun:
+        pronoun_key = explicit_pronoun
+        if ctx:
+            ctx.pronoun = explicit_pronoun
 
     # If the current English clause clearly has a third-person subject (e.g., "the Levites")
     # but our context is still the congregational "we", switch to that subject unless the
     # Korean source explicitly contained first-person markers.
-    if (not _contains_we_markers(source_text)) and (not _contains_first_person_markers(source_text)):
+    if (not _contains_we_markers(source_text)):
         inferred_subj, inferred_pronoun = _infer_subject_from_english(en, "", "")
         if inferred_pronoun and (not pronoun_key or pronoun_key == "we"):
             pronoun_key = inferred_pronoun
@@ -594,8 +635,6 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
         return en
     forms = PRONOUN_FORMS.get(pronoun_key)
     if not forms:
-        return en
-    if _contains_first_person_markers(source_text):
         return en
 
     updated = en

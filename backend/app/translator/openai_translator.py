@@ -12,6 +12,19 @@ FIRST_PERSON_KO_MARKERS = [
     "우리", "우리가", "우리는", "우릴", "우리의", "우리도", "우리만", "우리와", "우리에게", "우리한테"
 ]
 
+HE_KO_MARKERS = [
+    "그는", "그가", "그를", "그의", "그에게", "그한테",
+    "그분은", "그분이", "그분을", "그분의",
+]
+
+SHE_KO_MARKERS = [
+    "그녀는", "그녀가", "그녀를", "그녀의", "그녀에게", "그녀한테",
+]
+
+THEY_KO_MARKERS = [
+    "그들은", "그들이", "그들을", "그들의", "그들에게", "그들한테",
+]
+
 PRONOUN_FORMS = {
     "he": {
         "subject": "He",
@@ -112,8 +125,22 @@ def _build_messages(ko: str, ctx: TranslationContext) -> list[dict[str, str]]:
     ]
 
 def _contains_first_person_markers(ko: str) -> bool:
+    compact = re.sub(r"\s+", "", ko or "")
+    for marker in FIRST_PERSON_KO_MARKERS:
+        pattern = rf"(?<![가-힣]){re.escape(marker)}(?![가-힣])"
+        if re.search(pattern, compact):
+            return True
+    return False
+
+def _detect_third_person_pronoun(ko: str) -> str:
     compact = re.sub(r"\s+", "", ko)
-    return any(marker in compact for marker in FIRST_PERSON_KO_MARKERS)
+    if any(marker in compact for marker in SHE_KO_MARKERS):
+        return "she"
+    if any(marker in compact for marker in THEY_KO_MARKERS):
+        return "they"
+    if any(marker in compact for marker in HE_KO_MARKERS):
+        return "he"
+    return ""
 
 def _normalize_pronoun(ctx: TranslationContext) -> Optional[str]:
     raw = (ctx.pronoun or ENV.CONTEXT_PRONOUN or "").strip().lower()
@@ -138,7 +165,15 @@ def _format_replacement(match: re.Match, replacement: str) -> str:
     return replacement
 
 def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> str:
+    if _contains_first_person_markers(ko):
+        return en
+
     pronoun_key = _normalize_pronoun(ctx)
+
+    explicit = _detect_third_person_pronoun(ko)
+    if explicit:
+        pronoun_key = explicit
+        ctx.pronoun = explicit
 
     # If Korean lacks first-person cues but the English output clearly names a third-person subject
     # (e.g., "the Levites") and our context is still "we", pivot the pronoun to that subject.
@@ -158,10 +193,6 @@ def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> st
 
     debug_tag = "[guardrail]"
     print(debug_tag, "ko:", ko, "raw_en:", en, "pronoun_key:", pronoun_key)
-
-    if _contains_first_person_markers(ko):
-        print(debug_tag, "skip because first-person marker detected")
-        return en
 
     updated = en
 
