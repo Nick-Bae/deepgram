@@ -101,6 +101,7 @@ async def ws_translate(ws: WebSocket):
             except Exception as exc:
                 print("[WS translate][producer_commit][error]", exc)
                 translated = src_text
+                meta_payload.update(_fail_open_meta(exc))
 
         live_msg_new = {
             "mode": live_mode if not is_partial else "realtime",
@@ -183,6 +184,30 @@ def _normalize_lang(raw: Optional[str], default: str) -> str:
         return default
     primary = cleaned.split("-")[0]
     return primary or default
+
+
+def _fail_open_meta(exc: Exception) -> dict[str, Any]:
+    """
+    Build a small meta payload explaining why we fell back to echoing the source text.
+    Kept minimal so it can be shown safely in the UI.
+    """
+    msg = str(exc)
+    reason = "translation_failed"
+    code = None
+    if "insufficient_quota" in msg or "quota" in msg:
+        reason = "openai_quota"
+        code = "insufficient_quota"
+    elif "timeout" in msg:
+        reason = "timeout"
+    elif "Unauthorized" in msg or "401" in msg:
+        reason = "auth_error"
+    return {
+        "fail_open": True,
+        "reason": reason,
+        "code": code,
+        "provider": "openai",
+        "message": msg[:120],
+    }
 
 
 @app.websocket("/ws/stt/deepgram")
@@ -380,20 +405,21 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         translation_ctx.last_english = translated
                 elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
                     translated = clean_src
-                else:
-                    try:
-                        translated = await translate_text(
-                            clean_src,
-                            src_lang_full,
-                            tgt_lang_full,
+            else:
+                try:
+                    translated = await translate_text(
+                        clean_src,
+                        src_lang_full,
+                        tgt_lang_full,
                             ctx=translation_ctx,
                             update_ctx=update_ctx,
                         )
                         if update_ctx:
                             translation_ctx.last_english = translated
-                    except Exception as e:
-                        print("[TX] error:", e)
-                        translated = clean_src
+                except Exception as e:
+                    print("[TX] error:", e)
+                    translated = clean_src
+                    meta_payload.update(_fail_open_meta(e))
             else:
                 # previews: skip scripture/script matching for speed
                 if src_lang == tgt_lang and src_lang_full == tgt_lang_full:
@@ -410,6 +436,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     except Exception as e:
                         print("[TX][preview] error:", e)
                         translated = clean_src
+                        meta_payload.update(_fail_open_meta(e))
                 if update_ctx:
                     translation_ctx.last_english = translated
 
@@ -594,6 +621,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 except Exception as e:
                     print("[TX] error:", e)
                     translated = src_text  # fail-open
+                    meta_payload.update(_fail_open_meta(e))
 
             print(f"[A] FINAL seq={seq} {src_lang_full}->{tgt_lang_full} src='{src_text}' → tgt='{translated}'")
 

@@ -27,6 +27,11 @@ type Meta = {
   verse?: number;
   end_verse?: number;
   source_text?: string;
+  fail_open?: boolean;
+  reason?: string;
+  code?: string;
+  message?: string;
+  provider?: string;
 };
 
 type ServerBroadcast = {

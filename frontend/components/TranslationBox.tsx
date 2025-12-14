@@ -255,6 +255,23 @@ export default function TranslationBox() {
   }, [formatSourceForDisplay, last])
   const previewSnippet = clip(previewSource, 100)
 
+  const failOpenMeta = useMemo(() => {
+    const meta = last?.meta
+    if (meta && (meta as any).fail_open) return meta as any
+    return null
+  }, [last])
+
+  const failReasonLabel = useMemo(() => {
+    if (!failOpenMeta) return ''
+    const code = typeof failOpenMeta.code === 'string' ? failOpenMeta.code : ''
+    const reason = typeof failOpenMeta.reason === 'string' ? failOpenMeta.reason : ''
+    const msg = typeof failOpenMeta.message === 'string' ? failOpenMeta.message : ''
+    if (code === 'insufficient_quota' || reason === 'openai_quota') return 'OpenAI quota exceeded'
+    if (reason === 'timeout') return 'Translation timed out'
+    if (reason === 'auth_error') return 'Translator auth error'
+    return msg || 'Translation failed; showing source text'
+  }, [failOpenMeta])
+
   const endsWithSentenceBoundary = useCallback((raw: string) => {
     const trimmed = (raw || '').trim()
     if (!trimmed) return false
@@ -927,6 +944,15 @@ export default function TranslationBox() {
                       </div>
                       <span className="rounded-full border border-[#feda6a]/30 bg-[#feda6a]/10 px-3 py-1 text-xs uppercase tracking-wide text-[#feda6a]">Broadcast ready</span>
                     </div>
+                    {failOpenMeta && (
+                      <div className="flex items-start gap-3 rounded-xl border border-[#f2c53d]/50 bg-[#f2c53d]/15 px-3 py-2 text-sm text-[#feda6a]">
+                        <span className="mt-0.5 text-lg">⚠️</span>
+                        <div>
+                          <p className="font-semibold">Translation temporarily unavailable</p>
+                          <p className="text-[#f2f5e3]/80">{failReasonLabel}</p>
+                        </div>
+                      </div>
+                    )}
                     <p className="min-h-[170px] whitespace-pre-wrap text-xl leading-relaxed">
                       {translated || 'Waiting for the next sentence…'}
                     </p>
