@@ -255,9 +255,19 @@ export default function TranslationBox() {
   }, [formatSourceForDisplay, last])
   const previewSnippet = clip(previewSource, 100)
 
-  const failOpenMeta = useMemo(() => {
-    const meta = last?.meta
-    if (meta && (meta as any).fail_open) return meta as any
+  type FailOpenMeta = {
+    fail_open?: boolean
+    reason?: string
+    code?: string
+    message?: string
+    provider?: string
+  }
+
+  const failOpenMeta = useMemo<FailOpenMeta | null>(() => {
+    const meta = last?.meta as unknown
+    if (meta && typeof meta === 'object' && (meta as FailOpenMeta).fail_open) {
+      return meta as FailOpenMeta
+    }
     return null
   }, [last])
 

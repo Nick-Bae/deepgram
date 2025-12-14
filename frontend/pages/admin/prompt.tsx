@@ -27,7 +27,6 @@ export default function PromptAdmin() {
 
   useEffect(() => {
     loadPrompt();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const savePrompt = async (e?: FormEvent) => {
