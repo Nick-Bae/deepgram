@@ -4,6 +4,7 @@ import { API_URL } from "../../utils/urls";
 
 export default function PromptAdmin() {
   const [prompt, setPrompt] = useState("");
+  const [servicePrompt, setServicePrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -16,6 +17,7 @@ export default function PromptAdmin() {
       if (!res.ok) throw new Error(await res.text());
       const j = await res.json();
       setPrompt(j.prompt || "");
+      setServicePrompt(j.service_prompt || j.servicePrompt || "");
     } catch (err: unknown) {
       setMessage(toMessage(err) || "Failed to load prompt");
     } finally {
@@ -36,7 +38,7 @@ export default function PromptAdmin() {
       const res = await fetch(`${API_URL}/api/prompt`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, service_prompt: servicePrompt }),
       });
       if (!res.ok) throw new Error(await res.text());
       setMessage("Saved");
@@ -52,6 +54,11 @@ export default function PromptAdmin() {
     setMessage("Cleared (remember to Save)");
   };
 
+  const clearServicePrompt = () => {
+    setServicePrompt("");
+    setMessage("Service background cleared (remember to Save)");
+  };
+
   return (
     <div style={styles.page}>
       <h1 style={styles.title}>Custom Translation Prompt</h1>
@@ -60,24 +67,49 @@ export default function PromptAdmin() {
       </p>
 
       <form onSubmit={savePrompt} style={styles.form}>
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          style={styles.textarea}
-          placeholder="Add brief guardrails or style notes. Avoid long essays."
-          rows={14}
-        />
+        <div style={styles.field}>
+          <div style={styles.labelRow}>
+            <h3 style={styles.sectionTitle}>Global guidance</h3>
+            <span style={styles.helper}>Always on; tweak sparingly.</span>
+          </div>
+          <textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            style={styles.textarea}
+            placeholder="Add brief guardrails or style notes. Avoid long essays."
+            rows={10}
+          />
+          <div style={styles.inlineMeta}>Chars: {prompt.length}</div>
+        </div>
+
+        <div style={styles.field}>
+          <div style={styles.labelRow}>
+            <h3 style={styles.sectionTitle}>Service background (today&apos;s sermon)</h3>
+            <span style={styles.helper}>Update before each service; clear afterwards.</span>
+          </div>
+          <textarea
+            value={servicePrompt}
+            onChange={(e) => setServicePrompt(e.target.value)}
+            style={styles.textarea}
+            placeholder={'Example: Series: Advent Hope. Sermon: "Light in the Darkness". Scripture: Isaiah 9:1-7. Emphasis: hope, waiting, Christ as true light. Audience: mixed ages.'}
+            rows={10}
+          />
+          <div style={styles.inlineMeta}>Chars: {servicePrompt.length}</div>
+        </div>
+
         <div style={styles.actions}>
           <button type="submit" style={styles.button} disabled={saving || loading}>
-            {saving ? "Saving…" : "Save"}
+            {saving ? "Saving…" : "Save both"}
+          </button>
+          <button type="button" style={styles.secondary} onClick={clearServicePrompt} disabled={loading}>
+            Clear service background
           </button>
           <button type="button" style={styles.secondary} onClick={clearPrompt} disabled={loading}>
-            Clear
+            Clear global guidance
           </button>
           <button type="button" style={styles.secondary} onClick={loadPrompt} disabled={loading}>
             Refresh
           </button>
-          <span style={styles.note}>Chars: {prompt.length}</span>
         </div>
       </form>
 
@@ -122,6 +154,27 @@ const styles: Record<string, CSSProperties> = {
     flexDirection: "column",
     gap: "12px",
   },
+  field: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+  },
+  labelRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+    gap: "12px",
+    flexWrap: "wrap",
+  },
+  sectionTitle: {
+    margin: 0,
+    fontSize: "18px",
+    fontWeight: 700,
+  },
+  helper: {
+    color: "#6b7280",
+    fontSize: "13px",
+  },
   textarea: {
     width: "100%",
     minHeight: "280px",
@@ -159,6 +212,11 @@ const styles: Record<string, CSSProperties> = {
     color: "#6b7280",
     fontSize: "13px",
   },
+  inlineMeta: {
+    color: "#6b7280",
+    fontSize: "13px",
+    textAlign: "right",
+  },
   message: {
     marginTop: "12px",
     padding: "10px 12px",
@@ -167,4 +225,3 @@ const styles: Record<string, CSSProperties> = {
     borderRadius: 8,
   },
 };
-

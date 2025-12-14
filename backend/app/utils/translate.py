@@ -21,6 +21,7 @@ _API_KEY = os.getenv("OPENAI_API_KEY")
 
 _client: AsyncOpenAI | None = None
 _CUSTOM_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
+_SERVICE_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
 
 @dataclass
 class TranslationContext:
@@ -48,6 +49,7 @@ _DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data"
 _BIBLE_NAMES_PATH = _DATA_DIR / "bible_names.json"
 _TRANSLATION_LOG_PATH = _DATA_DIR / "translation_examples.jsonl"
 _CUSTOM_PROMPT_PATH = _DATA_DIR / "custom_prompt.txt"
+_SERVICE_PROMPT_PATH = _DATA_DIR / "service_prompt.txt"
 
 try:
     with open(_BIBLE_NAMES_PATH, encoding="utf-8") as f:
@@ -172,6 +174,27 @@ def _get_custom_prompt() -> str:
     except Exception:
         text = ""
     _CUSTOM_PROMPT_CACHE = {"mtime": mtime, "text": text}
+    return text
+
+
+def _get_service_prompt() -> str:
+    """Read per-service background prompt with mtime caching."""
+    global _SERVICE_PROMPT_CACHE
+    try:
+        stat = _SERVICE_PROMPT_PATH.stat()
+    except FileNotFoundError:
+        _SERVICE_PROMPT_CACHE = {"mtime": None, "text": ""}
+        return ""
+
+    mtime = stat.st_mtime
+    if _SERVICE_PROMPT_CACHE.get("mtime") == mtime:
+        return str(_SERVICE_PROMPT_CACHE.get("text", ""))
+
+    try:
+        text = _SERVICE_PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception:
+        text = ""
+    _SERVICE_PROMPT_CACHE = {"mtime": mtime, "text": text}
     return text
 
 
@@ -541,6 +564,16 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
         )
 
     fewshot_block = _build_fewshot_block(source, target, current_source_text=current_source_text)
+
+    service_prompt = (_get_service_prompt() or "").strip()
+    service_block = ""
+    if service_prompt:
+        service_block = (
+            "\nToday's service background (set before the service; clear afterwards):\n"
+            + service_prompt
+            + "\n"
+        )
+
     custom_prompt = (_get_custom_prompt() or "").strip()
     custom_block = ""
     if custom_prompt:
@@ -563,6 +596,7 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
         + bible_names_block
         + glossary_block
         + fewshot_block
+        + service_block
         + custom_block +
         "\n"
         "Context:\n"
