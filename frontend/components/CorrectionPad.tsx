@@ -53,9 +53,13 @@ export default function CorrectionPad({ last }: Props) {
       }
       setStatus("saved");
       setMessage("Saved as a corrected example. Future prompts can reuse it.");
-    } catch (err: any) {
+    } catch (err: unknown) {
       setStatus("error");
-      setMessage(err?.message || "Failed to save");
+      if (err instanceof Error) {
+        setMessage(err.message || "Failed to save");
+      } else {
+        setMessage("Failed to save");
+      }
     }
   };
 
