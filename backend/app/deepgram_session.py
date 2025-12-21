@@ -31,7 +31,7 @@ DG_ENDPOINT = os.getenv("DEEPGRAM_ENDPOINT", "wss://api.deepgram.com/v1/listen")
 DG_KEY      = os.getenv("DEEPGRAM_API_KEY")
 DG_MODEL    = os.getenv("DEEPGRAM_MODEL", "nova-3")   # Korean supported
 DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
-DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 3500, min_value=200, max_value=6000)
+DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 4200, min_value=200, max_value=6000)
 DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 1800, min_value=500, max_value=6000)
 _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
 DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 60, min_value=0, max_value=200)
@@ -167,7 +167,12 @@ async def connect_to_deepgram(
 
     m  = model or DG_MODEL
     lg = language or DG_LANGUAGE
+
+    # Use keyword biasing only for Korean; avoid skewing other languages.
     kw = keywords if keywords is not None else _current_keywords()
+    if lg and not str(lg).lower().startswith("ko"):
+        kw = []
+
     url = f"{DG_ENDPOINT}?{_qs(m, lg, sample_rate, kw, DG_ENDPOINTING_MS, DG_UTTER_END_MS)}"
 
     headers = {"Authorization": f"Token {DG_KEY}"}

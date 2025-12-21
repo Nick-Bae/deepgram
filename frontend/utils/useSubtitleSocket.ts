@@ -15,11 +15,13 @@ type Translation = {
     [key: string]: unknown;
   };
 };
+type DisplayConfig = { type: "display_config"; speed?: number; speedFactor?: number };
 
 function isInterim(m: any): m is InterimKR { return m && m.type === "interim_kr" && typeof m.text === "string"; }
 function isFinalKR(m: any): m is FinalKR   { return m && m.type === "final_kr"  && typeof m.text === "string"; }
 function isFastFinal(m: any): m is FastFinal { return m && m.type === "fast_final" && typeof m.en === "string"; }
 function isTranslation(m: any): m is Translation { return m && m.type === "translation"; }
+function isDisplayConfig(m: any): m is DisplayConfig { return m && m.type === "display_config"; }
 
 type Options = {
   maxLines?: number;           // how many lines to keep on screen
@@ -87,18 +89,40 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const nextSlotAtRef = useRef(0);
   const timerRef = useRef<number | null>(null);
   const idCounterRef = useRef(0);
+  const lastEnArrivalRef = useRef<number | null>(null);
+  const avgEnIntervalRef = useRef<number | null>(null);
+  const displaySpeedRef = useRef(1);
 
   function pushLine(setter: React.Dispatch<React.SetStateAction<string[]>>, text: string) {
     setter((prev) => prev.concat(text).slice(-maxLines));
   }
 
+  function updateEnglishPace(now: number) {
+    const last = lastEnArrivalRef.current;
+    lastEnArrivalRef.current = now;
+    if (!last) return;
+    const interval = Math.max(120, Math.min(4000, now - last));
+    if (avgEnIntervalRef.current == null) {
+      avgEnIntervalRef.current = interval;
+    } else {
+      avgEnIntervalRef.current = avgEnIntervalRef.current * 0.8 + interval * 0.2;
+    }
+  }
+
   function computeLingerMs(text: string) {
     const len = text.length;
-    const base = 900;            // short sentences get ~1.4s
-    const perChar = 55;          // scale with length so long sentences stay longer
-    const minMs = 1400;
-    const maxMs = 4200;
-    return Math.max(minMs, Math.min(maxMs, base + len * perChar));
+    const base = 650;            // fast mode friendly base
+    const perChar = 40;          // scale with length so long sentences stay longer
+    const paceMs = avgEnIntervalRef.current ?? 1200;
+    const fastMs = 700;
+    const slowMs = 1700;
+    const t = Math.min(1, Math.max(0, (paceMs - fastMs) / (slowMs - fastMs)));
+    const factor = 0.7 + t * 0.45; // 0.7..1.15
+    const speed = Math.max(0.6, Math.min(1.6, displaySpeedRef.current || 1));
+    const minMs = 700 * speed;
+    const maxMs = 3200 * speed;
+    const dwell = (base + len * perChar) * factor * speed;
+    return Math.max(minMs, Math.min(maxMs, dwell));
   }
 
   function scheduleDrain() {
@@ -159,6 +183,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
 
   function enqueueEnglish(seq: number | null, lines: string[]) {
     if (!lines.length) return;
+    updateEnglishPace(Date.now());
     const entries = lines.map((text) => ({
       id: idCounterRef.current++,
       seq,
@@ -181,6 +206,9 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     enQueueRef.current = [];
     enDisplayRef.current = [];
     nextSlotAtRef.current = 0;
+    lastEnArrivalRef.current = null;
+    avgEnIntervalRef.current = null;
+    displaySpeedRef.current = 1;
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
@@ -249,6 +277,13 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
               if (!t) return;
               setEnFinal(t);
               if (track === "en" || track === "both") enqueueEnglish(seq, splitSentences(t));
+              return;
+            }
+
+            if (isDisplayConfig(msg)) {
+              const raw = typeof msg.speed === "number" ? msg.speed : msg.speedFactor;
+              const next = typeof raw === "number" && Number.isFinite(raw) ? raw : 1;
+              displaySpeedRef.current = Math.max(0.6, Math.min(1.6, next));
               return;
             }
 

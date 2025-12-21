@@ -115,6 +115,13 @@ const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
 const HANGUL_CHAR_RE = /[\uac00-\ud7a3]/
 const SILENT_AUDIO_DATA_URL = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AACJWAAACABAAZGF0YQAAAAA='
+const DISPLAY_SPEED_MIN = 0.6
+const DISPLAY_SPEED_MAX = 1.6
+const DISPLAY_SPEED_STEP = 0.1
+const DISPLAY_SPEED_STORAGE_KEY = 'display_speed_factor'
+
+const clampDisplaySpeed = (value: number) =>
+  Math.max(DISPLAY_SPEED_MIN, Math.min(DISPLAY_SPEED_MAX, value))
 
 type QueuedTTS = { id: number; text: string; url: string }
 
@@ -123,7 +130,7 @@ type CancelableFn<Args extends unknown[] = unknown[]> = ((...args: Args) => void
 }
 
 export default function TranslationBox() {
-  const { connected, last } = useTranslationSocket({ isProducer: true })
+  const { connected, last, sendDisplayConfig } = useTranslationSocket({ isProducer: true })
 
   // UI state
   const [text, setText] = useState('')
@@ -139,6 +146,7 @@ export default function TranslationBox() {
   const [aiAssistEnabled, setAiAssistEnabled] = useState(true)
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
   const [displayOnAir, setDisplayOnAir] = useState(true)
+  const [displaySpeed, setDisplaySpeed] = useState(1)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
@@ -176,6 +184,32 @@ export default function TranslationBox() {
       sourceLabel: sourceParts.join(' · ') || undefined,
     }
   }, [last])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const raw = window.localStorage.getItem(DISPLAY_SPEED_STORAGE_KEY)
+    const parsed = raw ? Number(raw) : 1
+    if (Number.isFinite(parsed)) {
+      setDisplaySpeed(clampDisplaySpeed(parsed))
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!connected) return
+    sendDisplayConfig(displaySpeed)
+  }, [connected, displaySpeed, sendDisplayConfig])
+
+  const applyDisplaySpeed = useCallback(
+    (next: number) => {
+      const clamped = clampDisplaySpeed(Number(next.toFixed(2)))
+      setDisplaySpeed(clamped)
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(DISPLAY_SPEED_STORAGE_KEY, String(clamped))
+      }
+      sendDisplayConfig(clamped)
+    },
+    [sendDisplayConfig]
+  )
 
   // Deepgram mic producer
   const dgController: DeepgramProducerController & { finalize?: () => void } = useDeepgramProducer()
@@ -1057,6 +1091,26 @@ export default function TranslationBox() {
                   >
                     {displayOnAir ? 'On air' : 'Standby'}
                   </button>
+                </div>
+                <div className="flex items-center justify-between border-t border-[#454543] pt-3 text-sm text-[#d4d4dc]">
+                  <div className="flex flex-col">
+                    <span>Display speed</span>
+                    <span className="text-xs text-[#b1b1ac]">{displaySpeed.toFixed(2)}x</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => applyDisplaySpeed(displaySpeed - DISPLAY_SPEED_STEP)}
+                      className="rounded-lg border border-[#454543] px-3 py-1.5 text-xs font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
+                    >
+                      Slower
+                    </button>
+                    <button
+                      onClick={() => applyDisplaySpeed(displaySpeed + DISPLAY_SPEED_STEP)}
+                      className="rounded-lg border border-[#454543] px-3 py-1.5 text-xs font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
+                    >
+                      Faster
+                    </button>
+                  </div>
                 </div>
               </div>
 

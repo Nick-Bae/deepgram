@@ -85,6 +85,7 @@ export type TranslationSocketHook = {
     rev?: number,
     finalFlag?: boolean
   ) => void;
+  sendDisplayConfig: (speed: number) => void;
 };
 
 export function useTranslationSocket({ isProducer = false }: { isProducer?: boolean } = {}): TranslationSocketHook {
@@ -269,5 +270,14 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     []
   );
 
-  return { connected, last, sendProducerText };
+  const sendDisplayConfig = useCallback((speed: number) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const safeSpeed = Number.isFinite(speed) ? speed : 1;
+    const payload = { type: 'display_config', speed: safeSpeed };
+    try { d('ws->', JSON.stringify(payload)); } catch {}
+    ws.send(JSON.stringify(payload));
+  }, []);
+
+  return { connected, last, sendProducerText, sendDisplayConfig };
 }

@@ -44,6 +44,9 @@ THEOLOGICAL_TERMS: list[tuple[str, str]] = [
     ("복음", "the gospel")
 ]
 
+# Optional hard glossary (protected tokens). Defaults to the same set, but can be extended.
+HARD_GLOSSARY_TERMS: list[tuple[str, str]] = THEOLOGICAL_TERMS.copy()
+
 # Load Bible names map (Korean -> English) from JSON
 _DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data"
 _BIBLE_NAMES_PATH = _DATA_DIR / "bible_names.json"
@@ -57,7 +60,7 @@ try:
     print(f"[TX] Loaded {len(BIBLE_NAMES)} Bible names from {__file__}")
 except FileNotFoundError:
     print(f"[TX] bible_names.json not found at {_BIBLE_NAMES_PATH}; continuing without Bible name map")
-BIBLE_NAMES = {}
+    BIBLE_NAMES = {}
 
 FIRST_PERSON_KO_MARKERS = [
     "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테",
@@ -525,14 +528,36 @@ def _build_context_block(ctx: Optional[TranslationContext]) -> str:
         "- When translating 스스로 or similar reflexives, use himself/herself/themselves matching the subject.\n"
     )
 
+def _mask_hard_glossary(text: str, source_lang: str) -> tuple[str, dict[str, str]]:
+    """
+    Replace hard glossary Korean terms with stable tokens [[T1]], [[T2]]...
+    Returns masked text and token->target map.
+    Only applied for Korean source to avoid harming other languages.
+    """
+    if not text or not source_lang.lower().startswith("ko"):
+        return text, {}
+
+    masked = text
+    mapping: dict[str, str] = {}
+    for idx, (ko_term, en_term) in enumerate(HARD_GLOSSARY_TERMS, start=1):
+        if not ko_term:
+            continue
+        token = f"[[T{idx}]]"
+        if ko_term in masked:
+            masked = masked.replace(ko_term, token)
+            mapping[token] = en_term
+    return masked, mapping
+
+def _unmask_hard_glossary(text: str, mapping: dict[str, str]) -> str:
+    out = text or ""
+    for token, replacement in mapping.items():
+        out = out.replace(token, replacement)
+    return out
+
 
 def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationContext], *, current_source_text: Optional[str] = None) -> str:
     """
-    Sermon translator with:
-    - light STT error correction
-    - theological term preferences
-    - Biblical names recovery
-    - church-safe, cautious language
+    Core system prompt: neutral/cautious worship captioning with domain aids.
     """
     source_name = _language_name(source)
     target_name = _language_name(target)
@@ -544,9 +569,7 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
             glossary_lines.append(f'- Translate "{src}" as "{tgt}".')
 
     glossary_block = (
-        "\nImportant terminology preferences for key theological words:\n"
-        + "\n".join(glossary_lines)
-        + "\n"
+        "\nImportant terms (prefer these renderings):\n" + "\n".join(glossary_lines) + "\n"
     ) if glossary_lines else ""
 
     # Bible names list (Korean -> English)
@@ -558,86 +581,49 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
     bible_names_block = ""
     if bible_name_lines:
         bible_names_block = (
-            "\nCommon Biblical names and places (Korean → standard English form):\n"
-            + "\n".join(bible_name_lines)
-            + "\n"
+            "\nBiblical names/places (standard forms):\n" + "\n".join(bible_name_lines) + "\n"
         )
 
     fewshot_block = _build_fewshot_block(source, target, current_source_text=current_source_text)
 
     service_prompt = (_get_service_prompt() or "").strip()
-    service_block = ""
-    if service_prompt:
-        service_block = (
-            "\nToday's service background (set before the service; clear afterwards):\n"
-            + service_prompt
-            + "\n"
-        )
+    service_block = ("\nService background:\n" + service_prompt + "\n") if service_prompt else ""
 
     custom_prompt = (_get_custom_prompt() or "").strip()
-    custom_block = ""
-    if custom_prompt:
-        custom_block = (
-            "\nCustom guidance (set by admins):\n"
-            + custom_prompt
-            + "\n"
-        )
+    custom_block = ("\nGlobal guidance:\n" + custom_prompt + "\n") if custom_prompt else ""
 
     system = (
-        "You are a professional translator specializing in Christian theology and sermons.\n"
-        f"Your task is to translate from {source_name} to {target_name}.\n"
+        "You are a professional translator for live church worship captions.\n"
+        f"Translate {source_name} → {target_name} faithfully and naturally.\n"
         "\n"
-        "The source text often comes from automatic speech recognition (STT), "
-        "so there may be small recognition errors, especially with similar-sounding Korean words "
-        "and Biblical names.\n"
-        "If a word or name looks clearly wrong, ungrammatical, or unnatural in context, "
-        "silently infer the most likely intended original wording or name and translate that intended meaning.\n"
-        "Do NOT mention that you corrected anything; just translate as if the input were already correct.\n"
+        "Safety & neutrality:\n"
+        "- Do NOT add meaning not present in the Korean; resolve ambiguity with the most neutral, church-appropriate reading.\n"
+        "- Avoid slang, romantic/sexual nuance, or suggestive wording unless explicit in Korean.\n"
+        "- Keep wording reverent and family-friendly for mixed ages.\n"
+        "- Keep proper nouns; do not invent names or details.\n"
+        "- If you see placeholder tokens like [[T1]], [[T2]], leave them unchanged; they will be mapped to glossary terms after translation.\n"
+        "\n"
+        "Style:\n"
+        "- Clear, contemporary, pastoral tone.\n"
+        "- Split overly long sentences for subtitle readability.\n"
+        "- If input seems incomplete, translate only what is present; do not guess endings.\n"
+        "\n"
+        "STT robustness:\n"
+        "- Input may come from speech recognition; if a word is clearly a mis-hear, quietly recover the intended Korean before translating.\n"
+        "- Restore missing Korean spacing mentally.\n"
+        "\n"
+        "Congregation cues:\n"
+        "- If the Korean says 일어나/일어나서/일어나셔서/자리에서 일어나 with no subject, interpret as an invitation to the congregation (e.g., \"let's stand\" / \"please stand\").\n"
+        "\n"
         + bible_names_block
         + glossary_block
         + fewshot_block
         + service_block
-        + custom_block +
-        "\n"
-        "Context:\n"
-        "- The input text is usually a spoken sermon, Bible teaching, or church-related script.\n"
-        "- The translation will often be read aloud or shown as subtitles or slides during worship, "
-        "including with children and families present.\n"
-        "\n"
-        "Style and safety rules:\n"
-        "1. Use clear, natural, contemporary language that sounds like a respectful, mature pastor.\n"
-        "2. Never use slang, jokes, or expressions that could sound flirtatious, crude, or suggestive.\n"
-        "3. Never use profanity, vulgar language, or sexual slang under any circumstances.\n"
-        "4. When translating phrases about a husband and wife spending time together, "
-        "or people enjoying time together (for example, '아내와 나는 오늘밤 좋은 시간을 보내고 있습니다'), "
-        "avoid ambiguous phrases like 'having a good time tonight' that could sound romantic or sexual. "
-        "Use explicit, wholesome wording that fits a church context, such as "
-        "'My wife and I are spending a good evening together, talking and sharing.'\n"
-        "5. When the Korean text is emotionally warm but innocent (for example about family, marriage, or friendships), "
-        "translate it with gentle, wholesome wording. Do NOT introduce romantic or sexual nuance that is not clearly in the original.\n"
-        "6. If a phrase could sound suggestive in English (for example, 'having a good time tonight'), replace it with explicit, "
-        "safe, descriptive wording like 'spending a good evening together talking and sharing' or 'enjoying time together as a family.'\n"
-        "7. Do not exaggerate or dramatize emotions beyond what the Korean clearly expresses; keep the tone steady and pastoral.\n"
-        "8. When the Korean is general or ambiguous, keep a similar level of generality in the translation and do not add specific details.\n"
-        "9. Always choose wording that is completely appropriate to say in a mixed-age worship service with children, teens, and adults.\n"
-        "10. Do not introduce people or place names (e.g., Bible figures) unless that name is explicitly present in the Korean source clause.\n"
-        "Spacing reliability: Korean STT often omits spaces; mentally restore natural spacing before translating so words are not merged or dropped.\n"
-        "Congregation cues: If the Korean clause uses 일어나/일어나서/일어나셔서/자리에서 일어나 without an explicit subject, "
-        "assume the speaker is inviting the congregation. Translate with an invitation like 'let's stand' or 'please stand' "
-        "instead of 'he stood up.' Preserve timing phrases such as '이 시간' (e.g., '이 시간 다 같이 일어나셔서' → 'At this time, let's stand together').\n"
-        "\n"
-        "General requirements:\n"
-        "11. Preserve biblical and theological meaning very accurately.\n"
-        "12. Break up very long sentences into shorter, easy-to-follow sentences suitable for listening.\n"
-        "13. Keep all Scripture references, person names, and place names correct (using the Bible name list above when relevant).\n"
-        "14. Preserve paragraph and line-break structure as much as reasonably possible.\n"
-        "15. Perform only light, obvious corrections to STT mistakes; do not rewrite or summarize.\n"
-        "16. Do not add explanations, comments, headings, or brackets.\n"
-        "17. Output ONLY the translated text; no quotes, no extra commentary, no meta text.\n"
-        "18. If the input seems incomplete or ends abruptly (common with STT pauses), translate only what was actually said and do not invent endings or extra sentences.\n"
+        + custom_block
+        + _build_context_block(ctx)
     )
 
-    return system + _build_context_block(ctx)
+    return system
 
 
 def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
@@ -773,9 +759,10 @@ async def translate_text(
     """
     text = (text or "").strip()
     text = _preprocess_source_text(text, source)
+    masked_text, hard_map = _mask_hard_glossary(text, source)
     if source.lower().startswith("ko"):
-        text = apply_ko_spacing(text)
-    if not text:
+        masked_text = apply_ko_spacing(masked_text)
+    if not masked_text:
         return ""
 
     explicit_first_person = _contains_first_person_markers(text)
@@ -794,7 +781,7 @@ async def translate_text(
 
     client = _get_client()
     system = _build_system_prompt(source, target, ctx_for_prompt, current_source_text=text)
-    user_content = text
+    user_content = masked_text
     if ctx_for_prompt:
         prev = ctx_for_prompt.last_english or "(none yet)"
         subject_hint = ctx_for_prompt.subject or ENV.CONTEXT_SUBJECT
@@ -802,7 +789,7 @@ async def translate_text(
         user_content = (
             f"Previous English sentence: {prev}\n"
             f"Subject hint: continue referring to {subject_hint} ({pronoun_hint}).\n\n"
-            f"Current text:\n{text}"
+            f"Current text:\n{masked_text}"
         )
 
     try:
@@ -813,9 +800,13 @@ async def translate_text(
                 {"role": "user", "content": user_content}
             ],
             temperature=0.2,
+            presence_penalty=0,
+            frequency_penalty=0,
+            top_p=1.0,
         )
         out = (resp.choices[0].message.content or "").strip()
         out = out.strip('"\u201c\u201d')
+        out = _unmask_hard_glossary(out, hard_map)
         if ctx and source.lower().startswith("ko"):
             out = _enforce_subject_guardrails(out, text, ctx)
         if source.lower().startswith("ko"):

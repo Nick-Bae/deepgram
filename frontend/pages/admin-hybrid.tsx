@@ -6,6 +6,7 @@ import ScriptUpload from "../components/ScriptUpload";
 import ProducerBox from "../components/ProducerBox";
 import SermonPrep from "../components/SermonPrep";
 import { useTranslationSocket } from "../utils/useTranslationSocket";
+import CorrectionPad from "../components/CorrectionPad";
 
 export default function AdminHybrid() {
   const { last, connected } = useTranslationSocket();
@@ -138,6 +139,10 @@ export default function AdminHybrid() {
 
           <section className="mt-2">
             <SermonPrep />
+          </section>
+
+          <section className="mt-2">
+            <CorrectionPad last={last} />
           </section>
         </div>
       </main>

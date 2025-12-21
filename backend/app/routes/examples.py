@@ -6,6 +6,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from app.utils.translate import log_corrected_translation
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LOG_PATH = DATA_DIR / "translation_examples.jsonl"
 FEWSHOT_PATH = DATA_DIR / "fewshot_examples.json"
@@ -33,6 +35,14 @@ class ExportPayload(BaseModel):
 class CleanPayload(BaseModel):
     dedupe: bool = True
     keep: Optional[int] = 400
+
+
+class CorrectionPayload(BaseModel):
+    source_lang: str = Field(default="ko", description="Source language code (e.g., ko)")
+    target_lang: str = Field(default="en", description="Target language code (e.g., en)")
+    stt_text: str = Field(..., min_length=1, description="Original STT text")
+    auto_translation: str = Field(..., min_length=1, description="Auto-generated translation")
+    final_translation: str = Field(..., min_length=1, description="Corrected translation to keep")
 
 
 def _load_records() -> tuple[list[dict[str, Any]], int]:
@@ -221,3 +231,25 @@ def download_examples():
         media_type="application/jsonl",
         filename="translation_examples.jsonl",
     )
+
+
+@router.post("/correct")
+def add_correction(payload: CorrectionPayload):
+    """
+    Log an operator-corrected translation so it can be surfaced in few-shot prompts.
+    """
+    if not payload.stt_text.strip() or not payload.final_translation.strip():
+        raise HTTPException(status_code=400, detail="stt_text and final_translation are required")
+
+    try:
+        log_corrected_translation(
+            source_lang=payload.source_lang.strip(),
+            target_lang=payload.target_lang.strip(),
+            stt_text=payload.stt_text.strip(),
+            auto_translation=payload.auto_translation.strip(),
+            final_translation=payload.final_translation.strip(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"log_failed: {exc}") from exc
+
+    return {"saved": True}

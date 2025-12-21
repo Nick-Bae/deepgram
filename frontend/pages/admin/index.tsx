@@ -8,6 +8,10 @@ export default function AdminHome() {
       <p style={styles.subtitle}>Quick links to maintenance views.</p>
       <ul style={styles.list}>
         <li style={styles.item}>
+          <Link href="/admin/display" style={styles.link}>Display Speed</Link>
+          <span style={styles.note}>Adjust how fast captions roll on the public display.</span>
+        </li>
+        <li style={styles.item}>
           <Link href="/admin/examples" style={styles.link}>Translation Examples</Link>
           <span style={styles.note}>Review, correct, dedupe, trim, export few-shots.</span>
         </li>

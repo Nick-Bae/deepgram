@@ -11,6 +11,9 @@ set IP=%IP: =%
 echo 🌐 Your Local IP is: http://%IP%:3000
 echo ✅ Backend API will run on: http://%IP%:8000
 
+:: Ensure we run inside the backend folder so .env is discovered
+cd /d "%~dp0"
+
 :: Activate venv
 call venv\Scripts\activate
 
