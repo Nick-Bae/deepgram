@@ -7,8 +7,8 @@ from ..utils.translate import _infer_subject_from_english
 import re
 
 FIRST_PERSON_KO_MARKERS = [
-    "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테",
-    "저는", "전", "제가", "제게", "저를", "저도", "저만", "저와", "저에게", "저한테",
+    "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테", "나의",
+    "저는", "전", "제가", "제게", "저를", "저도", "저만", "저와", "저에게", "저한테", "저의",
     "우리", "우리가", "우리는", "우릴", "우리의", "우리도", "우리만", "우리와", "우리에게", "우리한테"
 ]
 
@@ -25,7 +25,32 @@ THEY_KO_MARKERS = [
     "그들은", "그들이", "그들을", "그들의", "그들에게", "그들한테",
 ]
 
+IMPLICIT_FIRST_PERSON_KO_TERMS = [
+    "아내", "남편", "부인", "배우자", "집사람", "마누라", "와이프",
+]
+
+IMPLICIT_FIRST_PERSON_BLOCKERS = [
+    "그의", "그녀의", "그들의", "그분의", "누구의", "어떤", "한", "이런", "저런", "그", "이", "저",
+    "남의", "타인의", "이웃의",
+]
+
 PRONOUN_FORMS = {
+    "i": {
+        "subject": "I",
+        "object": "me",
+        "possessive": "my",
+        "reflexive": "myself",
+        "be_present": "I am",
+        "be_present_contracted": "I'm",
+        "be_past": "I was",
+        "have": "I have",
+        "have_contracted": "I've",
+        "will": "I will",
+        "will_contracted": "I'll",
+        "would": "I would",
+        "would_contracted": "I'd",
+        "can": "I can",
+    },
     "he": {
         "subject": "He",
         "object": "him",
@@ -94,7 +119,8 @@ class TranslationContext:
         return (
             f"Narration mode: {mode}. "
             "Do not switch to first-person narration unless the Korean clause explicitly contains first-person markers "
-            "(나, 난, 내가, 나를, 저, 제가, 저를, 우리, 우리는, 우리를)."
+            "(나, 난, 내가, 나를, 저, 제가, 저를, 우리, 우리는, 우리를) or implies speaker ownership via kinship terms "
+            "(아내, 남편, 부인, 배우자)."
         )
 
     def previous_line(self) -> str:
@@ -109,7 +135,8 @@ def _build_messages(ko: str, ctx: TranslationContext) -> list[dict[str, str]]:
         ctx.subject_line(),
         ctx.mode_line(),
         "When Korean omits the subject, continue using the same subject/pronoun stated above.",
-        "Never output first-person pronouns (I, me, we, our, myself) unless the Korean clause explicitly contains first-person markers.",
+        "Never output first-person pronouns (I, me, we, our, myself) unless the Korean clause explicitly contains first-person markers or implies speaker ownership via kinship terms.",
+        "If a kinship term (아내/남편/부인/배우자/집사람/와이프) appears without an explicit possessor (그의/그녀의/그들의), assume it refers to the speaker (e.g., \"my wife\").",
         "Handle reflexives (스스로) as 'himself' / 'herself' / 'themselves' according to the subject.",
         "Output only the final English sentence.",
     ])
@@ -132,6 +159,22 @@ def _contains_first_person_markers(ko: str) -> bool:
             return True
     return False
 
+def _contains_implicit_first_person_kinship(ko: str) -> bool:
+    compact = re.sub(r"\s+", "", ko or "")
+    if not compact:
+        return False
+    if _detect_third_person_pronoun(compact):
+        return False
+    for term in IMPLICIT_FIRST_PERSON_KO_TERMS:
+        idx = compact.find(term)
+        if idx == -1:
+            continue
+        prefix = compact[max(0, idx - 6):idx]
+        if any(prefix.endswith(block) for block in IMPLICIT_FIRST_PERSON_BLOCKERS):
+            continue
+        return True
+    return False
+
 def _detect_third_person_pronoun(ko: str) -> str:
     compact = re.sub(r"\s+", "", ko)
     if any(marker in compact for marker in SHE_KO_MARKERS):
@@ -144,6 +187,8 @@ def _detect_third_person_pronoun(ko: str) -> str:
 
 def _normalize_pronoun(ctx: TranslationContext) -> Optional[str]:
     raw = (ctx.pronoun or ENV.CONTEXT_PRONOUN or "").strip().lower()
+    if raw.startswith("i"):
+        return "i"
     if raw.startswith("he"):
         return "he"
     if raw.startswith("she"):
@@ -165,10 +210,11 @@ def _format_replacement(match: re.Match, replacement: str) -> str:
     return replacement
 
 def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> str:
-    if _contains_first_person_markers(ko):
+    implicit_first_person = _contains_implicit_first_person_kinship(ko)
+    if _contains_first_person_markers(ko) and not implicit_first_person:
         return en
 
-    pronoun_key = _normalize_pronoun(ctx)
+    pronoun_key = "i" if implicit_first_person else _normalize_pronoun(ctx)
 
     explicit = _detect_third_person_pronoun(ko)
     if explicit:
@@ -254,10 +300,19 @@ async def translate_ko_to_en_chunk(ko: str, ctx: Optional[TranslationContext] = 
     if not ENV.OPENAI_API_KEY:
         return ko  # fall back to echo to keep pipeline flowing
     context = ctx or TranslationContext()
+    implicit_first_person = _contains_implicit_first_person_kinship(ko)
+    prompt_ctx = context
+    if implicit_first_person:
+        prompt_ctx = TranslationContext(
+            subject="the speaker",
+            pronoun="I",
+            narration_mode=context.narration_mode,
+            last_english=context.last_english,
+        )
     body = {
         "model": ENV.TRANSLATION_MODEL,
         "temperature": 0.2,
-        "messages": _build_messages(ko, context),
+        "messages": _build_messages(ko, prompt_ctx),
     }
     headers = {"Authorization": f"Bearer {ENV.OPENAI_API_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=10) as client:
@@ -265,4 +320,14 @@ async def translate_ko_to_en_chunk(ko: str, ctx: Optional[TranslationContext] = 
         r.raise_for_status()
         data = r.json()
         text = (data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or ko)
-        return _enforce_subject_guardrails(text, ko, context)
+        text = _enforce_subject_guardrails(text, ko, context)
+        if ctx is not None:
+            subj_hint, pronoun_hint = _infer_subject_from_english(
+                text,
+                context.subject or ENV.CONTEXT_SUBJECT,
+                context.pronoun or ENV.CONTEXT_PRONOUN,
+            )
+            ctx.subject = subj_hint
+            ctx.pronoun = pronoun_hint
+            ctx.last_english = text
+        return text

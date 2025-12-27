@@ -63,8 +63,8 @@ except FileNotFoundError:
     BIBLE_NAMES = {}
 
 FIRST_PERSON_KO_MARKERS = [
-    "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테",
-    "저는", "전", "제가", "제게", "저를", "저도", "저만", "저와", "저에게", "저한테",
+    "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테", "나의",
+    "저는", "전", "제가", "제게", "저를", "저도", "저만", "저와", "저에게", "저한테", "저의",
     "우리", "우리가", "우리는", "우릴", "우리의", "우리도", "우리만", "우리와", "우리에게", "우리한테"
 ]
 
@@ -85,7 +85,32 @@ THEY_KO_MARKERS = [
     "그들은", "그들이", "그들을", "그들의", "그들에게", "그들한테",
 ]
 
+IMPLICIT_FIRST_PERSON_KO_TERMS = [
+    "아내", "남편", "부인", "배우자", "집사람", "마누라", "와이프",
+]
+
+IMPLICIT_FIRST_PERSON_BLOCKERS = [
+    "그의", "그녀의", "그들의", "그분의", "누구의", "어떤", "한", "이런", "저런", "그", "이", "저",
+    "남의", "타인의", "이웃의",
+]
+
 PRONOUN_FORMS = {
+    "i": {
+        "subject": "I",
+        "object": "me",
+        "possessive": "my",
+        "reflexive": "myself",
+        "be_present": "I am",
+        "be_present_contracted": "I'm",
+        "be_past": "I was",
+        "have": "I have",
+        "have_contracted": "I've",
+        "will": "I will",
+        "will_contracted": "I'll",
+        "would": "I would",
+        "would_contracted": "I'd",
+        "can": "I can",
+    },
     "he": {
         "subject": "He",
         "object": "him",
@@ -405,6 +430,8 @@ def _normalize_pronoun(ctx: Optional[TranslationContext]) -> Optional[str]:
     if not ctx:
         return None
     raw = (ctx.pronoun or ENV.CONTEXT_PRONOUN or "").strip().lower()
+    if raw.startswith("i"):
+        return "i"
     if raw.startswith("he"):
         return "he"
     if raw.startswith("she"):
@@ -428,6 +455,22 @@ def _contains_marker_list(text: str, markers: list[str]) -> bool:
 
 def _contains_first_person_markers(text: str) -> bool:
     return _contains_marker_list(text, FIRST_PERSON_KO_MARKERS)
+
+def _contains_implicit_first_person_kinship(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    if _detect_third_person_pronoun(compact):
+        return False
+    for term in IMPLICIT_FIRST_PERSON_KO_TERMS:
+        idx = compact.find(term)
+        if idx == -1:
+            continue
+        prefix = compact[max(0, idx - 6):idx]
+        if any(prefix.endswith(block) for block in IMPLICIT_FIRST_PERSON_BLOCKERS):
+            continue
+        return True
+    return False
 
 
 def _contains_we_markers(text: str) -> bool:
@@ -466,6 +509,8 @@ def _infer_subject_from_english(
     low = head.lower()
     if re.match(r"^(let's|let us)\b", low):
         return default_subject or ENV.CONTEXT_SUBJECT, "we"
+    if re.match(r"^(i|my|me|myself)\b", low):
+        return "I", "i"
     if re.match(r"^(we|our|us|ourselves)\b", low):
         return default_subject or ENV.CONTEXT_SUBJECT, "we"
     if re.match(r"^(they|those|these)\b", low):
@@ -524,7 +569,10 @@ def _build_context_block(ctx: Optional[TranslationContext]) -> str:
         "\nSubject continuity:\n"
         f"- Main character: {subject} ({pronoun}). Keep dropped subjects anchored here.\n"
         f"- Narration mode: {narration}. Do not switch to first-person narration unless the Korean clause "
-        "explicitly contains first-person markers (나/저/우리 variants).\n"
+        "explicitly contains first-person markers (나/저/우리 variants) or implies speaker ownership via "
+        "kinship terms (e.g., 아내/남편/부인/배우자).\n"
+        "- If a kinship term (아내/남편/부인/배우자/집사람/와이프) appears without an explicit possessor "
+        "(그의/그녀의/그들의), assume it refers to the speaker (e.g., \"my wife\").\n"
         "- When translating 스스로 or similar reflexives, use himself/herself/themselves matching the subject.\n"
     )
 
@@ -615,6 +663,10 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
         "Congregation cues:\n"
         "- If the Korean says 일어나/일어나서/일어나셔서/자리에서 일어나 with no subject, interpret as an invitation to the congregation (e.g., \"let's stand\" / \"please stand\").\n"
         "\n"
+        "Kinship cues:\n"
+        "- If Korean mentions spouse/kinship terms (아내/남편/부인/배우자/집사람/와이프) without a possessor "
+        "(그의/그녀의/그들의), treat them as the speaker's relation (\"my wife/husband\").\n"
+        "\n"
         + bible_names_block
         + glossary_block
         + fewshot_block
@@ -627,10 +679,11 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
 
 
 def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
-    if _contains_first_person_markers(source_text):
+    implicit_first_person = _contains_implicit_first_person_kinship(source_text)
+    if _contains_first_person_markers(source_text) and not implicit_first_person:
         return en
 
-    pronoun_key = _normalize_pronoun(ctx)
+    pronoun_key = "i" if implicit_first_person else _normalize_pronoun(ctx)
 
     # If Korean explicitly uses third-person pronouns (그는/그녀는/그들은), honor that.
     explicit_pronoun = _detect_third_person_pronoun(source_text)
@@ -710,6 +763,8 @@ def _enforce_we_guardrails(en: str, source_text: str, ctx: Optional[TranslationC
       - Context pronoun is set to "we".
     Converts stray third-person pronouns to inclusive "we/our/us" and prefers "let us" invitations.
     """
+    if _contains_first_person_markers(source_text) or _contains_implicit_first_person_kinship(source_text):
+        return en
     pronoun_pref = _normalize_pronoun(ctx)
     if not _contains_we_markers(source_text) and pronoun_pref != "we":
         return en
@@ -766,6 +821,7 @@ async def translate_text(
         return ""
 
     explicit_first_person = _contains_first_person_markers(text)
+    implicit_first_person = _contains_implicit_first_person_kinship(text)
 
     if ctx:
         # Use the most recent English line to shape the subject/pronoun hint.
@@ -777,7 +833,17 @@ async def translate_text(
         ctx.subject = subj_hint
         ctx.pronoun = pronoun_hint
 
-    ctx_for_prompt = None if explicit_first_person else ctx
+    if explicit_first_person:
+        ctx_for_prompt = None
+    elif implicit_first_person and ctx:
+        ctx_for_prompt = TranslationContext(
+            subject="the speaker",
+            pronoun="I",
+            narration_mode=ctx.narration_mode,
+            last_english=ctx.last_english,
+        )
+    else:
+        ctx_for_prompt = ctx
 
     client = _get_client()
     system = _build_system_prompt(source, target, ctx_for_prompt, current_source_text=text)
