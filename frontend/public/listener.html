@@ -107,9 +107,11 @@
   
       unlockTTS();
   
-      const wsBase = location.hostname === 'localhost'
-        ? 'ws://localhost:8000'
-        : 'ws://10.0.0.17:8000';
+      const wsBase = (() => {
+        const host = location.hostname || 'localhost';
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        return `${proto}://${host}:8000`;
+      })();
   
       socket = new WebSocket(`${wsBase}/ws/translate`);
   

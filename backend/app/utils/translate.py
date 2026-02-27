@@ -511,6 +511,8 @@ def _infer_subject_from_english(
         return default_subject or ENV.CONTEXT_SUBJECT, "we"
     if re.match(r"^(i|my|me|myself)\b", low):
         return "I", "i"
+    if re.search(r"\bmy\b", low):
+        return "I", "i"
     if re.match(r"^(we|our|us|ourselves)\b", low):
         return default_subject or ENV.CONTEXT_SUBJECT, "we"
     if re.match(r"^(they|those|these)\b", low):
@@ -711,6 +713,33 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
         return en
 
     updated = en
+
+    if pronoun_key == "i":
+        def replace_sentence_start(text: str, pattern: str, replacement: str) -> str:
+            return re.sub(
+                rf"(^|[.!?]\s+)({pattern})\b",
+                lambda m: f"{m.group(1)}{replacement}",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+        updated = replace_sentence_start(updated, r"they['’]re", forms.get("be_present_contracted") or forms.get("be_present"))
+        updated = replace_sentence_start(updated, r"they are", forms.get("be_present"))
+        updated = replace_sentence_start(updated, r"they were", forms.get("be_past"))
+        updated = replace_sentence_start(updated, r"they['’]ve", forms.get("have_contracted") or forms.get("have"))
+        updated = replace_sentence_start(updated, r"they have", forms.get("have"))
+        updated = replace_sentence_start(updated, r"they['’]ll", forms.get("will_contracted") or forms.get("will"))
+        updated = replace_sentence_start(updated, r"they will", forms.get("will"))
+        updated = replace_sentence_start(updated, r"they['’]d", forms.get("would_contracted") or forms.get("would"))
+        updated = replace_sentence_start(updated, r"they would", forms.get("would"))
+        updated = replace_sentence_start(updated, r"they can", forms.get("can"))
+        updated = replace_sentence_start(updated, r"they", forms.get("subject"))
+        updated = replace_sentence_start(updated, r"he", forms.get("subject"))
+        updated = replace_sentence_start(updated, r"she", forms.get("subject"))
+
+        updated = re.sub(r"\bby themselves\b", "by myself", updated, flags=re.IGNORECASE)
+        updated = re.sub(r"\bfor themselves\b", "for myself", updated, flags=re.IGNORECASE)
+        updated = re.sub(r"\bon their own\b", "on my own", updated, flags=re.IGNORECASE)
     replacements = [
         # First-person plural (we → they, etc.) to enforce third-person continuity
         (r"\bwe['’]re\b", forms.get("be_present_contracted") or forms.get("be_present")),
