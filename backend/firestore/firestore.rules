@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Server SDK (Cloud Run service account) bypasses rules.
+    // These rules apply to direct client SDK access only.
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function memberDoc(orgId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid);
+    }
+
+    function isOrgMember(orgId) {
+      return isSignedIn() && exists(memberDoc(orgId));
+    }
+
+    function isOrgAdmin(orgId) {
+      return isOrgMember(orgId) &&
+        get(memberDoc(orgId)).data.role in ['owner', 'admin', 'host'];
+    }
+
+    match /organizations/{orgId} {
+      allow read: if isOrgMember(orgId);
+      allow create, update, delete: if false;
+
+      // Public resolver path can be backed by Firestore reads if needed.
+      match /services/{serviceKey} {
+        allow read: if true;
+        allow create, update, delete: if false;
+      }
+
+      match /rooms/{roomId} {
+        allow read: if true;
+        allow create, update, delete: if false;
+
+        match /finalTranscript/{docId} {
+          allow read: if isOrgMember(orgId);
+          allow create, update, delete: if false;
+        }
+      }
+
+      match /usage/{periodKey} {
+        allow read: if isOrgMember(orgId);
+        allow create, update, delete: if false;
+      }
+
+      match /members/{uid} {
+        allow read: if isOrgMember(orgId);
+        allow create, update, delete: if false;
+      }
+    }
+  }
+}
+

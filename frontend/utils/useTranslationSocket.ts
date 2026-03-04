@@ -4,6 +4,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { WS_URL } from './urls';
 import { d } from './debug';
+import type { StreamContext } from './streamContext';
+import { appendStreamContextToUrl, getAuthTokenFromSession, getHostTokenFromSession, resolveStreamContext } from './streamContext';
 
 type Meta = {
   translated?: string;
@@ -104,16 +106,31 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
   const retryRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
+  const contextRef = useRef<StreamContext>({});
 
   const seqRef = useRef(0);
   const nextSeq = () => ++seqRef.current;
 
   useEffect(() => {
     aliveRef.current = true;
+    const streamContext = resolveStreamContext(WS_URL);
+    contextRef.current = streamContext;
+    const hostToken = isProducer ? getHostTokenFromSession() : undefined;
+    const idToken = isProducer ? getAuthTokenFromSession() : undefined;
+    const wsConnectUrl = appendStreamContextToUrl(
+      WS_URL,
+      streamContext,
+      hostToken || idToken
+        ? {
+            ...(hostToken ? { hostToken } : {}),
+            ...(idToken ? { idToken } : {}),
+          }
+        : undefined,
+    );
 
     // sanity: catch bad WS_URLs (double paths, missing scheme, etc.)
-    if (!/^wss?:\/\/.+/.test(WS_URL)) {
-      console.warn('[ws] Suspicious WS_URL:', WS_URL);
+    if (!/^wss?:\/\/.+/.test(wsConnectUrl)) {
+      console.warn('[ws] Suspicious WS_URL:', wsConnectUrl);
     }
 
     const connect = () => {
@@ -121,10 +138,10 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
       if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
 
       try { wsRef.current?.close(); } catch {}
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(wsConnectUrl);
       wsRef.current = ws;
 
-      d('ws', 'connecting ' + WS_URL);
+      d('ws', 'connecting ' + wsConnectUrl);
       setConnected(false);
 
       ws.onopen = () => {
@@ -133,9 +150,19 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         retryRef.current = 0;
         // reset local seq on a fresh connection so effects re-run on first message
         seqRef.current = 0;
-        if (!isProducer) {
-          try { ws.send(JSON.stringify({ type: 'consumer_join' })); } catch {}
-        }
+        try {
+          const payload: Record<string, string> = { type: 'consumer_join', role: isProducer ? 'host' : 'listener' };
+          if (streamContext.orgId) payload.orgId = streamContext.orgId;
+          if (streamContext.roomId) payload.roomId = streamContext.roomId;
+          if (streamContext.serviceKey) {
+            payload.serviceKey = streamContext.serviceKey;
+            payload.service_key = streamContext.serviceKey;
+          }
+          if (streamContext.churchSlug) payload.churchSlug = streamContext.churchSlug;
+          if (hostToken) payload.hostToken = hostToken;
+          if (idToken) payload.idToken = idToken;
+          ws.send(JSON.stringify(payload));
+        } catch {}
       };
 
       ws.onclose = () => {
@@ -259,10 +286,19 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     (text: string, source: string, target: string, isPartial: boolean, id?: number, rev?: number, finalFlag?: boolean) => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const ctx = contextRef.current;
 
       const payload = isPartial
         ? { type: 'producer_partial', text, source, target }
         : { type: 'producer_commit', text, source, target, id, rev, final: !!finalFlag };
+      if (ctx.orgId) (payload as any).orgId = ctx.orgId;
+      if (ctx.roomId) (payload as any).roomId = ctx.roomId;
+      if (ctx.serviceKey) (payload as any).serviceKey = ctx.serviceKey;
+      if (ctx.churchSlug) (payload as any).churchSlug = ctx.churchSlug;
+      const hostToken = isProducer ? getHostTokenFromSession() : undefined;
+      const idToken = isProducer ? getAuthTokenFromSession() : undefined;
+      if (hostToken) (payload as any).hostToken = hostToken;
+      if (idToken) (payload as any).idToken = idToken;
 
       try { d('ws->', JSON.stringify(payload)); } catch {}
       ws.send(JSON.stringify(payload));

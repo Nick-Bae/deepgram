@@ -3,12 +3,13 @@ import io
 import logging
 from time import perf_counter
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.services.google_tts import synthesize_async as synthesize_google_tts
 from app.services.gemini_flash_tts import synthesize_async as synthesize_gemini_tts
+from app.services.multichurch_store import multichurch_store
 from app.socket_manager import manager
 from app.utils.translate import translate_text
 
@@ -29,7 +30,11 @@ class TTSRequest(BaseModel):
     provider: str | None = Field(default="google", description="google | gemini_flash")
 
 @router.post("/translate")
-async def translate(data: dict):
+async def translate(
+    data: dict,
+    x_host_token: str | None = Header(default=None),
+    x_host_uid: str | None = Header(default=None),
+):
     text = (data.get("text") or "").trim() if hasattr(str, "trim") else (data.get("text") or "").strip()
     source = (data.get("source") or "ko").strip()
     target = (data.get("target") or "en").strip()
@@ -68,12 +73,28 @@ async def translate(data: dict):
         },
     )
 
-    await manager.broadcast({
+    org_id = (data.get("orgId") or data.get("org_id") or "").strip() or None
+    room_id = (data.get("roomId") or data.get("room_id") or "").strip() or None
+    if org_id and room_id:
+        host_uid = (data.get("hostUid") or data.get("host_uid") or x_host_uid or "").strip() or None
+        host_token = (data.get("hostToken") or data.get("host_token") or x_host_token or "").strip() or None
+        if not multichurch_store.authorize_host(org_id, host_uid=host_uid, host_token=host_token):
+            raise HTTPException(status_code=403, detail="host_auth_failed")
+    payload = {
         "type": "translation",
         "payload": translated,
         "lang": target,
-        "meta": {"is_final": is_final, "source": source}
-    })
+        "meta": {"is_final": is_final, "source": source},
+    }
+    if org_id:
+        payload["orgId"] = org_id
+    if room_id:
+        payload["roomId"] = room_id
+
+    if org_id and room_id:
+        await manager.broadcast_room(org_id, room_id, payload)
+    else:
+        await manager.broadcast(payload)
 
     return {"translated": translated, "final": is_final}
 

@@ -1,0 +1,1980 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from hmac import compare_digest
+import hashlib
+import math
+import os
+import re
+import secrets
+from threading import Lock
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+
+try:
+    from google.cloud import firestore as gcf_firestore  # type: ignore
+except Exception:  # pragma: no cover - optional dependency in dev
+    gcf_firestore = None
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _yyyymm(dt: Optional[datetime] = None) -> str:
+    now = dt or _utcnow()
+    return f"{now.year:04d}{now.month:02d}"
+
+
+def _new_room_id() -> str:
+    return f"room_{uuid4().hex[:12]}"
+
+
+def _clean_token(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    return txt or None
+
+
+def _tick_minutes(tick_seconds: int) -> int:
+    return max(1, int(math.ceil(max(1, int(tick_seconds)) / 60)))
+
+
+DEFAULT_SERVICE_SEEDS: tuple[tuple[str, str], ...] = (
+    ("sun-11am", "Sunday 11 AM"),
+    ("sun-2pm", "Sunday 2 PM"),
+    ("wed-7pm", "Wednesday 7 PM"),
+)
+
+ALLOWED_MEMBER_ROLES: set[str] = {"owner", "admin", "host", "viewer"}
+ALLOWED_INVITE_ROLES: set[str] = {"admin", "host", "viewer"}
+INVITE_STATUS_ACTIVE = "active"
+INVITE_STATUS_CONSUMED = "consumed"
+INVITE_STATUS_EXPIRED = "expired"
+INVITE_STATUS_REVOKED = "revoked"
+ALLOWED_INVITE_STATUSES: set[str] = {
+    INVITE_STATUS_ACTIVE,
+    INVITE_STATUS_CONSUMED,
+    INVITE_STATUS_EXPIRED,
+    INVITE_STATUS_REVOKED,
+}
+
+
+def _normalize_slug(raw: str) -> str:
+    token = (raw or "").strip().lower()
+    token = re.sub(r"[^a-z0-9]+", "-", token)
+    token = re.sub(r"-{2,}", "-", token).strip("-")
+    if not token:
+        raise ValueError("invalid_slug")
+    return token
+
+
+def _normalize_role(raw: Optional[str], *, fallback: str = "viewer") -> str:
+    token = (raw or "").strip().lower()
+    if token in ALLOWED_MEMBER_ROLES:
+        return token
+    return fallback
+
+
+def _normalize_invite_role(raw: Optional[str]) -> str:
+    token = (raw or "").strip().lower()
+    if token not in ALLOWED_INVITE_ROLES:
+        raise ValueError("invalid_role")
+    return token
+
+
+def _normalize_invite_status(raw: Optional[str]) -> Optional[str]:
+    token = (raw or "").strip().lower()
+    if not token:
+        return None
+    if token not in ALLOWED_INVITE_STATUSES:
+        raise ValueError("invalid_status")
+    return token
+
+
+def _invite_code_hash(code: str) -> str:
+    return hashlib.sha256((code or "").encode("utf-8")).hexdigest()
+
+
+def _new_invite_code() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _invite_expiry(hours: int) -> datetime:
+    safe_hours = max(1, min(24 * 30, int(hours)))
+    return _utcnow() + timedelta(hours=safe_hours)
+
+
+def _serialize_invite(invite: Dict[str, Any], *, fallback_org: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    org_id = _clean_token(invite.get("orgId")) or ""
+    slug = _clean_token(invite.get("slug")) or _clean_token((fallback_org or {}).get("slug")) or org_id
+    name = _clean_token(invite.get("name")) or _clean_token((fallback_org or {}).get("name")) or org_id
+    return {
+        "inviteId": str(invite.get("inviteId") or invite.get("codeHash") or ""),
+        "orgId": org_id,
+        "slug": slug,
+        "name": name,
+        "role": _normalize_role(invite.get("role"), fallback="viewer"),
+        "status": str(invite.get("status") or ""),
+        "expiresAt": invite.get("expiresAt"),
+        "createdBy": _clean_token(invite.get("createdBy")),
+        "createdAt": invite.get("createdAt"),
+        "consumedBy": _clean_token(invite.get("consumedBy")),
+        "consumedAt": invite.get("consumedAt"),
+        "revokedBy": _clean_token(invite.get("revokedBy")),
+        "revokedAt": invite.get("revokedAt"),
+    }
+
+
+@dataclass
+class RoomRef:
+    org_id: str
+    room_id: str
+
+
+class InMemoryMultiChurchStore:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._global_host_token = (os.getenv("HOST_API_TOKEN") or "").strip()
+        self._orgs: Dict[str, Dict[str, Any]] = {}
+        self._slug_to_org: Dict[str, str] = {}
+        self._services: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._rooms: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._usage: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._members: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._users: Dict[str, Dict[str, Any]] = {}
+        self._org_invites: Dict[str, Dict[str, Any]] = {}
+        self._seed_dev_data()
+
+    def _seed_dev_data(self) -> None:
+        # Keep local/dev usable without manual bootstrap.
+        self._seed_dev_org(
+            org_id="demo-org",
+            slug="demo",
+            name="Demo Church",
+            host_token="demo-host-token",
+            host_uid="demo-host",
+        )
+        self._seed_dev_org(
+            org_id="arkchurch",
+            slug="arkchurch",
+            name="Ark Church",
+            host_token="arkchurch-host-token",
+            host_uid="ark-host",
+        )
+
+    def _seed_dev_org(self, *, org_id: str, slug: str, name: str, host_token: str, host_uid: str) -> None:
+        now = _utcnow()
+        self._orgs[org_id] = {
+            "slug": slug,
+            "name": name,
+            "plan": "starter",
+            "status": "active",
+            "maxMinutesPerMonth": 500,
+            "currentMonthMinutes": 0,
+            "currentMonthKey": _yyyymm(),
+            "maxConcurrentRooms": 1,
+            "hardCapReached": False,
+            "hostToken": host_token,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        self._slug_to_org[slug] = org_id
+        self._members[(org_id, host_uid)] = {"role": "host", "createdAt": now, "updatedAt": now}
+        self._users[host_uid] = {"currentOrgId": org_id, "updatedAt": now}
+        for service_key, title in DEFAULT_SERVICE_SEEDS:
+            self._services[(org_id, service_key)] = {
+                "title": title,
+                "timezone": "America/Chicago",
+                "rrule": None,
+                "defaultLanguagePair": {"source": "ko", "target": "en"},
+                "activeRoomId": None,
+                "lastRoomId": None,
+                "updatedAt": now,
+            }
+
+    def _member_role(self, org_id: str, uid: Optional[str]) -> Optional[str]:
+        clean_uid = _clean_token(uid)
+        if not clean_uid:
+            return None
+        member = self._members.get((org_id, clean_uid))
+        if not member:
+            return None
+        return _normalize_role(member.get("role"), fallback="viewer")
+
+    def _serialize_room_status(self, room_doc: Optional[Dict[str, Any]]) -> str:
+        if not room_doc:
+            return "waiting"
+        return str(room_doc.get("status") or "waiting")
+
+    def _org_host_token(self, org: Dict[str, Any]) -> Optional[str]:
+        token = _clean_token(org.get("hostToken"))
+        if token:
+            return token
+        global_token = _clean_token(self._global_host_token)
+        return global_token
+
+    def _roll_billing_period_if_needed(self, org: Dict[str, Any], now: datetime) -> None:
+        current_key = _yyyymm(now)
+        if str(org.get("currentMonthKey") or "") == current_key:
+            return
+        org["currentMonthKey"] = current_key
+        org["currentMonthMinutes"] = 0
+        org["hardCapReached"] = False
+
+    def authorize_host(self, org_id: str, *, host_uid: Optional[str] = None, host_token: Optional[str] = None) -> bool:
+        with self._lock:
+            org = self._orgs.get(org_id)
+            if not org:
+                return False
+            uid = _clean_token(host_uid)
+            if uid:
+                member = self._members.get((org_id, uid)) or {}
+                role = str(member.get("role") or "").strip().lower()
+                if role in {"owner", "admin", "host"}:
+                    return True
+
+            org_token = _clean_token(org.get("hostToken"))
+            global_token = _clean_token(self._global_host_token)
+            if org_token or global_token:
+                provided_token = _clean_token(host_token)
+                if not provided_token:
+                    return False
+                if org_token and compare_digest(org_token, provided_token):
+                    return True
+                if global_token and compare_digest(global_token, provided_token):
+                    return True
+                return False
+            # Backward compatible local/dev mode when no token exists.
+            return True
+
+    def resolve_service(self, slug: str, service_key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            org_id = self._slug_to_org.get((slug or "").strip().lower())
+            if not org_id:
+                return None
+            service = self._services.get((org_id, service_key))
+            if not service:
+                return None
+            active_room_id = service.get("activeRoomId")
+            room_doc = self._rooms.get((org_id, active_room_id)) if active_room_id else None
+            if room_doc and room_doc.get("status") != "live":
+                active_room_id = None
+            return {
+                "orgId": org_id,
+                "slug": self._orgs[org_id]["slug"],
+                "serviceKey": service_key,
+                "activeRoomId": active_room_id,
+                "roomStatus": self._serialize_room_status(room_doc),
+                "languagePair": (room_doc or {}).get("languagePair")
+                or service.get("defaultLanguagePair")
+                or {"source": "ko", "target": "en"},
+                "service": {
+                    "title": service.get("title") or service_key,
+                    "timezone": service.get("timezone") or "UTC",
+                    "rrule": service.get("rrule"),
+                },
+            }
+
+    def list_services(self, slug: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            org_id = self._slug_to_org.get((slug or "").strip().lower())
+            if not org_id:
+                return None
+            rows: List[Dict[str, Any]] = []
+            for (row_org_id, service_key), service in sorted(self._services.items()):
+                if row_org_id != org_id:
+                    continue
+                active_room_id = service.get("activeRoomId")
+                room_doc = self._rooms.get((org_id, active_room_id)) if active_room_id else None
+                rows.append(
+                    {
+                        "serviceKey": service_key,
+                        "title": service.get("title") or service_key,
+                        "timezone": service.get("timezone") or "UTC",
+                        "activeRoomId": active_room_id if room_doc and room_doc.get("status") == "live" else None,
+                        "roomStatus": self._serialize_room_status(room_doc),
+                        "defaultLanguagePair": service.get("defaultLanguagePair") or {"source": "ko", "target": "en"},
+                    }
+                )
+            return {
+                "orgId": org_id,
+                "slug": self._orgs[org_id]["slug"],
+                "name": self._orgs[org_id]["name"],
+                "services": rows,
+            }
+
+    def list_memberships(self, uid: str) -> List[Dict[str, Any]]:
+        clean_uid = _clean_token(uid)
+        if not clean_uid:
+            return []
+        with self._lock:
+            rows: List[Dict[str, Any]] = []
+            for (org_id, member_uid), member in self._members.items():
+                if member_uid != clean_uid:
+                    continue
+                org = self._orgs.get(org_id)
+                if not org:
+                    continue
+                role = str(member.get("role") or "viewer")
+                lowered_role = role.strip().lower()
+                rows.append(
+                    {
+                        "orgId": org_id,
+                        "slug": str(org.get("slug") or org_id),
+                        "name": str(org.get("name") or org_id),
+                        "status": str(org.get("status") or "active"),
+                        "role": role,
+                        "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
+                    }
+                )
+            rows.sort(key=lambda row: (row["orgId"], row["slug"]))
+            return rows
+
+    def get_current_org_id(self, uid: str) -> Optional[str]:
+        clean_uid = _clean_token(uid)
+        if not clean_uid:
+            return None
+        with self._lock:
+            current_org_id = _clean_token((self._users.get(clean_uid) or {}).get("currentOrgId"))
+            if current_org_id and (current_org_id, clean_uid) in self._members:
+                return current_org_id
+            memberships = [
+                org_id for (org_id, member_uid) in self._members.keys() if member_uid == clean_uid
+            ]
+            memberships.sort()
+            if not memberships:
+                return None
+            chosen_org_id = memberships[0]
+            profile = self._users.setdefault(clean_uid, {})
+            profile["currentOrgId"] = chosen_org_id
+            profile["updatedAt"] = _utcnow()
+            return chosen_org_id
+
+    def set_current_org(self, uid: str, org_id: str) -> str:
+        clean_uid = _clean_token(uid)
+        clean_org_id = _clean_token(org_id)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        with self._lock:
+            if clean_org_id not in self._orgs:
+                raise ValueError("org_not_found")
+            if (clean_org_id, clean_uid) not in self._members:
+                raise PermissionError("org_access_denied")
+            profile = self._users.setdefault(clean_uid, {})
+            profile["currentOrgId"] = clean_org_id
+            profile["updatedAt"] = _utcnow()
+            return clean_org_id
+
+    def create_invite(
+        self,
+        *,
+        org_id: str,
+        created_by_uid: str,
+        role: str,
+        expires_in_hours: int = 24 * 7,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_creator_uid = _clean_token(created_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_creator_uid:
+            raise ValueError("invalid_uid")
+        invite_role = _normalize_invite_role(role)
+        expires_at = _invite_expiry(expires_in_hours)
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            creator_role = self._member_role(clean_org_id, clean_creator_uid)
+            if creator_role not in {"owner", "admin"}:
+                raise PermissionError("forbidden")
+            code = _new_invite_code()
+            code_hash = _invite_code_hash(code)
+            while code_hash in self._org_invites:
+                code = _new_invite_code()
+                code_hash = _invite_code_hash(code)
+            self._org_invites[code_hash] = {
+                "inviteId": code_hash,
+                "codeHash": code_hash,
+                "orgId": clean_org_id,
+                "slug": str(org.get("slug") or clean_org_id),
+                "name": str(org.get("name") or clean_org_id),
+                "role": invite_role,
+                "status": INVITE_STATUS_ACTIVE,
+                "expiresAt": expires_at,
+                "createdBy": clean_creator_uid,
+                "createdAt": now,
+                "consumedBy": None,
+                "consumedAt": None,
+                "updatedAt": now,
+            }
+            return {
+                "inviteId": code_hash,
+                "code": code,
+                "orgId": clean_org_id,
+                "slug": str(org.get("slug") or clean_org_id),
+                "name": str(org.get("name") or clean_org_id),
+                "role": invite_role,
+                "status": INVITE_STATUS_ACTIVE,
+                "expiresAt": expires_at,
+                "createdAt": now,
+            }
+
+    def preview_invite(self, *, code: str, uid: str) -> Dict[str, Any]:
+        clean_uid = _clean_token(uid)
+        clean_code = _clean_token(code)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_code:
+            raise ValueError("invite_not_found")
+        now = _utcnow()
+        with self._lock:
+            invite = self._org_invites.get(_invite_code_hash(clean_code))
+            if not invite:
+                raise ValueError("invite_not_found")
+            status = str(invite.get("status") or "")
+            if status != INVITE_STATUS_ACTIVE:
+                raise ValueError("invite_invalid")
+            expires_at = invite.get("expiresAt")
+            if isinstance(expires_at, datetime) and expires_at <= now:
+                invite["status"] = INVITE_STATUS_EXPIRED
+                invite["updatedAt"] = now
+                raise ValueError("invite_expired")
+
+            org_id = _clean_token(invite.get("orgId"))
+            if not org_id:
+                raise ValueError("org_not_found")
+            org = self._orgs.get(org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            already_member = (org_id, clean_uid) in self._members
+            return {
+                "inviteId": str(invite.get("inviteId") or ""),
+                "orgId": org_id,
+                "slug": str(org.get("slug") or org_id),
+                "name": str(org.get("name") or org_id),
+                "role": str(invite.get("role") or "viewer"),
+                "status": status,
+                "expiresAt": expires_at,
+                "alreadyMember": already_member,
+            }
+
+    def redeem_invite(
+        self,
+        *,
+        code: str,
+        uid: str,
+        email: Optional[str],
+        display_name: Optional[str],
+    ) -> Dict[str, Any]:
+        clean_uid = _clean_token(uid)
+        clean_code = _clean_token(code)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_code:
+            raise ValueError("invite_not_found")
+        clean_email = _clean_token(email)
+        clean_display_name = _clean_token(display_name)
+        now = _utcnow()
+        with self._lock:
+            invite = self._org_invites.get(_invite_code_hash(clean_code))
+            if not invite:
+                raise ValueError("invite_not_found")
+            status = str(invite.get("status") or "")
+            if status != INVITE_STATUS_ACTIVE:
+                raise ValueError("invite_invalid")
+            expires_at = invite.get("expiresAt")
+            if isinstance(expires_at, datetime) and expires_at <= now:
+                invite["status"] = INVITE_STATUS_EXPIRED
+                invite["updatedAt"] = now
+                raise ValueError("invite_expired")
+
+            org_id = _clean_token(invite.get("orgId"))
+            if not org_id:
+                raise ValueError("org_not_found")
+            org = self._orgs.get(org_id)
+            if not org:
+                raise ValueError("org_not_found")
+
+            invite_role = _normalize_invite_role(invite.get("role"))
+            created = False
+            member = self._members.get((org_id, clean_uid))
+            if member:
+                member_role = _normalize_role(member.get("role"), fallback="viewer")
+                member["updatedAt"] = now
+                if clean_email and not _clean_token(member.get("email")):
+                    member["email"] = clean_email
+                if clean_display_name and not _clean_token(member.get("displayName")):
+                    member["displayName"] = clean_display_name
+            else:
+                created = True
+                member_role = invite_role
+                self._members[(org_id, clean_uid)] = {
+                    "role": member_role,
+                    "email": clean_email,
+                    "displayName": clean_display_name,
+                    "createdAt": now,
+                    "updatedAt": now,
+                }
+
+            profile = self._users.setdefault(clean_uid, {})
+            profile["currentOrgId"] = org_id
+            if clean_email:
+                profile["email"] = clean_email
+            if clean_display_name:
+                profile["displayName"] = clean_display_name
+            profile["updatedAt"] = now
+
+            invite["status"] = INVITE_STATUS_CONSUMED
+            invite["consumedBy"] = clean_uid
+            invite["consumedAt"] = now
+            invite["updatedAt"] = now
+
+            member_role = _normalize_role(member_role, fallback="viewer")
+            return {
+                "orgId": org_id,
+                "slug": str(org.get("slug") or org_id),
+                "name": str(org.get("name") or org_id),
+                "role": member_role,
+                "created": created,
+                "alreadyMember": not created,
+                "currentOrgId": org_id,
+                "hostToken": str(org.get("hostToken") or "") if member_role in {"owner", "admin", "host"} else None,
+            }
+
+    def list_invites(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        status: Optional[str] = INVITE_STATUS_ACTIVE,
+    ) -> List[Dict[str, Any]]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        status_filter = _normalize_invite_status(status)
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in {"owner", "admin"}:
+                raise PermissionError("forbidden")
+
+            rows: List[Dict[str, Any]] = []
+            for invite in self._org_invites.values():
+                if _clean_token(invite.get("orgId")) != clean_org_id:
+                    continue
+                invite_status = str(invite.get("status") or "")
+                expires_at = invite.get("expiresAt")
+                if invite_status == INVITE_STATUS_ACTIVE and isinstance(expires_at, datetime) and expires_at <= now:
+                    invite_status = INVITE_STATUS_EXPIRED
+                    invite["status"] = INVITE_STATUS_EXPIRED
+                    invite["updatedAt"] = now
+                if status_filter and invite_status != status_filter:
+                    continue
+                rows.append(_serialize_invite(invite, fallback_org=org))
+            rows.sort(key=lambda row: row.get("createdAt") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            return rows
+
+    def revoke_invite(
+        self,
+        *,
+        org_id: str,
+        invite_id: str,
+        revoked_by_uid: str,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_invite_id = _clean_token(invite_id)
+        clean_uid = _clean_token(revoked_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_invite_id:
+            raise ValueError("invite_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in {"owner", "admin"}:
+                raise PermissionError("forbidden")
+
+            invite = self._org_invites.get(clean_invite_id)
+            if not invite:
+                raise ValueError("invite_not_found")
+            if _clean_token(invite.get("orgId")) != clean_org_id:
+                raise ValueError("invite_not_found")
+
+            invite_status = str(invite.get("status") or "")
+            expires_at = invite.get("expiresAt")
+            if invite_status == INVITE_STATUS_ACTIVE and isinstance(expires_at, datetime) and expires_at <= now:
+                invite["status"] = INVITE_STATUS_EXPIRED
+                invite["updatedAt"] = now
+                raise ValueError("invite_expired")
+            if invite_status != INVITE_STATUS_ACTIVE:
+                raise ValueError("invite_invalid")
+
+            invite["status"] = INVITE_STATUS_REVOKED
+            invite["revokedBy"] = clean_uid
+            invite["revokedAt"] = now
+            invite["updatedAt"] = now
+            return _serialize_invite(invite, fallback_org=org)
+
+    def bootstrap_owner_org(
+        self,
+        *,
+        owner_uid: str,
+        owner_email: Optional[str],
+        owner_display_name: Optional[str],
+        church_name: str,
+        church_slug: str,
+        timezone: str,
+        source: str,
+        target: str,
+    ) -> Dict[str, Any]:
+        clean_uid = _clean_token(owner_uid)
+        clean_name = _clean_token(church_name)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_name:
+            raise ValueError("invalid_name")
+        slug = _normalize_slug(church_slug)
+        tz = _clean_token(timezone) or "America/Chicago"
+        src = (_clean_token(source) or "ko").lower()
+        tgt = (_clean_token(target) or "en").lower()
+        host_token = secrets.token_urlsafe(24)
+
+        with self._lock:
+            existing_memberships: List[Dict[str, Any]] = []
+            for (org_id, member_uid), member in self._members.items():
+                if member_uid != clean_uid:
+                    continue
+                org = self._orgs.get(org_id)
+                if not org:
+                    continue
+                existing_memberships.append(
+                    {
+                        "orgId": org_id,
+                        "slug": str(org.get("slug") or org_id),
+                        "name": str(org.get("name") or org_id),
+                        "status": str(org.get("status") or "active"),
+                        "role": str(member.get("role") or "viewer"),
+                    }
+                )
+            existing_memberships.sort(key=lambda row: (row["orgId"], row["slug"]))
+            if existing_memberships:
+                org = existing_memberships[0]
+                profile = self._users.setdefault(clean_uid, {})
+                profile["currentOrgId"] = org["orgId"]
+                profile["updatedAt"] = _utcnow()
+                return {
+                    "created": False,
+                    "orgId": org["orgId"],
+                    "slug": org["slug"],
+                    "name": org["name"],
+                    "role": org["role"],
+                    "hostToken": None,
+                    "services": [],
+                }
+
+            if slug in self._slug_to_org:
+                raise ValueError("slug_taken")
+
+            org_id = slug
+            if org_id in self._orgs:
+                suffix = 1
+                while f"{slug}-{suffix}" in self._orgs:
+                    suffix += 1
+                org_id = f"{slug}-{suffix}"
+
+            now = _utcnow()
+            self._orgs[org_id] = {
+                "slug": slug,
+                "name": clean_name,
+                "plan": "trial",
+                "status": "active",
+                "maxMinutesPerMonth": 500,
+                "currentMonthMinutes": 0,
+                "currentMonthKey": _yyyymm(now),
+                "maxConcurrentRooms": 1,
+                "hardCapReached": False,
+                "hostToken": host_token,
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            self._slug_to_org[slug] = org_id
+            self._members[(org_id, clean_uid)] = {
+                "role": "owner",
+                "email": _clean_token(owner_email),
+                "displayName": _clean_token(owner_display_name),
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            self._users[clean_uid] = {
+                "email": _clean_token(owner_email),
+                "displayName": _clean_token(owner_display_name),
+                "currentOrgId": org_id,
+                "updatedAt": now,
+            }
+
+            service_rows: List[Dict[str, str]] = []
+            for service_key, title in DEFAULT_SERVICE_SEEDS:
+                self._services[(org_id, service_key)] = {
+                    "title": title,
+                    "timezone": tz,
+                    "rrule": None,
+                    "defaultLanguagePair": {"source": src, "target": tgt},
+                    "activeRoomId": None,
+                    "lastRoomId": None,
+                    "updatedAt": now,
+                }
+                service_rows.append({"serviceKey": service_key, "title": title})
+
+            return {
+                "created": True,
+                "orgId": org_id,
+                "slug": slug,
+                "name": clean_name,
+                "role": "owner",
+                "hostToken": host_token,
+                "services": service_rows,
+            }
+
+    def start_service(
+        self,
+        org_id: str,
+        service_key: str,
+        *,
+        host_uid: Optional[str],
+        source: str,
+        target: str,
+    ) -> Dict[str, Any]:
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            self._roll_billing_period_if_needed(org, now)
+            status = (org.get("status") or "").lower()
+            if status not in {"active", "trial"}:
+                raise PermissionError("org_inactive")
+            if bool(org.get("hardCapReached")):
+                raise PermissionError("hard_cap_reached")
+
+            service = self._services.get((org_id, service_key))
+            if not service:
+                # Allow on-the-fly service creation for easier onboarding.
+                service = {
+                    "title": service_key,
+                    "timezone": "UTC",
+                    "rrule": None,
+                    "defaultLanguagePair": {"source": source, "target": target},
+                    "activeRoomId": None,
+                    "lastRoomId": None,
+                    "updatedAt": now,
+                }
+                self._services[(org_id, service_key)] = service
+
+            active_room_id = service.get("activeRoomId")
+            if active_room_id:
+                active_room = self._rooms.get((org_id, active_room_id))
+                if active_room and active_room.get("status") == "live":
+                    return {
+                        "orgId": org_id,
+                        "serviceKey": service_key,
+                        "roomId": active_room_id,
+                        "status": "live",
+                        "languagePair": active_room.get("languagePair") or {"source": source, "target": target},
+                    }
+
+            max_concurrent = int(org.get("maxConcurrentRooms") or 0)
+            if max_concurrent > 0:
+                live_count = 0
+                for (row_org_id, _room_id), row_room in self._rooms.items():
+                    if row_org_id == org_id and row_room.get("status") == "live":
+                        live_count += 1
+                if live_count >= max_concurrent:
+                    raise PermissionError("concurrency_limit_reached")
+
+            room_id = _new_room_id()
+            self._rooms[(org_id, room_id)] = {
+                "serviceKey": service_key,
+                "status": "live",
+                "startedAt": now,
+                "endedAt": None,
+                "hostUid": host_uid or "unknown",
+                "languagePair": {"source": source, "target": target},
+                "listenerCountPeak": 0,
+                "billingPeriodKey": _yyyymm(now),
+                "endReason": None,
+                "lastAudioAt": now,
+                "lastUsageTickAt": now,
+                "finalTranscript": "",
+            }
+            service["activeRoomId"] = room_id
+            service["updatedAt"] = now
+            return {
+                "orgId": org_id,
+                "serviceKey": service_key,
+                "roomId": room_id,
+                "status": "live",
+                "languagePair": {"source": source, "target": target},
+            }
+
+    def end_room(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        reason: str,
+        transcript: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now = _utcnow()
+        with self._lock:
+            room = self._rooms.get((org_id, room_id))
+            if not room:
+                raise ValueError("room_not_found")
+            if room.get("status") == "ended":
+                return {"orgId": org_id, "roomId": room_id, "status": "ended", "endedAt": room.get("endedAt"), "alreadyEnded": True}
+
+            room["status"] = "ended"
+            room["endedAt"] = now
+            room["endReason"] = reason or "host_end"
+            if transcript:
+                room["finalTranscript"] = transcript
+
+            service_key = room.get("serviceKey")
+            service = self._services.get((org_id, service_key)) if service_key else None
+            if service:
+                if service.get("activeRoomId") == room_id:
+                    service["activeRoomId"] = None
+                service["lastRoomId"] = room_id
+                service["updatedAt"] = now
+
+            started_at: datetime = room.get("startedAt") or now
+            duration_min = max(1, int(math.ceil((now - started_at).total_seconds() / 60)))
+            usage_key = (org_id, _yyyymm(now))
+            usage = self._usage.setdefault(
+                usage_key,
+                {
+                    "minutesStreamed": 0,
+                    "minutesTranslated": 0,
+                    "peakListeners": 0,
+                    "sessionsCount": 0,
+                    "updatedAt": now,
+                },
+            )
+            usage["minutesStreamed"] += duration_min
+            usage["sessionsCount"] += 1
+            usage["peakListeners"] = max(int(usage.get("peakListeners", 0)), int(room.get("listenerCountPeak", 0)))
+            usage["updatedAt"] = now
+            return {"orgId": org_id, "roomId": room_id, "status": "ended", "endedAt": now}
+
+    def touch_audio(self, org_id: str, room_id: str) -> None:
+        now = _utcnow()
+        with self._lock:
+            room = self._rooms.get((org_id, room_id))
+            if room and room.get("status") == "live":
+                room["lastAudioAt"] = now
+
+    def bump_listener_peak(self, org_id: str, room_id: str, viewer_count: int) -> None:
+        with self._lock:
+            room = self._rooms.get((org_id, room_id))
+            if not room:
+                return
+            room["listenerCountPeak"] = max(int(room.get("listenerCountPeak", 0)), int(viewer_count))
+
+    def get_active_room(self, org_id: str, service_key: str) -> Optional[str]:
+        with self._lock:
+            service = self._services.get((org_id, service_key))
+            if not service:
+                return None
+            active_room_id = service.get("activeRoomId")
+            if not active_room_id:
+                return None
+            room = self._rooms.get((org_id, active_room_id))
+            if not room or room.get("status") != "live":
+                return None
+            return active_room_id
+
+    def stale_live_rooms(self, *, idle_seconds: int, max_duration_seconds: int) -> List[Dict[str, Any]]:
+        now = _utcnow()
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            for (org_id, room_id), room in self._rooms.items():
+                if room.get("status") != "live":
+                    continue
+                started_at: datetime = room.get("startedAt") or now
+                last_audio_at: datetime = room.get("lastAudioAt") or started_at
+                age = (now - started_at).total_seconds()
+                idle = (now - last_audio_at).total_seconds()
+                if idle >= idle_seconds:
+                    out.append({"orgId": org_id, "roomId": room_id, "reason": "idle_timeout"})
+                elif age >= max_duration_seconds:
+                    out.append({"orgId": org_id, "roomId": room_id, "reason": "max_duration"})
+        return out
+
+    def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        tick_min = _tick_minutes(tick_seconds)
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            flagged: set[tuple[str, str]] = set()
+            for org_id, org in self._orgs.items():
+                self._roll_billing_period_if_needed(org, now)
+                if bool(org.get("hardCapReached")):
+                    for (room_org_id, room_id), room in self._rooms.items():
+                        if room_org_id == org_id and room.get("status") == "live":
+                            flagged.add((org_id, room_id))
+
+            for (org_id, room_id), room in self._rooms.items():
+                if room.get("status") != "live":
+                    continue
+                org = self._orgs.get(org_id)
+                if not org:
+                    continue
+
+                max_minutes = int(org.get("maxMinutesPerMonth") or 0)
+                if max_minutes <= 0:
+                    continue
+
+                last_tick_at = room.get("lastUsageTickAt") or room.get("startedAt") or now
+                if not isinstance(last_tick_at, datetime):
+                    last_tick_at = now
+                elapsed_sec = (now - last_tick_at).total_seconds()
+                increments = int(elapsed_sec // max(1, tick_seconds))
+                if increments <= 0:
+                    continue
+
+                delta_minutes = increments * tick_min
+                room["lastUsageTickAt"] = last_tick_at + timedelta(seconds=increments * tick_seconds)
+
+                usage = self._usage.setdefault(
+                    (org_id, period_key),
+                    {
+                        "minutesStreamed": 0,
+                        "minutesTranslated": 0,
+                        "peakListeners": 0,
+                        "sessionsCount": 0,
+                        "updatedAt": now,
+                    },
+                )
+                usage["minutesTranslated"] += delta_minutes
+                usage["updatedAt"] = now
+
+                org["currentMonthMinutes"] = int(org.get("currentMonthMinutes") or 0) + delta_minutes
+                if int(org.get("currentMonthMinutes") or 0) >= max_minutes:
+                    org["hardCapReached"] = True
+                    flagged.add((org_id, room_id))
+
+            for org_id, room_id in sorted(flagged):
+                out.append({"orgId": org_id, "roomId": room_id, "reason": "monthly_limit_reached"})
+        return out
+
+
+class FirestoreMultiChurchStore:
+    def __init__(self) -> None:
+        assert gcf_firestore is not None
+        project_id = (
+            (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
+            or (os.getenv("FIRESTORE_PROJECT") or "").strip()
+            or (os.getenv("GCP_PROJECT") or "").strip()
+            or None
+        )
+        self._db = gcf_firestore.Client(project=project_id, database="worship-translation")
+        self._global_host_token = (os.getenv("HOST_API_TOKEN") or "").strip()
+
+    def _org_ref(self, org_id: str):
+        return self._db.collection("organizations").document(org_id)
+
+    def _service_ref(self, org_id: str, service_key: str):
+        return self._org_ref(org_id).collection("services").document(service_key)
+
+    def _room_ref(self, org_id: str, room_id: str):
+        return self._org_ref(org_id).collection("rooms").document(room_id)
+
+    def _usage_ref(self, org_id: str, period_key: str):
+        return self._org_ref(org_id).collection("usage").document(period_key)
+
+    def _user_ref(self, uid: str):
+        return self._db.collection("users").document(uid)
+
+    def _org_invite_ref(self, invite_id: str):
+        return self._db.collection("orgInvites").document(invite_id)
+
+    def _member_role(self, org_id: str, uid: Optional[str]) -> Optional[str]:
+        clean_uid = _clean_token(uid)
+        if not clean_uid:
+            return None
+        member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
+        if not member_snap.exists:
+            return None
+        member = member_snap.to_dict() or {}
+        return _normalize_role(member.get("role"), fallback="viewer")
+
+    def _roll_billing_period_if_needed(self, org_id: str, org: Dict[str, Any], *, now: datetime) -> Dict[str, Any]:
+        current_key = _yyyymm(now)
+        if str(org.get("currentMonthKey") or "") == current_key:
+            return org
+        update = {
+            "currentMonthKey": current_key,
+            "currentMonthMinutes": 0,
+            "hardCapReached": False,
+            "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+        }
+        self._org_ref(org_id).set(update, merge=True)
+        merged = dict(org)
+        merged.update({"currentMonthKey": current_key, "currentMonthMinutes": 0, "hardCapReached": False})
+        return merged
+
+    def _resolve_org_id_by_slug(self, slug: str) -> Optional[str]:
+        rows = (
+            self._db.collection("organizations")
+            .where("slug", "==", (slug or "").strip().lower())
+            .limit(1)
+            .stream()
+        )
+        row = next(rows, None)
+        return row.id if row else None
+
+    def resolve_service(self, slug: str, service_key: str) -> Optional[Dict[str, Any]]:
+        org_id = self._resolve_org_id_by_slug(slug)
+        if not org_id:
+            return None
+        service_snap = self._service_ref(org_id, service_key).get()
+        if not service_snap.exists:
+            return None
+        service = service_snap.to_dict() or {}
+        active_room_id = service.get("activeRoomId")
+        room_doc = None
+        room_status = "waiting"
+        if active_room_id:
+            room_snap = self._room_ref(org_id, active_room_id).get()
+            if room_snap.exists:
+                room_doc = room_snap.to_dict() or {}
+                room_status = str(room_doc.get("status") or "waiting")
+                if room_status != "live":
+                    active_room_id = None
+        return {
+            "orgId": org_id,
+            "slug": slug,
+            "serviceKey": service_key,
+            "activeRoomId": active_room_id,
+            "roomStatus": room_status,
+            "languagePair": (room_doc or {}).get("languagePair")
+            or service.get("defaultLanguagePair")
+            or {"source": "ko", "target": "en"},
+            "service": {
+                "title": service.get("title") or service_key,
+                "timezone": service.get("timezone") or "UTC",
+                "rrule": service.get("rrule"),
+            },
+        }
+
+    def list_services(self, slug: str) -> Optional[Dict[str, Any]]:
+        org_id = self._resolve_org_id_by_slug(slug)
+        if not org_id:
+            return None
+        org_snap = self._org_ref(org_id).get()
+        org = org_snap.to_dict() if org_snap.exists else {}
+        rows: List[Dict[str, Any]] = []
+        for snap in self._org_ref(org_id).collection("services").stream():
+            service_key = snap.id
+            service = snap.to_dict() or {}
+            active_room_id = service.get("activeRoomId")
+            room_status = "waiting"
+            if active_room_id:
+                room_snap = self._room_ref(org_id, active_room_id).get()
+                if room_snap.exists:
+                    room_status = str((room_snap.to_dict() or {}).get("status") or "waiting")
+                if room_status != "live":
+                    active_room_id = None
+            rows.append(
+                {
+                    "serviceKey": service_key,
+                    "title": service.get("title") or service_key,
+                    "timezone": service.get("timezone") or "UTC",
+                    "activeRoomId": active_room_id,
+                    "roomStatus": room_status,
+                    "defaultLanguagePair": service.get("defaultLanguagePair") or {"source": "ko", "target": "en"},
+                }
+            )
+        rows.sort(key=lambda r: r["serviceKey"])
+        return {"orgId": org_id, "slug": slug, "name": (org or {}).get("name", slug), "services": rows}
+
+    def list_memberships(self, uid: str) -> List[Dict[str, Any]]:
+        clean_uid = _clean_token(uid)
+        if not clean_uid:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for org_snap in self._db.collection("organizations").stream():
+            org_id = org_snap.id
+            member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
+            if not member_snap.exists:
+                continue
+            org = org_snap.to_dict() or {}
+            member = member_snap.to_dict() or {}
+            role = str(member.get("role") or "viewer")
+            lowered_role = role.strip().lower()
+            rows.append(
+                {
+                    "orgId": org_id,
+                    "slug": str(org.get("slug") or org_id),
+                    "name": str(org.get("name") or org_id),
+                    "status": str(org.get("status") or "active"),
+                    "role": role,
+                    "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
+                }
+            )
+        rows.sort(key=lambda row: (row["orgId"], row["slug"]))
+        return rows
+
+    def get_current_org_id(self, uid: str) -> Optional[str]:
+        clean_uid = _clean_token(uid)
+        if not clean_uid:
+            return None
+        user_snap = self._user_ref(clean_uid).get()
+        current_org_id = _clean_token((user_snap.to_dict() or {}).get("currentOrgId")) if user_snap.exists else None
+        if current_org_id:
+            member_snap = self._org_ref(current_org_id).collection("members").document(clean_uid).get()
+            if member_snap.exists:
+                return current_org_id
+        memberships = self.list_memberships(clean_uid)
+        if not memberships:
+            return None
+        fallback_org_id = str(memberships[0]["orgId"])
+        self._user_ref(clean_uid).set(
+            {"currentOrgId": fallback_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+        return fallback_org_id
+
+    def set_current_org(self, uid: str, org_id: str) -> str:
+        clean_uid = _clean_token(uid)
+        clean_org_id = _clean_token(org_id)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        member_snap = self._org_ref(clean_org_id).collection("members").document(clean_uid).get()
+        if not member_snap.exists:
+            raise PermissionError("org_access_denied")
+        self._user_ref(clean_uid).set(
+            {"currentOrgId": clean_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+        return clean_org_id
+
+    def create_invite(
+        self,
+        *,
+        org_id: str,
+        created_by_uid: str,
+        role: str,
+        expires_in_hours: int = 24 * 7,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_creator_uid = _clean_token(created_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_creator_uid:
+            raise ValueError("invalid_uid")
+        invite_role = _normalize_invite_role(role)
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        creator_role = self._member_role(clean_org_id, clean_creator_uid)
+        if creator_role not in {"owner", "admin"}:
+            raise PermissionError("forbidden")
+
+        org = org_snap.to_dict() or {}
+        now = _utcnow()
+        expires_at = _invite_expiry(expires_in_hours)
+        code = _new_invite_code()
+        invite_id = _invite_code_hash(code)
+        invite_ref = self._org_invite_ref(invite_id)
+        while invite_ref.get().exists:
+            code = _new_invite_code()
+            invite_id = _invite_code_hash(code)
+            invite_ref = self._org_invite_ref(invite_id)
+
+        invite_ref.set(
+            {
+                "inviteId": invite_id,
+                "orgId": clean_org_id,
+                "slug": str(org.get("slug") or clean_org_id),
+                "name": str(org.get("name") or clean_org_id),
+                "role": invite_role,
+                "status": INVITE_STATUS_ACTIVE,
+                "expiresAt": expires_at,
+                "createdBy": clean_creator_uid,
+                "createdAt": now,
+                "consumedBy": None,
+                "consumedAt": None,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            }
+        )
+        return {
+            "inviteId": invite_id,
+            "code": code,
+            "orgId": clean_org_id,
+            "slug": str(org.get("slug") or clean_org_id),
+            "name": str(org.get("name") or clean_org_id),
+            "role": invite_role,
+            "status": INVITE_STATUS_ACTIVE,
+            "expiresAt": expires_at,
+            "createdAt": now,
+        }
+
+    def preview_invite(self, *, code: str, uid: str) -> Dict[str, Any]:
+        clean_uid = _clean_token(uid)
+        clean_code = _clean_token(code)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_code:
+            raise ValueError("invite_not_found")
+
+        invite_ref = self._org_invite_ref(_invite_code_hash(clean_code))
+        invite_snap = invite_ref.get()
+        if not invite_snap.exists:
+            raise ValueError("invite_not_found")
+        invite = invite_snap.to_dict() or {}
+        status = str(invite.get("status") or "")
+        if status != INVITE_STATUS_ACTIVE:
+            raise ValueError("invite_invalid")
+        now = _utcnow()
+        expires_at = invite.get("expiresAt")
+        if isinstance(expires_at, datetime) and expires_at <= now:
+            invite_ref.set({"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True)
+            raise ValueError("invite_expired")
+
+        org_id = _clean_token(invite.get("orgId"))
+        if not org_id:
+            raise ValueError("org_not_found")
+        org_snap = self._org_ref(org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        org = org_snap.to_dict() or {}
+        member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
+        return {
+            "inviteId": str(invite.get("inviteId") or invite_snap.id),
+            "orgId": org_id,
+            "slug": str(org.get("slug") or org_id),
+            "name": str(org.get("name") or org_id),
+            "role": _normalize_role(invite.get("role"), fallback="viewer"),
+            "status": status,
+            "expiresAt": expires_at,
+            "alreadyMember": member_snap.exists,
+        }
+
+    def redeem_invite(
+        self,
+        *,
+        code: str,
+        uid: str,
+        email: Optional[str],
+        display_name: Optional[str],
+    ) -> Dict[str, Any]:
+        clean_uid = _clean_token(uid)
+        clean_code = _clean_token(code)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_code:
+            raise ValueError("invite_not_found")
+
+        clean_email = _clean_token(email)
+        clean_display_name = _clean_token(display_name)
+        invite_ref = self._org_invite_ref(_invite_code_hash(clean_code))
+        now = _utcnow()
+        db = self._db
+
+        @gcf_firestore.transactional
+        def _tx(transaction):
+            invite_snap = invite_ref.get(transaction=transaction)
+            if not invite_snap.exists:
+                raise ValueError("invite_not_found")
+            invite = invite_snap.to_dict() or {}
+            status = str(invite.get("status") or "")
+            if status != INVITE_STATUS_ACTIVE:
+                raise ValueError("invite_invalid")
+
+            expires_at = invite.get("expiresAt")
+            if isinstance(expires_at, datetime) and expires_at <= now:
+                transaction.set(
+                    invite_ref,
+                    {"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+                    merge=True,
+                )
+                raise ValueError("invite_expired")
+
+            org_id = _clean_token(invite.get("orgId"))
+            if not org_id:
+                raise ValueError("org_not_found")
+            org_ref = self._org_ref(org_id)
+            org_snap = org_ref.get(transaction=transaction)
+            if not org_snap.exists:
+                raise ValueError("org_not_found")
+            org = org_snap.to_dict() or {}
+
+            invite_role = _normalize_invite_role(invite.get("role"))
+            member_ref = org_ref.collection("members").document(clean_uid)
+            member_snap = member_ref.get(transaction=transaction)
+            created = False
+            member_role = invite_role
+            if member_snap.exists:
+                member = member_snap.to_dict() or {}
+                member_role = _normalize_role(member.get("role"), fallback="viewer")
+                merge_payload: Dict[str, Any] = {"updatedAt": gcf_firestore.SERVER_TIMESTAMP}
+                if clean_email and not _clean_token(member.get("email")):
+                    merge_payload["email"] = clean_email
+                if clean_display_name and not _clean_token(member.get("displayName")):
+                    merge_payload["displayName"] = clean_display_name
+                transaction.set(member_ref, merge_payload, merge=True)
+            else:
+                created = True
+                transaction.set(
+                    member_ref,
+                    {
+                        "role": member_role,
+                        "email": clean_email,
+                        "displayName": clean_display_name,
+                        "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                        "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+
+            user_payload: Dict[str, Any] = {
+                "currentOrgId": org_id,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            }
+            if clean_email:
+                user_payload["email"] = clean_email
+            if clean_display_name:
+                user_payload["displayName"] = clean_display_name
+            transaction.set(self._user_ref(clean_uid), user_payload, merge=True)
+
+            transaction.set(
+                invite_ref,
+                {
+                    "status": INVITE_STATUS_CONSUMED,
+                    "consumedBy": clean_uid,
+                    "consumedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+
+            normalized_member_role = _normalize_role(member_role, fallback="viewer")
+            return {
+                "orgId": org_id,
+                "slug": str(org.get("slug") or org_id),
+                "name": str(org.get("name") or org_id),
+                "role": normalized_member_role,
+                "created": created,
+                "alreadyMember": not created,
+                "currentOrgId": org_id,
+                "hostToken": str(org.get("hostToken") or "") if normalized_member_role in {"owner", "admin", "host"} else None,
+            }
+
+        tx = db.transaction()
+        return _tx(tx)
+
+    def list_invites(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        status: Optional[str] = INVITE_STATUS_ACTIVE,
+    ) -> List[Dict[str, Any]]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        status_filter = _normalize_invite_status(status)
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        org = org_snap.to_dict() or {}
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin"}:
+            raise PermissionError("forbidden")
+
+        now = _utcnow()
+        rows: List[Dict[str, Any]] = []
+        query = self._db.collection("orgInvites").where("orgId", "==", clean_org_id)
+        for invite_snap in query.stream():
+            invite = invite_snap.to_dict() or {}
+            invite_status = str(invite.get("status") or "")
+            expires_at = invite.get("expiresAt")
+            if invite_status == INVITE_STATUS_ACTIVE and isinstance(expires_at, datetime) and expires_at <= now:
+                invite_status = INVITE_STATUS_EXPIRED
+                self._org_invite_ref(invite_snap.id).set(
+                    {"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+                    merge=True,
+                )
+                invite["status"] = INVITE_STATUS_EXPIRED
+            if status_filter and invite_status != status_filter:
+                continue
+            rows.append(_serialize_invite(invite, fallback_org=org))
+
+        rows.sort(key=lambda row: row.get("createdAt") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return rows
+
+    def revoke_invite(
+        self,
+        *,
+        org_id: str,
+        invite_id: str,
+        revoked_by_uid: str,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_invite_id = _clean_token(invite_id)
+        clean_uid = _clean_token(revoked_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_invite_id:
+            raise ValueError("invite_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        org = org_snap.to_dict() or {}
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin"}:
+            raise PermissionError("forbidden")
+
+        invite_ref = self._org_invite_ref(clean_invite_id)
+        now = _utcnow()
+        db = self._db
+
+        @gcf_firestore.transactional
+        def _tx(transaction):
+            invite_snap = invite_ref.get(transaction=transaction)
+            if not invite_snap.exists:
+                raise ValueError("invite_not_found")
+            invite = invite_snap.to_dict() or {}
+            if _clean_token(invite.get("orgId")) != clean_org_id:
+                raise ValueError("invite_not_found")
+            invite_status = str(invite.get("status") or "")
+            expires_at = invite.get("expiresAt")
+            if invite_status == INVITE_STATUS_ACTIVE and isinstance(expires_at, datetime) and expires_at <= now:
+                transaction.set(
+                    invite_ref,
+                    {"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+                    merge=True,
+                )
+                raise ValueError("invite_expired")
+            if invite_status != INVITE_STATUS_ACTIVE:
+                raise ValueError("invite_invalid")
+
+            transaction.set(
+                invite_ref,
+                {
+                    "status": INVITE_STATUS_REVOKED,
+                    "revokedBy": clean_uid,
+                    "revokedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+            merged = dict(invite)
+            merged["status"] = INVITE_STATUS_REVOKED
+            merged["revokedBy"] = clean_uid
+            merged["revokedAt"] = now
+            return _serialize_invite(merged, fallback_org=org)
+
+        tx = db.transaction()
+        return _tx(tx)
+
+    def bootstrap_owner_org(
+        self,
+        *,
+        owner_uid: str,
+        owner_email: Optional[str],
+        owner_display_name: Optional[str],
+        church_name: str,
+        church_slug: str,
+        timezone: str,
+        source: str,
+        target: str,
+    ) -> Dict[str, Any]:
+        clean_uid = _clean_token(owner_uid)
+        clean_name = _clean_token(church_name)
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if not clean_name:
+            raise ValueError("invalid_name")
+
+        slug = _normalize_slug(church_slug)
+        tz = _clean_token(timezone) or "America/Chicago"
+        src = (_clean_token(source) or "ko").lower()
+        tgt = (_clean_token(target) or "en").lower()
+
+        existing_memberships = self.list_memberships(clean_uid)
+        if existing_memberships:
+            org = existing_memberships[0]
+            self._user_ref(clean_uid).set(
+                {
+                    "email": _clean_token(owner_email),
+                    "displayName": _clean_token(owner_display_name),
+                    "currentOrgId": org["orgId"],
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+            return {
+                "created": False,
+                "orgId": org["orgId"],
+                "slug": org["slug"],
+                "name": org["name"],
+                "role": org["role"],
+                "hostToken": None,
+                "services": [],
+            }
+
+        existing_org_id = self._resolve_org_id_by_slug(slug)
+        if existing_org_id:
+            raise ValueError("slug_taken")
+
+        org_id = slug
+        if self._org_ref(org_id).get().exists:
+            suffix = 1
+            while self._org_ref(f"{slug}-{suffix}").get().exists:
+                suffix += 1
+            org_id = f"{slug}-{suffix}"
+
+        now = _utcnow()
+        host_token = secrets.token_urlsafe(24)
+        org_ref = self._org_ref(org_id)
+        org_ref.set(
+            {
+                "slug": slug,
+                "name": clean_name,
+                "plan": "trial",
+                "status": "active",
+                "maxMinutesPerMonth": 500,
+                "currentMonthMinutes": 0,
+                "currentMonthKey": _yyyymm(now),
+                "maxConcurrentRooms": 1,
+                "hardCapReached": False,
+                "hostToken": host_token,
+                "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        org_ref.collection("members").document(clean_uid).set(
+            {
+                "role": "owner",
+                "email": _clean_token(owner_email),
+                "displayName": _clean_token(owner_display_name),
+                "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        self._db.collection("users").document(clean_uid).set(
+            {
+                "email": _clean_token(owner_email),
+                "displayName": _clean_token(owner_display_name),
+                "currentOrgId": org_id,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+        service_rows: List[Dict[str, str]] = []
+        for service_key, title in DEFAULT_SERVICE_SEEDS:
+            org_ref.collection("services").document(service_key).set(
+                {
+                    "title": title,
+                    "timezone": tz,
+                    "rrule": None,
+                    "defaultLanguagePair": {"source": src, "target": tgt},
+                    "activeRoomId": None,
+                    "lastRoomId": None,
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+            service_rows.append({"serviceKey": service_key, "title": title})
+
+        return {
+            "created": True,
+            "orgId": org_id,
+            "slug": slug,
+            "name": clean_name,
+            "role": "owner",
+            "hostToken": host_token,
+            "services": service_rows,
+        }
+
+    def authorize_host(self, org_id: str, *, host_uid: Optional[str] = None, host_token: Optional[str] = None) -> bool:
+        org_snap = self._org_ref(org_id).get()
+        if not org_snap.exists:
+            return False
+        org = org_snap.to_dict() or {}
+
+        uid = _clean_token(host_uid)
+        if uid:
+            member_snap = self._org_ref(org_id).collection("members").document(uid).get()
+            if member_snap.exists:
+                role = str((member_snap.to_dict() or {}).get("role") or "").strip().lower()
+                if role in {"owner", "admin", "host"}:
+                    return True
+
+        org_token = _clean_token(org.get("hostToken"))
+        global_token = _clean_token(self._global_host_token)
+        if org_token or global_token:
+            provided = _clean_token(host_token)
+            if not provided:
+                return False
+            if org_token and compare_digest(org_token, provided):
+                return True
+            if global_token and compare_digest(global_token, provided):
+                return True
+            return False
+        return True
+
+    def start_service(
+        self,
+        org_id: str,
+        service_key: str,
+        *,
+        host_uid: Optional[str],
+        source: str,
+        target: str,
+    ) -> Dict[str, Any]:
+        db = self._db
+        org_ref = self._org_ref(org_id)
+        service_ref = self._service_ref(org_id, service_key)
+        room_id = _new_room_id()
+        room_ref = self._room_ref(org_id, room_id)
+        now = _utcnow()
+
+        @gcf_firestore.transactional
+        def _tx(transaction):
+            org_snap = org_ref.get(transaction=transaction)
+            if not org_snap.exists:
+                raise ValueError("org_not_found")
+            org = org_snap.to_dict() or {}
+            current_key = _yyyymm(now)
+            if str(org.get("currentMonthKey") or "") != current_key:
+                org["currentMonthKey"] = current_key
+                org["currentMonthMinutes"] = 0
+                org["hardCapReached"] = False
+                transaction.set(
+                    org_ref,
+                    {
+                        "currentMonthKey": current_key,
+                        "currentMonthMinutes": 0,
+                        "hardCapReached": False,
+                        "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+            status = (org.get("status") or "").lower()
+            if status not in {"active", "trial"}:
+                raise PermissionError("org_inactive")
+            if bool(org.get("hardCapReached")):
+                raise PermissionError("hard_cap_reached")
+
+            service_snap = service_ref.get(transaction=transaction)
+            if service_snap.exists:
+                service = service_snap.to_dict() or {}
+            else:
+                service = {
+                    "title": service_key,
+                    "timezone": "UTC",
+                    "rrule": None,
+                    "defaultLanguagePair": {"source": source, "target": target},
+                    "activeRoomId": None,
+                    "lastRoomId": None,
+                }
+                transaction.set(service_ref, {**service, "updatedAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True)
+
+            existing_room_id = service.get("activeRoomId")
+            if existing_room_id:
+                existing_room_ref = self._room_ref(org_id, str(existing_room_id))
+                existing_room_snap = existing_room_ref.get(transaction=transaction)
+                if existing_room_snap.exists:
+                    existing_room = existing_room_snap.to_dict() or {}
+                    if existing_room.get("status") == "live":
+                        return {
+                            "orgId": org_id,
+                            "serviceKey": service_key,
+                            "roomId": str(existing_room_id),
+                            "status": "live",
+                            "languagePair": existing_room.get("languagePair") or {"source": source, "target": target},
+                        }
+
+            max_concurrent = int(org.get("maxConcurrentRooms") or 0)
+            if max_concurrent > 0:
+                live_rooms = list(
+                    self._org_ref(org_id).collection("rooms").where("status", "==", "live").stream(transaction=transaction)
+                )
+                if len(live_rooms) >= max_concurrent:
+                    raise PermissionError("concurrency_limit_reached")
+
+            transaction.set(
+                room_ref,
+                {
+                    "serviceKey": service_key,
+                    "status": "live",
+                    "startedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "endedAt": None,
+                    "hostUid": host_uid or "unknown",
+                    "languagePair": {"source": source, "target": target},
+                    "listenerCountPeak": 0,
+                    "billingPeriodKey": _yyyymm(now),
+                    "endReason": None,
+                    "lastAudioAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "lastUsageTickAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+            )
+            transaction.set(
+                service_ref,
+                {"activeRoomId": room_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+            return {
+                "orgId": org_id,
+                "serviceKey": service_key,
+                "roomId": room_id,
+                "status": "live",
+                "languagePair": {"source": source, "target": target},
+            }
+
+        tx = db.transaction()
+        return _tx(tx)
+
+    def end_room(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        reason: str,
+        transcript: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        db = self._db
+        room_ref = self._room_ref(org_id, room_id)
+        now = _utcnow()
+
+        @gcf_firestore.transactional
+        def _tx(transaction):
+            room_snap = room_ref.get(transaction=transaction)
+            if not room_snap.exists:
+                raise ValueError("room_not_found")
+            room = room_snap.to_dict() or {}
+            if room.get("status") == "ended":
+                return {"orgId": org_id, "roomId": room_id, "status": "ended", "alreadyEnded": True}
+
+            service_key = str(room.get("serviceKey") or "")
+            service_ref = self._service_ref(org_id, service_key)
+            service_snap = service_ref.get(transaction=transaction)
+            service = service_snap.to_dict() if service_snap.exists else {}
+            started_at = room.get("startedAt")
+            if isinstance(started_at, datetime):
+                duration_min = max(1, int(math.ceil((now - started_at).total_seconds() / 60)))
+            else:
+                duration_min = 1
+
+            transaction.set(
+                room_ref,
+                {
+                    "status": "ended",
+                    "endedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "endReason": reason or "host_end",
+                },
+                merge=True,
+            )
+            if service and service.get("activeRoomId") == room_id:
+                transaction.set(
+                    service_ref,
+                    {
+                        "activeRoomId": None,
+                        "lastRoomId": room_id,
+                        "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+            usage_ref = self._usage_ref(org_id, _yyyymm(now))
+            transaction.set(
+                usage_ref,
+                {
+                    "minutesStreamed": gcf_firestore.Increment(duration_min),
+                    "sessionsCount": gcf_firestore.Increment(1),
+                    "peakListeners": gcf_firestore.Increment(0),
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+            return {"orgId": org_id, "roomId": room_id, "status": "ended"}
+
+        tx = db.transaction()
+        result = _tx(tx)
+        if transcript:
+            room_ref.collection("finalTranscript").document("latest").set(
+                {"text": transcript, "createdAt": gcf_firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+        return result
+
+    def touch_audio(self, org_id: str, room_id: str) -> None:
+        self._room_ref(org_id, room_id).set({"lastAudioAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True)
+
+    def bump_listener_peak(self, org_id: str, room_id: str, viewer_count: int) -> None:
+        # Firestore lacks a server-side max primitive; this is best-effort.
+        ref = self._room_ref(org_id, room_id)
+        snap = ref.get()
+        if not snap.exists:
+            return
+        room = snap.to_dict() or {}
+        current = int(room.get("listenerCountPeak") or 0)
+        if viewer_count > current:
+            ref.set({"listenerCountPeak": int(viewer_count)}, merge=True)
+
+    def get_active_room(self, org_id: str, service_key: str) -> Optional[str]:
+        snap = self._service_ref(org_id, service_key).get()
+        if not snap.exists:
+            return None
+        service = snap.to_dict() or {}
+        room_id = service.get("activeRoomId")
+        if not room_id:
+            return None
+        room_snap = self._room_ref(org_id, str(room_id)).get()
+        if not room_snap.exists:
+            return None
+        room = room_snap.to_dict() or {}
+        return str(room_id) if room.get("status") == "live" else None
+
+    def stale_live_rooms(self, *, idle_seconds: int, max_duration_seconds: int) -> List[Dict[str, Any]]:
+        now = _utcnow()
+        out: List[Dict[str, Any]] = []
+        for org_snap in self._db.collection("organizations").stream():
+            org_id = org_snap.id
+            for room_snap in self._org_ref(org_id).collection("rooms").where("status", "==", "live").stream():
+                room = room_snap.to_dict() or {}
+                started_at = room.get("startedAt")
+                last_audio_at = room.get("lastAudioAt") or started_at
+                if not isinstance(started_at, datetime):
+                    continue
+                age = (now - started_at).total_seconds()
+                idle = (now - last_audio_at).total_seconds() if isinstance(last_audio_at, datetime) else age
+                if idle >= idle_seconds:
+                    out.append({"orgId": org_id, "roomId": room_snap.id, "reason": "idle_timeout"})
+                elif age >= max_duration_seconds:
+                    out.append({"orgId": org_id, "roomId": room_snap.id, "reason": "max_duration"})
+        return out
+
+    def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        tick_min = _tick_minutes(tick_seconds)
+        out: List[Dict[str, Any]] = []
+
+        for org_snap in self._db.collection("organizations").stream():
+            org_id = org_snap.id
+            org = self._roll_billing_period_if_needed(org_id, org_snap.to_dict() or {}, now=now)
+            max_minutes = int(org.get("maxMinutesPerMonth") or 0)
+            if max_minutes <= 0:
+                continue
+
+            current_minutes = int(org.get("currentMonthMinutes") or 0)
+            cap_reached = bool(org.get("hardCapReached"))
+
+            room_snaps = list(self._org_ref(org_id).collection("rooms").where("status", "==", "live").stream())
+            live_room_ids = [snap.id for snap in room_snaps]
+            if not live_room_ids:
+                continue
+
+            org_delta = 0
+            usage_delta = 0
+            for room_snap in room_snaps:
+                room = room_snap.to_dict() or {}
+                if cap_reached:
+                    break
+                last_tick_at = room.get("lastUsageTickAt") or room.get("startedAt")
+                if not isinstance(last_tick_at, datetime):
+                    continue
+                elapsed_sec = (now - last_tick_at).total_seconds()
+                increments = int(elapsed_sec // max(1, tick_seconds))
+                if increments <= 0:
+                    continue
+                delta_minutes = increments * tick_min
+                org_delta += delta_minutes
+                usage_delta += delta_minutes
+
+                next_tick_at = last_tick_at + timedelta(seconds=increments * tick_seconds)
+                self._room_ref(org_id, room_snap.id).set({"lastUsageTickAt": next_tick_at}, merge=True)
+
+                if (current_minutes + org_delta) >= max_minutes:
+                    cap_reached = True
+
+            if org_delta > 0 or cap_reached:
+                org_update: Dict[str, Any] = {}
+                if org_delta > 0:
+                    org_update["currentMonthMinutes"] = gcf_firestore.Increment(org_delta)
+                if cap_reached:
+                    org_update["hardCapReached"] = True
+                if org_update:
+                    self._org_ref(org_id).set(org_update, merge=True)
+
+            if usage_delta > 0:
+                self._usage_ref(org_id, period_key).set(
+                    {
+                        "minutesTranslated": gcf_firestore.Increment(usage_delta),
+                        "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+
+            if cap_reached:
+                for room_id in live_room_ids:
+                    out.append({"orgId": org_id, "roomId": room_id, "reason": "monthly_limit_reached"})
+
+        return out
+
+
+def _build_store():
+    backend = (os.getenv("MULTICHURCH_STORE_BACKEND") or "").strip().lower()
+    if backend == "memory":
+        return InMemoryMultiChurchStore()
+    if backend == "firestore":
+        if gcf_firestore is None:
+            raise RuntimeError("MULTICHURCH_STORE_BACKEND=firestore but google-cloud-firestore is not installed")
+        return FirestoreMultiChurchStore()
+
+    # auto-detect
+    if gcf_firestore is not None and (
+        os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("FIRESTORE_PROJECT") or os.getenv("GCP_PROJECT")
+    ):
+        return FirestoreMultiChurchStore()
+    return InMemoryMultiChurchStore()
+
+
+multichurch_store = _build_store()

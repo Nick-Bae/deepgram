@@ -3,7 +3,7 @@
 import os, json, asyncio, logging, time, re
 from typing import Optional, Any
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
@@ -12,16 +12,25 @@ load_dotenv()
 from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram
 from app.services.script_store import script_store
+from app.services.multichurch_store import multichurch_store
 from app.utils.translate import translate_text, TranslationContext  # async wrapper you already have
 from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 from app.routes import examples as examples_routes
 from app.routes import script as script_routes
 from app.routes import prompt as prompt_routes
+from app.routes import multichurch as multichurch_routes
+from app.routes import auth as auth_routes
+from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 
 # Global display pacing config (broadcast to display clients)
 APP_DISPLAY_SPEED = {"speed": 1.0}
+ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "900"))  # 15 min
+ROOM_MAX_DURATION_SEC = int(os.getenv("ROOM_MAX_DURATION_SEC", "10800"))  # 3 hours
+ROOM_SWEEPER_INTERVAL_SEC = int(os.getenv("ROOM_SWEEPER_INTERVAL_SEC", "60"))
+ROOM_USAGE_TICK_SEC = int(os.getenv("ROOM_USAGE_TICK_SEC", "300"))  # 5 min
+_room_sweeper_task: asyncio.Task | None = None
 
 # ------------------------------------------------------------------------------
 # ONE app only
@@ -40,10 +49,182 @@ app.include_router(translate_routes.router, prefix="/api")
 app.include_router(examples_routes.router, prefix="/api")
 app.include_router(script_routes.router, prefix="/api")
 app.include_router(prompt_routes.router, prefix="/api")
+app.include_router(multichurch_routes.router, prefix="/api")
+app.include_router(auth_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
     return {"ok": True, "msg": "server is live"}
+
+
+def _clean_token(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    return txt or None
+
+
+def _resolve_room_context(
+    *,
+    org_id: Optional[str],
+    room_id: Optional[str],
+    service_key: Optional[str],
+    church_slug: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    org = _clean_token(org_id)
+    room = _clean_token(room_id)
+    service = _clean_token(service_key)
+    slug = _clean_token(church_slug)
+    if org and room:
+        return org, room
+
+    if org and service:
+        active = multichurch_store.get_active_room(org, service)
+        if active:
+            return org, active
+
+    if slug and service:
+        resolved = multichurch_store.resolve_service(slug=slug, service_key=service)
+        if resolved and resolved.get("orgId") and resolved.get("activeRoomId"):
+            return str(resolved["orgId"]), str(resolved["activeRoomId"])
+    return org, None
+
+
+def _context_from_query_params(query_params) -> dict[str, Optional[str]]:
+    org_id = _clean_token(query_params.get("orgId") or query_params.get("org_id"))
+    room_id = _clean_token(query_params.get("roomId") or query_params.get("room_id"))
+    service_key = _clean_token(query_params.get("serviceKey") or query_params.get("service_key"))
+    church_slug = _clean_token(query_params.get("churchSlug") or query_params.get("church_slug") or query_params.get("slug"))
+    role = _clean_token(query_params.get("role"))
+    host_token = _clean_token(query_params.get("hostToken") or query_params.get("host_token") or query_params.get("token"))
+    host_uid = _clean_token(query_params.get("hostUid") or query_params.get("host_uid") or query_params.get("uid"))
+    id_token = _clean_token(query_params.get("idToken") or query_params.get("id_token"))
+    return {
+        "orgId": org_id,
+        "roomId": room_id,
+        "serviceKey": service_key,
+        "churchSlug": church_slug,
+        "role": role,
+        "hostToken": host_token,
+        "hostUid": host_uid,
+        "idToken": id_token,
+    }
+
+
+def _host_claims_from_payload(payload: dict[str, Any], base_ctx: dict[str, Optional[str]]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    host_token = _clean_token(
+        payload.get("hostToken")
+        or payload.get("host_token")
+        or payload.get("token")
+        or base_ctx.get("hostToken")
+    )
+    host_uid = _clean_token(
+        payload.get("hostUid")
+        or payload.get("host_uid")
+        or payload.get("uid")
+        or base_ctx.get("hostUid")
+    )
+    id_token = _clean_token(
+        payload.get("idToken")
+        or payload.get("id_token")
+        or base_ctx.get("idToken")
+    )
+    return host_uid, host_token, id_token
+
+
+def _uid_from_id_token(raw_token: Optional[str]) -> Optional[str]:
+    token = _clean_token(raw_token)
+    if not token:
+        return None
+    try:
+        user = verify_id_token_value(token)
+    except Exception:
+        return None
+    return _clean_token(user.uid) if user else None
+
+
+def _can_host(org_id: Optional[str], *, host_uid: Optional[str], host_token: Optional[str]) -> bool:
+    clean_org = _clean_token(org_id)
+    if not clean_org:
+        return False
+    try:
+        return bool(
+            multichurch_store.authorize_host(
+                clean_org,
+                host_uid=_clean_token(host_uid),
+                host_token=_clean_token(host_token),
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _room_sweeper_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(max(15, ROOM_SWEEPER_INTERVAL_SEC))
+            stale_rooms = multichurch_store.stale_live_rooms(
+                idle_seconds=max(60, ROOM_IDLE_TIMEOUT_SEC),
+                max_duration_seconds=max(600, ROOM_MAX_DURATION_SEC),
+            )
+            cap_rooms = multichurch_store.enforce_live_usage_caps(
+                tick_seconds=max(60, ROOM_USAGE_TICK_SEC),
+            )
+            for room in stale_rooms + cap_rooms:
+                org_id = _clean_token(room.get("orgId"))
+                room_id = _clean_token(room.get("roomId"))
+                reason = _clean_token(room.get("reason")) or "idle_timeout"
+                if not org_id or not room_id:
+                    continue
+                try:
+                    result = multichurch_store.end_room(org_id, room_id, reason=reason)
+                    if result.get("alreadyEnded"):
+                        continue
+                except ValueError:
+                    continue
+                except Exception as exc:
+                    print(f"[ROOM_SWEEPER] end_room failed org={org_id} room={room_id} err={exc}")
+                    continue
+                try:
+                    await manager.broadcast_room(
+                        org_id,
+                        room_id,
+                        {
+                            "type": "STATUS",
+                            "orgId": org_id,
+                            "roomId": room_id,
+                            "roomStatus": "ended",
+                            "viewerCount": 0,
+                            "reason": reason,
+                            "message": "Monthly limit reached. Please contact your admin." if reason == "monthly_limit_reached" else None,
+                        },
+                    )
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"[ROOM_SWEEPER] loop error: {exc}")
+
+
+@app.on_event("startup")
+async def _on_startup():
+    global _room_sweeper_task
+    print(f"[MULTICHURCH] store={type(multichurch_store).__name__}")
+    if _room_sweeper_task is None or _room_sweeper_task.done():
+        _room_sweeper_task = asyncio.create_task(_room_sweeper_loop())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    global _room_sweeper_task
+    if _room_sweeper_task and not _room_sweeper_task.done():
+        _room_sweeper_task.cancel()
+        try:
+            await _room_sweeper_task
+        except asyncio.CancelledError:
+            pass
+    _room_sweeper_task = None
 
 # ------------------------------------------------------------------------------
 # Consumer hub: /ws/translate
@@ -60,17 +241,117 @@ async def ws_translate(ws: WebSocket):
         pass
     translation_ctx = TranslationContext()
     seq = 0
+    qctx = _context_from_query_params(ws.query_params)
+    joined_org_id, joined_room_id = _resolve_room_context(
+        org_id=qctx.get("orgId"),
+        room_id=qctx.get("roomId"),
+        service_key=qctx.get("serviceKey"),
+        church_slug=qctx.get("churchSlug"),
+    )
+    claimed_role = (qctx.get("role") or "listener").strip().lower()
+    joined_role = claimed_role if claimed_role in {"host", "listener", "viewer"} else "listener"
+    host_uid_claim = _uid_from_id_token(qctx.get("idToken")) or qctx.get("hostUid")
+    host_token_claim = qctx.get("hostToken")
+    host_authed = False
+    joined_service_key = qctx.get("serviceKey")
+    joined_church_slug = qctx.get("churchSlug")
+
+    async def _broadcast_status_for_joined_room() -> None:
+        if not joined_org_id or not joined_room_id:
+            return
+        viewer_count = manager.room_viewer_count(joined_org_id, joined_room_id)
+        try:
+            multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
+        except Exception:
+            pass
+        await manager.broadcast_room(
+            joined_org_id,
+            joined_room_id,
+            {
+                "type": "STATUS",
+                "orgId": joined_org_id,
+                "roomId": joined_room_id,
+                "roomStatus": "live",
+                "viewerCount": viewer_count,
+            },
+        )
+
+    if joined_org_id and joined_room_id:
+        if joined_role == "host":
+            host_authed = _can_host(joined_org_id, host_uid=host_uid_claim, host_token=host_token_claim)
+            if not host_authed:
+                joined_role = "listener"
+        viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
+        try:
+            multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
+        except Exception:
+            pass
+        try:
+            await ws.send_json(
+                {
+                    "type": "JOINED",
+                    "orgId": joined_org_id,
+                    "roomId": joined_room_id,
+                    "serviceKey": joined_service_key,
+                    "viewerCount": viewer_count,
+                    "role": joined_role,
+                    "hostAuth": host_authed,
+                }
+            )
+        except Exception:
+            pass
+        try:
+            await _broadcast_status_for_joined_room()
+        except Exception:
+            pass
 
     async def handle_commit(payload: dict, is_partial: bool = False):
-        nonlocal seq
+        nonlocal seq, joined_org_id, joined_room_id, joined_service_key, joined_church_slug, host_uid_claim, host_token_claim, host_authed
         src_text = (payload.get("text") or "").strip()
         if not src_text:
+            return
+
+        ws_role = manager.get_role(ws)
+        host_uid, host_token, id_token = _host_claims_from_payload(payload, qctx)
+        verified_uid = _uid_from_id_token(id_token)
+        if verified_uid:
+            host_uid_claim = verified_uid
+        elif host_uid:
+            host_uid_claim = host_uid
+        if host_token:
+            host_token_claim = host_token
+
+        active_org_id = joined_org_id or _clean_token(payload.get("orgId") or payload.get("org_id"))
+        if ws_role != "host":
+            try:
+                await ws.send_json({"type": "error", "message": "host_role_required"})
+            except Exception:
+                pass
+            return
+        if not host_authed:
+            host_authed = _can_host(active_org_id, host_uid=host_uid_claim, host_token=host_token_claim)
+        if not host_authed:
+            try:
+                await ws.send_json({"type": "error", "message": "host_auth_failed"})
+            except Exception:
+                pass
             return
 
         src_lang_full = _clean_lang(payload.get("source"), "ko")
         tgt_lang_full = _clean_lang(payload.get("target"), "en")
         src_lang = _normalize_lang(src_lang_full, "ko")
         tgt_lang = _normalize_lang(tgt_lang_full, "en")
+
+        payload_org_id = _clean_token(payload.get("orgId") or payload.get("org_id")) or joined_org_id
+        payload_room_id = _clean_token(payload.get("roomId") or payload.get("room_id")) or joined_room_id
+        payload_service_key = _clean_token(payload.get("serviceKey") or payload.get("service_key")) or joined_service_key
+        payload_church_slug = _clean_token(payload.get("churchSlug") or payload.get("church_slug") or payload.get("slug")) or joined_church_slug
+        target_org_id, target_room_id = _resolve_room_context(
+            org_id=payload_org_id,
+            room_id=payload_room_id,
+            service_key=payload_service_key,
+            church_slug=payload_church_slug,
+        )
 
         seq += 1
         meta_payload = {
@@ -82,6 +363,12 @@ async def ws_translate(ws: WebSocket):
             "is_final": not is_partial and bool(payload.get("final", True)),
             "producer": True,
         }
+        if target_org_id:
+            meta_payload["org_id"] = target_org_id
+        if target_room_id:
+            meta_payload["room_id"] = target_room_id
+        if payload_service_key:
+            meta_payload["service_key"] = payload_service_key
 
         script_match, match_score, script_version, script_threshold = script_store.match(src_text)
         live_mode = "live"
@@ -119,6 +406,11 @@ async def ws_translate(ws: WebSocket):
             "tgt": {"lang": tgt_lang_full},
             "meta": meta_payload.copy(),
         }
+        if target_org_id:
+            live_msg_new["orgId"] = target_org_id
+        if target_room_id:
+            live_msg_new["roomId"] = target_room_id
+
         live_msg_legacy = {
             "type": "translation",
             "payload": translated,
@@ -127,12 +419,15 @@ async def ws_translate(ws: WebSocket):
         }
 
         try:
-            await manager.broadcast(live_msg_new)
-            await manager.broadcast(live_msg_legacy)
+            if target_org_id and target_room_id:
+                await manager.broadcast_room(target_org_id, target_room_id, live_msg_new)
+                await manager.broadcast_room(target_org_id, target_room_id, live_msg_legacy)
+            else:
+                await manager.broadcast(live_msg_new)
+                await manager.broadcast(live_msg_legacy)
         except Exception as exc:
             print("[WS translate][broadcast][error]", exc)
 
-        # Acknowledge back to producer connection
         try:
             await ws.send_json(live_msg_legacy)
         except Exception:
@@ -140,13 +435,11 @@ async def ws_translate(ws: WebSocket):
 
     try:
         while True:
-            # Keep the socket alive; most consumers won't send anything after join.
             try:
                 raw = await ws.receive_text()
             except WebSocketDisconnect:
                 break
             except Exception:
-                # Ignore weird frames so the connection persists
                 continue
             try:
                 msg = json.loads(raw)
@@ -156,10 +449,75 @@ async def ws_translate(ws: WebSocket):
             if not isinstance(msg, dict):
                 continue
 
-            mtype = msg.get("type")
-            if mtype == "consumer_join":
-                continue  # keepalive
-            if mtype == "display_config":
+            mtype = str(msg.get("type") or "").strip()
+            mtype_l = mtype.lower()
+            if mtype_l in {"consumer_join", "join"}:
+                joined_service_key = _clean_token(msg.get("serviceKey") or msg.get("service_key")) or joined_service_key
+                joined_church_slug = _clean_token(msg.get("churchSlug") or msg.get("church_slug") or msg.get("slug")) or joined_church_slug
+                req_org_id = _clean_token(msg.get("orgId") or msg.get("org_id")) or joined_org_id
+                req_room_id = _clean_token(msg.get("roomId") or msg.get("room_id")) or joined_room_id
+                host_uid, host_token, id_token = _host_claims_from_payload(msg, qctx)
+                verified_uid = _uid_from_id_token(id_token)
+                if verified_uid:
+                    host_uid_claim = verified_uid
+                elif host_uid:
+                    host_uid_claim = host_uid
+                if host_token:
+                    host_token_claim = host_token
+                resolved_org_id, resolved_room_id = _resolve_room_context(
+                    org_id=req_org_id,
+                    room_id=req_room_id,
+                    service_key=joined_service_key,
+                    church_slug=joined_church_slug,
+                )
+                if resolved_org_id and resolved_room_id:
+                    joined_org_id = resolved_org_id
+                    joined_room_id = resolved_room_id
+                    requested_role = (_clean_token(msg.get("role")) or joined_role or "listener").strip().lower()
+                    joined_role = requested_role if requested_role in {"host", "listener", "viewer"} else "listener"
+                    if joined_role == "host":
+                        host_authed = _can_host(
+                            joined_org_id,
+                            host_uid=host_uid_claim,
+                            host_token=host_token_claim,
+                        )
+                        if not host_authed:
+                            joined_role = "listener"
+                    else:
+                        host_authed = False
+                    viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
+                    try:
+                        multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
+                    except Exception:
+                        pass
+                    await _broadcast_status_for_joined_room()
+                    try:
+                        await ws.send_json(
+                            {
+                                "type": "JOINED",
+                                "orgId": joined_org_id,
+                                "roomId": joined_room_id,
+                                "serviceKey": joined_service_key,
+                                "viewerCount": viewer_count,
+                                "role": joined_role,
+                                "hostAuth": host_authed,
+                            }
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await ws.send_json({"type": "STATUS", "roomStatus": "waiting", "viewerCount": 0})
+                    except Exception:
+                        pass
+                continue
+            if mtype_l == "display_config":
+                if manager.get_role(ws) != "host" or not host_authed:
+                    try:
+                        await ws.send_json({"type": "error", "message": "host_auth_required"})
+                    except Exception:
+                        pass
+                    continue
                 raw_speed = msg.get("speed")
                 if raw_speed is None:
                     raw_speed = msg.get("speedFactor")
@@ -170,19 +528,39 @@ async def ws_translate(ws: WebSocket):
                 speed = max(0.6, min(1.6, speed))
                 APP_DISPLAY_SPEED["speed"] = speed
                 try:
-                    await manager.broadcast({"type": "display_config", "speed": speed})
+                    if joined_org_id and joined_room_id:
+                        await manager.broadcast_room(joined_org_id, joined_room_id, {"type": "display_config", "speed": speed})
+                    else:
+                        await manager.broadcast({"type": "display_config", "speed": speed})
                 except Exception:
                     pass
                 continue
-            if mtype == "producer_commit":
+            if mtype_l == "producer_commit":
                 await handle_commit(msg, is_partial=False)
                 continue
-            if mtype == "producer_partial":
+            if mtype_l == "producer_partial":
                 await handle_commit(msg, is_partial=True)
                 continue
-            # ignore everything else to keep socket stable
     finally:
+        room_before = manager.get_room(ws)
         manager.disconnect(ws)
+        if room_before:
+            org_id, room_id = room_before
+            viewer_count = manager.room_viewer_count(org_id, room_id)
+            try:
+                await manager.broadcast_room(
+                    org_id,
+                    room_id,
+                    {
+                        "type": "STATUS",
+                        "orgId": org_id,
+                        "roomId": room_id,
+                        "roomStatus": "live",
+                        "viewerCount": viewer_count,
+                    },
+                )
+            except Exception:
+                pass
 
 # ------------------------------------------------------------------------------
 # Producer: /ws/stt/deepgram
@@ -239,9 +617,32 @@ async def ws_stt_deepgram(websocket: WebSocket):
     tgt_lang_full = _clean_lang(websocket.query_params.get("target"), "en")
     src_lang = _normalize_lang(src_lang_full, "ko")
     tgt_lang = _normalize_lang(tgt_lang_full, "en")
+    ctx = _context_from_query_params(websocket.query_params)
+    org_id, room_id = _resolve_room_context(
+        org_id=ctx.get("orgId"),
+        room_id=ctx.get("roomId"),
+        service_key=ctx.get("serviceKey"),
+        church_slug=ctx.get("churchSlug"),
+    )
+    service_key = ctx.get("serviceKey")
+    church_slug = ctx.get("churchSlug")
+    host_uid_claim = _uid_from_id_token(ctx.get("idToken")) or ctx.get("hostUid")
+    host_token_claim = ctx.get("hostToken")
     early_commit = str(websocket.query_params.get("early") or websocket.query_params.get("early_commit") or "").lower() in {"1", "true", "yes", "on"}
     dg_language = _deepgram_language_preference(src_lang_full)
     dg_keywords = None if src_lang.startswith("ko") else []
+
+    if org_id and not room_id:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "message": "room_not_live"})
+        await websocket.close(code=1008)
+        return
+    if org_id and not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "message": "host_auth_failed"})
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     translation_ctx = TranslationContext()
     chunker = KoChunker() if early_commit and src_lang.startswith("ko") else None
@@ -255,8 +656,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
     seq = 0
     closed = asyncio.Event()
     finalize_event = asyncio.Event()
+    last_audio_touch_ts = 0.0
 
     async def from_client_to_deepgram():
+        nonlocal last_audio_touch_ts
         try:
             while True:
                 msg = await websocket.receive()
@@ -269,6 +672,14 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 if (b := msg.get("bytes")):
                     # your AudioWorklet streams raw 16-bit PCM @ 48k
                     await dg.send(b)
+                    if org_id and room_id:
+                        now_ts = time.time()
+                        if (now_ts - last_audio_touch_ts) >= 20:
+                            last_audio_touch_ts = now_ts
+                            try:
+                                multichurch_store.touch_audio(org_id, room_id)
+                            except Exception:
+                                pass
                 elif (t := msg.get("text")):
                     # allow client-side finalize
                     try:
@@ -379,6 +790,14 @@ async def ws_stt_deepgram(websocket: WebSocket):
             }
             if meta_extra:
                 meta_payload.update(meta_extra)
+            if org_id:
+                meta_payload["org_id"] = org_id
+            if room_id:
+                meta_payload["room_id"] = room_id
+            if service_key:
+                meta_payload["service_key"] = service_key
+            if church_slug:
+                meta_payload["church_slug"] = church_slug
 
             translated = clean_src
 
@@ -471,6 +890,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 "tgt": {"lang": tgt_lang_full},
                 "meta": meta_payload.copy(),
             }
+            if org_id:
+                live_msg_new["orgId"] = org_id
+            if room_id:
+                live_msg_new["roomId"] = room_id
             live_msg_legacy = {
                 "type": "translation",
                 "payload": translated,
@@ -485,8 +908,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print("[DG] send back to producer failed:", e)
 
             try:
-                await manager.broadcast(live_msg_new)
-                await manager.broadcast(live_msg_legacy)
+                if org_id and room_id:
+                    await manager.broadcast_room(org_id, room_id, live_msg_new)
+                    await manager.broadcast_room(org_id, room_id, live_msg_legacy)
+                else:
+                    await manager.broadcast(live_msg_new)
+                    await manager.broadcast(live_msg_legacy)
                 print(f"[BROADCAST] seq={seq} '{translated[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
@@ -707,7 +1134,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 # Quick debug to prove the FE consumer is listening
 # ------------------------------------------------------------------------------
 @app.get("/debug/broadcast")
-async def debug_broadcast():
+async def debug_broadcast(org_id: Optional[str] = Query(default=None), room_id: Optional[str] = Query(default=None)):
     msg_new = {"mode": "live", "text": "**TEST BROADCAST**", "seq": 999, "tgt": {"lang": "en"}}
     msg_legacy = {
         "type": "translation",
@@ -715,9 +1142,19 @@ async def debug_broadcast():
         "lang": "en",
         "meta": {"mode": "realtime", "partial": False, "segment_id": 999, "rev": 0, "seq": 999},
     }
+    clean_org = _clean_token(org_id)
+    clean_room = _clean_token(room_id)
+    if clean_org and clean_room:
+        msg_new["orgId"] = clean_org
+        msg_new["roomId"] = clean_room
+        msg_legacy["orgId"] = clean_org
+        msg_legacy["roomId"] = clean_room
+        await manager.broadcast_room(clean_org, clean_room, msg_new)
+        await manager.broadcast_room(clean_org, clean_room, msg_legacy)
+        return {"ok": True, "scoped": True, "orgId": clean_org, "roomId": clean_room}
     await manager.broadcast(msg_new)
     await manager.broadcast(msg_legacy)
-    return {"ok": True}
+    return {"ok": True, "scoped": False}
 DEFAULT_DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 
 

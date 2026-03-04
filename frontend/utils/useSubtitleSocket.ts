@@ -1,5 +1,6 @@
 // utils/useSubtitleSocket.ts
 import { useEffect, useMemo, useRef, useState } from "react";
+import { appendStreamContextToUrl, resolveStreamContext, type StreamContext } from "./streamContext";
 
 type InterimKR = { type: "interim_kr"; text: string };
 type FinalKR   = { type: "final_kr";  text: string };
@@ -26,11 +27,14 @@ function isDisplayConfig(m: any): m is DisplayConfig { return m && m.type === "d
 type Options = {
   maxLines?: number;           // how many lines to keep on screen
   track?: "en" | "kr" | "both" // which language(s) to keep as lines
+  enabled?: boolean;
 };
 
 export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const maxLines = Math.max(1, opts.maxLines ?? 3);
   const track = opts.track ?? "en";
+  const enabled = opts.enabled ?? true;
+  const streamContext = useMemo(() => resolveStreamContext(explicitUrl), [explicitUrl]);
 
   const [connected, setConnected] = useState(false);
 
@@ -52,22 +56,24 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const wsRef = useRef<WebSocket | null>(null);
   const backoff = useRef(0);
   const stopFlag = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contextRef = useRef<StreamContext>({});
 
   // Resolve viewing WS URL (append role=viewer)
   const resolvedUrl = useMemo(() => {
-    const withViewer = (u: string) => (u.includes("?") ? `${u}&role=viewer` : `${u}?role=viewer`);
-    if (explicitUrl) return withViewer(explicitUrl);
+    if (!enabled) return "";
+    if (explicitUrl) return appendStreamContextToUrl(explicitUrl, streamContext, { role: "viewer" });
 
     const env = process.env.NEXT_PUBLIC_WS_URL;
-    if (env && /^wss?:\/\//i.test(env)) return withViewer(env);
+    if (env && /^wss?:\/\//i.test(env)) return appendStreamContextToUrl(env, streamContext, { role: "viewer" });
 
     if (typeof window !== "undefined") {
       const { protocol, host } = window.location;
       const wsProto = protocol === "https:" ? "wss:" : "ws:";
-      return `${wsProto}//${host}/ws/translate?role=viewer`;
+      return appendStreamContextToUrl(`${wsProto}//${host}/ws/translate`, streamContext, { role: "viewer" });
     }
     return "";
-  }, [explicitUrl]);
+  }, [enabled, explicitUrl, streamContext]);
 
   function splitSentences(text: string): string[] {
     const normalized = text.replace(/\r/g, "").trim();
@@ -201,7 +207,8 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   }
 
   useEffect(() => {
-    if (!resolvedUrl) return;
+    contextRef.current = streamContext;
+    if (!enabled || !resolvedUrl) return;
     stopFlag.current = false;
     enQueueRef.current = [];
     enDisplayRef.current = [];
@@ -220,7 +227,8 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
       if (stopFlag.current) return;
       backoff.current = Math.min(backoff.current * 2 || 800, 8000);
       const jitter = 0.5 + Math.random() * 0.5;
-      setTimeout(connect, Math.round(backoff.current * jitter));
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = setTimeout(connect, Math.round(backoff.current * jitter));
     }
 
     function connect() {
@@ -229,7 +237,27 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
         const ws = new WebSocket(resolvedUrl);
         wsRef.current = ws;
 
-        ws.onopen = () => { setConnected(true); backoff.current = 0; };
+        ws.onopen = () => {
+          setConnected(true);
+          backoff.current = 0;
+          if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
+          }
+          try {
+            const joinPayload: Record<string, string> = { type: "consumer_join" };
+            const ctx = contextRef.current;
+            if (ctx.orgId) joinPayload.orgId = ctx.orgId;
+            if (ctx.roomId) joinPayload.roomId = ctx.roomId;
+            if (ctx.serviceKey) {
+              joinPayload.serviceKey = ctx.serviceKey;
+              joinPayload.service_key = ctx.serviceKey;
+            }
+            if (ctx.churchSlug) joinPayload.churchSlug = ctx.churchSlug;
+            joinPayload.role = "listener";
+            ws.send(JSON.stringify(joinPayload));
+          } catch {}
+        };
         ws.onclose = () => { setConnected(false); wsRef.current = null; scheduleReconnect(); };
         ws.onerror = () => { /* close will follow */ };
 
@@ -301,6 +329,11 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     connect();
     return () => {
       stopFlag.current = true;
+      setConnected(false);
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       if (rafId.current) cancelAnimationFrame(rafId.current);
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
@@ -309,7 +342,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
       try { wsRef.current?.close(); } catch {}
       wsRef.current = null;
     };
-  }, [resolvedUrl, track, maxLines]);
+  }, [enabled, resolvedUrl, streamContext, track, maxLines]);
 
   return {
     connected,
