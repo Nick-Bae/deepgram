@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "update-env": "node utils/detectBackend.js",
+    "update-env": "AUTO_DETECT_BACKEND_IP=1 node utils/detectBackend.js",
     "backend": "cd ../backend && venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000",
     "dev": "next dev -H localhost -p 3000",
     "dev:lan": "next dev -H 0.0.0.0 -p 3000",

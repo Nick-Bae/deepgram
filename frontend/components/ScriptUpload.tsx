@@ -1,20 +1,59 @@
 // components/ScriptUpload.tsx
 "use client";
 
-import { useId, useState } from "react";
-import { API_URL } from "../utils/urls";
+import { useEffect, useId, useState } from "react";
 
-export default function ScriptUpload() {
+import { useAuth } from "../lib/authContext";
+import { clearOrgScript, fetchOrgScriptStatus, uploadOrgScript } from "../lib/backendAuth";
+
+type Props = {
+  orgId: string;
+};
+
+export default function ScriptUpload({ orgId }: Props) {
+  const { getIdToken } = useAuth();
   const [ko, setKo] = useState("");
   const [en, setEn] = useState("");
   const [threshold, setThreshold] = useState<number>(0.84);
   const [status, setStatus] = useState<string>("");
+  const [busy, setBusy] = useState(false);
   const fieldId = useId();
   const koId = `${fieldId}-ko`;
   const enId = `${fieldId}-en`;
   const thresholdId = `${fieldId}-threshold`;
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadStatus = async () => {
+      if (!orgId) {
+        setStatus("Select a church to manage pre-script pairs.");
+        return;
+      }
+      try {
+        const idToken = await getIdToken();
+        if (!idToken || cancelled) return;
+        const stats = await fetchOrgScriptStatus(idToken, orgId);
+        if (cancelled) return;
+        setThreshold(stats.threshold);
+        setStatus(`Ready. ${stats.count} pairs loaded.`);
+      } catch (err: unknown) {
+        if (!cancelled) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setStatus(`❌ ${msg}`);
+        }
+      }
+    };
+    void loadStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, [getIdToken, orgId]);
+
   const upload = async () => {
+    if (!orgId) {
+      setStatus("❌ Select a church first");
+      return;
+    }
     const koLines = ko
       .split("\n")
       .map((s) => s.trim())
@@ -30,38 +69,37 @@ export default function ScriptUpload() {
     const pairs = koLines.map((k, i) => ({ source: k, target: enLines[i] }));
 
     try {
+      setBusy(true);
       setStatus("⏳ Uploading…");
-      const res = await fetch(`${API_URL}/api/script/upload`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          payload: { pairs },
-          cfg: { threshold },
-        }),
-      });
-
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const detail = j && j.detail ? JSON.stringify(j.detail) : res.statusText;
-        throw new Error(detail || "Upload failed");
-      }
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      const j = await uploadOrgScript(idToken, orgId, { pairs, threshold });
       setStatus(`✅ Uploaded ${j.loaded} pairs. threshold=${j.threshold}`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setStatus(`❌ ${msg}`);
+    } finally {
+      setBusy(false);
     }
   };
 
   const clearScript = async () => {
+    if (!orgId) {
+      setStatus("❌ Select a church first");
+      return;
+    }
     try {
+      setBusy(true);
       setStatus("⏳ Clearing script…");
-      const res = await fetch(`${API_URL}/api/script`, { method: "DELETE" });
-      const j = await res.json();
-      if (!res.ok) throw new Error(j.detail || "Clear failed");
-      setStatus("🗑️ Cleared pre-script");
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      const j = await clearOrgScript(idToken, orgId);
+      setStatus(`🗑️ Cleared pre-script (${j.removed} removed)`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setStatus(`❌ ${msg}`);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -77,9 +115,11 @@ export default function ScriptUpload() {
     <section className="rounded-[32px] border border-white/10 bg-white/5 p-6 shadow-[0_35px_120px_rgba(3,7,18,0.55)] backdrop-blur">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="space-y-1">
-          <p className="text-xs uppercase tracking-[0.35em] text-white/60">Pre-script</p>
-          <h2 className="text-xl font-semibold text-white">Upload bilingual pairs</h2>
-          <p className="text-sm text-white/70">Paste Korean + English lines to prime the hybrid translator.</p>
+          <p className="text-xs uppercase tracking-[0.35em] text-white/60">Legacy Mode</p>
+          <h2 className="text-xl font-semibold text-white">Line-by-line pair upload</h2>
+          <p className="text-sm text-white/70">
+            Keep using one-sentence-per-line KO+EN uploads when needed.
+          </p>
         </div>
         <span className="text-xs font-semibold text-white/60">Threshold • {threshold.toFixed(2)}</span>
       </div>
@@ -138,13 +178,15 @@ export default function ScriptUpload() {
           <button
             type="button"
             onClick={upload}
+            disabled={busy || !orgId}
             className="inline-flex items-center justify-center gap-2 rounded-2xl bg-[#22d3ee] px-5 py-2.5 text-sm font-semibold text-[#041018] shadow-[0_15px_45px_rgba(34,211,238,0.35)] transition hover:bg-[#00ffff]"
           >
-            Upload to buffer
+            {busy ? "Working..." : "Upload to buffer"}
           </button>
           <button
             type="button"
             onClick={clearScript}
+            disabled={busy || !orgId}
             className="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/20 px-5 py-2.5 text-sm font-semibold text-white transition hover:border-rose-300/80 hover:text-rose-200"
           >
             Clear script

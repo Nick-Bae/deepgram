@@ -25,7 +25,7 @@ export default function HostRedirectPage() {
     if (orgId) params.set("orgId", orgId);
 
     const query = params.toString();
-    return `/host/c/${encodeURIComponent(slug)}${query ? `?${query}` : ""}`;
+    return `/host/c/${encodeURIComponent(slug)}/broadcast${query ? `?${query}` : ""}`;
   }, [router.query]);
 
   useEffect(() => {
@@ -41,10 +41,10 @@ export default function HostRedirectPage() {
         ) : (
           <div style={{ display: "grid", gap: 8 }}>
             <p style={{ margin: 0, opacity: 0.9 }}>
-              Host URL is now <code>/host/c/&lt;churchSlug&gt;</code>.
+              Host URL is now <code>/host/c/&lt;churchSlug&gt;/broadcast</code>.
             </p>
             <p style={{ margin: 0, opacity: 0.8 }}>
-              Example: <Link href="/host/c/arkchurch" style={{ color: "#93c5fd" }}>/host/c/arkchurch</Link>
+              Example: <Link href="/host/c/arkchurch/broadcast" style={{ color: "#93c5fd" }}>/host/c/arkchurch/broadcast</Link>
             </p>
           </div>
         )}

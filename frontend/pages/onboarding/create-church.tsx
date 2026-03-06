@@ -45,7 +45,7 @@ export default function CreateChurchOnboardingPage() {
         if (primary.hostToken) persistHostToken(primary.hostToken);
         const params = new URLSearchParams();
         params.set("orgId", primary.orgId);
-        await router.replace(`/host/c/${encodeURIComponent(primary.slug)}?${params.toString()}`);
+        await router.replace(`/host/c/${encodeURIComponent(primary.slug)}/broadcast?${params.toString()}`);
       } catch (err) {
         if (!cancelled && err instanceof Error) {
           setErrorMsg(err.message);
@@ -91,7 +91,7 @@ export default function CreateChurchOnboardingPage() {
       const params = new URLSearchParams();
       params.set("orgId", org.orgId);
       params.set("serviceKey", serviceKey);
-      await router.replace(`/host/c/${encodeURIComponent(org.slug)}?${params.toString()}`);
+      await router.replace(`/host/c/${encodeURIComponent(org.slug)}/broadcast?${params.toString()}`);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Failed to create church.");
     } finally {

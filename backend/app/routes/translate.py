@@ -39,13 +39,40 @@ async def translate(
     source = (data.get("source") or "ko").strip()
     target = (data.get("target") or "en").strip()
     is_final = bool(data.get("final", False))
+    org_id = (data.get("orgId") or data.get("org_id") or "").strip() or None
+    room_id = (data.get("roomId") or data.get("room_id") or "").strip() or None
 
     if not text:
         raise HTTPException(status_code=400, detail="No text provided for translation")
 
+    if org_id and room_id:
+        host_uid = (data.get("hostUid") or data.get("host_uid") or x_host_uid or "").strip() or None
+        host_token = (data.get("hostToken") or data.get("host_token") or x_host_token or "").strip() or None
+        if not multichurch_store.authorize_host(org_id, host_uid=host_uid, host_token=host_token):
+            raise HTTPException(status_code=403, detail="host_auth_failed")
+
+    custom_prompt_override = None
+    service_prompt_override = None
+    if org_id:
+        try:
+            org_prompt = multichurch_store.get_org_prompt_for_translation(org_id) or {}
+            custom_prompt_override = str(org_prompt.get("prompt") or "")
+            service_prompt_override = str(org_prompt.get("service_prompt") or "")
+        except Exception:
+            custom_prompt_override = ""
+            service_prompt_override = ""
+
     t0 = perf_counter()
     try:
-        translated = await _resolve(translate_text(text, source, target))
+        translated = await _resolve(
+            translate_text(
+                text,
+                source,
+                target,
+                custom_prompt=custom_prompt_override,
+                service_prompt=service_prompt_override,
+            )
+        )
     except Exception as e:
         logger.exception("translate_text raised")
         raise HTTPException(status_code=500, detail=f"translator_error: {e}")
@@ -73,13 +100,6 @@ async def translate(
         },
     )
 
-    org_id = (data.get("orgId") or data.get("org_id") or "").strip() or None
-    room_id = (data.get("roomId") or data.get("room_id") or "").strip() or None
-    if org_id and room_id:
-        host_uid = (data.get("hostUid") or data.get("host_uid") or x_host_uid or "").strip() or None
-        host_token = (data.get("hostToken") or data.get("host_token") or x_host_token or "").strip() or None
-        if not multichurch_store.authorize_host(org_id, host_uid=host_uid, host_token=host_token):
-            raise HTTPException(status_code=403, detail="host_auth_failed")
     payload = {
         "type": "translation",
         "payload": translated,

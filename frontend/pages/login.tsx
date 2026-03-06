@@ -46,7 +46,7 @@ export default function LoginPage() {
     if (primary.hostToken) persistHostToken(primary.hostToken);
     const params = new URLSearchParams();
     params.set("orgId", primary.orgId);
-    await router.replace(`/host/c/${encodeURIComponent(primary.slug)}?${params.toString()}`);
+    await router.replace(`/host/c/${encodeURIComponent(primary.slug)}/broadcast?${params.toString()}`);
   };
 
   useEffect(() => {

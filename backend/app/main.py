@@ -90,6 +90,17 @@ def _resolve_room_context(
     return org, None
 
 
+def _prompt_overrides_for_org(org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    clean_org_id = _clean_token(org_id)
+    if not clean_org_id:
+        return None, None
+    try:
+        data = multichurch_store.get_org_prompt_for_translation(clean_org_id) or {}
+    except Exception:
+        return "", ""
+    return str(data.get("prompt") or ""), str(data.get("service_prompt") or "")
+
+
 def _context_from_query_params(query_params) -> dict[str, Optional[str]]:
     org_id = _clean_token(query_params.get("orgId") or query_params.get("org_id"))
     room_id = _clean_token(query_params.get("roomId") or query_params.get("room_id"))
@@ -370,7 +381,10 @@ async def ws_translate(ws: WebSocket):
         if payload_service_key:
             meta_payload["service_key"] = payload_service_key
 
-        script_match, match_score, script_version, script_threshold = script_store.match(src_text)
+        script_match, match_score, script_version, script_threshold = script_store.match(
+            src_text,
+            org_id=target_org_id,
+        )
         live_mode = "live"
 
         if script_match:
@@ -391,7 +405,15 @@ async def ws_translate(ws: WebSocket):
             translated = src_text
         else:
             try:
-                translated = await translate_text(src_text, src_lang_full, tgt_lang_full, ctx=translation_ctx)
+                custom_prompt, service_prompt = _prompt_overrides_for_org(target_org_id)
+                translated = await translate_text(
+                    src_text,
+                    src_lang_full,
+                    tgt_lang_full,
+                    ctx=translation_ctx,
+                    custom_prompt=custom_prompt,
+                    service_prompt=service_prompt,
+                )
                 translation_ctx.last_english = translated
             except Exception as exc:
                 print("[WS translate][producer_commit][error]", exc)
@@ -802,7 +824,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
             translated = clean_src
 
             if not partial:
-                script_match, match_score, script_version, script_threshold = script_store.match(clean_src)
+                script_match, match_score, script_version, script_threshold = script_store.match(
+                    clean_src,
+                    org_id=org_id,
+                )
                 scripture_hit = None
                 if src_lang.startswith("ko"):
                     try:
@@ -849,12 +874,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     translated = clean_src
                 else:
                     try:
+                        custom_prompt, service_prompt = _prompt_overrides_for_org(org_id)
                         translated = await translate_text(
                             clean_src,
                             src_lang_full,
                             tgt_lang_full,
                             ctx=translation_ctx,
                             update_ctx=update_ctx,
+                            custom_prompt=custom_prompt,
+                            service_prompt=service_prompt,
                         )
                         if update_ctx:
                             translation_ctx.last_english = translated
@@ -868,12 +896,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     translated = clean_src
                 else:
                     try:
+                        custom_prompt, service_prompt = _prompt_overrides_for_org(org_id)
                         translated = await translate_text(
                             clean_src,
                             src_lang_full,
                             tgt_lang_full,
                             ctx=translation_ctx,
                             update_ctx=update_ctx,
+                            custom_prompt=custom_prompt,
+                            service_prompt=service_prompt,
                         )
                     except Exception as e:
                         print("[TX][preview] error:", e)

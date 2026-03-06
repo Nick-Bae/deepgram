@@ -84,7 +84,7 @@ export default function SignupPage() {
       const params = new URLSearchParams();
       params.set("orgId", org.orgId);
       params.set("serviceKey", serviceKey);
-      await router.replace(`/host/c/${encodeURIComponent(org.slug)}?${params.toString()}`);
+      await router.replace(`/host/c/${encodeURIComponent(org.slug)}/broadcast?${params.toString()}`);
     } catch (err) {
       setErrorMsg(mapFirebaseError(err));
     } finally {

@@ -12,6 +12,10 @@ export default function AdminHome() {
           <span style={styles.note}>Adjust how fast captions roll on the public display.</span>
         </li>
         <li style={styles.item}>
+          <Link href="/admin/sermon-prep" style={styles.link}>Sermon Prep</Link>
+          <span style={styles.note}>Paste Korean sermon text, draft translate, edit English, and save final pairs.</span>
+        </li>
+        <li style={styles.item}>
           <Link href="/admin/examples" style={styles.link}>Translation Examples</Link>
           <span style={styles.note}>Review, correct, dedupe, trim, export few-shots.</span>
         </li>
@@ -53,6 +57,7 @@ const styles: Record<string, CSSProperties> = {
     display: "flex",
     gap: "10px",
     alignItems: "center",
+    marginBottom: 10,
   },
   link: {
     fontWeight: 600,

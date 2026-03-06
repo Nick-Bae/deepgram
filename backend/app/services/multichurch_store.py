@@ -42,6 +42,17 @@ def _tick_minutes(tick_seconds: int) -> int:
     return max(1, int(math.ceil(max(1, int(tick_seconds)) / 60)))
 
 
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
 DEFAULT_SERVICE_SEEDS: tuple[tuple[str, str], ...] = (
     ("sun-11am", "Sunday 11 AM"),
     ("sun-2pm", "Sunday 2 PM"),
@@ -49,6 +60,7 @@ DEFAULT_SERVICE_SEEDS: tuple[tuple[str, str], ...] = (
 )
 
 ALLOWED_MEMBER_ROLES: set[str] = {"owner", "admin", "host", "viewer"}
+PROMPT_EDITOR_ROLES: set[str] = {"owner", "admin", "host"}
 ALLOWED_INVITE_ROLES: set[str] = {"admin", "host", "viewer"}
 INVITE_STATUS_ACTIVE = "active"
 INVITE_STATUS_CONSUMED = "consumed"
@@ -60,6 +72,9 @@ ALLOWED_INVITE_STATUSES: set[str] = {
     INVITE_STATUS_EXPIRED,
     INVITE_STATUS_REVOKED,
 }
+DEFAULT_INVITE_EXPIRY_HOURS = _env_int("INVITE_DEFAULT_EXPIRY_HOURS", 24 * 3, min_value=1, max_value=24 * 30)
+MAX_ACTIVE_INVITES_PER_ORG = _env_int("INVITE_MAX_ACTIVE_PER_ORG", 20, min_value=1, max_value=500)
+INVITE_RETENTION_DAYS = _env_int("INVITE_RETENTION_DAYS", 30, min_value=1, max_value=365)
 
 
 def _normalize_slug(raw: str) -> str:
@@ -69,6 +84,22 @@ def _normalize_slug(raw: str) -> str:
     if not token:
         raise ValueError("invalid_slug")
     return token
+
+
+def _normalize_service_key(raw: str) -> str:
+    token = (raw or "").strip().lower()
+    token = re.sub(r"[^a-z0-9]+", "-", token)
+    token = re.sub(r"-{2,}", "-", token).strip("-")
+    if not token:
+        raise ValueError("invalid_service_key")
+    return token
+
+
+def _default_service_title(service_key: str) -> str:
+    parts = [part for part in (service_key or "").split("-") if part]
+    if not parts:
+        return service_key
+    return " ".join(part.capitalize() for part in parts)
 
 
 def _normalize_role(raw: Optional[str], *, fallback: str = "viewer") -> str:
@@ -146,6 +177,7 @@ class InMemoryMultiChurchStore:
         self._members: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._users: Dict[str, Dict[str, Any]] = {}
         self._org_invites: Dict[str, Dict[str, Any]] = {}
+        self._invite_audits: List[Dict[str, Any]] = []
         self._seed_dev_data()
 
     def _seed_dev_data(self) -> None:
@@ -178,6 +210,8 @@ class InMemoryMultiChurchStore:
             "maxConcurrentRooms": 1,
             "hardCapReached": False,
             "hostToken": host_token,
+            "customPrompt": "",
+            "servicePrompt": "",
             "createdAt": now,
             "updatedAt": now,
         }
@@ -306,6 +340,86 @@ class InMemoryMultiChurchStore:
                 "services": rows,
             }
 
+    def create_service(
+        self,
+        *,
+        org_id: str,
+        service_key: str,
+        requested_by_uid: str,
+        title: Optional[str] = None,
+        timezone: Optional[str] = None,
+        source: str = "ko",
+        target: str = "en",
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        normalized_key = _normalize_service_key(service_key)
+        title_token = _clean_token(title) or _default_service_title(normalized_key)
+        timezone_token = _clean_token(timezone) or "America/Chicago"
+        src = (_clean_token(source) or "ko").lower()
+        tgt = (_clean_token(target) or "en").lower()
+
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in {"owner", "admin", "host"}:
+                raise PermissionError("forbidden")
+            row_key = (clean_org_id, normalized_key)
+            if row_key in self._services:
+                raise ValueError("service_exists")
+            now = _utcnow()
+            self._services[row_key] = {
+                "title": title_token,
+                "timezone": timezone_token,
+                "rrule": None,
+                "defaultLanguagePair": {"source": src, "target": tgt},
+                "activeRoomId": None,
+                "lastRoomId": None,
+                "updatedAt": now,
+            }
+            return {
+                "orgId": clean_org_id,
+                "serviceKey": normalized_key,
+                "title": title_token,
+                "timezone": timezone_token,
+                "activeRoomId": None,
+                "roomStatus": "waiting",
+                "defaultLanguagePair": {"source": src, "target": tgt},
+            }
+
+    def delete_service(self, *, org_id: str, service_key: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        normalized_key = _normalize_service_key(service_key)
+
+        with self._lock:
+            if clean_org_id not in self._orgs:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in {"owner", "admin", "host"}:
+                raise PermissionError("forbidden")
+            row_key = (clean_org_id, normalized_key)
+            service = self._services.get(row_key)
+            if not service:
+                raise ValueError("service_not_found")
+            active_room_id = _clean_token(service.get("activeRoomId"))
+            if active_room_id:
+                room = self._rooms.get((clean_org_id, active_room_id))
+                if room and str(room.get("status") or "") == "live":
+                    raise ValueError("service_active")
+            self._services.pop(row_key, None)
+            return {"deleted": True, "orgId": clean_org_id, "serviceKey": normalized_key}
+
     def list_memberships(self, uid: str) -> List[Dict[str, Any]]:
         clean_uid = _clean_token(uid)
         if not clean_uid:
@@ -370,13 +484,141 @@ class InMemoryMultiChurchStore:
             profile["updatedAt"] = _utcnow()
             return clean_org_id
 
+    def get_org_prompt(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in PROMPT_EDITOR_ROLES:
+                raise PermissionError("forbidden")
+            return {
+                "orgId": clean_org_id,
+                "prompt": str(org.get("customPrompt") or ""),
+                "service_prompt": str(org.get("servicePrompt") or ""),
+                "updatedAt": org.get("updatedAt"),
+            }
+
+    def set_org_prompt(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        prompt: str,
+        service_prompt: str,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in PROMPT_EDITOR_ROLES:
+                raise PermissionError("forbidden")
+            now = _utcnow()
+            org["customPrompt"] = str(prompt or "")
+            org["servicePrompt"] = str(service_prompt or "")
+            org["updatedAt"] = now
+            return {
+                "orgId": clean_org_id,
+                "prompt": str(org.get("customPrompt") or ""),
+                "service_prompt": str(org.get("servicePrompt") or ""),
+                "updatedAt": now,
+            }
+
+    def get_org_prompt_for_translation(self, org_id: Optional[str]) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return {"orgId": "", "prompt": "", "service_prompt": ""}
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                return {"orgId": clean_org_id, "prompt": "", "service_prompt": ""}
+            return {
+                "orgId": clean_org_id,
+                "prompt": str(org.get("customPrompt") or ""),
+                "service_prompt": str(org.get("servicePrompt") or ""),
+            }
+
+    def _cleanup_invites_locked(self, *, org_id: Optional[str], now: datetime) -> None:
+        cutoff = now - timedelta(days=INVITE_RETENTION_DAYS)
+        to_delete: List[str] = []
+        for invite_id, invite in self._org_invites.items():
+            if org_id and _clean_token(invite.get("orgId")) != org_id:
+                continue
+            invite_status = str(invite.get("status") or "")
+            expires_at = invite.get("expiresAt")
+            if invite_status == INVITE_STATUS_ACTIVE and isinstance(expires_at, datetime) and expires_at <= now:
+                invite["status"] = INVITE_STATUS_EXPIRED
+                invite["updatedAt"] = now
+                invite_status = INVITE_STATUS_EXPIRED
+
+            if invite_status == INVITE_STATUS_ACTIVE:
+                continue
+
+            marker = (
+                invite.get("updatedAt")
+                or invite.get("consumedAt")
+                or invite.get("revokedAt")
+                or invite.get("createdAt")
+            )
+            if isinstance(marker, datetime) and marker <= cutoff:
+                to_delete.append(invite_id)
+
+        for invite_id in to_delete:
+            self._org_invites.pop(invite_id, None)
+
+    def _active_invite_count_locked(self, org_id: str, *, now: datetime) -> int:
+        self._cleanup_invites_locked(org_id=org_id, now=now)
+        count = 0
+        for invite in self._org_invites.values():
+            if _clean_token(invite.get("orgId")) != org_id:
+                continue
+            if str(invite.get("status") or "") == INVITE_STATUS_ACTIVE:
+                count += 1
+        return count
+
+    def _record_invite_audit_locked(
+        self,
+        *,
+        org_id: str,
+        invite_id: str,
+        action: str,
+        actor_uid: Optional[str],
+        target_uid: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._invite_audits.append(
+            {
+                "eventId": uuid4().hex,
+                "orgId": org_id,
+                "inviteId": invite_id,
+                "action": action,
+                "actorUid": _clean_token(actor_uid),
+                "targetUid": _clean_token(target_uid),
+                "metadata": dict(metadata or {}),
+                "createdAt": _utcnow(),
+            }
+        )
+
     def create_invite(
         self,
         *,
         org_id: str,
         created_by_uid: str,
         role: str,
-        expires_in_hours: int = 24 * 7,
+        expires_in_hours: int = DEFAULT_INVITE_EXPIRY_HOURS,
     ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_creator_uid = _clean_token(created_by_uid)
@@ -394,6 +636,9 @@ class InMemoryMultiChurchStore:
             creator_role = self._member_role(clean_org_id, clean_creator_uid)
             if creator_role not in {"owner", "admin"}:
                 raise PermissionError("forbidden")
+            active_count = self._active_invite_count_locked(clean_org_id, now=now)
+            if active_count >= MAX_ACTIVE_INVITES_PER_ORG:
+                raise ValueError("invite_active_limit_reached")
             code = _new_invite_code()
             code_hash = _invite_code_hash(code)
             while code_hash in self._org_invites:
@@ -414,6 +659,13 @@ class InMemoryMultiChurchStore:
                 "consumedAt": None,
                 "updatedAt": now,
             }
+            self._record_invite_audit_locked(
+                org_id=clean_org_id,
+                invite_id=code_hash,
+                action="created",
+                actor_uid=clean_creator_uid,
+                metadata={"role": invite_role, "expiresHours": int(expires_in_hours)},
+            )
             return {
                 "inviteId": code_hash,
                 "code": code,
@@ -435,6 +687,7 @@ class InMemoryMultiChurchStore:
             raise ValueError("invite_not_found")
         now = _utcnow()
         with self._lock:
+            self._cleanup_invites_locked(org_id=None, now=now)
             invite = self._org_invites.get(_invite_code_hash(clean_code))
             if not invite:
                 raise ValueError("invite_not_found")
@@ -483,6 +736,7 @@ class InMemoryMultiChurchStore:
         clean_display_name = _clean_token(display_name)
         now = _utcnow()
         with self._lock:
+            self._cleanup_invites_locked(org_id=None, now=now)
             invite = self._org_invites.get(_invite_code_hash(clean_code))
             if not invite:
                 raise ValueError("invite_not_found")
@@ -535,6 +789,14 @@ class InMemoryMultiChurchStore:
             invite["consumedBy"] = clean_uid
             invite["consumedAt"] = now
             invite["updatedAt"] = now
+            self._record_invite_audit_locked(
+                org_id=org_id,
+                invite_id=str(invite.get("inviteId") or _invite_code_hash(clean_code)),
+                action="redeemed",
+                actor_uid=clean_uid,
+                target_uid=clean_uid,
+                metadata={"createdMembership": created},
+            )
 
             member_role = _normalize_role(member_role, fallback="viewer")
             return {
@@ -570,6 +832,7 @@ class InMemoryMultiChurchStore:
             role = self._member_role(clean_org_id, clean_uid)
             if role not in {"owner", "admin"}:
                 raise PermissionError("forbidden")
+            self._cleanup_invites_locked(org_id=clean_org_id, now=now)
 
             rows: List[Dict[str, Any]] = []
             for invite in self._org_invites.values():
@@ -631,6 +894,12 @@ class InMemoryMultiChurchStore:
             invite["revokedBy"] = clean_uid
             invite["revokedAt"] = now
             invite["updatedAt"] = now
+            self._record_invite_audit_locked(
+                org_id=clean_org_id,
+                invite_id=clean_invite_id,
+                action="revoked",
+                actor_uid=clean_uid,
+            )
             return _serialize_invite(invite, fallback_org=org)
 
     def bootstrap_owner_org(
@@ -712,6 +981,8 @@ class InMemoryMultiChurchStore:
                 "maxConcurrentRooms": 1,
                 "hardCapReached": False,
                 "hostToken": host_token,
+                "customPrompt": "",
+                "servicePrompt": "",
                 "createdAt": now,
                 "updatedAt": now,
             }
@@ -998,6 +1269,15 @@ class FirestoreMultiChurchStore:
         self._db = gcf_firestore.Client(project=project_id, database="worship-translation")
         self._global_host_token = (os.getenv("HOST_API_TOKEN") or "").strip()
 
+    def _where(self, query: Any, field_path: str, op_string: str, value: Any):
+        field_filter_cls = getattr(gcf_firestore, "FieldFilter", None)
+        if field_filter_cls is not None:
+            try:
+                return query.where(filter=field_filter_cls(field_path, op_string, value))
+            except TypeError:
+                pass
+        return query.where(field_path, op_string, value)
+
     def _org_ref(self, org_id: str):
         return self._db.collection("organizations").document(org_id)
 
@@ -1015,6 +1295,70 @@ class FirestoreMultiChurchStore:
 
     def _org_invite_ref(self, invite_id: str):
         return self._db.collection("orgInvites").document(invite_id)
+
+    def _org_invite_audit_ref(self, event_id: str):
+        return self._db.collection("orgInviteAudits").document(event_id)
+
+    def _write_invite_audit(
+        self,
+        *,
+        org_id: str,
+        invite_id: str,
+        action: str,
+        actor_uid: Optional[str],
+        target_uid: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        transaction=None,
+    ) -> None:
+        payload = {
+            "orgId": org_id,
+            "inviteId": invite_id,
+            "action": action,
+            "actorUid": _clean_token(actor_uid),
+            "targetUid": _clean_token(target_uid),
+            "metadata": dict(metadata or {}),
+            "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+        }
+        event_ref = self._org_invite_audit_ref(uuid4().hex)
+        if transaction is None:
+            event_ref.set(payload, merge=True)
+            return
+        transaction.set(event_ref, payload, merge=True)
+
+    def _cleanup_org_invites(self, *, org_id: str, now: Optional[datetime] = None) -> None:
+        current = now or _utcnow()
+        cutoff = current - timedelta(days=INVITE_RETENTION_DAYS)
+        query = self._where(self._db.collection("orgInvites"), "orgId", "==", org_id)
+        for invite_snap in query.stream():
+            invite = invite_snap.to_dict() or {}
+            invite_status = str(invite.get("status") or "")
+            expires_at = invite.get("expiresAt")
+            if invite_status == INVITE_STATUS_ACTIVE and isinstance(expires_at, datetime) and expires_at <= current:
+                self._org_invite_ref(invite_snap.id).set(
+                    {"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+                    merge=True,
+                )
+                invite_status = INVITE_STATUS_EXPIRED
+            if invite_status == INVITE_STATUS_ACTIVE:
+                continue
+            marker = (
+                invite.get("updatedAt")
+                or invite.get("consumedAt")
+                or invite.get("revokedAt")
+                or invite.get("createdAt")
+            )
+            if isinstance(marker, datetime) and marker <= cutoff:
+                self._org_invite_ref(invite_snap.id).delete()
+
+    def _count_active_org_invites(self, *, org_id: str, now: Optional[datetime] = None) -> int:
+        self._cleanup_org_invites(org_id=org_id, now=now)
+        query = self._where(
+            self._where(self._db.collection("orgInvites"), "orgId", "==", org_id),
+            "status",
+            "==",
+            INVITE_STATUS_ACTIVE,
+        )
+        return sum(1 for _ in query.stream())
 
     def _member_role(self, org_id: str, uid: Optional[str]) -> Optional[str]:
         clean_uid = _clean_token(uid)
@@ -1043,8 +1387,7 @@ class FirestoreMultiChurchStore:
 
     def _resolve_org_id_by_slug(self, slug: str) -> Optional[str]:
         rows = (
-            self._db.collection("organizations")
-            .where("slug", "==", (slug or "").strip().lower())
+            self._where(self._db.collection("organizations"), "slug", "==", (slug or "").strip().lower())
             .limit(1)
             .stream()
         )
@@ -1115,6 +1458,92 @@ class FirestoreMultiChurchStore:
             )
         rows.sort(key=lambda r: r["serviceKey"])
         return {"orgId": org_id, "slug": slug, "name": (org or {}).get("name", slug), "services": rows}
+
+    def create_service(
+        self,
+        *,
+        org_id: str,
+        service_key: str,
+        requested_by_uid: str,
+        title: Optional[str] = None,
+        timezone: Optional[str] = None,
+        source: str = "ko",
+        target: str = "en",
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        normalized_key = _normalize_service_key(service_key)
+        title_token = _clean_token(title) or _default_service_title(normalized_key)
+        timezone_token = _clean_token(timezone) or "America/Chicago"
+        src = (_clean_token(source) or "ko").lower()
+        tgt = (_clean_token(target) or "en").lower()
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin", "host"}:
+            raise PermissionError("forbidden")
+
+        service_ref = self._service_ref(clean_org_id, normalized_key)
+        if service_ref.get().exists:
+            raise ValueError("service_exists")
+        service_ref.set(
+            {
+                "title": title_token,
+                "timezone": timezone_token,
+                "rrule": None,
+                "defaultLanguagePair": {"source": src, "target": tgt},
+                "activeRoomId": None,
+                "lastRoomId": None,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return {
+            "orgId": clean_org_id,
+            "serviceKey": normalized_key,
+            "title": title_token,
+            "timezone": timezone_token,
+            "activeRoomId": None,
+            "roomStatus": "waiting",
+            "defaultLanguagePair": {"source": src, "target": tgt},
+        }
+
+    def delete_service(self, *, org_id: str, service_key: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        normalized_key = _normalize_service_key(service_key)
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin", "host"}:
+            raise PermissionError("forbidden")
+
+        service_ref = self._service_ref(clean_org_id, normalized_key)
+        service_snap = service_ref.get()
+        if not service_snap.exists:
+            raise ValueError("service_not_found")
+        service = service_snap.to_dict() or {}
+        active_room_id = _clean_token(service.get("activeRoomId"))
+        if active_room_id:
+            room_snap = self._room_ref(clean_org_id, active_room_id).get()
+            if room_snap.exists:
+                room = room_snap.to_dict() or {}
+                if str(room.get("status") or "") == "live":
+                    raise ValueError("service_active")
+        service_ref.delete()
+        return {"deleted": True, "orgId": clean_org_id, "serviceKey": normalized_key}
 
     def list_memberships(self, uid: str) -> List[Dict[str, Any]]:
         clean_uid = _clean_token(uid)
@@ -1188,7 +1617,7 @@ class FirestoreMultiChurchStore:
         org_id: str,
         created_by_uid: str,
         role: str,
-        expires_in_hours: int = 24 * 7,
+        expires_in_hours: int = DEFAULT_INVITE_EXPIRY_HOURS,
     ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_creator_uid = _clean_token(created_by_uid)
@@ -1207,6 +1636,9 @@ class FirestoreMultiChurchStore:
 
         org = org_snap.to_dict() or {}
         now = _utcnow()
+        active_count = self._count_active_org_invites(org_id=clean_org_id, now=now)
+        if active_count >= MAX_ACTIVE_INVITES_PER_ORG:
+            raise ValueError("invite_active_limit_reached")
         expires_at = _invite_expiry(expires_in_hours)
         code = _new_invite_code()
         invite_id = _invite_code_hash(code)
@@ -1231,6 +1663,13 @@ class FirestoreMultiChurchStore:
                 "consumedAt": None,
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             }
+        )
+        self._write_invite_audit(
+            org_id=clean_org_id,
+            invite_id=invite_id,
+            action="created",
+            actor_uid=clean_creator_uid,
+            metadata={"role": invite_role, "expiresHours": int(expires_in_hours)},
         )
         return {
             "inviteId": invite_id,
@@ -1382,6 +1821,15 @@ class FirestoreMultiChurchStore:
                 },
                 merge=True,
             )
+            self._write_invite_audit(
+                org_id=org_id,
+                invite_id=str(invite.get("inviteId") or invite_snap.id),
+                action="redeemed",
+                actor_uid=clean_uid,
+                target_uid=clean_uid,
+                metadata={"createdMembership": created},
+                transaction=transaction,
+            )
 
             normalized_member_role = _normalize_role(member_role, fallback="viewer")
             return {
@@ -1422,8 +1870,9 @@ class FirestoreMultiChurchStore:
             raise PermissionError("forbidden")
 
         now = _utcnow()
+        self._cleanup_org_invites(org_id=clean_org_id, now=now)
         rows: List[Dict[str, Any]] = []
-        query = self._db.collection("orgInvites").where("orgId", "==", clean_org_id)
+        query = self._where(self._db.collection("orgInvites"), "orgId", "==", clean_org_id)
         for invite_snap in query.stream():
             invite = invite_snap.to_dict() or {}
             invite_status = str(invite.get("status") or "")
@@ -1500,6 +1949,13 @@ class FirestoreMultiChurchStore:
                     "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
                 merge=True,
+            )
+            self._write_invite_audit(
+                org_id=clean_org_id,
+                invite_id=str(invite.get("inviteId") or invite_snap.id),
+                action="revoked",
+                actor_uid=clean_uid,
+                transaction=transaction,
             )
             merged = dict(invite)
             merged["status"] = INVITE_STATUS_REVOKED
@@ -1582,6 +2038,8 @@ class FirestoreMultiChurchStore:
                 "maxConcurrentRooms": 1,
                 "hardCapReached": False,
                 "hostToken": host_token,
+                "customPrompt": "",
+                "servicePrompt": "",
                 "createdAt": gcf_firestore.SERVER_TIMESTAMP,
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
@@ -1631,6 +2089,77 @@ class FirestoreMultiChurchStore:
             "role": "owner",
             "hostToken": host_token,
             "services": service_rows,
+        }
+
+    def get_org_prompt(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in PROMPT_EDITOR_ROLES:
+            raise PermissionError("forbidden")
+        org = org_snap.to_dict() or {}
+        return {
+            "orgId": clean_org_id,
+            "prompt": str(org.get("customPrompt") or ""),
+            "service_prompt": str(org.get("servicePrompt") or ""),
+            "updatedAt": org.get("updatedAt"),
+        }
+
+    def set_org_prompt(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        prompt: str,
+        service_prompt: str,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in PROMPT_EDITOR_ROLES:
+            raise PermissionError("forbidden")
+        org_ref.set(
+            {
+                "customPrompt": str(prompt or ""),
+                "servicePrompt": str(service_prompt or ""),
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return {
+            "orgId": clean_org_id,
+            "prompt": str(prompt or ""),
+            "service_prompt": str(service_prompt or ""),
+            "updatedAt": _utcnow(),
+        }
+
+    def get_org_prompt_for_translation(self, org_id: Optional[str]) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return {"orgId": "", "prompt": "", "service_prompt": ""}
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            return {"orgId": clean_org_id, "prompt": "", "service_prompt": ""}
+        org = org_snap.to_dict() or {}
+        return {
+            "orgId": clean_org_id,
+            "prompt": str(org.get("customPrompt") or ""),
+            "service_prompt": str(org.get("servicePrompt") or ""),
         }
 
     def authorize_host(self, org_id: str, *, host_uid: Optional[str] = None, host_token: Optional[str] = None) -> bool:
@@ -1734,9 +2263,7 @@ class FirestoreMultiChurchStore:
 
             max_concurrent = int(org.get("maxConcurrentRooms") or 0)
             if max_concurrent > 0:
-                live_rooms = list(
-                    self._org_ref(org_id).collection("rooms").where("status", "==", "live").stream(transaction=transaction)
-                )
+                live_rooms = list(self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream(transaction=transaction))
                 if len(live_rooms) >= max_concurrent:
                     raise PermissionError("concurrency_limit_reached")
 
@@ -1877,7 +2404,7 @@ class FirestoreMultiChurchStore:
         out: List[Dict[str, Any]] = []
         for org_snap in self._db.collection("organizations").stream():
             org_id = org_snap.id
-            for room_snap in self._org_ref(org_id).collection("rooms").where("status", "==", "live").stream():
+            for room_snap in self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream():
                 room = room_snap.to_dict() or {}
                 started_at = room.get("startedAt")
                 last_audio_at = room.get("lastAudioAt") or started_at
@@ -1907,7 +2434,7 @@ class FirestoreMultiChurchStore:
             current_minutes = int(org.get("currentMonthMinutes") or 0)
             cap_reached = bool(org.get("hardCapReached"))
 
-            room_snaps = list(self._org_ref(org_id).collection("rooms").where("status", "==", "live").stream())
+            room_snaps = list(self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream())
             live_room_ids = [snap.id for snap in room_snaps]
             if not live_room_ids:
                 continue

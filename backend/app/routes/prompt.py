@@ -1,46 +1,57 @@
-from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
+from app.services.multichurch_store import multichurch_store
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-PROMPT_PATH = DATA_DIR / "custom_prompt.txt"
-SERVICE_PROMPT_PATH = DATA_DIR / "service_prompt.txt"
-
-router = APIRouter(prefix="/prompt", tags=["prompt"])
+router = APIRouter(tags=["prompt"])
 
 
 class PromptPayload(BaseModel):
-    prompt: str = ""
-    service_prompt: str = ""
+    prompt: str = Field(default="", max_length=16000)
+    service_prompt: str = Field(default="", max_length=16000)
 
 
-def _read_text(path: Path) -> str:
-    if not path.exists():
-        return ""
+@router.get("/org/{org_id}/prompt")
+def get_org_prompt(
+    org_id: str,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
     try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
+        return multichurch_store.get_org_prompt(
+            org_id=org_id,
+            requested_by_uid=user.uid,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "invalid_uid":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "prompt_fetch_failed") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
 
 
-@router.get("")
-def get_prompt():
-    return {
-        "prompt": _read_text(PROMPT_PATH),
-        "service_prompt": _read_text(SERVICE_PROMPT_PATH),
-    }
-
-
-@router.post("")
-def set_prompt(payload: PromptPayload):
-    text = payload.prompt or ""
-    service_text = payload.service_prompt or ""
-    PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PROMPT_PATH.write_text(text, encoding="utf-8")
-    SERVICE_PROMPT_PATH.write_text(service_text, encoding="utf-8")
-    return {
-        "saved": True,
-        "length": len(text),
-        "service_length": len(service_text),
-    }
+@router.post("/org/{org_id}/prompt")
+def set_org_prompt(
+    org_id: str,
+    payload: PromptPayload,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        return multichurch_store.set_org_prompt(
+            org_id=org_id,
+            requested_by_uid=user.uid,
+            prompt=payload.prompt or "",
+            service_prompt=payload.service_prompt or "",
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "invalid_uid":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "prompt_save_failed") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc

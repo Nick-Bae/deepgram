@@ -105,6 +105,7 @@ function extractVersionBadge(label?: string | null) {
 const LINGER_MS = 300
 const MIN_FINAL_CHARS = 10
 const FINALIZE_PULSE_MS = 2600
+const MANUAL_FINALIZE_MIN_GAP_MS = 1400
 const MIN_FORCE_FINALIZE_CHARS = 8
 const INTRO_HOLD_RE = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
 const EOS_PUNCT_RE = /[.!?。！？…]$/
@@ -332,9 +333,14 @@ export default function TranslationBox() {
   const triggerFinalize = useCallback(
     (reason?: string) => {
       if (!dgFinalize) return
+      const now = Date.now()
+      if (now - lastFinalizeAtRef.current < MANUAL_FINALIZE_MIN_GAP_MS) {
+        if (DEBUG && reason) console.log('[FE][finalize][skip-rate-limit]', reason)
+        return
+      }
       try {
         dgFinalize()
-        lastFinalizeAtRef.current = Date.now()
+        lastFinalizeAtRef.current = now
         if (DEBUG && reason) console.log('[FE][finalize][pulse]', reason)
       } catch (err) {
         if (DEBUG) console.warn('[FE][finalize][pulse][error]', err)
@@ -418,9 +424,12 @@ export default function TranslationBox() {
       }
 
       lastPreviewSentRef.current = '';
-      triggerFinalize('clause complete');
+      // Avoid over-segmenting Korean by only forcing finalize at sentence boundaries.
+      if (endsWithSentenceBoundary(clean)) {
+        triggerFinalize('clause complete');
+      }
     },
-    [postTranslate, sendPreview, shouldEmitClause, triggerFinalize]
+    [endsWithSentenceBoundary, postTranslate, sendPreview, shouldEmitClause, triggerFinalize]
   );
 
   const scheduleFinal = useCallback(() => {

@@ -17,8 +17,15 @@ const requiredKeys = [
   "NEXT_PUBLIC_FIREBASE_APP_ID",
 ] as const;
 
+const firebaseEnvValues: Record<(typeof requiredKeys)[number], string | undefined> = {
+  NEXT_PUBLIC_FIREBASE_API_KEY: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  NEXT_PUBLIC_FIREBASE_PROJECT_ID: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  NEXT_PUBLIC_FIREBASE_APP_ID: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+};
+
 export const missingFirebaseEnv = requiredKeys.filter((key) => {
-  const value = process.env[key];
+  const value = firebaseEnvValues[key];
   return !value || !String(value).trim();
 });
 
@@ -37,4 +44,3 @@ export function getFirebaseClient(): { app: FirebaseApp; auth: Auth } | null {
   if (!cachedAuth) return null;
   return { app: cachedApp, auth: cachedAuth };
 }
-

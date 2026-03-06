@@ -4,7 +4,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import TranslationBox from "../../../components/TranslationBox";
 import { useAuth } from "../../../lib/authContext";
 import {
+  createOrgService,
   createOrgInvite,
+  deleteOrgService,
   fetchAuthMe,
   listOrgInvites,
   revokeOrgInvite,
@@ -45,6 +47,13 @@ const DEFAULT_SERVICE_KEY = "sun-11am";
 
 type HostAction = "load_services" | "start_service" | "end_service";
 type InviteRoleChoice = Extract<InviteRole, "admin" | "host" | "viewer">;
+type HostTab = "broadcast" | "settings" | "team";
+
+function resolveHostTab(raw: string): HostTab {
+  const token = (raw || "").trim().toLowerCase();
+  if (token === "settings" || token === "team") return token;
+  return "broadcast";
+}
 
 const ERROR_DETAIL_MESSAGES: Record<string, string> = {
   host_auth_failed: "Host authentication failed. Enter a valid Host Token and try again.",
@@ -55,6 +64,9 @@ const ERROR_DETAIL_MESSAGES: Record<string, string> = {
   org_inactive: "This church account is inactive. Check subscription or billing status.",
   org_not_found: "Church organization was not found.",
   service_not_found: "This service key was not found for the church.",
+  service_exists: "That service key already exists.",
+  service_active: "You cannot delete a service while a room is live.",
+  invalid_service_key: "Service key is invalid. Use letters, numbers, and hyphens.",
   room_not_found: "Live room was not found. Refresh and try again.",
 };
 
@@ -93,13 +105,38 @@ function formatDateTime(raw?: string | null): string {
   return parsed.toLocaleString();
 }
 
+async function copyTextToClipboard(value: string): Promise<void> {
+  const text = value.trim();
+  if (!text) throw new Error("empty_text");
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  if (typeof document === "undefined") throw new Error("clipboard_unavailable");
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-9999px";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!copied) throw new Error("clipboard_unavailable");
+}
+
 export default function HostChurchPage() {
   const router = useRouter();
   const { user, loading: authLoading, getIdToken, logout } = useAuth();
   const slug = typeof router.query.churchSlug === "string" ? router.query.churchSlug : "";
+  const querySection = typeof router.query.section === "string" ? router.query.section : "";
   const queryServiceKey = typeof router.query.serviceKey === "string" ? router.query.serviceKey : "";
   const queryHostToken = typeof router.query.hostToken === "string" ? router.query.hostToken : "";
   const queryOrgId = typeof router.query.orgId === "string" ? router.query.orgId : "";
+  const queryRoomId = typeof router.query.roomId === "string" ? router.query.roomId : "";
 
   const [origin, setOrigin] = useState("");
   const [loading, setLoading] = useState(true);
@@ -119,14 +156,27 @@ export default function HostChurchPage() {
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
   const [inviteError, setInviteError] = useState<string | null>(null);
+  const [inviteNotice, setInviteNotice] = useState<string | null>(null);
   const [inviteRows, setInviteRows] = useState<OrgInviteSummary[]>([]);
   const [invitesLoading, setInvitesLoading] = useState(false);
   const [revokingInviteId, setRevokingInviteId] = useState("");
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [newServiceKey, setNewServiceKey] = useState("");
+  const [newServiceTitle, setNewServiceTitle] = useState("");
+  const [serviceManageBusy, setServiceManageBusy] = useState(false);
+  const [serviceManageError, setServiceManageError] = useState<string | null>(null);
+  const [deletingServiceKey, setDeletingServiceKey] = useState("");
   const normalizedServiceKey = serviceKey.trim();
+  const activeTab = resolveHostTab(querySection);
   const resolvedOrgId = (orgData?.orgId || queryOrgId || "").trim();
   const canManageInvites = useMemo(() => {
     const lowered = membershipRole.trim().toLowerCase();
     return lowered === "owner" || lowered === "admin";
+  }, [membershipRole]);
+  const canManageServices = useMemo(() => {
+    const lowered = membershipRole.trim().toLowerCase();
+    return lowered === "owner" || lowered === "admin" || lowered === "host";
   }, [membershipRole]);
 
   useEffect(() => {
@@ -136,14 +186,21 @@ export default function HostChurchPage() {
   useEffect(() => {
     setInviteLink("");
     setInviteError(null);
+    setInviteNotice(null);
     setInviteRows([]);
     setRevokingInviteId("");
+    setCopyBusy(false);
+    setShareBusy(false);
+    setNewServiceKey("");
+    setNewServiceTitle("");
+    setServiceManageError(null);
+    setDeletingServiceKey("");
   }, [resolvedOrgId]);
 
   useEffect(() => {
     if (authLoading) return;
     if (user) return;
-    const nextPath = router.asPath || `/host/c/${encodeURIComponent(slug || "demo")}`;
+    const nextPath = router.asPath || `/host/c/${encodeURIComponent(slug || "demo")}/broadcast`;
     router.replace(`/login?next=${encodeURIComponent(nextPath)}`);
   }, [authLoading, router, slug, user]);
 
@@ -204,35 +261,43 @@ export default function HostChurchPage() {
     if (saved) setHostToken(saved);
   }, [queryHostToken]);
 
+  const refreshServices = useCallback(
+    async (preferredServiceKey?: string) => {
+      if (!slug) return;
+      const res = await fetch(`${API_URL}/api/c/${encodeURIComponent(slug)}/services`);
+      if (!res.ok) {
+        const msg = await readErrorMessage(res, "load_services");
+        throw new Error(msg);
+      }
+      const data: ServicesResponse = await res.json();
+      setOrgData(data);
+
+      const preferredKey = (preferredServiceKey || normalizedServiceKey || queryServiceKey || data.services[0]?.serviceKey || DEFAULT_SERVICE_KEY).trim();
+      const selected = data.services.find((row) => row.serviceKey === preferredKey) || data.services[0];
+      const selectedKey = (selected?.serviceKey || preferredKey || "").trim();
+      if (selectedKey && selectedKey !== serviceKey) setServiceKey(selectedKey);
+
+      const rowRoomId = selected?.activeRoomId || null;
+      setActiveRoomId(rowRoomId);
+      persistStreamContext({
+        orgId: data.orgId,
+        serviceKey: selectedKey || undefined,
+        roomId: rowRoomId || undefined,
+        churchSlug: slug,
+      });
+      if (!rowRoomId) clearRoomInSession();
+      setErrorMsg(null);
+    },
+    [normalizedServiceKey, queryServiceKey, serviceKey, slug],
+  );
+
   useEffect(() => {
     if (!slug) return;
     let disposed = false;
 
-    const fetchServices = async () => {
+    const run = async () => {
       try {
-        const res = await fetch(`${API_URL}/api/c/${encodeURIComponent(slug)}/services`);
-        if (!res.ok) {
-          const msg = await readErrorMessage(res, "load_services");
-          throw new Error(msg);
-        }
-        const data: ServicesResponse = await res.json();
-        if (disposed) return;
-        setOrgData(data);
-        setErrorMsg(null);
-
-        const preferredKey = normalizedServiceKey || queryServiceKey || data.services[0]?.serviceKey || DEFAULT_SERVICE_KEY;
-        if (preferredKey !== serviceKey) setServiceKey(preferredKey);
-
-        const selected = data.services.find((s) => s.serviceKey === preferredKey) || data.services[0];
-        const rowRoomId = selected?.activeRoomId || null;
-        setActiveRoomId(rowRoomId);
-        persistStreamContext({
-          orgId: data.orgId,
-          serviceKey: selected?.serviceKey || preferredKey,
-          roomId: rowRoomId || undefined,
-          churchSlug: slug,
-        });
-        if (!rowRoomId) clearRoomInSession();
+        await refreshServices();
       } catch (err: unknown) {
         if (disposed) return;
         const message = err instanceof Error ? err.message : String(err);
@@ -242,13 +307,13 @@ export default function HostChurchPage() {
       }
     };
 
-    fetchServices();
-    const timer = window.setInterval(fetchServices, POLL_MS);
+    run();
+    const timer = window.setInterval(run, POLL_MS);
     return () => {
       disposed = true;
       clearInterval(timer);
     };
-  }, [normalizedServiceKey, queryServiceKey, serviceKey, slug]);
+  }, [refreshServices, slug]);
 
   const selectedService = useMemo(() => {
     if (!orgData) return null;
@@ -266,15 +331,60 @@ export default function HostChurchPage() {
     return `${origin}/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(normalizedServiceKey)}`;
   }, [normalizedServiceKey, origin, slug]);
 
+  const buildTabHref = useCallback(
+    (
+      tab: HostTab,
+      options?: {
+        serviceKey?: string;
+        orgId?: string;
+        roomId?: string | null;
+        churchSlug?: string;
+      },
+    ) => {
+      const churchSlug = (options?.churchSlug || slug || "").trim();
+      if (!churchSlug) return "";
+      const serviceToken = (options?.serviceKey || normalizedServiceKey || queryServiceKey || "").trim();
+      const orgToken = (options?.orgId || orgData?.orgId || queryOrgId || "").trim();
+      const hasExplicitRoom = Boolean(options && Object.prototype.hasOwnProperty.call(options, "roomId"));
+      const roomCandidate = hasExplicitRoom ? options?.roomId : activeRoomId || queryRoomId || "";
+      const roomToken = typeof roomCandidate === "string" ? roomCandidate.trim() : "";
+      const params = new URLSearchParams();
+      if (serviceToken) params.set("serviceKey", serviceToken);
+      if (orgToken) params.set("orgId", orgToken);
+      if (roomToken) params.set("roomId", roomToken);
+      const query = params.toString();
+      const base = `/host/c/${encodeURIComponent(churchSlug)}/${tab}`;
+      return query ? `${base}?${query}` : base;
+    },
+    [activeRoomId, normalizedServiceKey, orgData?.orgId, queryOrgId, queryRoomId, queryServiceKey, slug],
+  );
+
+  const navigateToTab = useCallback(
+    (tab: HostTab) => {
+      const href = buildTabHref(tab);
+      if (!href) return;
+      void router.push(href);
+    },
+    [buildTabHref, router],
+  );
+
+  useEffect(() => {
+    if (!router.isReady || !slug || querySection) return;
+    const href = buildTabHref("broadcast");
+    if (!href) return;
+    void router.replace(href, undefined, { shallow: true });
+  }, [buildTabHref, querySection, router, slug]);
+
   const syncHostUrl = (nextRoomId?: string | null, nextServiceKey?: string) => {
-    const key = (nextServiceKey || normalizedServiceKey).trim();
+    const key = (nextServiceKey || normalizedServiceKey || queryServiceKey).trim();
     const effectiveOrgId = (orgData?.orgId || queryOrgId || "").trim();
-    if (!slug || !key || !effectiveOrgId) return;
-    const params = new URLSearchParams();
-    params.set("serviceKey", key);
-    params.set("orgId", effectiveOrgId);
-    if (nextRoomId) params.set("roomId", nextRoomId);
-    router.replace(`/host/c/${encodeURIComponent(slug)}?${params.toString()}`, undefined, { shallow: true });
+    const href = buildTabHref(activeTab, {
+      serviceKey: key || undefined,
+      orgId: effectiveOrgId || undefined,
+      roomId: nextRoomId ?? null,
+    });
+    if (!href) return;
+    void router.replace(href, undefined, { shallow: true });
   };
 
   const switchOrganization = useCallback(
@@ -305,7 +415,10 @@ export default function HostChurchPage() {
         const params = new URLSearchParams();
         params.set("orgId", cleanOrgId);
         if (normalizedServiceKey) params.set("serviceKey", normalizedServiceKey);
-        await router.replace(`/host/c/${encodeURIComponent(targetMembership.slug)}?${params.toString()}`);
+        const query = params.toString();
+        await router.replace(
+          `/host/c/${encodeURIComponent(targetMembership.slug)}/${activeTab}${query ? `?${query}` : ""}`,
+        );
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         setErrorMsg(message || "Failed to switch church.");
@@ -313,7 +426,7 @@ export default function HostChurchPage() {
         setSwitchingOrg(false);
       }
     },
-    [getIdToken, memberships, normalizedServiceKey, resolvedOrgId, router],
+    [activeTab, getIdToken, memberships, normalizedServiceKey, resolvedOrgId, router],
   );
 
   const loadInvites = useCallback(async () => {
@@ -363,17 +476,16 @@ export default function HostChurchPage() {
     }
     setInviteBusy(true);
     setInviteError(null);
+    setInviteNotice(null);
     try {
       const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
-      const created = await createOrgInvite(idToken, resolvedOrgId, { role: inviteRole, expiresHours: 24 * 7 });
+      const created = await createOrgInvite(idToken, resolvedOrgId, { role: inviteRole, expiresHours: 24 * 3 });
       const originBase = typeof window !== "undefined" ? window.location.origin : "";
       const link = originBase ? `${originBase}/join?code=${encodeURIComponent(created.code)}` : `/join?code=${encodeURIComponent(created.code)}`;
       setInviteLink(link);
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(link).catch(() => {});
-      }
+      setInviteNotice("Invite link created. Use Copy Link or Share via...");
       await loadInvites();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -383,8 +495,59 @@ export default function HostChurchPage() {
     }
   };
 
+  const copyInviteLink = async () => {
+    const link = inviteLink.trim();
+    if (!link) return;
+    setCopyBusy(true);
+    setInviteError(null);
+    setInviteNotice(null);
+    try {
+      await copyTextToClipboard(link);
+      setInviteNotice("Invite link copied.");
+    } catch {
+      setInviteError("Could not copy the invite link. Copy it manually from the URL.");
+    } finally {
+      setCopyBusy(false);
+    }
+  };
+
+  const shareInviteLink = async () => {
+    const link = inviteLink.trim();
+    if (!link) return;
+    setShareBusy(true);
+    setInviteError(null);
+    setInviteNotice(null);
+    try {
+      const shareText = `Join ${orgData?.name || "our church"} translation team.`;
+      if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
+        await navigator.share({
+          title: "Church Team Invite",
+          text: shareText,
+          url: link,
+        });
+        setInviteNotice("Share menu opened.");
+        return;
+      }
+      await copyTextToClipboard(link);
+      setInviteNotice("Share is not available here. Link copied instead.");
+    } catch (err: unknown) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "AbortError") {
+        setInviteNotice("Share canceled.");
+      } else {
+        setInviteError("Could not open share. Use Copy Link instead.");
+      }
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
   const revokeInvite = async (inviteId: string) => {
     if (!resolvedOrgId) return;
+    if (typeof window !== "undefined") {
+      const ok = window.confirm("Revoke this invite? Anyone with this link will no longer be able to join.");
+      if (!ok) return;
+    }
     setRevokingInviteId(inviteId);
     setInviteError(null);
     try {
@@ -398,6 +561,73 @@ export default function HostChurchPage() {
       setInviteError(message || "Failed to revoke invite.");
     } finally {
       setRevokingInviteId("");
+    }
+  };
+
+  const addService = async () => {
+    if (!resolvedOrgId) {
+      setServiceManageError("Organization is not loaded yet.");
+      return;
+    }
+    const key = newServiceKey.trim().toLowerCase();
+    if (!key) {
+      setServiceManageError("Enter a service key first (example: sun-9am).");
+      return;
+    }
+    setServiceManageBusy(true);
+    setServiceManageError(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      await createOrgService(idToken, resolvedOrgId, {
+        serviceKey: key,
+        title: newServiceTitle.trim() || undefined,
+        timezone: selectedService?.timezone || "America/Chicago",
+        source: sourceLang,
+        target: targetLang,
+      });
+      setNewServiceKey("");
+      setNewServiceTitle("");
+      await refreshServices(key);
+      setServiceKey(key);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setServiceManageError(message || "Failed to add service.");
+    } finally {
+      setServiceManageBusy(false);
+    }
+  };
+
+  const removeService = async (serviceKeyToDelete: string) => {
+    if (!resolvedOrgId) return;
+    const key = serviceKeyToDelete.trim();
+    if (!key) return;
+    if (selectedService?.serviceKey === key && activeRoomId) {
+      setServiceManageError("Stop the live room first before deleting this service.");
+      return;
+    }
+    setDeletingServiceKey(key);
+    setServiceManageError(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      await deleteOrgService(idToken, resolvedOrgId, key);
+
+      const fallbackKey =
+        serviceKey === key
+          ? (orgData?.services.find((row) => row.serviceKey !== key)?.serviceKey || "")
+          : serviceKey;
+      await refreshServices(fallbackKey || undefined);
+      if (serviceKey === key) {
+        setServiceKey(fallbackKey || DEFAULT_SERVICE_KEY);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setServiceManageError(message || "Failed to delete service.");
+    } finally {
+      setDeletingServiceKey("");
     }
   };
 
@@ -451,11 +681,14 @@ export default function HostChurchPage() {
         churchSlug: slug,
       });
       if (nextOrgId && nextOrgId !== queryOrgId) {
-        const params = new URLSearchParams();
-        params.set("serviceKey", data.serviceKey || normalizedServiceKey);
-        params.set("orgId", nextOrgId);
-        params.set("roomId", data.roomId);
-        router.replace(`/host/c/${encodeURIComponent(slug)}?${params.toString()}`, undefined, { shallow: true });
+        const href = buildTabHref("broadcast", {
+          serviceKey: data.serviceKey || normalizedServiceKey,
+          orgId: nextOrgId,
+          roomId: data.roomId,
+        });
+        if (href) {
+          void router.replace(href, undefined, { shallow: true });
+        }
       } else {
         syncHostUrl(data.roomId, data.serviceKey || normalizedServiceKey);
       }
@@ -574,222 +807,475 @@ export default function HostChurchPage() {
               {switchingOrg ? <span style={{ fontSize: 12, opacity: 0.75 }}>Switching church...</span> : null}
             </div>
           ) : null}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 10 }}>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12, opacity: 0.75 }}>Service</span>
-              {orgData?.services?.length ? (
-                <select
-                  value={serviceKey}
-                  onChange={(e) => {
-                    const nextKey = e.target.value;
-                    setServiceKey(nextKey);
-                    setActiveRoomId(null);
-                    persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
-                  }}
-                  disabled={loading}
-                  style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
-                >
-                  {orgData?.services?.map((row) => (
-                    <option key={row.serviceKey} value={row.serviceKey}>
-                      {row.title} ({row.serviceKey})
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <input
-                  value={serviceKey}
-                  onChange={(e) => {
-                    const nextKey = e.target.value;
-                    setServiceKey(nextKey);
-                    setActiveRoomId(null);
-                    persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
-                  }}
-                  placeholder={DEFAULT_SERVICE_KEY}
-                  style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
-                />
-              )}
-              {!loading && orgData && !orgData.services?.length ? (
-                <span style={{ fontSize: 12, opacity: 0.75 }}>No predefined services found. Enter a service key to create/start one.</span>
-              ) : null}
-            </label>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12, opacity: 0.75 }}>Source</span>
-              <input value={sourceLang} onChange={(e) => setSourceLang(e.target.value)} style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }} />
-            </label>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12, opacity: 0.75 }}>Target</span>
-              <input value={targetLang} onChange={(e) => setTargetLang(e.target.value)} style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }} />
-            </label>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12, opacity: 0.75 }}>Host Token</span>
-              <input
-                value={hostToken}
-                onChange={(e) => {
-                  const next = e.target.value;
-                  setHostToken(next);
-                  persistHostToken(next);
-                }}
-                placeholder="Required if org hostToken is set"
-                style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
-              />
-            </label>
-          </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, alignItems: "center" }}>
+          <div
+            style={{
+              position: "sticky",
+              top: 8,
+              zIndex: 5,
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 8,
+              marginBottom: 12,
+              padding: 6,
+              borderRadius: 12,
+              border: "1px solid rgba(56,189,248,0.35)",
+              background: "rgba(8,16,35,0.92)",
+              backdropFilter: "blur(8px)",
+            }}
+          >
             <button
-              onClick={startService}
-              disabled={busy}
+              onClick={() => navigateToTab("broadcast")}
               style={{
                 borderRadius: 10,
-                border: "none",
-                background: "#22c55e",
-                color: "#052e16",
-                fontWeight: 700,
-                padding: "9px 14px",
-                cursor: busy ? "not-allowed" : "pointer",
-                opacity: busy ? 0.6 : 1,
+                border: activeTab === "broadcast" ? "2px solid rgba(56,189,248,1)" : "1px solid rgba(255,255,255,0.2)",
+                background: activeTab === "broadcast" ? "rgba(56,189,248,0.95)" : "rgba(15,23,42,0.8)",
+                color: activeTab === "broadcast" ? "#082f49" : "#e2e8f0",
+                fontSize: 13,
+                fontWeight: 800,
+                padding: "8px 12px",
+                cursor: "pointer",
+                boxShadow: activeTab === "broadcast" ? "inset 0 -3px 0 rgba(8,47,73,0.5)" : "none",
               }}
             >
-              {activeRoomId ? "Restart / Rejoin Room" : "Start Service"}
+              Live Broadcast
             </button>
             <button
-              onClick={endService}
-              disabled={busy || !orgData?.orgId || !activeRoomId}
+              onClick={() => navigateToTab("settings")}
               style={{
                 borderRadius: 10,
-                border: "none",
-                background: "#f43f5e",
-                color: "#fff",
-                fontWeight: 700,
-                padding: "9px 14px",
-                cursor: busy || !orgData?.orgId || !activeRoomId ? "not-allowed" : "pointer",
-                opacity: busy || !orgData?.orgId || !activeRoomId ? 0.6 : 1,
+                border: activeTab === "settings" ? "2px solid rgba(56,189,248,1)" : "1px solid rgba(255,255,255,0.2)",
+                background: activeTab === "settings" ? "rgba(56,189,248,0.95)" : "rgba(15,23,42,0.8)",
+                color: activeTab === "settings" ? "#082f49" : "#e2e8f0",
+                fontSize: 13,
+                fontWeight: 800,
+                padding: "8px 12px",
+                cursor: "pointer",
+                boxShadow: activeTab === "settings" ? "inset 0 -3px 0 rgba(8,47,73,0.5)" : "none",
               }}
             >
-              End Service
+              Church Settings
             </button>
-            <span style={{ opacity: 0.84, fontSize: 14 }}>
-              {activeRoomId ? `Live room: ${activeRoomId}` : "No live room"}
-            </span>
+            <button
+              onClick={() => navigateToTab("team")}
+              style={{
+                borderRadius: 10,
+                border: activeTab === "team" ? "2px solid rgba(56,189,248,1)" : "1px solid rgba(255,255,255,0.2)",
+                background: activeTab === "team" ? "rgba(56,189,248,0.95)" : "rgba(15,23,42,0.8)",
+                color: activeTab === "team" ? "#082f49" : "#e2e8f0",
+                fontSize: 13,
+                fontWeight: 800,
+                padding: "8px 12px",
+                cursor: "pointer",
+                boxShadow: activeTab === "team" ? "inset 0 -3px 0 rgba(8,47,73,0.5)" : "none",
+              }}
+            >
+              Team
+            </button>
           </div>
-          {listenerUrl ? (
-            <p style={{ marginTop: 10, marginBottom: 0, fontSize: 13, opacity: 0.84 }}>
-              Listener URL: <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: "#93c5fd" }}>{listenerUrl}</a>
-            </p>
-          ) : null}
-          {canManageInvites ? (
-            <div style={{ marginTop: 14, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12, display: "grid", gap: 8 }}>
-              <p style={{ margin: 0, fontWeight: 700 }}>Invite Team Member</p>
-              <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
-                Create a one-time invite link for another user to join this church.
-              </p>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+          {activeTab === "broadcast" ? (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 10 }}>
                 <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75 }}>Role</span>
-                  <select
-                    value={inviteRole}
-                    onChange={(e) => setInviteRole(e.target.value as InviteRoleChoice)}
-                    style={{ borderRadius: 8, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "8px 10px" }}
-                  >
-                    <option value="host">host</option>
-                    <option value="admin">admin</option>
-                    <option value="viewer">viewer</option>
-                  </select>
+                  <span style={{ fontSize: 12, opacity: 0.75 }}>Service</span>
+                  {orgData?.services?.length ? (
+                    <select
+                      value={serviceKey}
+                      onChange={(e) => {
+                        const nextKey = e.target.value;
+                        setServiceKey(nextKey);
+                        setActiveRoomId(null);
+                        persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
+                      }}
+                      disabled={loading}
+                      style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
+                    >
+                      {orgData?.services?.map((row) => (
+                        <option key={row.serviceKey} value={row.serviceKey}>
+                          {row.title} ({row.serviceKey})
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      value={serviceKey}
+                      onChange={(e) => {
+                        const nextKey = e.target.value;
+                        setServiceKey(nextKey);
+                        setActiveRoomId(null);
+                        persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
+                      }}
+                      placeholder={DEFAULT_SERVICE_KEY}
+                      style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
+                    />
+                  )}
+                  {!loading && orgData && !orgData.services?.length ? (
+                    <span style={{ fontSize: 12, opacity: 0.75 }}>No predefined services found. Enter a service key to create/start one.</span>
+                  ) : null}
                 </label>
+                <label style={{ display: "grid", gap: 4 }}>
+                  <span style={{ fontSize: 12, opacity: 0.75 }}>Source</span>
+                  <input value={sourceLang} onChange={(e) => setSourceLang(e.target.value)} style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }} />
+                </label>
+                <label style={{ display: "grid", gap: 4 }}>
+                  <span style={{ fontSize: 12, opacity: 0.75 }}>Target</span>
+                  <input value={targetLang} onChange={(e) => setTargetLang(e.target.value)} style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }} />
+                </label>
+                <label style={{ display: "grid", gap: 4 }}>
+                  <span style={{ fontSize: 12, opacity: 0.75 }}>Host Token</span>
+                  <input
+                    value={hostToken}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setHostToken(next);
+                      persistHostToken(next);
+                    }}
+                    placeholder="Required if org hostToken is set"
+                    style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
+                  />
+                </label>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, alignItems: "center" }}>
                 <button
-                  onClick={generateInviteLink}
-                  disabled={inviteBusy || !resolvedOrgId}
+                  onClick={startService}
+                  disabled={busy}
                   style={{
-                    marginTop: 18,
-                    borderRadius: 8,
+                    borderRadius: 10,
                     border: "none",
-                    background: "#38bdf8",
-                    color: "#082f49",
+                    background: "#22c55e",
+                    color: "#052e16",
                     fontWeight: 700,
-                    padding: "8px 12px",
-                    cursor: inviteBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                    opacity: inviteBusy || !resolvedOrgId ? 0.6 : 1,
+                    padding: "9px 14px",
+                    cursor: busy ? "not-allowed" : "pointer",
+                    opacity: busy ? 0.6 : 1,
                   }}
                 >
-                  {inviteBusy ? "Generating..." : "Generate Invite Link"}
+                  {activeRoomId ? "Restart / Rejoin Room" : "Start Service"}
                 </button>
+                <button
+                  onClick={endService}
+                  disabled={busy || !orgData?.orgId || !activeRoomId}
+                  style={{
+                    borderRadius: 10,
+                    border: "none",
+                    background: "#f43f5e",
+                    color: "#fff",
+                    fontWeight: 700,
+                    padding: "9px 14px",
+                    cursor: busy || !orgData?.orgId || !activeRoomId ? "not-allowed" : "pointer",
+                    opacity: busy || !orgData?.orgId || !activeRoomId ? 0.6 : 1,
+                  }}
+                >
+                  End Service
+                </button>
+                <span style={{ opacity: 0.84, fontSize: 14 }}>
+                  {activeRoomId ? `Live room: ${activeRoomId}` : "No live room"}
+                </span>
               </div>
-              {inviteError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {inviteError}</p> : null}
-              {inviteLink ? (
-                <p style={{ margin: 0, fontSize: 13, wordBreak: "break-all" }}>
-                  Invite URL:{" "}
-                  <a href={inviteLink} target="_blank" rel="noreferrer" style={{ color: "#93c5fd" }}>
-                    {inviteLink}
-                  </a>
+              {listenerUrl ? (
+                <p style={{ marginTop: 10, marginBottom: 0, fontSize: 13, opacity: 0.84 }}>
+                  Listener URL: <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: "#93c5fd" }}>{listenerUrl}</a>
                 </p>
               ) : null}
-              <div style={{ marginTop: 4, borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: 10 }}>
-                <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>Active Invites</p>
-                {invitesLoading ? (
-                  <p style={{ marginTop: 6, marginBottom: 0, fontSize: 13, opacity: 0.8 }}>Loading invites...</p>
+            </>
+          ) : null}
+          {activeTab === "settings" ? (
+            canManageServices ? (
+              <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12, display: "grid", gap: 8 }}>
+                <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Service Schedule</p>
+                <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
+                  Add service times for this church. Added services appear in the dropdown for all members.
+                </p>
+                {resolvedOrgId ? (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    <button
+                      onClick={() => {
+                        const qs = new URLSearchParams();
+                        qs.set("orgId", resolvedOrgId);
+                        if (slug) qs.set("churchSlug", slug);
+                        void router.push(`/admin/prompt?${qs.toString()}`);
+                      }}
+                      style={{
+                        borderRadius: 8,
+                        border: "1px solid rgba(255,255,255,0.24)",
+                        background: "rgba(148,163,184,0.18)",
+                        color: "#e2e8f0",
+                        fontWeight: 600,
+                        padding: "7px 10px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Open Prompt Settings
+                    </button>
+                    <button
+                      onClick={() => {
+                        const qs = new URLSearchParams();
+                        qs.set("orgId", resolvedOrgId);
+                        if (slug) qs.set("churchSlug", slug);
+                        void router.push(`/admin/sermon-prep?${qs.toString()}`);
+                      }}
+                      style={{
+                        borderRadius: 8,
+                        border: "1px solid rgba(255,255,255,0.24)",
+                        background: "rgba(148,163,184,0.18)",
+                        color: "#e2e8f0",
+                        fontWeight: 600,
+                        padding: "7px 10px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Open Sermon Prep
+                    </button>
+                  </div>
                 ) : null}
-                {!invitesLoading && !inviteRows.length ? (
-                  <p style={{ marginTop: 6, marginBottom: 0, fontSize: 13, opacity: 0.8 }}>No active invites.</p>
-                ) : null}
-                {inviteRows.length ? (
-                  <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
-                    {inviteRows.map((row) => (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  <input
+                    value={newServiceKey}
+                    onChange={(e) => setNewServiceKey(e.target.value)}
+                    placeholder="service key (example: sun-9am)"
+                    style={{ flex: "1 1 220px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "8px 10px" }}
+                  />
+                  <input
+                    value={newServiceTitle}
+                    onChange={(e) => setNewServiceTitle(e.target.value)}
+                    placeholder="title (optional)"
+                    style={{ flex: "1 1 220px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "8px 10px" }}
+                  />
+                  <button
+                    onClick={addService}
+                    disabled={serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId}
+                    style={{
+                      borderRadius: 8,
+                      border: "none",
+                      background: "#38bdf8",
+                      color: "#082f49",
+                      fontWeight: 700,
+                      padding: "8px 12px",
+                      cursor: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? "not-allowed" : "pointer",
+                      opacity: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? 0.6 : 1,
+                    }}
+                  >
+                    {serviceManageBusy ? "Adding..." : "Add Service"}
+                  </button>
+                </div>
+                {serviceManageError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {serviceManageError}</p> : null}
+                <div style={{ display: "grid", gap: 6 }}>
+                  {(orgData?.services || []).map((row) => {
+                    const isSelected = row.serviceKey === serviceKey;
+                    const isLive = Boolean(row.activeRoomId);
+                    const deleting = deletingServiceKey === row.serviceKey;
+                    return (
                       <div
-                        key={row.inviteId}
+                        key={row.serviceKey}
                         style={{
                           display: "grid",
                           gridTemplateColumns: "1fr auto",
                           gap: 8,
                           alignItems: "center",
                           border: "1px solid rgba(255,255,255,0.12)",
-                          borderRadius: 10,
-                          padding: "8px 10px",
+                          borderRadius: 9,
+                          padding: "7px 9px",
                         }}
                       >
-                        <div style={{ minWidth: 0 }}>
-                          <p style={{ margin: 0, fontSize: 13 }}>
-                            Role: <strong>{row.role}</strong>
-                          </p>
-                          <p style={{ margin: 0, fontSize: 12, opacity: 0.75 }}>
-                            Expires: {formatDateTime(row.expiresAt || null)}
-                          </p>
-                          <p style={{ margin: 0, fontSize: 12, opacity: 0.75 }}>
-                            Created: {formatDateTime(row.createdAt || null)}
-                          </p>
-                        </div>
+                        <p style={{ margin: 0, fontSize: 13, opacity: 0.88 }}>
+                          <strong>{row.title}</strong> ({row.serviceKey})
+                          {isSelected ? " • selected" : ""}
+                          {isLive ? " • live" : ""}
+                        </p>
                         <button
-                          onClick={() => revokeInvite(row.inviteId)}
-                          disabled={Boolean(revokingInviteId) || inviteBusy}
+                          onClick={() => removeService(row.serviceKey)}
+                          disabled={serviceManageBusy || deletingServiceKey.length > 0 || isLive}
                           style={{
                             borderRadius: 8,
-                            border: "1px solid rgba(252,165,165,0.6)",
-                            background: "rgba(127,29,29,0.35)",
+                            border: "1px solid rgba(252,165,165,0.55)",
+                            background: "rgba(127,29,29,0.36)",
                             color: "#fecaca",
                             fontWeight: 700,
-                            padding: "7px 10px",
-                            cursor: Boolean(revokingInviteId) || inviteBusy ? "not-allowed" : "pointer",
-                            opacity: Boolean(revokingInviteId) || inviteBusy ? 0.6 : 1,
+                            padding: "6px 10px",
+                            cursor: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? "not-allowed" : "pointer",
+                            opacity: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? 0.55 : 1,
                           }}
                         >
-                          {revokingInviteId === row.inviteId ? "Revoking..." : "Revoke"}
+                          {deleting ? "Deleting..." : "Delete"}
                         </button>
                       </div>
-                    ))}
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.12)", borderRadius: 12, padding: 12, fontSize: 13, opacity: 0.82 }}>
+                You do not have permission to manage service schedules for this church.
+              </div>
+            )
+          ) : null}
+          {activeTab === "team" ? (
+            canManageInvites ? (
+              <div style={{ marginTop: 14, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12, display: "grid", gap: 8 }}>
+                <p style={{ margin: 0, fontWeight: 700 }}>Invite Team Member</p>
+                <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
+                  Create a one-time invite link for another user to join this church.
+                </p>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                  <label style={{ display: "grid", gap: 4 }}>
+                    <span style={{ fontSize: 12, opacity: 0.75 }}>Role</span>
+                    <select
+                      value={inviteRole}
+                      onChange={(e) => setInviteRole(e.target.value as InviteRoleChoice)}
+                      style={{ borderRadius: 8, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "8px 10px" }}
+                    >
+                      <option value="host">host</option>
+                      <option value="admin">admin</option>
+                      <option value="viewer">viewer</option>
+                    </select>
+                  </label>
+                  <button
+                    onClick={generateInviteLink}
+                    disabled={inviteBusy || !resolvedOrgId}
+                    style={{
+                      marginTop: 18,
+                      borderRadius: 8,
+                      border: "none",
+                      background: "#38bdf8",
+                      color: "#082f49",
+                      fontWeight: 700,
+                      padding: "8px 12px",
+                      cursor: inviteBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                      opacity: inviteBusy || !resolvedOrgId ? 0.6 : 1,
+                    }}
+                  >
+                    {inviteBusy ? "Generating..." : "Generate Invite Link"}
+                  </button>
+                </div>
+                {inviteError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {inviteError}</p> : null}
+                {inviteNotice ? <p style={{ margin: 0, color: "#86efac", fontSize: 13 }}>{inviteNotice}</p> : null}
+                {inviteLink ? (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <label style={{ display: "grid", gap: 4 }}>
+                      <span style={{ margin: 0, fontSize: 13 }}>Invite URL</span>
+                      <input
+                        readOnly
+                        value={inviteLink}
+                        style={{
+                          borderRadius: 8,
+                          border: "1px solid rgba(255,255,255,0.25)",
+                          background: "rgba(15,23,42,0.8)",
+                          color: "#cbd5e1",
+                          fontSize: 13,
+                          padding: "8px 10px",
+                        }}
+                      />
+                    </label>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                      <button
+                        onClick={copyInviteLink}
+                        disabled={copyBusy || shareBusy || inviteBusy}
+                        style={{
+                          borderRadius: 8,
+                          border: "1px solid rgba(255,255,255,0.22)",
+                          background: "rgba(148,163,184,0.18)",
+                          color: "#e2e8f0",
+                          fontWeight: 600,
+                          padding: "7px 10px",
+                          cursor: copyBusy || shareBusy || inviteBusy ? "not-allowed" : "pointer",
+                          opacity: copyBusy || shareBusy || inviteBusy ? 0.6 : 1,
+                        }}
+                      >
+                        {copyBusy ? "Copying..." : "Copy Link"}
+                      </button>
+                      <button
+                        onClick={shareInviteLink}
+                        disabled={copyBusy || shareBusy || inviteBusy}
+                        style={{
+                          borderRadius: 8,
+                          border: "1px solid rgba(56,189,248,0.52)",
+                          background: "rgba(56,189,248,0.22)",
+                          color: "#e0f2fe",
+                          fontWeight: 600,
+                          padding: "7px 10px",
+                          cursor: copyBusy || shareBusy || inviteBusy ? "not-allowed" : "pointer",
+                          opacity: copyBusy || shareBusy || inviteBusy ? 0.6 : 1,
+                        }}
+                      >
+                        {shareBusy ? "Sharing..." : "Share via..."}
+                      </button>
+                    </div>
                   </div>
                 ) : null}
+                <div style={{ marginTop: 4, borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: 10 }}>
+                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>Active Invites</p>
+                  {invitesLoading ? (
+                    <p style={{ marginTop: 6, marginBottom: 0, fontSize: 13, opacity: 0.8 }}>Loading invites...</p>
+                  ) : null}
+                  {!invitesLoading && !inviteRows.length ? (
+                    <p style={{ marginTop: 6, marginBottom: 0, fontSize: 13, opacity: 0.8 }}>No active invites.</p>
+                  ) : null}
+                  {inviteRows.length ? (
+                    <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
+                      {inviteRows.map((row) => (
+                        <div
+                          key={row.inviteId}
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "1fr auto",
+                            gap: 8,
+                            alignItems: "center",
+                            border: "1px solid rgba(255,255,255,0.12)",
+                            borderRadius: 10,
+                            padding: "8px 10px",
+                          }}
+                        >
+                          <div style={{ minWidth: 0 }}>
+                            <p style={{ margin: 0, fontSize: 13 }}>
+                              Role: <strong>{row.role}</strong>
+                            </p>
+                            <p style={{ margin: 0, fontSize: 12, opacity: 0.75 }}>
+                              Expires: {formatDateTime(row.expiresAt || null)}
+                            </p>
+                            <p style={{ margin: 0, fontSize: 12, opacity: 0.75 }}>
+                              Created: {formatDateTime(row.createdAt || null)}
+                            </p>
+                          </div>
+                          <button
+                            onClick={() => revokeInvite(row.inviteId)}
+                            disabled={Boolean(revokingInviteId) || inviteBusy}
+                            style={{
+                              borderRadius: 8,
+                              border: "1px solid rgba(252,165,165,0.6)",
+                              background: "rgba(127,29,29,0.35)",
+                              color: "#fecaca",
+                              fontWeight: 700,
+                              padding: "7px 10px",
+                              cursor: Boolean(revokingInviteId) || inviteBusy ? "not-allowed" : "pointer",
+                              opacity: Boolean(revokingInviteId) || inviteBusy ? 0.6 : 1,
+                            }}
+                          >
+                            {revokingInviteId === row.inviteId ? "Revoking..." : "Revoke"}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.12)", borderRadius: 12, padding: 12, fontSize: 13, opacity: 0.82 }}>
+                You do not have permission to manage team invites for this church.
+              </div>
+            )
           ) : null}
         </section>
 
-        {activeRoomId ? (
-          <section>
-            <TranslationBox />
-          </section>
-        ) : (
-          <section style={{ border: "1px dashed rgba(255,255,255,0.2)", borderRadius: 14, padding: 16, opacity: 0.82 }}>
-            Start a service to enable producer controls.
-          </section>
-        )}
+        {activeTab === "broadcast" ? (
+          activeRoomId ? (
+            <section>
+              <TranslationBox />
+            </section>
+          ) : (
+            <section style={{ border: "1px dashed rgba(255,255,255,0.2)", borderRadius: 14, padding: 16, opacity: 0.82 }}>
+              Start a service to enable producer controls.
+            </section>
+          )
+        ) : null}
       </div>
     </main>
   );

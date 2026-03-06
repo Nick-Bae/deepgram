@@ -1,48 +1,138 @@
-import { useEffect, useState } from "react";
+import { useRouter } from "next/router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
-import { API_URL } from "../../utils/urls";
+
+import { useAuth } from "../../lib/authContext";
+import { fetchAuthMe, fetchOrgPrompt, saveOrgPrompt, type OrgMembership } from "../../lib/backendAuth";
+
+type MessageTone = "info" | "success" | "error";
 
 export default function PromptAdmin() {
+  const router = useRouter();
+  const { user, loading: authLoading, getIdToken } = useAuth();
+
+  const queryOrgId = typeof router.query.orgId === "string" ? router.query.orgId : "";
+  const [memberships, setMemberships] = useState<OrgMembership[]>([]);
+  const [selectedOrgId, setSelectedOrgId] = useState("");
   const [prompt, setPrompt] = useState("");
   const [servicePrompt, setServicePrompt] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loadingMemberships, setLoadingMemberships] = useState(false);
+  const [loadingPrompt, setLoadingPrompt] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [messageTone, setMessageTone] = useState<MessageTone>("info");
+  const promptRequestSeq = useRef(0);
 
-  const loadPrompt = async () => {
-    setLoading(true);
-    setMessage(null);
+  const selectedMembership = useMemo(
+    () => memberships.find((row) => row.orgId === selectedOrgId) || null,
+    [memberships, selectedOrgId],
+  );
+
+  const setInfo = useCallback((text: string | null, tone: MessageTone = "info") => {
+    setMessage(text);
+    setMessageTone(tone);
+  }, []);
+
+  const syncOrgInUrl = useCallback(
+    async (orgId: string) => {
+      if (!router.isReady) return;
+      const nextQuery = { ...router.query, orgId };
+      await router.replace({ pathname: router.pathname, query: nextQuery }, undefined, { shallow: true });
+    },
+    [router],
+  );
+
+  const loadPromptForOrg = useCallback(
+    async (orgId: string) => {
+      if (!orgId) return;
+      const requestSeq = ++promptRequestSeq.current;
+      setLoadingPrompt(true);
+      setInfo(null);
+      try {
+        const idToken = await getIdToken();
+        if (!idToken) throw new Error("Please sign in again.");
+        const payload = await fetchOrgPrompt(idToken, orgId);
+        if (requestSeq !== promptRequestSeq.current) return;
+        setPrompt(payload.prompt || "");
+        setServicePrompt(payload.service_prompt || "");
+      } catch (err: unknown) {
+        if (requestSeq !== promptRequestSeq.current) return;
+        setInfo(toMessage(err) || "Failed to load church prompt settings.", "error");
+      } finally {
+        if (requestSeq !== promptRequestSeq.current) return;
+        setLoadingPrompt(false);
+      }
+    },
+    [getIdToken, setInfo],
+  );
+
+  const loadMemberships = useCallback(async () => {
+    if (!user) return;
+    setLoadingMemberships(true);
+    setInfo(null);
     try {
-      const res = await fetch(`${API_URL}/api/prompt`);
-      if (!res.ok) throw new Error(await res.text());
-      const j = await res.json();
-      setPrompt(j.prompt || "");
-      setServicePrompt(j.service_prompt || j.servicePrompt || "");
+      const idToken = await getIdToken();
+      if (!idToken) throw new Error("Please sign in again.");
+      const me = await fetchAuthMe(idToken);
+      const rows = me.memberships || [];
+      setMemberships(rows);
+      if (!rows.length) {
+        setSelectedOrgId("");
+        setPrompt("");
+        setServicePrompt("");
+        setInfo("No church memberships found. Create or join a church first.", "error");
+        return;
+      }
+      const queryMatch = queryOrgId && rows.some((row) => row.orgId === queryOrgId) ? queryOrgId : "";
+      const currentMatch =
+        (me.currentOrgId || "").trim() && rows.some((row) => row.orgId === me.currentOrgId)
+          ? String(me.currentOrgId)
+          : "";
+      const fallback = rows[0]?.orgId || "";
+      const chosen = queryMatch || currentMatch || fallback;
+      setSelectedOrgId(chosen);
+      if (chosen && chosen !== queryOrgId) {
+        await syncOrgInUrl(chosen);
+      }
     } catch (err: unknown) {
-      setMessage(toMessage(err) || "Failed to load prompt");
+      setInfo(toMessage(err) || "Failed to load church memberships.", "error");
     } finally {
-      setLoading(false);
+      setLoadingMemberships(false);
     }
-  };
+  }, [getIdToken, queryOrgId, setInfo, syncOrgInUrl, user]);
 
   useEffect(() => {
-    loadPrompt();
-  }, []);
+    if (authLoading) return;
+    if (user) return;
+    const nextPath = router.asPath || "/admin/prompt";
+    void router.replace(`/login?next=${encodeURIComponent(nextPath)}`);
+  }, [authLoading, router, user]);
+
+  useEffect(() => {
+    if (!router.isReady || authLoading || !user) return;
+    void loadMemberships();
+  }, [authLoading, loadMemberships, router.isReady, user]);
+
+  useEffect(() => {
+    if (authLoading || !user || !selectedOrgId) return;
+    void loadPromptForOrg(selectedOrgId);
+  }, [authLoading, loadPromptForOrg, selectedOrgId, user]);
 
   const savePrompt = async (e?: FormEvent) => {
     if (e) e.preventDefault();
+    if (!selectedOrgId) {
+      setInfo("Select a church first.", "error");
+      return;
+    }
     setSaving(true);
-    setMessage("Saving…");
+    setInfo("Saving...", "info");
     try {
-      const res = await fetch(`${API_URL}/api/prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, service_prompt: servicePrompt }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      setMessage("Saved");
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      await saveOrgPrompt(idToken, selectedOrgId, { prompt, service_prompt: servicePrompt });
+      setInfo("Saved", "success");
     } catch (err: unknown) {
-      setMessage(toMessage(err) || "Save failed");
+      setInfo(toMessage(err) || "Save failed", "error");
     } finally {
       setSaving(false);
     }
@@ -50,69 +140,111 @@ export default function PromptAdmin() {
 
   const clearPrompt = () => {
     setPrompt("");
-    setMessage("Cleared (remember to Save)");
+    setInfo("Global guidance cleared (remember to Save).", "info");
   };
 
   const clearServicePrompt = () => {
     setServicePrompt("");
-    setMessage("Service background cleared (remember to Save)");
+    setInfo("Service background cleared (remember to Save).", "info");
   };
+
+  const onSelectOrg = async (nextOrgId: string) => {
+    promptRequestSeq.current += 1;
+    setSelectedOrgId(nextOrgId);
+    setPrompt("");
+    setServicePrompt("");
+    setInfo(null);
+    await syncOrgInUrl(nextOrgId);
+  };
+
+  const busy = loadingMemberships || loadingPrompt;
+  const disableOrgSelect = loadingMemberships || saving || !memberships.length;
 
   return (
     <div style={styles.page}>
-      <h1 style={styles.title}>Custom Translation Prompt</h1>
+      <h1 style={styles.title}>Church Translation Prompt</h1>
       <p style={styles.subtitle}>
-        Edit the admin-defined guidance appended to the system prompt. Keep it concise and safe; changes apply to new translations after saving.
+        This page is church-specific. Use URL format <code>/admin/prompt?orgId=...</code> to open a specific church prompt.
       </p>
 
-      <form onSubmit={savePrompt} style={styles.form}>
+      <div style={styles.form}>
         <div style={styles.field}>
           <div style={styles.labelRow}>
-            <h3 style={styles.sectionTitle}>Global guidance</h3>
-            <span style={styles.helper}>Always on; tweak sparingly.</span>
+            <h3 style={styles.sectionTitle}>Church</h3>
+            {selectedMembership ? <span style={styles.helper}>Role: {selectedMembership.role || "viewer"}</span> : null}
           </div>
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            style={styles.textarea}
-            placeholder="Add brief guardrails or style notes. Avoid long essays."
-            rows={10}
-          />
-          <div style={styles.inlineMeta}>Chars: {prompt.length}</div>
+          <select
+            value={selectedOrgId}
+            onChange={(e) => {
+              void onSelectOrg(e.target.value);
+            }}
+            disabled={disableOrgSelect}
+            style={styles.select}
+          >
+            {memberships.map((row) => (
+              <option key={row.orgId} value={row.orgId}>
+                {row.name} ({row.slug})
+              </option>
+            ))}
+          </select>
+          {!memberships.length ? <span style={styles.helper}>No memberships available.</span> : null}
         </div>
 
-        <div style={styles.field}>
-          <div style={styles.labelRow}>
-            <h3 style={styles.sectionTitle}>Service background (today&apos;s sermon)</h3>
-            <span style={styles.helper}>Update before each service; clear afterwards.</span>
+        <form onSubmit={savePrompt} style={styles.formInner}>
+          <div style={styles.field}>
+            <div style={styles.labelRow}>
+              <h3 style={styles.sectionTitle}>Global guidance</h3>
+              <span style={styles.helper}>Always on; tweak sparingly.</span>
+            </div>
+            <textarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              style={styles.textarea}
+              placeholder="Add brief guardrails or style notes. Avoid long essays."
+              rows={10}
+              disabled={!selectedOrgId || busy}
+            />
+            <div style={styles.inlineMeta}>Chars: {prompt.length}</div>
           </div>
-          <textarea
-            value={servicePrompt}
-            onChange={(e) => setServicePrompt(e.target.value)}
-            style={styles.textarea}
-            placeholder={'Example: Series: Advent Hope. Sermon: "Light in the Darkness". Scripture: Isaiah 9:1-7. Emphasis: hope, waiting, Christ as true light. Audience: mixed ages.'}
-            rows={10}
-          />
-          <div style={styles.inlineMeta}>Chars: {servicePrompt.length}</div>
-        </div>
 
-        <div style={styles.actions}>
-          <button type="submit" style={styles.button} disabled={saving || loading}>
-            {saving ? "Saving…" : "Save both"}
-          </button>
-          <button type="button" style={styles.secondary} onClick={clearServicePrompt} disabled={loading}>
-            Clear service background
-          </button>
-          <button type="button" style={styles.secondary} onClick={clearPrompt} disabled={loading}>
-            Clear global guidance
-          </button>
-          <button type="button" style={styles.secondary} onClick={loadPrompt} disabled={loading}>
-            Refresh
-          </button>
-        </div>
-      </form>
+          <div style={styles.field}>
+            <div style={styles.labelRow}>
+              <h3 style={styles.sectionTitle}>Service background (today&apos;s sermon)</h3>
+              <span style={styles.helper}>Update before each service; clear afterwards.</span>
+            </div>
+            <textarea
+              value={servicePrompt}
+              onChange={(e) => setServicePrompt(e.target.value)}
+              style={styles.textarea}
+              placeholder={'Example: Series: Advent Hope. Sermon: "Light in the Darkness". Scripture: Isaiah 9:1-7.'}
+              rows={10}
+              disabled={!selectedOrgId || busy}
+            />
+            <div style={styles.inlineMeta}>Chars: {servicePrompt.length}</div>
+          </div>
 
-      {message && <div style={styles.message}>{message}</div>}
+          <div style={styles.actions}>
+            <button type="submit" style={styles.button} disabled={saving || busy || !selectedOrgId}>
+              {saving ? "Saving..." : "Save both"}
+            </button>
+            <button type="button" style={styles.secondary} onClick={clearServicePrompt} disabled={busy || !selectedOrgId}>
+              Clear service background
+            </button>
+            <button type="button" style={styles.secondary} onClick={clearPrompt} disabled={busy || !selectedOrgId}>
+              Clear global guidance
+            </button>
+            <button type="button" style={styles.secondary} onClick={() => void loadPromptForOrg(selectedOrgId)} disabled={busy || !selectedOrgId}>
+              Refresh
+            </button>
+          </div>
+        </form>
+      </div>
+
+      {message ? (
+        <div style={messageTone === "error" ? styles.messageError : messageTone === "success" ? styles.messageSuccess : styles.messageInfo}>
+          {message}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -153,6 +285,11 @@ const styles: Record<string, CSSProperties> = {
     flexDirection: "column",
     gap: "12px",
   },
+  formInner: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "12px",
+  },
   field: {
     display: "flex",
     flexDirection: "column",
@@ -174,9 +311,18 @@ const styles: Record<string, CSSProperties> = {
     color: "#6b7280",
     fontSize: "13px",
   },
+  select: {
+    width: "100%",
+    borderRadius: 10,
+    border: "1px solid #d0d5dd",
+    padding: "10px",
+    fontSize: "14px",
+    background: "#f8fafc",
+    color: "#111827",
+  },
   textarea: {
     width: "100%",
-    minHeight: "280px",
+    minHeight: "240px",
     borderRadius: 10,
     border: "1px solid #d0d5dd",
     padding: "12px",
@@ -207,20 +353,30 @@ const styles: Record<string, CSSProperties> = {
     color: "#111827",
     cursor: "pointer",
   },
-  note: {
-    color: "#6b7280",
-    fontSize: "13px",
-  },
   inlineMeta: {
     color: "#6b7280",
     fontSize: "13px",
     textAlign: "right",
   },
-  message: {
+  messageInfo: {
     marginTop: "12px",
     padding: "10px 12px",
     background: "#e0f2fe",
     color: "#075985",
+    borderRadius: 8,
+  },
+  messageSuccess: {
+    marginTop: "12px",
+    padding: "10px 12px",
+    background: "#dcfce7",
+    color: "#14532d",
+    borderRadius: 8,
+  },
+  messageError: {
+    marginTop: "12px",
+    padding: "10px 12px",
+    background: "#fee2e2",
+    color: "#991b1b",
     borderRadius: 8,
   },
 };

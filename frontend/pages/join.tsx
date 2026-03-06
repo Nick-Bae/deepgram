@@ -74,7 +74,7 @@ export default function JoinByInvitePage() {
       persistStreamContext({ orgId: joined.orgId, churchSlug: joined.slug });
       const params = new URLSearchParams();
       params.set("orgId", joined.orgId);
-      await router.replace(`/host/c/${encodeURIComponent(joined.slug)}?${params.toString()}`);
+      await router.replace(`/host/c/${encodeURIComponent(joined.slug)}/broadcast?${params.toString()}`);
     } catch (err: unknown) {
       setErrorMsg(readError(err));
     } finally {

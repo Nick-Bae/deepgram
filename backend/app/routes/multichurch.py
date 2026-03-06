@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from app.auth.firebase_auth import AuthenticatedUser, get_current_user_optional
+from app.auth.firebase_auth import AuthenticatedUser, get_current_user_optional, get_current_user_required
 from app.services.multichurch_store import multichurch_store
 
 router = APIRouter()
@@ -25,6 +25,14 @@ class EndRoomRequest(BaseModel):
     hostToken: str | None = Field(default=None)
     host_token: str | None = Field(default=None)
     token: str | None = Field(default=None)
+
+
+class CreateServiceRequest(BaseModel):
+    serviceKey: str = Field(..., min_length=2, max_length=80)
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    timezone: str | None = Field(default=None, min_length=2, max_length=80)
+    source: str = Field(default="ko", min_length=2, max_length=20)
+    target: str = Field(default="en", min_length=2, max_length=20)
 
 
 def _host_claims(
@@ -98,6 +106,60 @@ def list_services(slug: str):
     if not data:
         raise HTTPException(status_code=404, detail="org_not_found")
     return data
+
+
+@router.post("/org/{org_id}/services")
+def create_service(
+    org_id: str,
+    payload: CreateServiceRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        return multichurch_store.create_service(
+            org_id=org_id,
+            service_key=payload.serviceKey,
+            requested_by_uid=current_user.uid,
+            title=payload.title,
+            timezone=payload.timezone,
+            source=payload.source,
+            target=payload.target,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"invalid_uid", "invalid_service_key"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "service_exists":
+            raise HTTPException(status_code=409, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "service_create_failed") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
+
+
+@router.delete("/org/{org_id}/services/{service_key}")
+def delete_service(
+    org_id: str,
+    service_key: str,
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        return multichurch_store.delete_service(
+            org_id=org_id,
+            service_key=service_key,
+            requested_by_uid=current_user.uid,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"invalid_uid", "invalid_service_key"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail in {"org_not_found", "service_not_found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "service_active":
+            raise HTTPException(status_code=409, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "service_delete_failed") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
 
 
 @router.post("/org/{org_id}/service/{service_key}/start")

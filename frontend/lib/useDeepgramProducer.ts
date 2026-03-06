@@ -209,12 +209,22 @@ export function useDeepgramProducer(): DeepgramProducerController {
       ws.onerror = () => {
         setErrorMsg("WebSocket error");
         setStatus("error");
+        try { ws.close(); } catch {}
       };
 
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          if (msg.type === "error") { setErrorMsg(msg.message || "Server error"); return; }
+          if (msg.type === "error") {
+            setErrorMsg(msg.message || "Server error");
+            setStatus("error");
+            shouldRunRef.current = false;
+            clearReconnectTimer();
+            try { ws.close(); } catch {}
+            wsRef.current = null;
+            releaseMediaPipeline();
+            return;
+          }
           if (msg.type === "stt.partial") setPartial(msg.text || "");
           if (msg.type === "translation") setLastCommit(msg.payload || "");
         } catch {}
@@ -229,7 +239,17 @@ export function useDeepgramProducer(): DeepgramProducerController {
 
   async function start(options?: StartOptions) {
     try {
-      if (shouldRunRef.current) return;
+      if (shouldRunRef.current) {
+        const wsState = wsRef.current?.readyState;
+        const activeSocket = wsState === WebSocket.CONNECTING || wsState === WebSocket.OPEN;
+        if (status === "streaming" || status === "starting" || activeSocket) return;
+        // Recover from stale error states where shouldRunRef stayed true.
+        shouldRunRef.current = false;
+        clearReconnectTimer();
+        try { wsRef.current?.close(); } catch {}
+        wsRef.current = null;
+        releaseMediaPipeline();
+      }
       shouldRunRef.current = true;
       startOptionsRef.current = options;
       const resolvedContext = resolveStreamContext();

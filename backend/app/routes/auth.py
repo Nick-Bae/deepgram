@@ -1,12 +1,60 @@
 from __future__ import annotations
 
+from collections import deque
+import os
+import time
+from threading import Lock
+from typing import Deque, Dict, Tuple
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
-from app.services.multichurch_store import multichurch_store
+from app.services.multichurch_store import DEFAULT_INVITE_EXPIRY_HOURS, multichurch_store
 
 router = APIRouter()
+
+
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
+_INVITE_RATE_WINDOW_SECONDS = _env_int("INVITE_RATE_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
+_INVITE_RATE_CREATE_MAX = _env_int("INVITE_RATE_CREATE_MAX_PER_WINDOW", 20, min_value=1, max_value=5000)
+_INVITE_RATE_PREVIEW_MAX = _env_int("INVITE_RATE_PREVIEW_MAX_PER_WINDOW", 120, min_value=1, max_value=5000)
+_INVITE_RATE_REDEEM_MAX = _env_int("INVITE_RATE_REDEEM_MAX_PER_WINDOW", 40, min_value=1, max_value=5000)
+_invite_rate_hits: Dict[Tuple[str, str], Deque[float]] = {}
+_invite_rate_lock = Lock()
+
+
+def _enforce_invite_rate_limit(uid: str, *, action: str, max_hits: int) -> None:
+    clean_uid = (uid or "").strip()
+    if not clean_uid:
+        return
+    now = time.monotonic()
+    cutoff = now - _INVITE_RATE_WINDOW_SECONDS
+    key = (clean_uid, action)
+    with _invite_rate_lock:
+        bucket = _invite_rate_hits.get(key)
+        if bucket is None:
+            bucket = deque()
+            _invite_rate_hits[key] = bucket
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= max_hits:
+            raise HTTPException(status_code=429, detail="invite_rate_limited")
+        bucket.append(now)
+        if len(_invite_rate_hits) > 4096:
+            stale = [k for k, values in _invite_rate_hits.items() if not values or values[-1] <= cutoff]
+            for stale_key in stale:
+                _invite_rate_hits.pop(stale_key, None)
 
 
 class BootstrapOwnerRequest(BaseModel):
@@ -23,7 +71,7 @@ class SetCurrentOrgRequest(BaseModel):
 
 class CreateInviteRequest(BaseModel):
     role: str = Field(default="host", min_length=4, max_length=20)
-    expiresHours: int = Field(default=24 * 7, ge=1, le=24 * 30)
+    expiresHours: int = Field(default=DEFAULT_INVITE_EXPIRY_HOURS, ge=1, le=24 * 30)
 
 
 @router.get("/auth/me")
@@ -107,6 +155,7 @@ def auth_create_invite(
     payload: CreateInviteRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
+    _enforce_invite_rate_limit(user.uid, action="create", max_hits=_INVITE_RATE_CREATE_MAX)
     try:
         invite = multichurch_store.create_invite(
             org_id=org_id,
@@ -120,6 +169,8 @@ def auth_create_invite(
             raise HTTPException(status_code=400, detail=detail) from exc
         if detail == "org_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "invite_active_limit_reached":
+            raise HTTPException(status_code=429, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "invite_create_failed") from exc
     except PermissionError as exc:
         detail = str(exc) or "forbidden"
@@ -159,6 +210,7 @@ def auth_preview_invite(
     code: str,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
+    _enforce_invite_rate_limit(user.uid, action="preview", max_hits=_INVITE_RATE_PREVIEW_MAX)
     try:
         return multichurch_store.preview_invite(code=code, uid=user.uid)
     except ValueError as exc:
@@ -181,6 +233,7 @@ def auth_redeem_invite(
     code: str,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
+    _enforce_invite_rate_limit(user.uid, action="redeem", max_hits=_INVITE_RATE_REDEEM_MAX)
     try:
         return multichurch_store.redeem_invite(
             code=code,

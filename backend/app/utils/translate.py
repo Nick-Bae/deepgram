@@ -605,12 +605,40 @@ def _unmask_hard_glossary(text: str, mapping: dict[str, str]) -> str:
     return out
 
 
-def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationContext], *, current_source_text: Optional[str] = None) -> str:
+def _build_system_prompt(
+    source: str,
+    target: str,
+    ctx: Optional[TranslationContext],
+    *,
+    current_source_text: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    service_prompt: Optional[str] = None,
+    compact_prompt: bool = False,
+) -> str:
     """
     Core system prompt: neutral/cautious worship captioning with domain aids.
     """
     source_name = _language_name(source)
     target_name = _language_name(target)
+    service_text = ((service_prompt or "") if service_prompt is not None else (_get_service_prompt() or "")).strip()
+    service_block = ("\nService background:\n" + service_text + "\n") if service_text else ""
+
+    custom_text = ((custom_prompt or "") if custom_prompt is not None else (_get_custom_prompt() or "")).strip()
+    custom_block = ("\nGlobal guidance:\n" + custom_text + "\n") if custom_text else ""
+
+    if compact_prompt:
+        return (
+            "You are a professional translator for church sermon prep.\n"
+            f"Translate {source_name} → {target_name} faithfully and naturally.\n"
+            "Rules:\n"
+            "- Preserve meaning; do not add content.\n"
+            "- Keep a reverent, clear, family-safe tone.\n"
+            "- Keep proper nouns and Bible references accurate.\n"
+            "- Output only the translation text.\n"
+            + service_block
+            + custom_block
+            + _build_context_block(ctx)
+        )
 
     # Theological glossary (only if from Korean)
     glossary_lines: list[str] = []
@@ -635,12 +663,6 @@ def _build_system_prompt(source: str, target: str, ctx: Optional[TranslationCont
         )
 
     fewshot_block = _build_fewshot_block(source, target, current_source_text=current_source_text)
-
-    service_prompt = (_get_service_prompt() or "").strip()
-    service_block = ("\nService background:\n" + service_prompt + "\n") if service_prompt else ""
-
-    custom_prompt = (_get_custom_prompt() or "").strip()
-    custom_block = ("\nGlobal guidance:\n" + custom_prompt + "\n") if custom_prompt else ""
 
     system = (
         "You are a professional translator for live church worship captions.\n"
@@ -836,6 +858,10 @@ async def translate_text(
     ctx: Optional[TranslationContext] = None,
     *,
     update_ctx: bool = True,
+    custom_prompt: Optional[str] = None,
+    service_prompt: Optional[str] = None,
+    compact_prompt: bool = False,
+    model_override: Optional[str] = None,
 ) -> str:
     """
     Async translator. Returns ONLY the translated text (no quotes/explanations).
@@ -875,7 +901,15 @@ async def translate_text(
         ctx_for_prompt = ctx
 
     client = _get_client()
-    system = _build_system_prompt(source, target, ctx_for_prompt, current_source_text=text)
+    system = _build_system_prompt(
+        source,
+        target,
+        ctx_for_prompt,
+        current_source_text=text,
+        custom_prompt=custom_prompt,
+        service_prompt=service_prompt,
+        compact_prompt=compact_prompt,
+    )
     user_content = masked_text
     if ctx_for_prompt:
         prev = ctx_for_prompt.last_english or "(none yet)"
@@ -888,8 +922,9 @@ async def translate_text(
         )
 
     try:
+        model_name = (model_override or _MODEL or "gpt-4o-mini").strip() or "gpt-4o-mini"
         resp = await client.chat.completions.create(
-            model=_MODEL,
+            model=model_name,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content}
@@ -927,5 +962,5 @@ async def translate_text(
 
         return out
     except Exception as e:
-        print(f"[TX] OpenAI error: {e}")
+        print(f"[TX] OpenAI error (model={model_override or _MODEL}): {e}")
         return text

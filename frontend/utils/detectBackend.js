@@ -37,16 +37,54 @@ function getPreferredNetworkIP() {
   return null;
 }
 
-const ip = process.env.BACKEND_HOST || getPreferredNetworkIP() || 'localhost';
+const explicitHost = (process.env.BACKEND_HOST || '').trim();
+const autoDetect = /^(1|true|yes)$/i.test((process.env.AUTO_DETECT_BACKEND_IP || '').trim());
+const detectedIp = autoDetect ? getPreferredNetworkIP() : null;
+const ip = explicitHost || detectedIp || 'localhost';
 const envPath = path.join(__dirname, '../.env.local');
-const envContent =
-  `NEXT_PUBLIC_API_BASE_URL=http://${ip}:8000\n` +
-  `NEXT_PUBLIC_WS_URL=ws://${ip}:8000/ws/translate\n`;
 
-fs.writeFileSync(envPath, envContent);
+function upsertEnvVars(envFilePath, updates) {
+  const existing = fs.existsSync(envFilePath)
+    ? fs.readFileSync(envFilePath, 'utf8')
+    : '';
+  const lines = existing.split(/\r?\n/);
+  const seen = new Set();
+  const output = [];
+
+  for (const line of lines) {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+    if (!match) {
+      if (line.length) output.push(line);
+      continue;
+    }
+    const key = match[1];
+    if (Object.prototype.hasOwnProperty.call(updates, key)) {
+      output.push(`${key}=${updates[key]}`);
+      seen.add(key);
+    } else {
+      output.push(line);
+    }
+  }
+
+  for (const [key, value] of Object.entries(updates)) {
+    if (!seen.has(key)) output.push(`${key}=${value}`);
+  }
+
+  const nextContent = `${output.filter(Boolean).join('\n')}\n`;
+  fs.writeFileSync(envFilePath, nextContent, 'utf8');
+  return nextContent;
+}
+
+const envContent = upsertEnvVars(envPath, {
+  NEXT_PUBLIC_API_BASE_URL: `http://${ip}:8000`,
+  NEXT_PUBLIC_WS_URL: `ws://${ip}:8000/ws/translate`,
+});
 
 if (ip === 'localhost') {
-  console.log(`⚠️ .env.local updated with localhost fallback:\n${envContent}`);
+  const hint = autoDetect
+    ? '\nTip: pass BACKEND_HOST=<LAN_IP> if you are opening frontend from another device.'
+    : '';
+  console.log(`⚠️ .env.local updated with localhost default:\n${envContent}${hint}`);
 } else {
   console.log(`✅ .env.local updated with detected IP (${ip}):\n${envContent}`);
 }
