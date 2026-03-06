@@ -2,9 +2,9 @@ import Link from "next/link";
 import { useRouter } from "next/router";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-import { fetchAuthMe } from "../lib/backendAuth";
+import { fetchAuthMe, type OrgMembership } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
-import { persistAuthToken, persistHostToken } from "../utils/streamContext";
+import { clearHostToken, persistAuthToken, persistHostToken, persistStreamContext } from "../utils/streamContext";
 
 function mapFirebaseError(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
@@ -14,6 +14,32 @@ function mapFirebaseError(err: unknown): string {
   if (code === "auth/too-many-requests") return "Too many attempts. Try again later.";
   if (err instanceof Error) return err.message;
   return "Login failed.";
+}
+
+type NextRouteTarget = {
+  orgId?: string;
+  slug?: string;
+};
+
+function parseNextRouteTarget(nextPath: string): NextRouteTarget {
+  try {
+    const parsed = new URL(nextPath, "http://localhost");
+    const orgId = (parsed.searchParams.get("orgId") || parsed.searchParams.get("org_id") || "").trim() || undefined;
+    const hostMatch = parsed.pathname.match(/^\/host\/c\/([^/]+)/i);
+    const slug = hostMatch ? decodeURIComponent(hostMatch[1] || "").trim() || undefined : undefined;
+    return { orgId, slug };
+  } catch {
+    return {};
+  }
+}
+
+function membershipForTarget(target: NextRouteTarget, memberships: OrgMembership[]): OrgMembership | undefined {
+  if (target.orgId) {
+    const byOrg = memberships.find((row) => row.orgId === target.orgId);
+    if (byOrg) return byOrg;
+  }
+  if (target.slug) return memberships.find((row) => row.slug === target.slug);
+  return undefined;
 }
 
 export default function LoginPage() {
@@ -33,17 +59,41 @@ export default function LoginPage() {
 
   const redirectFromMembership = async (idToken: string) => {
     const me = await fetchAuthMe(idToken);
+    const memberships = me.memberships || [];
     const preferredOrgId = (me.currentOrgId || "").trim();
-    const primary = me.memberships.find((row) => row.orgId === preferredOrgId) || me.memberships[0];
-    if (nextPath && nextPath !== "/login" && !nextPath.startsWith("/login?")) {
+    const primary = memberships.find((row) => row.orgId === preferredOrgId) || memberships[0];
+    const target = parseNextRouteTarget(nextPath);
+    const targetMembership = membershipForTarget(target, memberships);
+    const hasOrgScopedTarget = Boolean(target.orgId || target.slug);
+
+    if (nextPath && nextPath !== "/login" && !nextPath.startsWith("/login?") && (!hasOrgScopedTarget || targetMembership)) {
+      const sessionMembership = targetMembership || primary;
+      if (sessionMembership) {
+        if (sessionMembership.hostToken) persistHostToken(sessionMembership.hostToken);
+        else clearHostToken();
+        persistStreamContext({
+          orgId: sessionMembership.orgId,
+          roomId: undefined,
+          serviceKey: undefined,
+          churchSlug: sessionMembership.slug,
+        });
+      }
       await router.replace(nextPath);
       return;
     }
     if (!primary) {
+      clearHostToken();
       await router.replace("/onboarding/create-church");
       return;
     }
     if (primary.hostToken) persistHostToken(primary.hostToken);
+    else clearHostToken();
+    persistStreamContext({
+      orgId: primary.orgId,
+      roomId: undefined,
+      serviceKey: undefined,
+      churchSlug: primary.slug,
+    });
     const params = new URLSearchParams();
     params.set("orgId", primary.orgId);
     await router.replace(`/host/c/${encodeURIComponent(primary.slug)}/broadcast?${params.toString()}`);

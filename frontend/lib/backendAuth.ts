@@ -151,10 +151,30 @@ export type OrgSermonFinalizeResponse = OrgSermonDraftResponse & {
 const AUTH_FETCH_TIMEOUT_MS = 15000;
 const PROMPT_FETCH_TIMEOUT_MS = 30000;
 const SERMON_FETCH_TIMEOUT_MS = 120000;
+const AUTH_ME_CACHE_TTL_MS = 10000;
 
 type AuthRequestInit = RequestInit & {
   timeoutMs?: number;
 };
+
+type AuthMeCacheEntry = {
+  expiresAt: number;
+  value: AuthMeResponse;
+};
+
+const authMeCache = new Map<string, AuthMeCacheEntry>();
+const authMeInFlight = new Map<string, Promise<AuthMeResponse>>();
+
+function invalidateAuthMeCache(idToken?: string): void {
+  const token = (idToken || "").trim();
+  if (!token) {
+    authMeCache.clear();
+    authMeInFlight.clear();
+    return;
+  }
+  authMeCache.delete(token);
+  authMeInFlight.delete(token);
+}
 
 function isAbortError(err: unknown): boolean {
   return typeof err === "object" && err !== null && "name" in err && String((err as { name?: string }).name) === "AbortError";
@@ -233,7 +253,26 @@ async function authFetch<T>(path: string, idToken: string, init?: AuthRequestIni
 }
 
 export function fetchAuthMe(idToken: string): Promise<AuthMeResponse> {
-  return authFetch<AuthMeResponse>("/api/auth/me", idToken, { method: "GET" });
+  const token = (idToken || "").trim();
+  if (!token) return authFetch<AuthMeResponse>("/api/auth/me", idToken, { method: "GET" });
+
+  const cached = authMeCache.get(token);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return Promise.resolve(cached.value);
+
+  const inFlight = authMeInFlight.get(token);
+  if (inFlight) return inFlight;
+
+  const request = authFetch<AuthMeResponse>("/api/auth/me", token, { method: "GET" })
+    .then((payload) => {
+      authMeCache.set(token, { value: payload, expiresAt: Date.now() + AUTH_ME_CACHE_TTL_MS });
+      return payload;
+    })
+    .finally(() => {
+      authMeInFlight.delete(token);
+    });
+  authMeInFlight.set(token, request);
+  return request;
 }
 
 export function bootstrapOwnerOrg(
@@ -250,6 +289,9 @@ export function bootstrapOwnerOrg(
       source: payload.source || "ko",
       target: payload.target || "en",
     }),
+  }).then((result) => {
+    invalidateAuthMeCache(idToken);
+    return result;
   });
 }
 
@@ -258,6 +300,9 @@ export function setCurrentOrg(idToken: string, orgId: string): Promise<SetCurren
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ orgId }),
+  }).then((result) => {
+    invalidateAuthMeCache(idToken);
+    return result;
   });
 }
 
@@ -285,6 +330,9 @@ export function previewOrgInvite(idToken: string, code: string): Promise<InviteP
 export function redeemOrgInvite(idToken: string, code: string): Promise<InviteRedeemResponse> {
   return authFetch<InviteRedeemResponse>(`/api/auth/invites/${encodeURIComponent(code)}/redeem`, idToken, {
     method: "POST",
+  }).then((result) => {
+    invalidateAuthMeCache(idToken);
+    return result;
   });
 }
 

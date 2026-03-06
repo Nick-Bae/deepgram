@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import time
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -1268,6 +1269,22 @@ class FirestoreMultiChurchStore:
         )
         self._db = gcf_firestore.Client(project=project_id, database="worship-translation")
         self._global_host_token = (os.getenv("HOST_API_TOKEN") or "").strip()
+        self._membership_cache_ttl_seconds = _env_int(
+            "MULTICHURCH_MEMBERSHIP_CACHE_TTL_SECONDS",
+            10,
+            min_value=0,
+            max_value=300,
+        )
+        self._membership_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._membership_cache_lock = Lock()
+        self._prompt_cache_ttl_seconds = _env_int(
+            "MULTICHURCH_PROMPT_CACHE_TTL_SECONDS",
+            20,
+            min_value=0,
+            max_value=300,
+        )
+        self._prompt_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._prompt_cache_lock = Lock()
 
     def _where(self, query: Any, field_path: str, op_string: str, value: Any):
         field_filter_cls = getattr(gcf_firestore, "FieldFilter", None)
@@ -1292,6 +1309,88 @@ class FirestoreMultiChurchStore:
 
     def _user_ref(self, uid: str):
         return self._db.collection("users").document(uid)
+
+    def _user_membership_ref(self, uid: str, org_id: str):
+        return self._user_ref(uid).collection("memberships").document(org_id)
+
+    def _get_cached_memberships(self, uid: str) -> Optional[List[Dict[str, Any]]]:
+        if self._membership_cache_ttl_seconds <= 0:
+            return None
+        now = time.monotonic()
+        with self._membership_cache_lock:
+            cached = self._membership_cache.get(uid)
+            if cached is None:
+                return None
+            expires_at, rows = cached
+            if expires_at <= now:
+                self._membership_cache.pop(uid, None)
+                return None
+            return [dict(row) for row in rows]
+
+    def _set_cached_memberships(self, uid: str, rows: List[Dict[str, Any]]) -> None:
+        if self._membership_cache_ttl_seconds <= 0:
+            return
+        expires_at = time.monotonic() + float(self._membership_cache_ttl_seconds)
+        with self._membership_cache_lock:
+            self._membership_cache[uid] = (expires_at, [dict(row) for row in rows])
+
+    def _invalidate_membership_cache(self, uid: Optional[str]) -> None:
+        clean_uid = _clean_token(uid)
+        if not clean_uid:
+            return
+        with self._membership_cache_lock:
+            self._membership_cache.pop(clean_uid, None)
+
+    def _upsert_user_membership_index(
+        self,
+        *,
+        uid: str,
+        org_id: str,
+        role: Optional[str],
+        transaction=None,
+    ) -> None:
+        clean_uid = _clean_token(uid)
+        clean_org_id = _clean_token(org_id)
+        if not clean_uid or not clean_org_id:
+            return
+        payload = {
+            "orgId": clean_org_id,
+            "role": _normalize_role(role, fallback="viewer"),
+            "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+        }
+        ref = self._user_membership_ref(clean_uid, clean_org_id)
+        if transaction is None:
+            ref.set(payload, merge=True)
+            return
+        transaction.set(ref, payload, merge=True)
+
+    def _get_cached_org_prompt(self, org_id: str) -> Optional[Dict[str, Any]]:
+        if self._prompt_cache_ttl_seconds <= 0:
+            return None
+        now = time.monotonic()
+        with self._prompt_cache_lock:
+            cached = self._prompt_cache.get(org_id)
+            if cached is None:
+                return None
+            expires_at, payload = cached
+            if expires_at <= now:
+                self._prompt_cache.pop(org_id, None)
+                return None
+            return dict(payload)
+
+    def _set_cached_org_prompt(self, org_id: str, payload: Dict[str, Any]) -> None:
+        if self._prompt_cache_ttl_seconds <= 0:
+            return
+        expires_at = time.monotonic() + float(self._prompt_cache_ttl_seconds)
+        with self._prompt_cache_lock:
+            self._prompt_cache[org_id] = (expires_at, dict(payload))
+
+    def _invalidate_org_prompt_cache(self, org_id: Optional[str]) -> None:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return
+        with self._prompt_cache_lock:
+            self._prompt_cache.pop(clean_org_id, None)
 
     def _org_invite_ref(self, invite_id: str):
         return self._db.collection("orgInvites").document(invite_id)
@@ -1549,27 +1648,70 @@ class FirestoreMultiChurchStore:
         clean_uid = _clean_token(uid)
         if not clean_uid:
             return []
+        cached = self._get_cached_memberships(clean_uid)
+        if cached is not None:
+            return cached
+
         rows: List[Dict[str, Any]] = []
-        for org_snap in self._db.collection("organizations").stream():
-            org_id = org_snap.id
-            member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
-            if not member_snap.exists:
-                continue
-            org = org_snap.to_dict() or {}
-            member = member_snap.to_dict() or {}
-            role = str(member.get("role") or "viewer")
-            lowered_role = role.strip().lower()
-            rows.append(
-                {
-                    "orgId": org_id,
-                    "slug": str(org.get("slug") or org_id),
-                    "name": str(org.get("name") or org_id),
-                    "status": str(org.get("status") or "active"),
-                    "role": role,
-                    "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
-                }
-            )
+        indexed_memberships = list(self._user_ref(clean_uid).collection("memberships").stream())
+        if indexed_memberships:
+            stale_org_ids: List[str] = []
+            for index_snap in indexed_memberships:
+                index_doc = index_snap.to_dict() or {}
+                org_id = _clean_token(index_doc.get("orgId")) or index_snap.id
+                if not org_id:
+                    continue
+                org_ref = self._org_ref(org_id)
+                member_snap = org_ref.collection("members").document(clean_uid).get()
+                if not member_snap.exists:
+                    stale_org_ids.append(org_id)
+                    continue
+                org_snap = org_ref.get()
+                if not org_snap.exists:
+                    stale_org_ids.append(org_id)
+                    continue
+                org = org_snap.to_dict() or {}
+                member = member_snap.to_dict() or {}
+                role = _normalize_role(member.get("role"), fallback=index_doc.get("role"))
+                lowered_role = role.strip().lower()
+                rows.append(
+                    {
+                        "orgId": org_id,
+                        "slug": str(org.get("slug") or org_id),
+                        "name": str(org.get("name") or org_id),
+                        "status": str(org.get("status") or "active"),
+                        "role": role,
+                        "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
+                    }
+                )
+                if _normalize_role(index_doc.get("role"), fallback="viewer") != role:
+                    self._upsert_user_membership_index(uid=clean_uid, org_id=org_id, role=role)
+            for stale_org_id in stale_org_ids:
+                self._user_membership_ref(clean_uid, stale_org_id).delete()
+        if not indexed_memberships or not rows:
+            rows = []
+            for org_snap in self._db.collection("organizations").stream():
+                org_id = org_snap.id
+                member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
+                if not member_snap.exists:
+                    continue
+                org = org_snap.to_dict() or {}
+                member = member_snap.to_dict() or {}
+                role = _normalize_role(member.get("role"), fallback="viewer")
+                lowered_role = role.strip().lower()
+                rows.append(
+                    {
+                        "orgId": org_id,
+                        "slug": str(org.get("slug") or org_id),
+                        "name": str(org.get("name") or org_id),
+                        "status": str(org.get("status") or "active"),
+                        "role": role,
+                        "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
+                    }
+                )
+                self._upsert_user_membership_index(uid=clean_uid, org_id=org_id, role=role)
         rows.sort(key=lambda row: (row["orgId"], row["slug"]))
+        self._set_cached_memberships(clean_uid, rows)
         return rows
 
     def get_current_org_id(self, uid: str) -> Optional[str]:
@@ -1810,6 +1952,12 @@ class FirestoreMultiChurchStore:
             if clean_display_name:
                 user_payload["displayName"] = clean_display_name
             transaction.set(self._user_ref(clean_uid), user_payload, merge=True)
+            self._upsert_user_membership_index(
+                uid=clean_uid,
+                org_id=org_id,
+                role=member_role,
+                transaction=transaction,
+            )
 
             transaction.set(
                 invite_ref,
@@ -1844,7 +1992,9 @@ class FirestoreMultiChurchStore:
             }
 
         tx = db.transaction()
-        return _tx(tx)
+        redeemed = _tx(tx)
+        self._invalidate_membership_cache(clean_uid)
+        return redeemed
 
     def list_invites(
         self,
@@ -2064,6 +2214,8 @@ class FirestoreMultiChurchStore:
             },
             merge=True,
         )
+        self._upsert_user_membership_index(uid=clean_uid, org_id=org_id, role="owner")
+        self._invalidate_membership_cache(clean_uid)
 
         service_rows: List[Dict[str, str]] = []
         for service_key, title in DEFAULT_SERVICE_SEEDS:
@@ -2141,6 +2293,7 @@ class FirestoreMultiChurchStore:
             },
             merge=True,
         )
+        self._invalidate_org_prompt_cache(clean_org_id)
         return {
             "orgId": clean_org_id,
             "prompt": str(prompt or ""),
@@ -2152,15 +2305,22 @@ class FirestoreMultiChurchStore:
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             return {"orgId": "", "prompt": "", "service_prompt": ""}
+        cached = self._get_cached_org_prompt(clean_org_id)
+        if cached is not None:
+            return cached
         org_snap = self._org_ref(clean_org_id).get()
         if not org_snap.exists:
-            return {"orgId": clean_org_id, "prompt": "", "service_prompt": ""}
+            payload = {"orgId": clean_org_id, "prompt": "", "service_prompt": ""}
+            self._set_cached_org_prompt(clean_org_id, payload)
+            return payload
         org = org_snap.to_dict() or {}
-        return {
+        payload = {
             "orgId": clean_org_id,
             "prompt": str(org.get("customPrompt") or ""),
             "service_prompt": str(org.get("servicePrompt") or ""),
         }
+        self._set_cached_org_prompt(clean_org_id, payload)
+        return payload
 
     def authorize_host(self, org_id: str, *, host_uid: Optional[str] = None, host_token: Optional[str] = None) -> bool:
         org_snap = self._org_ref(org_id).get()

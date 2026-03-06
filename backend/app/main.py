@@ -266,6 +266,18 @@ async def ws_translate(ws: WebSocket):
     host_authed = False
     joined_service_key = qctx.get("serviceKey")
     joined_church_slug = qctx.get("churchSlug")
+    prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
+
+    def _cached_prompt_overrides(org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return None, None
+        cached = prompt_overrides_cache.get(clean_org_id)
+        if cached is not None:
+            return cached
+        resolved = _prompt_overrides_for_org(clean_org_id)
+        prompt_overrides_cache[clean_org_id] = resolved
+        return resolved
 
     async def _broadcast_status_for_joined_room() -> None:
         if not joined_org_id or not joined_room_id:
@@ -405,7 +417,7 @@ async def ws_translate(ws: WebSocket):
             translated = src_text
         else:
             try:
-                custom_prompt, service_prompt = _prompt_overrides_for_org(target_org_id)
+                custom_prompt, service_prompt = _cached_prompt_overrides(target_org_id)
                 translated = await translate_text(
                     src_text,
                     src_lang_full,
@@ -679,6 +691,21 @@ async def ws_stt_deepgram(websocket: WebSocket):
     closed = asyncio.Event()
     finalize_event = asyncio.Event()
     last_audio_touch_ts = 0.0
+    prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
+
+    def _cached_prompt_overrides(active_org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        clean_org_id = _clean_token(active_org_id)
+        if not clean_org_id:
+            return None, None
+        cached = prompt_overrides_cache.get(clean_org_id)
+        if cached is not None:
+            return cached
+        resolved = _prompt_overrides_for_org(clean_org_id)
+        prompt_overrides_cache[clean_org_id] = resolved
+        return resolved
+
+    if org_id:
+        prompt_overrides_cache[org_id] = _prompt_overrides_for_org(org_id)
 
     async def from_client_to_deepgram():
         nonlocal last_audio_touch_ts
@@ -874,7 +901,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     translated = clean_src
                 else:
                     try:
-                        custom_prompt, service_prompt = _prompt_overrides_for_org(org_id)
+                        custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
                         translated = await translate_text(
                             clean_src,
                             src_lang_full,
@@ -896,7 +923,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     translated = clean_src
                 else:
                     try:
-                        custom_prompt, service_prompt = _prompt_overrides_for_org(org_id)
+                        custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
                         translated = await translate_text(
                             clean_src,
                             src_lang_full,

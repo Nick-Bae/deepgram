@@ -1,5 +1,5 @@
 import { useRouter } from "next/router";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { API_URL, WS_URL } from "../../../../utils/urls";
 import { useSubtitleSocket } from "../../../../utils/useSubtitleSocket";
@@ -15,7 +15,9 @@ type ResolveResponse = {
   service?: { title?: string; timezone?: string };
 };
 
-const RESOLVE_POLL_MS = 5000;
+const RESOLVE_POLL_MS = 8000;
+const DISPLAY_TOGGLE_KEY = "f";
+type DisplayMode = "subtitle" | "fullScreen";
 
 export default function ChurchServiceListenerPage() {
   const router = useRouter();
@@ -25,12 +27,28 @@ export default function ChurchServiceListenerPage() {
   const [loading, setLoading] = useState(true);
   const [resolveData, setResolveData] = useState<ResolveResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [displayMode, setDisplayMode] = useState<DisplayMode>("fullScreen");
+
+  const toggleDisplayMode = useCallback(() => {
+    setDisplayMode((prev) => (prev === "subtitle" ? "fullScreen" : "subtitle"));
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== DISPLAY_TOGGLE_KEY) return;
+      event.preventDefault();
+      toggleDisplayMode();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [toggleDisplayMode]);
 
   useEffect(() => {
     if (!slug || !serviceKey) return;
     let disposed = false;
 
     const fetchResolve = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const res = await fetch(`${API_URL}/api/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(serviceKey)}/resolve`);
         if (!res.ok) {
@@ -81,13 +99,18 @@ export default function ChurchServiceListenerPage() {
 
   const { connected, krLines, enLines } = useSubtitleSocket(scopedWsUrl, {
     maxLines: 4,
-    track: "en",
+    track: "both",
     enabled: socketEnabled,
   });
 
   const serviceTitle = resolveData?.service?.title || serviceKey || "Service";
   const lastKr = krLines[krLines.length - 1] || "";
   const lastEn = enLines[enLines.length - 1] || "";
+  const currentEn = lastEn || "— waiting —";
+  const recentEn = enLines.slice(0, -1).slice(-2);
+  const connectionLabel = connected ? "Connected" : socketEnabled ? "Reconnecting..." : "Offline";
+  const connectionColor = connected ? "#34d399" : socketEnabled ? "#f59e0b" : "#6b7280";
+  const stageWidth = "min(92vw, calc(92vh * 16 / 9))";
 
   return (
     <main
@@ -95,58 +118,209 @@ export default function ChurchServiceListenerPage() {
         minHeight: "100vh",
         background: "#000",
         color: "#fff",
-        padding: "24px 20px 32px",
         fontFamily: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+        position: "relative",
+        overflow: "hidden",
       }}
     >
-      <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-        <div style={{ marginBottom: 18, opacity: 0.86, fontSize: 14 }}>
-          {loading ? "Resolving service..." : `${slug} / ${serviceKey}`}
-        </div>
-
-        {errorMsg && (
-          <div style={{ marginBottom: 16, color: "#fca5a5", fontSize: 14 }}>
-            Failed to resolve service: {errorMsg}
-          </div>
-        )}
-
-        {!socketEnabled ? (
-          <section
-            style={{
-              border: "1px solid rgba(255,255,255,0.22)",
-              borderRadius: 18,
-              padding: "20px 18px",
-              background: "rgba(255,255,255,0.06)",
-            }}
-          >
-            <h1 style={{ margin: 0, fontSize: 28, fontWeight: 700 }}>{serviceTitle}</h1>
-            <p style={{ marginTop: 12, marginBottom: 0, opacity: 0.86 }}>
-              Waiting for service to start. Keep this page open.
-            </p>
-          </section>
-        ) : (
-          <section
-            style={{
-              border: "1px solid rgba(255,255,255,0.22)",
-              borderRadius: 18,
-              padding: "22px 20px",
-              background: "rgba(0,0,0,0.5)",
-              boxShadow: "0 18px 45px rgba(0,0,0,0.4)",
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 16, fontSize: 14 }}>
-              <strong style={{ fontWeight: 700 }}>{serviceTitle}</strong>
-              <span style={{ opacity: 0.9 }}>{connected ? "Connected" : "Reconnecting..."}</span>
-            </div>
-            {lastKr ? (
-              <div style={{ opacity: 0.72, fontSize: "clamp(18px, 2.6vw, 42px)", marginBottom: 14, lineHeight: 1.25 }}>{lastKr}</div>
-            ) : null}
-            <div style={{ fontSize: "clamp(34px, 8vw, 88px)", fontWeight: 700, lineHeight: 1.08 }}>
-              {lastEn || "— waiting —"}
-            </div>
-          </section>
-        )}
+      <div
+        style={{
+          position: "fixed",
+          top: 14,
+          left: 14,
+          zIndex: 20,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          fontSize: 12,
+          fontWeight: 600,
+          color: "rgba(255,255,255,0.85)",
+        }}
+      >
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: 999,
+            display: "inline-block",
+            background: connectionColor,
+            boxShadow: `0 0 0 3px ${connected ? "rgba(16,185,129,0.16)" : socketEnabled ? "rgba(245,158,11,0.12)" : "rgba(107,114,128,0.12)"}`,
+          }}
+        />
+        {connectionLabel}
       </div>
+
+      <button
+        type="button"
+        onClick={toggleDisplayMode}
+        style={{
+          position: "fixed",
+          top: 12,
+          right: 12,
+          zIndex: 20,
+          borderRadius: 999,
+          border: "1px solid rgba(255,255,255,0.28)",
+          background: "rgba(0,0,0,0.52)",
+          color: "#fff",
+          padding: "7px 14px",
+          fontSize: 12,
+          fontWeight: 700,
+          cursor: "pointer",
+          letterSpacing: "0.03em",
+          textTransform: "uppercase",
+        }}
+      >
+        {displayMode === "subtitle" ? "Full Screen (F)" : "Subtitle (F)"}
+      </button>
+
+      {errorMsg ? (
+        <div
+          style={{
+            position: "fixed",
+            top: 48,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 20,
+            color: "#fca5a5",
+            fontSize: 13,
+            background: "rgba(127,29,29,0.35)",
+            border: "1px solid rgba(252,165,165,0.4)",
+            borderRadius: 10,
+            padding: "6px 10px",
+          }}
+        >
+          Failed to resolve service: {errorMsg}
+        </div>
+      ) : null}
+
+      {loading ? (
+        <div
+          style={{
+            position: "fixed",
+            top: 48,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 19,
+            fontSize: 12,
+            opacity: 0.75,
+          }}
+        >
+          Resolving {serviceTitle}...
+        </div>
+      ) : null}
+
+      {displayMode === "subtitle" ? (
+        <div
+          style={{
+            position: "fixed",
+            left: 0,
+            right: 0,
+            bottom: 42,
+            padding: "0 5vw",
+            display: "flex",
+            justifyContent: "center",
+            zIndex: 10,
+          }}
+        >
+          <section
+            style={{
+              width: `min(${stageWidth}, 100%)`,
+              border: "1px solid rgba(255,255,255,0.12)",
+              background: "rgba(0,0,0,0.56)",
+              boxShadow: "0 20px 45px rgba(0,0,0,0.45)",
+              padding: "18px 22px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "0.7em",
+              textAlign: "left",
+            }}
+          >
+            {lastKr ? (
+              <div
+                style={{
+                  opacity: 0.72,
+                  fontSize: "clamp(16px, 2.2vw, 38px)",
+                  letterSpacing: "0.01em",
+                  lineHeight: 1.22,
+                }}
+              >
+                {lastKr}
+              </div>
+            ) : null}
+            <div style={{ lineHeight: 1.14, display: "flex", flexDirection: "column", gap: "0.28em" }}>
+              {enLines.length > 0 ? (
+                enLines.map((line, i) => {
+                  const isCurrent = i === enLines.length - 1;
+                  return (
+                    <div
+                      key={`${i}-${line.slice(0, 12)}`}
+                      style={{
+                        fontSize: "clamp(22px, 4.1vw, 72px)",
+                        fontWeight: isCurrent ? 700 : 500,
+                        wordBreak: "break-word",
+                        opacity: isCurrent ? 1 : 0.54,
+                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.72)",
+                      }}
+                    >
+                      {line}
+                    </div>
+                  );
+                })
+              ) : (
+                <div style={{ fontSize: "clamp(22px, 4.1vw, 72px)", opacity: 0.5 }}>— waiting —</div>
+              )}
+            </div>
+          </section>
+        </div>
+      ) : (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "10vh 6vw 12vh",
+            textAlign: "center",
+            zIndex: 8,
+          }}
+        >
+          <section
+            style={{
+              width: stageWidth,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: "1.2rem",
+            }}
+          >
+            {lastKr ? (
+              <div
+                style={{
+                  opacity: 0.76,
+                  fontSize: "clamp(20px, 3vw, 56px)",
+                  letterSpacing: "0.02em",
+                  lineHeight: 1.2,
+                }}
+              >
+                {lastKr}
+              </div>
+            ) : null}
+
+            <div style={{ fontSize: "clamp(72px, 11vw, 180px)", fontWeight: 700, lineHeight: 1.04 }}>
+              {currentEn}
+            </div>
+
+            {recentEn.length > 0 ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.22em", opacity: 0.52, fontSize: "clamp(22px, 3.3vw, 50px)" }}>
+                {recentEn.map((line, idx) => (
+                  <div key={`${idx}-${line.slice(0, 12)}`}>{line}</div>
+                ))}
+              </div>
+            ) : null}
+          </section>
+        </div>
+      )}
     </main>
   );
 }

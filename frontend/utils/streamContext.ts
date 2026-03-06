@@ -92,6 +92,16 @@ export function clearRoomInSession(): void {
   } catch {}
 }
 
+export function clearStreamContext(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.removeItem(STORAGE_KEYS.orgId);
+    window.sessionStorage.removeItem(STORAGE_KEYS.roomId);
+    window.sessionStorage.removeItem(STORAGE_KEYS.serviceKey);
+    window.sessionStorage.removeItem(STORAGE_KEYS.churchSlug);
+  } catch {}
+}
+
 export function getHostTokenFromSession(): string | undefined {
   if (typeof window === "undefined") return undefined;
   try {

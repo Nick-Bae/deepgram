@@ -42,7 +42,7 @@ type StartResponse = {
   languagePair?: { source?: string; target?: string };
 };
 
-const POLL_MS = 8000;
+const POLL_MS = 12000;
 const DEFAULT_SERVICE_KEY = "sun-11am";
 
 type HostAction = "load_services" | "start_service" | "end_service";
@@ -296,6 +296,7 @@ export default function HostChurchPage() {
     let disposed = false;
 
     const run = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         await refreshServices();
       } catch (err: unknown) {

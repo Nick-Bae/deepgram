@@ -9,6 +9,7 @@ import {
 import { ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 import { firebaseConfigured, getFirebaseClient, missingFirebaseEnv } from "./firebaseClient";
+import { clearAuthToken, clearHostToken, clearStreamContext } from "../utils/streamContext";
 
 type AuthContextValue = {
   user: User | null;
@@ -78,9 +79,14 @@ export function AuthProvider({ children }: Props) {
 
   const logout = useCallback(async (): Promise<void> => {
     const client = getFirebaseClient();
-    if (!client) return;
-    await signOut(client.auth);
-    setUser(null);
+    try {
+      if (client) await signOut(client.auth);
+    } finally {
+      clearHostToken();
+      clearAuthToken();
+      clearStreamContext();
+      setUser(null);
+    }
   }, []);
 
   const value = useMemo<AuthContextValue>(

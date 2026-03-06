@@ -144,9 +144,7 @@ export default function TranslationBox() {
   const [voicePreference, setVoicePreference] = useState('auto')
   const [ttsProvider, setTtsProvider] = useState<TTSProvider>('google')
   const [isBroadcasting, setIsBroadcasting] = useState(true)
-  const [aiAssistEnabled, setAiAssistEnabled] = useState(true)
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
-  const [displayOnAir, setDisplayOnAir] = useState(true)
   const [displaySpeed, setDisplaySpeed] = useState(1)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
@@ -1048,41 +1046,16 @@ export default function TranslationBox() {
                   >
                     {isListening ? 'Stop translation' : 'Start translation'}
                   </button>
-                  <button
-                    onClick={() => triggerFinalize('manual operator button')}
-                    className="rounded-2xl border border-[#454543] px-5 py-3 text-sm font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
-                  >
-                    Pulse finalize
-                  </button>
-                  <button
-                    onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')}
-                    className="rounded-2xl border border-[#454543] px-5 py-3 text-sm font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
-                  >
-                    Test TTS
-                  </button>
-                  <div className="ml-auto flex items-center gap-3 text-sm text-[#d4d4dc]">
-                    <span className="text-xs uppercase tracking-wide text-[#b1b1ac]">Monitor volume</span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={volume}
-                      onChange={(e) => setVolume(parseFloat(e.target.value))}
-                      className="accent-[#feda6a]"
-                    />
-                    <span className="text-[#f2f5e3]">{Math.round(volume * 100)}%</span>
-                  </div>
                 </div>
               </div>
             </div>
 
             <aside className="space-y-6 rounded-3xl border border-[#454543] bg-[#1d1e22]/70 p-5">
-              <div className="space-y-4">
+              <div className="space-y-4 rounded-2xl border border-[#454543] bg-[#1d1e22]/60 p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm font-semibold text-[#f2f5e3]">Go Live broadcast</p>
-                    <p className="text-xs text-[#b1b1ac]">Send translations to foyer &amp; stream overlays.</p>
+                    <p className="text-sm font-semibold text-[#f2f5e3]">Broadcast output</p>
+                    <p className="text-xs text-[#b1b1ac]">Enable or mute stage and display feeds.</p>
                   </div>
                   <button
                     onClick={() => setIsBroadcasting(v => !v)}
@@ -1090,15 +1063,6 @@ export default function TranslationBox() {
                     aria-pressed={isBroadcasting}
                   >
                     <span className={`inline-block h-6 w-6 rounded-full bg-[#f2f5e3] transition ${isBroadcasting ? 'translate-x-6' : 'translate-x-1'}`} />
-                  </button>
-                </div>
-                <div className="flex items-center justify-between text-sm text-[#d4d4dc]">
-                  <span>Display monitors</span>
-                  <button
-                    onClick={() => setDisplayOnAir(v => !v)}
-                    className={`text-xs font-semibold uppercase tracking-wide ${displayOnAir ? 'text-[#feda6a]' : 'text-[#b1b1ac]'}`}
-                  >
-                    {displayOnAir ? 'On air' : 'Standby'}
                   </button>
                 </div>
                 <div className="flex items-center justify-between border-t border-[#454543] pt-3 text-sm text-[#d4d4dc]">
@@ -1123,142 +1087,111 @@ export default function TranslationBox() {
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-[#454543] bg-[#1d1e22]/60 p-4 text-sm text-[#d4d4dc]">
-                <div className="flex items-center justify-between py-2">
-                  <span>AI refinement</span>
-                  <button
-                    onClick={() => setAiAssistEnabled(v => !v)}
-                    className={`relative inline-flex h-7 w-12 items-center rounded-full ${aiAssistEnabled ? 'bg-[#feda6a]' : 'bg-[#393f4d]'}`}
-                    aria-pressed={aiAssistEnabled}
-                  >
-                    <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${aiAssistEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
-                  </button>
-                </div>
-                <div className="flex items-center justify-between border-t border-[#454543] py-2">
-                  <span>Early commit (preview)</span>
-                  <button
-                    onClick={() => setEarlyCommitEnabled(v => !v)}
-                    className={`relative inline-flex h-7 w-12 items-center rounded-full ${earlyCommitEnabled ? 'bg-[#feda6a]' : 'bg-[#393f4d]'}`}
-                    aria-pressed={earlyCommitEnabled}
-                  >
-                    <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${earlyCommitEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
-                  </button>
-                </div>
-                <div className="flex items-center justify-between border-t border-[#454543] py-2">
-                  <span>Audience TTS</span>
-                  <button
-                    onClick={() => setIsMuted(m => !m)}
-                    className={`relative inline-flex h-7 w-12 items-center rounded-full ${ttsAudienceEnabled ? 'bg-[#feda6a]' : 'bg-[#393f4d]'}`}
-                    aria-pressed={ttsAudienceEnabled}
-                  >
-                    <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${ttsAudienceEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
-                  </button>
-                </div>
-                <div className="flex flex-col gap-2 border-t border-[#454543] py-2">
-                  <label className="text-xs uppercase tracking-wide text-[#b1b1ac]">Voice engine</label>
-                  <select
-                    value={ttsProvider}
-                    onChange={(e) => setTtsProvider(e.target.value as TTSProvider)}
-                    className="rounded-2xl border border-[#454543] bg-[#0f1012] px-3 py-2 text-sm text-[#f2f5e3] focus:border-[#feda6a] focus:outline-none"
-                  >
-                    {TTS_PROVIDER_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex flex-col gap-2 border-t border-[#454543] py-2">
-                  <label className="text-xs uppercase tracking-wide text-[#b1b1ac]">Voice preset</label>
-                  <select
-                    value={voicePreference}
-                    onChange={(e) => setVoicePreference(e.target.value)}
-                    className="rounded-2xl border border-[#454543] bg-[#0f1012] px-3 py-2 text-sm text-[#f2f5e3] focus:border-[#feda6a] focus:outline-none"
-                  >
-                    <option value="auto">Auto · match language</option>
-                    {voiceOptions.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex items-center justify-between border-t border-[#454543] py-2">
-                  <span>Stage display link</span>
-                  <span className={`text-xs font-semibold uppercase tracking-wide ${displayOnAir ? 'text-[#feda6a]' : 'text-[#b1b1ac]'}`}>
-                    {displayOnAir ? 'Live' : 'Muted'}
-                  </span>
-                </div>
-              </div>
-
               <div className="rounded-2xl border border-[#454543] bg-[#1d1e22]/60 p-4 text-sm">
-                <p className="mb-3 text-xs uppercase tracking-wide text-[#b1b1ac]">Connection health</p>
+                <p className="mb-3 text-xs uppercase tracking-wide text-[#b1b1ac]">System status</p>
                 <div className="space-y-2 text-[#d4d4dc]">
                   <div className="flex items-center justify-between">
                     <span>Producer socket</span>
-                    <span className="font-semibold text-[#f2f5e3]">{connected ? 'Stable' : 'Reconnecting'}</span>
+                    <span className="font-semibold text-[#f2f5e3]">{connected ? 'Connected' : 'Reconnecting'}</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span>Display sync</span>
-                    <span className="font-semibold text-[#f2f5e3]">{displayOnAir ? 'Mirrored' : 'Off'}</span>
+                    <span>Deepgram engine</span>
+                    <span className="font-semibold text-[#f2f5e3]">{status}</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span>TTS monitor</span>
-                    <span className="font-semibold text-[#f2f5e3]">{ttsAudienceEnabled ? 'Audible' : 'Muted'}</span>
+                    <span>Latency</span>
+                    <span className="font-semibold text-[#feda6a]">{latencyLabel}</span>
                   </div>
                 </div>
               </div>
 
-              <div className="flex flex-col gap-3 rounded-2xl border border-[#454543] bg-[#1d1e22]/70 p-4 text-sm">
-                <div>
-                  <p className="text-xs uppercase tracking-wide text-[#b1b1ac]">Admin console</p>
-                  <p className="text-[#d4d4dc]">Invite operators, manage monitors, and review transcripts.</p>
+              <details className="rounded-2xl border border-[#454543] bg-[#1d1e22]/60 p-4 text-sm text-[#d4d4dc]">
+                <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-[#b1b1ac]">
+                  Advanced controls
+                </summary>
+                <div className="mt-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span>Early commit (preview)</span>
+                    <button
+                      onClick={() => setEarlyCommitEnabled(v => !v)}
+                      className={`relative inline-flex h-7 w-12 items-center rounded-full ${earlyCommitEnabled ? 'bg-[#feda6a]' : 'bg-[#393f4d]'}`}
+                      aria-pressed={earlyCommitEnabled}
+                    >
+                      <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${earlyCommitEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between border-t border-[#454543] pt-3">
+                    <span>Audience TTS</span>
+                    <button
+                      onClick={() => setIsMuted(m => !m)}
+                      className={`relative inline-flex h-7 w-12 items-center rounded-full ${ttsAudienceEnabled ? 'bg-[#feda6a]' : 'bg-[#393f4d]'}`}
+                      aria-pressed={ttsAudienceEnabled}
+                    >
+                      <span className={`inline-block h-5 w-5 rounded-full bg-[#1d1e22] transition ${ttsAudienceEnabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                    </button>
+                  </div>
+                  <div className="flex flex-col gap-2 border-t border-[#454543] pt-3">
+                    <label className="text-xs uppercase tracking-wide text-[#b1b1ac]">Voice engine</label>
+                    <select
+                      value={ttsProvider}
+                      onChange={(e) => setTtsProvider(e.target.value as TTSProvider)}
+                      className="rounded-2xl border border-[#454543] bg-[#0f1012] px-3 py-2 text-sm text-[#f2f5e3] focus:border-[#feda6a] focus:outline-none"
+                    >
+                      {TTS_PROVIDER_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex flex-col gap-2 border-t border-[#454543] pt-3">
+                    <label className="text-xs uppercase tracking-wide text-[#b1b1ac]">Voice preset</label>
+                    <select
+                      value={voicePreference}
+                      onChange={(e) => setVoicePreference(e.target.value)}
+                      className="rounded-2xl border border-[#454543] bg-[#0f1012] px-3 py-2 text-sm text-[#f2f5e3] focus:border-[#feda6a] focus:outline-none"
+                    >
+                      <option value="auto">Auto · match language</option>
+                      {voiceOptions.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 border-t border-[#454543] pt-3">
+                    <span className="text-xs uppercase tracking-wide text-[#b1b1ac]">Monitor volume</span>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={volume}
+                        onChange={(e) => setVolume(parseFloat(e.target.value))}
+                        className="accent-[#feda6a]"
+                      />
+                      <span className="text-[#f2f5e3]">{Math.round(volume * 100)}%</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 border-t border-[#454543] pt-3">
+                    <button
+                      onClick={() => triggerFinalize('manual operator button')}
+                      className="flex-1 rounded-2xl border border-[#454543] px-4 py-2 text-xs font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
+                    >
+                      Pulse finalize
+                    </button>
+                    <button
+                      onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')}
+                      className="flex-1 rounded-2xl border border-[#454543] px-4 py-2 text-xs font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
+                    >
+                      Test TTS
+                    </button>
+                  </div>
                 </div>
-                <a
-                  href="/producer"
-                  target="_blank"
-                  className="inline-flex items-center justify-center rounded-2xl border border-[#feda6a]/50 bg-[#feda6a]/15 px-4 py-2 text-center text-sm font-semibold text-[#feda6a] hover:bg-[#feda6a]/25"
-                >
-                  Launch admin hub
-                </a>
-              </div>
+              </details>
             </aside>
           </div>
-        </div>
-      </div>
-
-      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-        <div className="rounded-2xl border border-[#454543] bg-gradient-to-b from-[#1d1e22] to-[#393f4d] p-5 shadow-lg shadow-black/30">
-          <p className="text-xs uppercase tracking-wide text-[#feda6a]">Scripted segments</p>
-          <h3 className="mt-2 text-lg font-semibold text-[#f2f5e3]">Upload-ready workflow</h3>
-          <p className="mt-3 text-sm text-[#d4d4dc]">
-            Drop sermon manuscripts or announcements to pre-translate, rehearse, and push to displays on cue.
-          </p>
-          <button className="mt-4 inline-flex items-center gap-2 rounded-2xl border border-[#feda6a]/40 px-4 py-2 text-sm font-semibold text-[#feda6a] hover:border-[#feda6a]">
-            📄 Import script
-          </button>
-        </div>
-
-        <div className="rounded-2xl border border-[#454543] bg-gradient-to-b from-[#1d1e22] to-[#393f4d] p-5 shadow-lg shadow-black/30">
-          <p className="text-xs uppercase tracking-wide text-[#feda6a]">Hybrid workflow</p>
-          <h3 className="mt-2 text-lg font-semibold text-[#f2f5e3]">Blend live + scripted</h3>
-          <p className="mt-3 text-sm text-[#d4d4dc]">
-            Pin key phrases, Scriptures, or benedictions so they surface exactly when the speaker nears those cues.
-          </p>
-          <button className="mt-4 inline-flex items-center gap-2 rounded-2xl border border-[#feda6a]/40 px-4 py-2 text-sm font-semibold text-[#feda6a] hover:border-[#feda6a]">
-            📌 Manage cue board
-          </button>
-        </div>
-
-        <div className="rounded-2xl border border-[#454543] bg-gradient-to-b from-[#1d1e22] to-[#393f4d] p-5 shadow-lg shadow-black/30">
-          <p className="text-xs uppercase tracking-wide text-[#feda6a]">Team ops</p>
-          <h3 className="mt-2 text-lg font-semibold text-[#f2f5e3]">Admin &amp; monitoring</h3>
-          <p className="mt-3 text-sm text-[#d4d4dc]">
-            Invite volunteers, assign auditorium channels, and monitor downstream displays from one command center.
-          </p>
-          <button className="mt-4 inline-flex items-center gap-2 rounded-2xl border border-[#feda6a]/40 px-4 py-2 text-sm font-semibold text-[#feda6a] hover:border-[#feda6a]">
-            🛠 Open admin console
-          </button>
         </div>
       </div>
     </section>
