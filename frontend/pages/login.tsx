@@ -1,10 +1,10 @@
 import Link from "next/link";
 import { useRouter } from "next/router";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 
 import { fetchAuthMe, type OrgMembership } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
-import { clearHostToken, persistAuthToken, persistHostToken, persistStreamContext } from "../utils/streamContext";
+import { clearHostToken, persistAuthToken, persistStreamContext } from "../utils/streamContext";
 
 function mapFirebaseError(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
@@ -14,6 +14,15 @@ function mapFirebaseError(err: unknown): string {
   if (code === "auth/too-many-requests") return "Too many attempts. Try again later.";
   if (err instanceof Error) return err.message;
   return "Login failed.";
+}
+
+function isInvalidSessionError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message.toLowerCase() : String(err || "").toLowerCase();
+  return message.includes("invalid_id_token") || message.includes("session is invalid") || message.includes("invalid id token");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 type NextRouteTarget = {
@@ -44,11 +53,12 @@ function membershipForTarget(target: NextRouteTarget, memberships: OrgMembership
 
 export default function LoginPage() {
   const router = useRouter();
-  const { login, getIdToken, user, loading, configured, missingEnv } = useAuth();
+  const { login, logout, getIdToken, user, configured, missingEnv } = useAuth();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  const [sessionBusy, setSessionBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const nextPath = useMemo(() => {
@@ -69,8 +79,7 @@ export default function LoginPage() {
     if (nextPath && nextPath !== "/login" && !nextPath.startsWith("/login?") && (!hasOrgScopedTarget || targetMembership)) {
       const sessionMembership = targetMembership || primary;
       if (sessionMembership) {
-        if (sessionMembership.hostToken) persistHostToken(sessionMembership.hostToken);
-        else clearHostToken();
+        clearHostToken();
         persistStreamContext({
           orgId: sessionMembership.orgId,
           roomId: undefined,
@@ -86,8 +95,7 @@ export default function LoginPage() {
       await router.replace("/onboarding/create-church");
       return;
     }
-    if (primary.hostToken) persistHostToken(primary.hostToken);
-    else clearHostToken();
+    clearHostToken();
     persistStreamContext({
       orgId: primary.orgId,
       roomId: undefined,
@@ -99,35 +107,70 @@ export default function LoginPage() {
     await router.replace(`/host/c/${encodeURIComponent(primary.slug)}/broadcast?${params.toString()}`);
   };
 
-  useEffect(() => {
-    if (loading || !user || !configured) return;
-    let cancelled = false;
-    const run = async () => {
+  const redirectWithFreshSession = async () => {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const token = await getIdToken(true);
+      if (!token) throw new Error("Please sign in again.");
+      persistAuthToken(token);
       try {
-        const token = await getIdToken();
-        if (!token || cancelled) return;
-        persistAuthToken(token);
         await redirectFromMembership(token);
+        return;
       } catch (err) {
-        if (!cancelled) setErrorMsg(mapFirebaseError(err));
+        if (!isInvalidSessionError(err)) throw err;
+        lastError = err;
+        await delay(250 * (attempt + 1));
       }
-    };
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [configured, getIdToken, loading, user]); // eslint-disable-line react-hooks/exhaustive-deps
+    }
+    if (lastError) throw lastError;
+    throw new Error("Please sign in again.");
+  };
+
+  const continueExistingSession = async () => {
+    setSessionBusy(true);
+    setErrorMsg(null);
+    try {
+      await redirectWithFreshSession();
+    } catch (err) {
+      if (isInvalidSessionError(err)) {
+        try {
+          await logout();
+        } catch {}
+      }
+      setErrorMsg(mapFirebaseError(err));
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const switchAccount = async () => {
+    setSessionBusy(true);
+    setErrorMsg(null);
+    try {
+      await logout();
+      clearHostToken();
+      setEmail("");
+      setPassword("");
+    } catch (err) {
+      setErrorMsg(mapFirebaseError(err));
+    } finally {
+      setSessionBusy(false);
+    }
+  };
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setErrorMsg(null);
     try {
-      const authUser = await login(email.trim(), password);
-      const token = await authUser.getIdToken(true);
-      persistAuthToken(token);
-      await redirectFromMembership(token);
+      await login(email.trim(), password);
+      await redirectWithFreshSession();
     } catch (err) {
+      if (isInvalidSessionError(err)) {
+        try {
+          await logout();
+        } catch {}
+      }
       setErrorMsg(mapFirebaseError(err));
     } finally {
       setBusy(false);
@@ -150,48 +193,94 @@ export default function LoginPage() {
           <p style={{ color: "#fca5a5", marginTop: 12, marginBottom: 0 }}>Error: {errorMsg}</p>
         ) : null}
 
-        <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, marginTop: 12 }}>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Email</span>
-            <input
-              type="email"
-              autoComplete="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-          </label>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Password</span>
-            <input
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-          </label>
+        {user ? (
+          <section style={{ marginTop: 12, display: "grid", gap: 10 }}>
+            <p style={{ margin: 0, fontSize: 13, opacity: 0.84 }}>
+              Already signed in as <strong>{user.email || user.uid}</strong>.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                void continueExistingSession();
+              }}
+              disabled={!configured || sessionBusy}
+              style={{
+                borderRadius: 10,
+                border: "none",
+                padding: "10px 12px",
+                fontWeight: 700,
+                background: "#22c55e",
+                color: "#052e16",
+                cursor: !configured || sessionBusy ? "not-allowed" : "pointer",
+                opacity: !configured || sessionBusy ? 0.6 : 1,
+              }}
+            >
+              {sessionBusy ? "Continuing..." : "Continue to dashboard"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                void switchAccount();
+              }}
+              disabled={sessionBusy}
+              style={{
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.3)",
+                padding: "10px 12px",
+                fontWeight: 600,
+                background: "transparent",
+                color: "#e2e8f0",
+                cursor: sessionBusy ? "not-allowed" : "pointer",
+                opacity: sessionBusy ? 0.6 : 1,
+              }}
+            >
+              Use a different account
+            </button>
+          </section>
+        ) : (
+          <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, marginTop: 12 }}>
+            <label style={{ display: "grid", gap: 4 }}>
+              <span style={{ fontSize: 13, opacity: 0.84 }}>Email</span>
+              <input
+                type="email"
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+                style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
+              />
+            </label>
+            <label style={{ display: "grid", gap: 4 }}>
+              <span style={{ fontSize: 13, opacity: 0.84 }}>Password</span>
+              <input
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
+              />
+            </label>
 
-          <button
-            type="submit"
-            disabled={!configured || busy}
-            style={{
-              marginTop: 4,
-              borderRadius: 10,
-              border: "none",
-              padding: "10px 12px",
-              fontWeight: 700,
-              background: "#22c55e",
-              color: "#052e16",
-              cursor: !configured || busy ? "not-allowed" : "pointer",
-              opacity: !configured || busy ? 0.6 : 1,
-            }}
-          >
-            {busy ? "Signing in..." : "Sign in"}
-          </button>
-        </form>
+            <button
+              type="submit"
+              disabled={!configured || busy}
+              style={{
+                marginTop: 4,
+                borderRadius: 10,
+                border: "none",
+                padding: "10px 12px",
+                fontWeight: 700,
+                background: "#22c55e",
+                color: "#052e16",
+                cursor: !configured || busy ? "not-allowed" : "pointer",
+                opacity: !configured || busy ? 0.6 : 1,
+              }}
+            >
+              {busy ? "Signing in..." : "Sign in"}
+            </button>
+          </form>
+        )}
 
         <p style={{ fontSize: 13, marginBottom: 0, marginTop: 12, opacity: 0.85 }}>
           Need an account?{" "}

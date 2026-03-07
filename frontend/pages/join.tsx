@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { previewOrgInvite, redeemOrgInvite, type InvitePreviewResponse } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
-import { persistAuthToken, persistHostToken, persistStreamContext } from "../utils/streamContext";
+import { clearHostToken, persistAuthToken, persistStreamContext } from "../utils/streamContext";
 
 function readError(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -70,7 +70,7 @@ export default function JoinByInvitePage() {
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
       const joined = await redeemOrgInvite(idToken, inviteCode);
-      if (joined.hostToken) persistHostToken(joined.hostToken);
+      clearHostToken();
       persistStreamContext({ orgId: joined.orgId, churchSlug: joined.slug });
       const params = new URLSearchParams();
       params.set("orgId", joined.orgId);

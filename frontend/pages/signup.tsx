@@ -5,7 +5,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { bootstrapOwnerOrg } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
 import { normalizeChurchSlug } from "../lib/churchSlug";
-import { persistAuthToken, persistHostToken, persistStreamContext } from "../utils/streamContext";
+import { clearHostToken, persistAuthToken, persistStreamContext } from "../utils/streamContext";
 
 function mapFirebaseError(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
@@ -74,7 +74,7 @@ export default function SignupPage() {
 
       const serviceKey = created.services?.[0]?.serviceKey || "sun-11am";
       const org = created.org;
-      if (created.hostToken) persistHostToken(created.hostToken);
+      clearHostToken();
       persistStreamContext({
         orgId: org.orgId,
         serviceKey,

@@ -1,12 +1,33 @@
 
 # backend/app/main.py
 import os, json, asyncio, logging, time, re
+from collections import deque
+from threading import Lock
 from typing import Optional, Any
+from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
+
+
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
 
 # --- local modules (single import each) ---
 from app.socket_manager import manager
@@ -30,7 +51,120 @@ ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "900"))  # 15 min
 ROOM_MAX_DURATION_SEC = int(os.getenv("ROOM_MAX_DURATION_SEC", "10800"))  # 3 hours
 ROOM_SWEEPER_INTERVAL_SEC = int(os.getenv("ROOM_SWEEPER_INTERVAL_SEC", "60"))
 ROOM_USAGE_TICK_SEC = int(os.getenv("ROOM_USAGE_TICK_SEC", "300"))  # 5 min
+WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
+WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
+WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW",
+    2400,
+    min_value=1,
+    max_value=1_000_000,
+)
+WS_TRANSLATION_GLOBAL_MAX_TOKENS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_GLOBAL_MAX_TOKENS_PER_WINDOW",
+    1_200_000,
+    min_value=100,
+    max_value=50_000_000,
+)
+WS_TRANSLATION_ORG_MAX_REQUESTS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_ORG_MAX_REQUESTS_PER_WINDOW",
+    300,
+    min_value=1,
+    max_value=500_000,
+)
+WS_TRANSLATION_ORG_MAX_TOKENS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_ORG_MAX_TOKENS_PER_WINDOW",
+    150_000,
+    min_value=100,
+    max_value=20_000_000,
+)
+WS_TRANSLATION_UID_MAX_REQUESTS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_UID_MAX_REQUESTS_PER_WINDOW",
+    180,
+    min_value=1,
+    max_value=500_000,
+)
+WS_TRANSLATION_UID_MAX_TOKENS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_UID_MAX_TOKENS_PER_WINDOW",
+    90_000,
+    min_value=100,
+    max_value=20_000_000,
+)
+WS_TRANSLATION_ANON_MAX_REQUESTS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_ANON_MAX_REQUESTS_PER_WINDOW",
+    60,
+    min_value=1,
+    max_value=500_000,
+)
+WS_TRANSLATION_ANON_MAX_TOKENS_PER_WINDOW = _env_int(
+    "WS_TRANSLATION_ANON_MAX_TOKENS_PER_WINDOW",
+    30_000,
+    min_value=100,
+    max_value=20_000_000,
+)
+WS_TRANSLATION_PROMPT_TOKEN_OVERHEAD = _env_int(
+    "WS_TRANSLATION_PROMPT_TOKEN_OVERHEAD",
+    220,
+    min_value=0,
+    max_value=10_000,
+)
+_tx_window_lock = Lock()
+_tx_window_entries: dict[str, deque[dict[str, float]]] = {}
 _room_sweeper_task: asyncio.Task | None = None
+
+
+_DEFAULT_CORS_ALLOW_ORIGINS = (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+
+
+def _split_csv(raw: str) -> list[str]:
+    return [part.strip() for part in (raw or "").split(",") if part and part.strip()]
+
+
+def _normalize_origin(raw_origin: str) -> Optional[str]:
+    token = (raw_origin or "").strip()
+    if not token:
+        return None
+    if token == "*":
+        raise RuntimeError("CORS wildcard origin is not allowed; configure explicit origins in CORS_ALLOW_ORIGINS")
+    parsed = urlsplit(token)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if not parsed.netloc:
+        return None
+    if parsed.path not in {"", "/"}:
+        return None
+    if parsed.query or parsed.fragment:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _resolve_cors_allow_origins() -> list[str]:
+    raw_csv = (os.getenv("CORS_ALLOW_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS") or "").strip()
+    origins_raw: list[str] = []
+    if raw_csv:
+        origins_raw.extend(_split_csv(raw_csv))
+    for legacy_name in ("FRONTEND_ORIGIN", "FRONTEND_URL"):
+        token = (os.getenv(legacy_name) or "").strip()
+        if token:
+            origins_raw.append(token)
+    if not origins_raw:
+        origins_raw.extend(_DEFAULT_CORS_ALLOW_ORIGINS)
+
+    seen: set[str] = set()
+    resolved: list[str] = []
+    for candidate in origins_raw:
+        normalized = _normalize_origin(candidate)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        resolved.append(normalized)
+    if not resolved:
+        raise RuntimeError("No valid CORS origins configured. Set CORS_ALLOW_ORIGINS to explicit http(s) origins.")
+    return resolved
 
 # ------------------------------------------------------------------------------
 # ONE app only
@@ -38,10 +172,10 @@ _room_sweeper_task: asyncio.Task | None = None
 app = FastAPI(title="Real-Time Translation Backend", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # relax for dev; tighten for prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_resolve_cors_allow_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin"],
 )
 
 # Keep your existing HTTP routes under /api
@@ -62,6 +196,182 @@ def _clean_token(raw: Any) -> Optional[str]:
         return None
     txt = str(raw).strip()
     return txt or None
+
+
+def _estimate_translation_tokens(source_text: str) -> int:
+    clean = " ".join((source_text or "").split())
+    if not clean:
+        return 0
+    ascii_chars = sum(1 for ch in clean if ord(ch) < 128)
+    non_ascii_chars = max(0, len(clean) - ascii_chars)
+    source_tokens = max(1, (ascii_chars // 4) + int(non_ascii_chars * 1.4))
+    target_tokens = max(8, int(source_tokens * 1.2))
+    estimated = source_tokens + target_tokens + WS_TRANSLATION_PROMPT_TOKEN_OVERHEAD
+    return max(64, estimated)
+
+
+def _tx_scope_limits(org_id: Optional[str], host_uid: Optional[str]) -> list[tuple[str, int, int]]:
+    clean_org = _clean_token(org_id)
+    clean_uid = _clean_token(host_uid)
+    scopes: list[tuple[str, int, int]] = [
+        (
+            "__global__",
+            WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW,
+            WS_TRANSLATION_GLOBAL_MAX_TOKENS_PER_WINDOW,
+        )
+    ]
+    if clean_org:
+        scopes.append(
+            (
+                f"org:{clean_org}",
+                WS_TRANSLATION_ORG_MAX_REQUESTS_PER_WINDOW,
+                WS_TRANSLATION_ORG_MAX_TOKENS_PER_WINDOW,
+            )
+        )
+    elif clean_uid:
+        scopes.append(
+            (
+                f"uid:{clean_uid}",
+                WS_TRANSLATION_UID_MAX_REQUESTS_PER_WINDOW,
+                WS_TRANSLATION_UID_MAX_TOKENS_PER_WINDOW,
+            )
+        )
+    else:
+        scopes.append(
+            (
+                "__anon__",
+                WS_TRANSLATION_ANON_MAX_REQUESTS_PER_WINDOW,
+                WS_TRANSLATION_ANON_MAX_TOKENS_PER_WINDOW,
+            )
+        )
+    return scopes
+
+
+def _prune_tx_entries(entries: deque[dict[str, float]], now: float) -> None:
+    cutoff = now - float(WS_TRANSLATION_LIMIT_WINDOW_SECONDS)
+    while entries and float(entries[0].get("ts", 0.0)) <= cutoff:
+        entries.popleft()
+
+
+def _window_tokens(entries: deque[dict[str, float]]) -> int:
+    total = 0
+    for row in entries:
+        total += int(row.get("tokens", 0.0) or 0.0)
+    return max(0, total)
+
+
+def _reserve_translation_budget(
+    *,
+    org_id: Optional[str],
+    host_uid: Optional[str],
+    source_text: str,
+) -> tuple[list[tuple[str, dict[str, float]]] | None, dict[str, Any] | None]:
+    if not WS_TRANSLATION_LIMITS_ENABLED:
+        return [], None
+    est_tokens = _estimate_translation_tokens(source_text)
+    now = time.monotonic()
+    scopes = _tx_scope_limits(org_id, host_uid)
+    with _tx_window_lock:
+        for scope_key, req_limit, token_limit in scopes:
+            bucket = _tx_window_entries.setdefault(scope_key, deque())
+            _prune_tx_entries(bucket, now)
+            req_used = len(bucket)
+            token_used = _window_tokens(bucket)
+            if req_used >= req_limit:
+                return None, {
+                    "reason": "translation_rate_limited",
+                    "kind": "requests",
+                    "scope": scope_key,
+                    "used": req_used,
+                    "limit": req_limit,
+                    "windowSeconds": WS_TRANSLATION_LIMIT_WINDOW_SECONDS,
+                    "estimatedTokens": est_tokens,
+                }
+            if token_used + est_tokens > token_limit:
+                return None, {
+                    "reason": "translation_rate_limited",
+                    "kind": "tokens",
+                    "scope": scope_key,
+                    "used": token_used,
+                    "limit": token_limit,
+                    "windowSeconds": WS_TRANSLATION_LIMIT_WINDOW_SECONDS,
+                    "estimatedTokens": est_tokens,
+                }
+        reservations: list[tuple[str, dict[str, float]]] = []
+        for scope_key, _, _ in scopes:
+            bucket = _tx_window_entries.setdefault(scope_key, deque())
+            entry = {"ts": now, "tokens": float(est_tokens)}
+            bucket.append(entry)
+            reservations.append((scope_key, entry))
+        return reservations, None
+
+
+def _settle_translation_budget(
+    reservations: list[tuple[str, dict[str, float]]] | None,
+    *,
+    actual_tokens: int,
+) -> None:
+    if reservations is None:
+        return
+    normalized = max(0, int(actual_tokens or 0))
+    if not reservations:
+        return
+    with _tx_window_lock:
+        for _, entry in reservations:
+            entry["tokens"] = float(normalized)
+
+
+def _rate_limit_meta(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fail_open": True,
+        "reason": "translation_rate_limited",
+        "provider": "openai",
+        "limit_kind": payload.get("kind"),
+        "limit_scope": payload.get("scope"),
+        "limit_window_seconds": payload.get("windowSeconds"),
+        "limit_used": payload.get("used"),
+        "limit": payload.get("limit"),
+        "estimated_tokens": payload.get("estimatedTokens"),
+    }
+
+
+async def _translate_text_guarded(
+    source_text: str,
+    source_lang: str,
+    target_lang: str,
+    *,
+    org_id: Optional[str],
+    host_uid: Optional[str],
+    ctx: Optional[TranslationContext],
+    update_ctx: bool = True,
+    custom_prompt: Optional[str] = None,
+    service_prompt: Optional[str] = None,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    reservations, blocked = _reserve_translation_budget(org_id=org_id, host_uid=host_uid, source_text=source_text)
+    if blocked is not None:
+        print(
+            "[TX][rate_limit] blocked",
+            blocked.get("scope"),
+            blocked.get("kind"),
+            f"used={blocked.get('used')}",
+            f"limit={blocked.get('limit')}",
+        )
+        return source_text, _rate_limit_meta(blocked)
+    usage: dict[str, Any] = {}
+    try:
+        translated = await translate_text(
+            source_text,
+            source_lang,
+            target_lang,
+            ctx=ctx,
+            update_ctx=update_ctx,
+            custom_prompt=custom_prompt,
+            service_prompt=service_prompt,
+            usage_out=usage,
+        )
+    finally:
+        _settle_translation_budget(reservations, actual_tokens=int(usage.get("totalTokens") or 0))
+    return translated, None
 
 
 def _resolve_room_context(
@@ -418,15 +728,21 @@ async def ws_translate(ws: WebSocket):
         else:
             try:
                 custom_prompt, service_prompt = _cached_prompt_overrides(target_org_id)
-                translated = await translate_text(
+                translated, limit_meta = await _translate_text_guarded(
                     src_text,
                     src_lang_full,
                     tgt_lang_full,
+                    org_id=target_org_id,
+                    host_uid=host_uid_claim,
                     ctx=translation_ctx,
+                    update_ctx=True,
                     custom_prompt=custom_prompt,
                     service_prompt=service_prompt,
                 )
-                translation_ctx.last_english = translated
+                if limit_meta:
+                    meta_payload.update(limit_meta)
+                else:
+                    translation_ctx.last_english = translated
             except Exception as exc:
                 print("[WS translate][producer_commit][error]", exc)
                 translated = src_text
@@ -902,16 +1218,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 else:
                     try:
                         custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
-                        translated = await translate_text(
+                        translated, limit_meta = await _translate_text_guarded(
                             clean_src,
                             src_lang_full,
                             tgt_lang_full,
+                            org_id=org_id,
+                            host_uid=host_uid_claim,
                             ctx=translation_ctx,
                             update_ctx=update_ctx,
                             custom_prompt=custom_prompt,
                             service_prompt=service_prompt,
                         )
-                        if update_ctx:
+                        if limit_meta:
+                            meta_payload.update(limit_meta)
+                        elif update_ctx:
                             translation_ctx.last_english = translated
                     except Exception as e:
                         print("[TX] error:", e)
@@ -924,15 +1244,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 else:
                     try:
                         custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
-                        translated = await translate_text(
+                        translated, limit_meta = await _translate_text_guarded(
                             clean_src,
                             src_lang_full,
                             tgt_lang_full,
+                            org_id=org_id,
+                            host_uid=host_uid_claim,
                             ctx=translation_ctx,
                             update_ctx=update_ctx,
                             custom_prompt=custom_prompt,
                             service_prompt=service_prompt,
                         )
+                        if limit_meta:
+                            meta_payload.update(limit_meta)
                     except Exception as e:
                         print("[TX][preview] error:", e)
                         translated = clean_src

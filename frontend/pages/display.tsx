@@ -38,6 +38,10 @@ export default function Display() {
   );
 
   const lastKr = krLines[krLines.length - 1] || "";
+  const waitingMessage = connected
+    ? "Live translation connected. Waiting for speech..."
+    : "Waiting for translation stream to start...";
+  const connectionLabel = connected ? "Connection: Connected" : "Connection: Disconnected";
 
   const isSubtitleMode = displayMode === "subtitle";
 
@@ -142,7 +146,7 @@ export default function Display() {
           zIndex: 2147483646,
         }}
       >
-        {connected ? "🟢 Connected" : "🔴 Disconnected"}
+        {connectionLabel}
       </div>
 
       <div style={containerStyle}>
@@ -177,11 +181,11 @@ export default function Display() {
                     <div
                       key={`${i}-${line.slice(0, 12)}`}
                       style={{
-                        fontSize: "clamp(26px, 6.6vw, 84px)",
+                        fontSize: isCurrent ? "clamp(30px, 7vw, 90px)" : "clamp(26px, 6.2vw, 82px)",
                         fontWeight: isCurrent ? 700 : 500,
                         wordBreak: "break-word",
                         opacity: isCurrent ? 1 : 0.72,
-                        background: isCurrent ? "rgba(255, 255, 255, 0.08)" : "transparent",
+                        background: isCurrent ? "rgba(255, 255, 255, 0.12)" : "transparent",
                         padding: "0.15em 0.35em",
                         borderRadius: "0.45em",
                         boxShadow: isCurrent ? "0 12px 32px rgba(0,0,0,0.35)" : "none",
@@ -195,7 +199,7 @@ export default function Display() {
                   );
                 })
               ) : (
-                <div style={{ fontSize: "clamp(22px, 5.5vw, 68px)", opacity: 0.6 }}>— waiting —</div>
+                <div style={{ fontSize: "clamp(22px, 4.8vw, 58px)", opacity: 0.68 }}>{waitingMessage}</div>
               )}
             </div>
           </div>
@@ -223,7 +227,7 @@ export default function Display() {
                 padding: "0.25em 0",
               }}
             >
-              {enLines.length > 0 ? enLines[enLines.length - 1] : "— waiting —"}
+              {enLines.length > 0 ? enLines[enLines.length - 1] : waitingMessage}
             </div>
 
             {enLines.length > 1 && (

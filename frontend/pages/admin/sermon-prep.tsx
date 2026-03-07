@@ -11,7 +11,7 @@ const SCRIPT_MANAGER_ROLES = new Set(["owner", "admin", "host"]);
 
 export default function AdminSermonPrepPage() {
   const router = useRouter();
-  const { user, loading: authLoading, getIdToken } = useAuth();
+  const { user, loading: authLoading, getIdToken, logout } = useAuth();
   const queryOrgId = typeof router.query.orgId === "string" ? router.query.orgId : "";
   const [memberships, setMemberships] = useState<OrgMembership[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState("");
@@ -67,6 +67,20 @@ export default function AdminSermonPrepPage() {
       } catch (err: unknown) {
         if (!cancelled) {
           const msg = err instanceof Error ? err.message : String(err);
+          const lower = (msg || "").toLowerCase();
+          if (
+            lower.includes("sign in again") ||
+            lower.includes("session is invalid") ||
+            lower.includes("invalid id token") ||
+            lower.includes("invalid_id_token") ||
+            lower.includes("auth_required")
+          ) {
+            setMembershipError("Session expired. Redirecting to login...");
+            const nextPath = router.asPath || "/admin/sermon-prep";
+            await logout();
+            void router.replace(`/login?next=${encodeURIComponent(nextPath)}`);
+            return;
+          }
           setMembershipError(msg || "Failed to load memberships.");
         }
       } finally {
@@ -77,7 +91,7 @@ export default function AdminSermonPrepPage() {
     return () => {
       cancelled = true;
     };
-  }, [authLoading, getIdToken, queryOrgId, router, user]);
+  }, [authLoading, getIdToken, logout, queryOrgId, router, user]);
 
   const onChangeOrg = async (nextOrgId: string) => {
     setSelectedOrgId(nextOrgId);

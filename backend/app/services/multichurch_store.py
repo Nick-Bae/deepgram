@@ -14,6 +14,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 try:
+    from app.auth.firebase_auth import is_super_uid as _claim_is_super_uid
+except Exception:  # pragma: no cover - auth module may be unavailable in some test/bootstrap paths
+    def _claim_is_super_uid(uid: Optional[str]) -> bool:
+        return False
+
+try:
     from google.cloud import firestore as gcf_firestore  # type: ignore
 except Exception:  # pragma: no cover - optional dependency in dev
     gcf_firestore = None
@@ -54,6 +60,33 @@ def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, parsed))
 
 
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _env_uid_set(name: str) -> set[str]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return set()
+    return {part.strip() for part in raw.split(",") if part and part.strip()}
+
+
 DEFAULT_SERVICE_SEEDS: tuple[tuple[str, str], ...] = (
     ("sun-11am", "Sunday 11 AM"),
     ("sun-2pm", "Sunday 2 PM"),
@@ -76,6 +109,175 @@ ALLOWED_INVITE_STATUSES: set[str] = {
 DEFAULT_INVITE_EXPIRY_HOURS = _env_int("INVITE_DEFAULT_EXPIRY_HOURS", 24 * 3, min_value=1, max_value=24 * 30)
 MAX_ACTIVE_INVITES_PER_ORG = _env_int("INVITE_MAX_ACTIVE_PER_ORG", 20, min_value=1, max_value=500)
 INVITE_RETENTION_DAYS = _env_int("INVITE_RETENTION_DAYS", 30, min_value=1, max_value=365)
+BILLING_LIMITS_ENABLED = not _env_bool("DISABLE_BILLING_LIMITS", False)
+SERMON_PREP_BUDGETS_ENABLED = not _env_bool("DISABLE_SERMON_PREP_BUDGETS", False)
+SERMON_PREP_DEFAULT_BUDGET_USD = _env_float(
+    "SERMON_PREP_DEFAULT_BUDGET_USD",
+    0.0,
+    min_value=0.0,
+    max_value=1_000_000.0,
+)
+SERMON_PREP_INPUT_COST_PER_MILLION = _env_float(
+    "SERMON_PREP_INPUT_COST_PER_MILLION",
+    0.15,
+    min_value=0.0,
+    max_value=10_000.0,
+)
+SERMON_PREP_OUTPUT_COST_PER_MILLION = _env_float(
+    "SERMON_PREP_OUTPUT_COST_PER_MILLION",
+    0.60,
+    min_value=0.0,
+    max_value=10_000.0,
+)
+MASTER_USER_UIDS = set().union(
+    _env_uid_set("MASTER_USER_UIDS"),
+    _env_uid_set("SUPER_ADMIN_UIDS"),
+    _env_uid_set("MASTER_UIDS"),
+)
+_single_master_uid = _clean_token(os.getenv("MASTER_USER_UID"))
+if _single_master_uid:
+    MASTER_USER_UIDS.add(_single_master_uid)
+
+
+def _is_master_uid(uid: Optional[str]) -> bool:
+    clean_uid = _clean_token(uid)
+    if not clean_uid:
+        return False
+    return clean_uid in MASTER_USER_UIDS or bool(_claim_is_super_uid(clean_uid))
+
+
+def _org_billing_limits_flag(org: Dict[str, Any]) -> bool:
+    if "billingLimitsEnabled" not in org:
+        return True
+    return bool(org.get("billingLimitsEnabled"))
+
+
+def _org_billing_limits_enabled(org: Dict[str, Any]) -> bool:
+    return BILLING_LIMITS_ENABLED and _org_billing_limits_flag(org)
+
+
+def _billing_limits_payload(*, org_id: str, org: Dict[str, Any]) -> Dict[str, Any]:
+    enabled = _org_billing_limits_flag(org)
+    return {
+        "orgId": org_id,
+        "billingLimitsEnabled": enabled,
+        "globalBillingLimitsEnabled": bool(BILLING_LIMITS_ENABLED),
+        "effectiveBillingLimitsEnabled": bool(BILLING_LIMITS_ENABLED and enabled),
+        "hardCapReached": bool(org.get("hardCapReached")),
+        "maxMinutesPerMonth": int(org.get("maxMinutesPerMonth") or 0),
+        "currentMonthMinutes": int(org.get("currentMonthMinutes") or 0),
+        "currentMonthKey": str(org.get("currentMonthKey") or ""),
+        "updatedAt": org.get("updatedAt"),
+    }
+
+
+def _normalize_period_key(raw: Optional[str], *, now: Optional[datetime] = None) -> str:
+    token = str(raw or "").strip()
+    if re.fullmatch(r"\d{6}", token):
+        return token
+    return _yyyymm(now)
+
+
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(parsed):
+        return fallback
+    return parsed
+
+
+def _round_usd(value: Any) -> float:
+    return round(max(0.0, _safe_float(value, 0.0)), 6)
+
+
+def _int_tokens(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
+def _sermon_budget_usd(org: Dict[str, Any]) -> float:
+    raw = org.get("sermonPrepBudgetUsd")
+    if raw is None:
+        return float(SERMON_PREP_DEFAULT_BUDGET_USD)
+    return max(0.0, _safe_float(raw, SERMON_PREP_DEFAULT_BUDGET_USD))
+
+
+def _sermon_budget_effective_enabled(org: Dict[str, Any]) -> bool:
+    return bool(SERMON_PREP_BUDGETS_ENABLED and _sermon_budget_usd(org) > 0.0)
+
+
+def _sermon_usage_doc_id(sermon_id: str) -> str:
+    clean = (sermon_id or "").strip()
+    if not clean:
+        return ""
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest()[:32]
+
+
+def _estimate_sermon_prep_usd(*, prompt_tokens: int, completion_tokens: int) -> float:
+    total = (
+        (max(0, int(prompt_tokens)) * float(SERMON_PREP_INPUT_COST_PER_MILLION))
+        + (max(0, int(completion_tokens)) * float(SERMON_PREP_OUTPUT_COST_PER_MILLION))
+    ) / 1_000_000.0
+    return max(0.0, total)
+
+
+def _sermon_usage_payload(
+    *,
+    org_id: str,
+    org: Dict[str, Any],
+    period_key: str,
+    usage_month: Dict[str, Any],
+    sermon_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    prompt_tokens = _int_tokens(usage_month.get("sermonPromptTokens"))
+    completion_tokens = _int_tokens(usage_month.get("sermonCompletionTokens"))
+    total_tokens = _int_tokens(usage_month.get("sermonTotalTokens")) or (prompt_tokens + completion_tokens)
+    requests_count = _int_tokens(usage_month.get("sermonRequestsCount"))
+    estimated_usd = _round_usd(usage_month.get("sermonEstimatedUsd"))
+    budget_usd = _round_usd(_sermon_budget_usd(org))
+    effective_enabled = bool(SERMON_PREP_BUDGETS_ENABLED and budget_usd > 0.0)
+    cap_reached = bool(effective_enabled and estimated_usd >= budget_usd)
+    remaining = _round_usd(max(0.0, budget_usd - estimated_usd)) if effective_enabled else 0.0
+    rows_sorted = sorted(
+        [
+            {
+                "sermonId": str(row.get("sermonId") or "").strip(),
+                "promptTokens": _int_tokens(row.get("promptTokens")),
+                "completionTokens": _int_tokens(row.get("completionTokens")),
+                "totalTokens": _int_tokens(row.get("totalTokens")),
+                "estimatedUsd": _round_usd(row.get("estimatedUsd")),
+                "requestsCount": _int_tokens(row.get("requestsCount")),
+                "lastModel": str(row.get("lastModel") or ""),
+                "lastUsedAt": row.get("lastUsedAt"),
+            }
+            for row in sermon_rows
+            if str(row.get("sermonId") or "").strip()
+        ],
+        key=lambda row: (float(row.get("estimatedUsd") or 0.0), int(row.get("totalTokens") or 0)),
+        reverse=True,
+    )
+    return {
+        "orgId": org_id,
+        "currentMonthKey": period_key,
+        "budgetUsd": budget_usd,
+        "globalBudgetsEnabled": bool(SERMON_PREP_BUDGETS_ENABLED),
+        "effectiveBudgetEnabled": effective_enabled,
+        "capReached": cap_reached,
+        "remainingBudgetUsd": remaining,
+        "currentMonthEstimatedUsd": estimated_usd,
+        "currentMonthPromptTokens": prompt_tokens,
+        "currentMonthCompletionTokens": completion_tokens,
+        "currentMonthTotalTokens": total_tokens,
+        "requestsCount": requests_count,
+        "inputCostPerMillionTokens": float(SERMON_PREP_INPUT_COST_PER_MILLION),
+        "outputCostPerMillionTokens": float(SERMON_PREP_OUTPUT_COST_PER_MILLION),
+        "sermons": rows_sorted,
+    }
 
 
 def _normalize_slug(raw: str) -> str:
@@ -175,6 +377,7 @@ class InMemoryMultiChurchStore:
         self._services: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._rooms: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._usage: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._usage_sermons: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._members: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._users: Dict[str, Dict[str, Any]] = {}
         self._org_invites: Dict[str, Dict[str, Any]] = {}
@@ -209,7 +412,9 @@ class InMemoryMultiChurchStore:
             "currentMonthMinutes": 0,
             "currentMonthKey": _yyyymm(),
             "maxConcurrentRooms": 1,
+            "billingLimitsEnabled": True,
             "hardCapReached": False,
+            "sermonPrepBudgetUsd": float(SERMON_PREP_DEFAULT_BUDGET_USD),
             "hostToken": host_token,
             "customPrompt": "",
             "servicePrompt": "",
@@ -234,6 +439,8 @@ class InMemoryMultiChurchStore:
         clean_uid = _clean_token(uid)
         if not clean_uid:
             return None
+        if _is_master_uid(clean_uid):
+            return "owner"
         member = self._members.get((org_id, clean_uid))
         if not member:
             return None
@@ -266,6 +473,8 @@ class InMemoryMultiChurchStore:
                 return False
             uid = _clean_token(host_uid)
             if uid:
+                if _is_master_uid(uid):
+                    return True
                 member = self._members.get((org_id, uid)) or {}
                 role = str(member.get("role") or "").strip().lower()
                 if role in {"owner", "admin", "host"}:
@@ -426,6 +635,22 @@ class InMemoryMultiChurchStore:
         if not clean_uid:
             return []
         with self._lock:
+            if _is_master_uid(clean_uid):
+                rows = [
+                    {
+                        "orgId": org_id,
+                        "slug": str(org.get("slug") or org_id),
+                        "name": str(org.get("name") or org_id),
+                        "status": str(org.get("status") or "active"),
+                        "role": "owner",
+                        "hostToken": str(org.get("hostToken") or ""),
+                        "billingLimitsEnabled": _org_billing_limits_flag(org),
+                    }
+                    for org_id, org in self._orgs.items()
+                ]
+                rows.sort(key=lambda row: (row["orgId"], row["slug"]))
+                return rows
+
             rows: List[Dict[str, Any]] = []
             for (org_id, member_uid), member in self._members.items():
                 if member_uid != clean_uid:
@@ -443,6 +668,7 @@ class InMemoryMultiChurchStore:
                         "status": str(org.get("status") or "active"),
                         "role": role,
                         "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
+                        "billingLimitsEnabled": _org_billing_limits_flag(org),
                     }
                 )
             rows.sort(key=lambda row: (row["orgId"], row["slug"]))
@@ -453,6 +679,19 @@ class InMemoryMultiChurchStore:
         if not clean_uid:
             return None
         with self._lock:
+            if _is_master_uid(clean_uid):
+                current_org_id = _clean_token((self._users.get(clean_uid) or {}).get("currentOrgId"))
+                if current_org_id and current_org_id in self._orgs:
+                    return current_org_id
+                org_ids = sorted(self._orgs.keys())
+                if not org_ids:
+                    return None
+                chosen_org_id = org_ids[0]
+                profile = self._users.setdefault(clean_uid, {})
+                profile["currentOrgId"] = chosen_org_id
+                profile["updatedAt"] = _utcnow()
+                return chosen_org_id
+
             current_org_id = _clean_token((self._users.get(clean_uid) or {}).get("currentOrgId"))
             if current_org_id and (current_org_id, clean_uid) in self._members:
                 return current_org_id
@@ -478,12 +717,231 @@ class InMemoryMultiChurchStore:
         with self._lock:
             if clean_org_id not in self._orgs:
                 raise ValueError("org_not_found")
-            if (clean_org_id, clean_uid) not in self._members:
+            if not _is_master_uid(clean_uid) and (clean_org_id, clean_uid) not in self._members:
                 raise PermissionError("org_access_denied")
             profile = self._users.setdefault(clean_uid, {})
             profile["currentOrgId"] = clean_org_id
             profile["updatedAt"] = _utcnow()
             return clean_org_id
+
+    def is_master_user(self, uid: str) -> bool:
+        return _is_master_uid(uid)
+
+    def get_org_billing_limits(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            if not _is_master_uid(clean_uid):
+                raise PermissionError("billing_admin_required")
+            return _billing_limits_payload(org_id=clean_org_id, org=org)
+
+    def set_org_billing_limits(self, *, org_id: str, requested_by_uid: str, enabled: bool) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            if not _is_master_uid(clean_uid):
+                raise PermissionError("billing_admin_required")
+            org["billingLimitsEnabled"] = bool(enabled)
+            org["updatedAt"] = _utcnow()
+            return _billing_limits_payload(org_id=clean_org_id, org=org)
+
+    def ensure_sermon_prep_budget_not_reached(self, *, org_id: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        period_key = _yyyymm(_utcnow())
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            usage_month = dict(self._usage.get((clean_org_id, period_key)) or {})
+            sermon_rows = [
+                dict(row)
+                for (row_org_id, row_period_key, _row_sermon_id), row in self._usage_sermons.items()
+                if row_org_id == clean_org_id and row_period_key == period_key
+            ]
+            payload = _sermon_usage_payload(
+                org_id=clean_org_id,
+                org=org,
+                period_key=period_key,
+                usage_month=usage_month,
+                sermon_rows=sermon_rows,
+            )
+            if bool(payload.get("capReached")):
+                raise PermissionError("sermon_prep_budget_reached")
+            return payload
+
+    def get_org_sermon_prep_usage(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        period_key: Optional[str] = None,
+        sermon_id: Optional[str] = None,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        clean_sermon_id = _clean_token(sermon_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        safe_limit = max(1, min(200, int(limit or 25)))
+        resolved_period = _normalize_period_key(period_key, now=_utcnow())
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in {"owner", "admin", "host"}:
+                raise PermissionError("forbidden")
+            usage_month = dict(self._usage.get((clean_org_id, resolved_period)) or {})
+            sermon_rows = [
+                dict(row)
+                for (row_org_id, row_period_key, row_sermon_id), row in self._usage_sermons.items()
+                if row_org_id == clean_org_id
+                and row_period_key == resolved_period
+                and (not clean_sermon_id or row_sermon_id == clean_sermon_id)
+            ]
+            payload = _sermon_usage_payload(
+                org_id=clean_org_id,
+                org=org,
+                period_key=resolved_period,
+                usage_month=usage_month,
+                sermon_rows=sermon_rows,
+            )
+            payload["sermons"] = (payload.get("sermons") or [])[:safe_limit]
+            return payload
+
+    def set_org_sermon_prep_budget(self, *, org_id: str, requested_by_uid: str, budget_usd: float) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        parsed_budget = _safe_float(budget_usd, -1.0)
+        if parsed_budget < 0:
+            raise ValueError("invalid_budget")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            if not _is_master_uid(clean_uid):
+                raise PermissionError("billing_admin_required")
+            now = _utcnow()
+            org["sermonPrepBudgetUsd"] = float(parsed_budget)
+            org["updatedAt"] = now
+            period_key = _yyyymm(now)
+            usage_month = dict(self._usage.get((clean_org_id, period_key)) or {})
+            sermon_rows = [
+                dict(row)
+                for (row_org_id, row_period_key, _row_sermon_id), row in self._usage_sermons.items()
+                if row_org_id == clean_org_id and row_period_key == period_key
+            ]
+            payload = _sermon_usage_payload(
+                org_id=clean_org_id,
+                org=org,
+                period_key=period_key,
+                usage_month=usage_month,
+                sermon_rows=sermon_rows,
+            )
+            payload["sermons"] = (payload.get("sermons") or [])[:25]
+            return payload
+
+    def record_sermon_prep_usage(
+        self,
+        *,
+        org_id: str,
+        sermon_id: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        estimated_usd: float,
+        requests_count: int = 1,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_sermon_id = _clean_token(sermon_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_sermon_id:
+            raise ValueError("invalid_sermon_id")
+        prompt = _int_tokens(prompt_tokens)
+        completion = _int_tokens(completion_tokens)
+        total = _int_tokens(total_tokens) or (prompt + completion)
+        calls = max(0, _int_tokens(requests_count) or 0)
+        usd = _round_usd(estimated_usd)
+        if usd <= 0.0 and (prompt > 0 or completion > 0):
+            usd = _round_usd(_estimate_sermon_prep_usd(prompt_tokens=prompt, completion_tokens=completion))
+        clean_model = str(model or "").strip()
+
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            usage_key = (clean_org_id, period_key)
+            usage = self._usage.get(usage_key) or {}
+            usage["sermonPromptTokens"] = _int_tokens(usage.get("sermonPromptTokens")) + prompt
+            usage["sermonCompletionTokens"] = _int_tokens(usage.get("sermonCompletionTokens")) + completion
+            usage["sermonTotalTokens"] = _int_tokens(usage.get("sermonTotalTokens")) + total
+            usage["sermonEstimatedUsd"] = _round_usd(_safe_float(usage.get("sermonEstimatedUsd"), 0.0) + usd)
+            usage["sermonRequestsCount"] = _int_tokens(usage.get("sermonRequestsCount")) + calls
+            usage["updatedAt"] = now
+            self._usage[usage_key] = usage
+
+            sermon_key = (clean_org_id, period_key, clean_sermon_id)
+            sermon_usage = self._usage_sermons.get(sermon_key) or {
+                "sermonId": clean_sermon_id,
+                "promptTokens": 0,
+                "completionTokens": 0,
+                "totalTokens": 0,
+                "estimatedUsd": 0.0,
+                "requestsCount": 0,
+                "lastModel": "",
+                "lastUsedAt": now,
+            }
+            sermon_usage["promptTokens"] = _int_tokens(sermon_usage.get("promptTokens")) + prompt
+            sermon_usage["completionTokens"] = _int_tokens(sermon_usage.get("completionTokens")) + completion
+            sermon_usage["totalTokens"] = _int_tokens(sermon_usage.get("totalTokens")) + total
+            sermon_usage["estimatedUsd"] = _round_usd(_safe_float(sermon_usage.get("estimatedUsd"), 0.0) + usd)
+            sermon_usage["requestsCount"] = _int_tokens(sermon_usage.get("requestsCount")) + calls
+            if clean_model:
+                sermon_usage["lastModel"] = clean_model
+            sermon_usage["lastUsedAt"] = now
+            self._usage_sermons[sermon_key] = sermon_usage
+
+            sermon_rows = [
+                dict(row)
+                for (row_org_id, row_period_key, _row_sermon_id), row in self._usage_sermons.items()
+                if row_org_id == clean_org_id and row_period_key == period_key
+            ]
+            payload = _sermon_usage_payload(
+                org_id=clean_org_id,
+                org=org,
+                period_key=period_key,
+                usage_month=usage,
+                sermon_rows=sermon_rows,
+            )
+            payload["sermons"] = (payload.get("sermons") or [])[:25]
+            return payload
 
     def get_org_prompt(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -980,7 +1438,9 @@ class InMemoryMultiChurchStore:
                 "currentMonthMinutes": 0,
                 "currentMonthKey": _yyyymm(now),
                 "maxConcurrentRooms": 1,
+                "billingLimitsEnabled": True,
                 "hardCapReached": False,
+                "sermonPrepBudgetUsd": float(SERMON_PREP_DEFAULT_BUDGET_USD),
                 "hostToken": host_token,
                 "customPrompt": "",
                 "servicePrompt": "",
@@ -1043,7 +1503,7 @@ class InMemoryMultiChurchStore:
             status = (org.get("status") or "").lower()
             if status not in {"active", "trial"}:
                 raise PermissionError("org_inactive")
-            if bool(org.get("hardCapReached")):
+            if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
                 raise PermissionError("hard_cap_reached")
 
             service = self._services.get((org_id, service_key))
@@ -1200,6 +1660,8 @@ class InMemoryMultiChurchStore:
         return out
 
     def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
+        if not BILLING_LIMITS_ENABLED:
+            return []
         now = _utcnow()
         period_key = _yyyymm(now)
         tick_min = _tick_minutes(tick_seconds)
@@ -1208,6 +1670,8 @@ class InMemoryMultiChurchStore:
             flagged: set[tuple[str, str]] = set()
             for org_id, org in self._orgs.items():
                 self._roll_billing_period_if_needed(org, now)
+                if not _org_billing_limits_enabled(org):
+                    continue
                 if bool(org.get("hardCapReached")):
                     for (room_org_id, room_id), room in self._rooms.items():
                         if room_org_id == org_id and room.get("status") == "live":
@@ -1218,6 +1682,8 @@ class InMemoryMultiChurchStore:
                     continue
                 org = self._orgs.get(org_id)
                 if not org:
+                    continue
+                if not _org_billing_limits_enabled(org):
                     continue
 
                 max_minutes = int(org.get("maxMinutesPerMonth") or 0)
@@ -1306,6 +1772,9 @@ class FirestoreMultiChurchStore:
 
     def _usage_ref(self, org_id: str, period_key: str):
         return self._org_ref(org_id).collection("usage").document(period_key)
+
+    def _usage_sermon_ref(self, org_id: str, period_key: str, sermon_id: str):
+        return self._usage_ref(org_id, period_key).collection("sermons").document(_sermon_usage_doc_id(sermon_id))
 
     def _user_ref(self, uid: str):
         return self._db.collection("users").document(uid)
@@ -1463,6 +1932,8 @@ class FirestoreMultiChurchStore:
         clean_uid = _clean_token(uid)
         if not clean_uid:
             return None
+        if _is_master_uid(clean_uid):
+            return "owner"
         member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
         if not member_snap.exists:
             return None
@@ -1644,6 +2115,71 @@ class FirestoreMultiChurchStore:
         service_ref.delete()
         return {"deleted": True, "orgId": clean_org_id, "serviceKey": normalized_key}
 
+    def _membership_row(self, *, org_id: str, org: Dict[str, Any], role: Optional[str]) -> Dict[str, Any]:
+        normalized_role = _normalize_role(role, fallback="viewer")
+        lowered_role = normalized_role.strip().lower()
+        return {
+            "orgId": org_id,
+            "slug": str(org.get("slug") or org_id),
+            "name": str(org.get("name") or org_id),
+            "status": str(org.get("status") or "active"),
+            "role": normalized_role,
+            "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
+            "billingLimitsEnabled": _org_billing_limits_flag(org),
+        }
+
+    def _list_memberships_from_collection_group(self, uid: str) -> Optional[List[Dict[str, Any]]]:
+        collection_group = getattr(self._db, "collection_group", None)
+        if collection_group is None:
+            return None
+
+        members_query = collection_group("members")
+        field_path: Any = "__name__"
+        field_path_cls = getattr(gcf_firestore, "FieldPath", None)
+        if field_path_cls is not None and hasattr(field_path_cls, "document_id"):
+            try:
+                field_path = field_path_cls.document_id()
+            except Exception:
+                field_path = "__name__"
+
+        try:
+            member_snaps = list(self._where(members_query, field_path, "==", uid).stream())
+        except Exception:
+            try:
+                member_snaps = list(members_query.where("__name__", "==", uid).stream())
+            except Exception:
+                return None
+
+        rows: List[Dict[str, Any]] = []
+        seen_org_ids: set[str] = set()
+        for member_snap in member_snaps:
+            org_ref = member_snap.reference.parent.parent
+            if org_ref is None:
+                continue
+            org_id = _clean_token(getattr(org_ref, "id", None))
+            if not org_id or org_id in seen_org_ids:
+                continue
+            seen_org_ids.add(org_id)
+            org_snap = org_ref.get()
+            if not org_snap.exists:
+                continue
+            org = org_snap.to_dict() or {}
+            member = member_snap.to_dict() or {}
+            rows.append(self._membership_row(org_id=org_id, org=org, role=member.get("role")))
+        return rows
+
+    def _list_memberships_by_full_org_scan(self, uid: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for org_snap in self._db.collection("organizations").stream():
+            org_id = org_snap.id
+            member_snap = self._org_ref(org_id).collection("members").document(uid).get()
+            if not member_snap.exists:
+                continue
+            org = org_snap.to_dict() or {}
+            member = member_snap.to_dict() or {}
+            rows.append(self._membership_row(org_id=org_id, org=org, role=member.get("role")))
+        return rows
+
     def list_memberships(self, uid: str) -> List[Dict[str, Any]]:
         clean_uid = _clean_token(uid)
         if not clean_uid:
@@ -1651,6 +2187,19 @@ class FirestoreMultiChurchStore:
         cached = self._get_cached_memberships(clean_uid)
         if cached is not None:
             return cached
+
+        if _is_master_uid(clean_uid):
+            rows = [
+                self._membership_row(
+                    org_id=org_snap.id,
+                    org=(org_snap.to_dict() or {}),
+                    role="owner",
+                )
+                for org_snap in self._db.collection("organizations").stream()
+            ]
+            rows.sort(key=lambda row: (row["orgId"], row["slug"]))
+            self._set_cached_memberships(clean_uid, rows)
+            return rows
 
         rows: List[Dict[str, Any]] = []
         indexed_memberships = list(self._user_ref(clean_uid).collection("memberships").stream())
@@ -1673,43 +2222,21 @@ class FirestoreMultiChurchStore:
                 org = org_snap.to_dict() or {}
                 member = member_snap.to_dict() or {}
                 role = _normalize_role(member.get("role"), fallback=index_doc.get("role"))
-                lowered_role = role.strip().lower()
-                rows.append(
-                    {
-                        "orgId": org_id,
-                        "slug": str(org.get("slug") or org_id),
-                        "name": str(org.get("name") or org_id),
-                        "status": str(org.get("status") or "active"),
-                        "role": role,
-                        "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
-                    }
-                )
+                rows.append(self._membership_row(org_id=org_id, org=org, role=role))
                 if _normalize_role(index_doc.get("role"), fallback="viewer") != role:
                     self._upsert_user_membership_index(uid=clean_uid, org_id=org_id, role=role)
             for stale_org_id in stale_org_ids:
                 self._user_membership_ref(clean_uid, stale_org_id).delete()
         if not indexed_memberships or not rows:
-            rows = []
-            for org_snap in self._db.collection("organizations").stream():
-                org_id = org_snap.id
-                member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
-                if not member_snap.exists:
-                    continue
-                org = org_snap.to_dict() or {}
-                member = member_snap.to_dict() or {}
-                role = _normalize_role(member.get("role"), fallback="viewer")
-                lowered_role = role.strip().lower()
-                rows.append(
-                    {
-                        "orgId": org_id,
-                        "slug": str(org.get("slug") or org_id),
-                        "name": str(org.get("name") or org_id),
-                        "status": str(org.get("status") or "active"),
-                        "role": role,
-                        "hostToken": str(org.get("hostToken") or "") if lowered_role in {"owner", "admin", "host"} else None,
-                    }
+            rows = self._list_memberships_from_collection_group(clean_uid)
+            if rows is None:
+                rows = self._list_memberships_by_full_org_scan(clean_uid)
+            for row in rows:
+                self._upsert_user_membership_index(
+                    uid=clean_uid,
+                    org_id=str(row.get("orgId") or ""),
+                    role=row.get("role"),
                 )
-                self._upsert_user_membership_index(uid=clean_uid, org_id=org_id, role=role)
         rows.sort(key=lambda row: (row["orgId"], row["slug"]))
         self._set_cached_memberships(clean_uid, rows)
         return rows
@@ -1720,6 +2247,18 @@ class FirestoreMultiChurchStore:
             return None
         user_snap = self._user_ref(clean_uid).get()
         current_org_id = _clean_token((user_snap.to_dict() or {}).get("currentOrgId")) if user_snap.exists else None
+        if _is_master_uid(clean_uid):
+            if current_org_id and self._org_ref(current_org_id).get().exists:
+                return current_org_id
+            memberships = self.list_memberships(clean_uid)
+            if not memberships:
+                return None
+            fallback_org_id = str(memberships[0]["orgId"])
+            self._user_ref(clean_uid).set(
+                {"currentOrgId": fallback_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+            return fallback_org_id
         if current_org_id:
             member_snap = self._org_ref(current_org_id).collection("members").document(clean_uid).get()
             if member_snap.exists:
@@ -1744,14 +2283,233 @@ class FirestoreMultiChurchStore:
         org_snap = self._org_ref(clean_org_id).get()
         if not org_snap.exists:
             raise ValueError("org_not_found")
-        member_snap = self._org_ref(clean_org_id).collection("members").document(clean_uid).get()
-        if not member_snap.exists:
-            raise PermissionError("org_access_denied")
+        if not _is_master_uid(clean_uid):
+            member_snap = self._org_ref(clean_org_id).collection("members").document(clean_uid).get()
+            if not member_snap.exists:
+                raise PermissionError("org_access_denied")
         self._user_ref(clean_uid).set(
             {"currentOrgId": clean_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
             merge=True,
         )
         return clean_org_id
+
+    def is_master_user(self, uid: str) -> bool:
+        return _is_master_uid(uid)
+
+    def get_org_billing_limits(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        if not _is_master_uid(clean_uid):
+            raise PermissionError("billing_admin_required")
+
+        org = org_snap.to_dict() or {}
+        return _billing_limits_payload(org_id=clean_org_id, org=org)
+
+    def set_org_billing_limits(self, *, org_id: str, requested_by_uid: str, enabled: bool) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        if not _is_master_uid(clean_uid):
+            raise PermissionError("billing_admin_required")
+
+        org_ref.set(
+            {
+                "billingLimitsEnabled": bool(enabled),
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        merged_org = org_snap.to_dict() or {}
+        merged_org["billingLimitsEnabled"] = bool(enabled)
+        merged_org["updatedAt"] = _utcnow()
+        return _billing_limits_payload(org_id=clean_org_id, org=merged_org)
+
+    def ensure_sermon_prep_budget_not_reached(self, *, org_id: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        usage_snap = self._usage_ref(clean_org_id, period_key).get()
+        payload = _sermon_usage_payload(
+            org_id=clean_org_id,
+            org=(org_snap.to_dict() or {}),
+            period_key=period_key,
+            usage_month=(usage_snap.to_dict() or {}) if usage_snap.exists else {},
+            sermon_rows=[],
+        )
+        if bool(payload.get("capReached")):
+            raise PermissionError("sermon_prep_budget_reached")
+        payload["sermons"] = []
+        return payload
+
+    def get_org_sermon_prep_usage(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        period_key: Optional[str] = None,
+        sermon_id: Optional[str] = None,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        clean_sermon_id = _clean_token(sermon_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        safe_limit = max(1, min(200, int(limit or 25)))
+        resolved_period = _normalize_period_key(period_key, now=_utcnow())
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin", "host"}:
+            raise PermissionError("forbidden")
+
+        usage_ref = self._usage_ref(clean_org_id, resolved_period)
+        usage_snap = usage_ref.get()
+        sermon_rows: List[Dict[str, Any]] = []
+        for sermon_snap in usage_ref.collection("sermons").stream():
+            row = sermon_snap.to_dict() or {}
+            row_sermon_id = _clean_token(row.get("sermonId"))
+            if clean_sermon_id and row_sermon_id != clean_sermon_id:
+                continue
+            sermon_rows.append(row)
+        payload = _sermon_usage_payload(
+            org_id=clean_org_id,
+            org=(org_snap.to_dict() or {}),
+            period_key=resolved_period,
+            usage_month=(usage_snap.to_dict() or {}) if usage_snap.exists else {},
+            sermon_rows=sermon_rows,
+        )
+        payload["sermons"] = (payload.get("sermons") or [])[:safe_limit]
+        return payload
+
+    def set_org_sermon_prep_budget(self, *, org_id: str, requested_by_uid: str, budget_usd: float) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        parsed_budget = _safe_float(budget_usd, -1.0)
+        if parsed_budget < 0:
+            raise ValueError("invalid_budget")
+
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        if not _is_master_uid(clean_uid):
+            raise PermissionError("billing_admin_required")
+
+        org_ref.set(
+            {
+                "sermonPrepBudgetUsd": float(parsed_budget),
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return self.get_org_sermon_prep_usage(
+            org_id=clean_org_id,
+            requested_by_uid=clean_uid,
+            limit=25,
+        )
+
+    def record_sermon_prep_usage(
+        self,
+        *,
+        org_id: str,
+        sermon_id: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        estimated_usd: float,
+        requests_count: int = 1,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_sermon_id = _clean_token(sermon_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_sermon_id:
+            raise ValueError("invalid_sermon_id")
+        prompt = _int_tokens(prompt_tokens)
+        completion = _int_tokens(completion_tokens)
+        total = _int_tokens(total_tokens) or (prompt + completion)
+        calls = max(0, _int_tokens(requests_count) or 0)
+        usd = _round_usd(estimated_usd)
+        if usd <= 0.0 and (prompt > 0 or completion > 0):
+            usd = _round_usd(_estimate_sermon_prep_usd(prompt_tokens=prompt, completion_tokens=completion))
+        model_name = str(model or "").strip()
+
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        usage_ref = self._usage_ref(clean_org_id, period_key)
+        usage_ref.set(
+            {
+                "sermonPromptTokens": gcf_firestore.Increment(prompt),
+                "sermonCompletionTokens": gcf_firestore.Increment(completion),
+                "sermonTotalTokens": gcf_firestore.Increment(total),
+                "sermonEstimatedUsd": gcf_firestore.Increment(float(usd)),
+                "sermonRequestsCount": gcf_firestore.Increment(calls),
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+        sermon_ref = self._usage_sermon_ref(clean_org_id, period_key, clean_sermon_id)
+        sermon_payload: Dict[str, Any] = {
+            "sermonId": clean_sermon_id,
+            "promptTokens": gcf_firestore.Increment(prompt),
+            "completionTokens": gcf_firestore.Increment(completion),
+            "totalTokens": gcf_firestore.Increment(total),
+            "estimatedUsd": gcf_firestore.Increment(float(usd)),
+            "requestsCount": gcf_firestore.Increment(calls),
+            "lastUsedAt": gcf_firestore.SERVER_TIMESTAMP,
+            "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+        }
+        if model_name:
+            sermon_payload["lastModel"] = model_name
+        sermon_ref.set(sermon_payload, merge=True)
+
+        usage_snap = usage_ref.get()
+        sermon_rows = [(snap.to_dict() or {}) for snap in usage_ref.collection("sermons").stream()]
+        payload = _sermon_usage_payload(
+            org_id=clean_org_id,
+            org=(org_snap.to_dict() or {}),
+            period_key=period_key,
+            usage_month=(usage_snap.to_dict() or {}) if usage_snap.exists else {},
+            sermon_rows=sermon_rows,
+        )
+        payload["sermons"] = (payload.get("sermons") or [])[:25]
+        return payload
 
     def create_invite(
         self,
@@ -2186,7 +2944,9 @@ class FirestoreMultiChurchStore:
                 "currentMonthMinutes": 0,
                 "currentMonthKey": _yyyymm(now),
                 "maxConcurrentRooms": 1,
+                "billingLimitsEnabled": True,
                 "hardCapReached": False,
+                "sermonPrepBudgetUsd": float(SERMON_PREP_DEFAULT_BUDGET_USD),
                 "hostToken": host_token,
                 "customPrompt": "",
                 "servicePrompt": "",
@@ -2330,6 +3090,8 @@ class FirestoreMultiChurchStore:
 
         uid = _clean_token(host_uid)
         if uid:
+            if _is_master_uid(uid):
+                return True
             member_snap = self._org_ref(org_id).collection("members").document(uid).get()
             if member_snap.exists:
                 role = str((member_snap.to_dict() or {}).get("role") or "").strip().lower()
@@ -2389,7 +3151,7 @@ class FirestoreMultiChurchStore:
             status = (org.get("status") or "").lower()
             if status not in {"active", "trial"}:
                 raise PermissionError("org_inactive")
-            if bool(org.get("hardCapReached")):
+            if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
                 raise PermissionError("hard_cap_reached")
 
             service_snap = service_ref.get(transaction=transaction)
@@ -2579,6 +3341,8 @@ class FirestoreMultiChurchStore:
         return out
 
     def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
+        if not BILLING_LIMITS_ENABLED:
+            return []
         now = _utcnow()
         period_key = _yyyymm(now)
         tick_min = _tick_minutes(tick_seconds)
@@ -2587,6 +3351,8 @@ class FirestoreMultiChurchStore:
         for org_snap in self._db.collection("organizations").stream():
             org_id = org_snap.id
             org = self._roll_billing_period_if_needed(org_id, org_snap.to_dict() or {}, now=now)
+            if not _org_billing_limits_enabled(org):
+                continue
             max_minutes = int(org.get("maxMinutesPerMonth") or 0)
             if max_minutes <= 0:
                 continue

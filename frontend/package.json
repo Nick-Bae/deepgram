@@ -7,6 +7,9 @@
     "backend": "cd ../backend && venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000",
     "dev": "next dev -H localhost -p 3000",
     "dev:lan": "next dev -H 0.0.0.0 -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint",
     "check": "node utils/check-status.js",
     "qr": "node utils/show-qr.js",
     "dev-all": "npm run update-env && concurrently -k -n BACKEND,FRONTEND \"npm:backend\" \"npm:dev:lan\" && npm run check && npm run qr"

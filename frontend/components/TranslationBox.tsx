@@ -1072,13 +1072,13 @@ export default function TranslationBox() {
                   </div>
                   <div className="flex items-center gap-2">
                     <button
-                      onClick={() => applyDisplaySpeed(displaySpeed - DISPLAY_SPEED_STEP)}
+                      onClick={() => applyDisplaySpeed(displaySpeed + DISPLAY_SPEED_STEP)}
                       className="rounded-lg border border-[#454543] px-3 py-1.5 text-xs font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
                     >
                       Slower
                     </button>
                     <button
-                      onClick={() => applyDisplaySpeed(displaySpeed + DISPLAY_SPEED_STEP)}
+                      onClick={() => applyDisplaySpeed(displaySpeed - DISPLAY_SPEED_STEP)}
                       className="rounded-lg border border-[#454543] px-3 py-1.5 text-xs font-semibold text-[#f2f5e3] transition hover:border-[#feda6a] hover:text-[#feda6a]"
                     >
                       Faster

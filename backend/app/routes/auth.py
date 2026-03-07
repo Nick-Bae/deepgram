@@ -74,18 +74,41 @@ class CreateInviteRequest(BaseModel):
     expiresHours: int = Field(default=DEFAULT_INVITE_EXPIRY_HOURS, ge=1, le=24 * 30)
 
 
+class SetOrgBillingLimitsRequest(BaseModel):
+    enabled: bool = Field(...)
+
+
+def _sanitize_membership_payload(rows: list[dict]) -> list[dict]:
+    sanitized: list[dict] = []
+    for row in rows:
+        item = dict(row or {})
+        item.pop("hostToken", None)
+        item.pop("host_token", None)
+        sanitized.append(item)
+    return sanitized
+
+
+def _sanitize_auth_payload(payload: dict) -> dict:
+    item = dict(payload or {})
+    item.pop("hostToken", None)
+    item.pop("host_token", None)
+    return item
+
+
 @router.get("/auth/me")
 def auth_me(user: AuthenticatedUser = Depends(get_current_user_required)):
     memberships = multichurch_store.list_memberships(user.uid)
     current_org_id = multichurch_store.get_current_org_id(user.uid)
+    is_master = bool(multichurch_store.is_master_user(user.uid))
     return {
         "user": {
             "uid": user.uid,
             "email": user.email,
             "displayName": user.displayName,
+            "isMaster": is_master,
         },
         "currentOrgId": current_org_id,
-        "memberships": memberships,
+        "memberships": _sanitize_membership_payload(memberships),
     }
 
 
@@ -124,8 +147,7 @@ def auth_bootstrap_owner(
         "created": bool(result.get("created", True)),
         "org": org_payload,
         "services": result.get("services") or [],
-        "hostToken": result.get("hostToken"),
-        "memberships": memberships,
+        "memberships": _sanitize_membership_payload(memberships),
     }
 
 
@@ -147,6 +169,52 @@ def auth_set_current_org(
         detail = str(exc) or "org_access_denied"
         raise HTTPException(status_code=403, detail=detail) from exc
     return {"ok": True, "currentOrgId": org_id}
+
+
+@router.get("/auth/org/{org_id}/billing-limits")
+def auth_get_org_billing_limits(
+    org_id: str,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        return multichurch_store.get_org_billing_limits(
+            org_id=org_id,
+            requested_by_uid=user.uid,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "invalid_uid":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "billing_limits_fetch_failed") from exc
+    except PermissionError as exc:
+        detail = str(exc) or "forbidden"
+        raise HTTPException(status_code=403, detail=detail) from exc
+
+
+@router.post("/auth/org/{org_id}/billing-limits")
+def auth_set_org_billing_limits(
+    org_id: str,
+    payload: SetOrgBillingLimitsRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        return multichurch_store.set_org_billing_limits(
+            org_id=org_id,
+            requested_by_uid=user.uid,
+            enabled=payload.enabled,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "invalid_uid":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "billing_limits_update_failed") from exc
+    except PermissionError as exc:
+        detail = str(exc) or "forbidden"
+        raise HTTPException(status_code=403, detail=detail) from exc
 
 
 @router.post("/auth/org/{org_id}/invites")
@@ -235,12 +303,13 @@ def auth_redeem_invite(
 ):
     _enforce_invite_rate_limit(user.uid, action="redeem", max_hits=_INVITE_RATE_REDEEM_MAX)
     try:
-        return multichurch_store.redeem_invite(
+        redeemed = multichurch_store.redeem_invite(
             code=code,
             uid=user.uid,
             email=user.email,
             display_name=user.displayName,
         )
+        return _sanitize_auth_payload(redeemed)
     except ValueError as exc:
         detail = str(exc)
         if detail == "invite_not_found":

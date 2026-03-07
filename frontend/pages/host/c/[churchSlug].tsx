@@ -8,12 +8,18 @@ import {
   createOrgInvite,
   deleteOrgService,
   fetchAuthMe,
+  fetchOrgBillingLimits,
+  fetchOrgSermonUsage,
   listOrgInvites,
   revokeOrgInvite,
+  saveOrgBillingLimits,
+  saveOrgSermonBudget,
   setCurrentOrg,
   type InviteRole,
+  type OrgBillingLimitsResponse,
   type OrgInviteSummary,
   type OrgMembership,
+  type OrgSermonUsageResponse,
 } from "../../../lib/backendAuth";
 import { API_URL } from "../../../utils/urls";
 import { clearAuthToken, clearHostToken, clearRoomInSession, getHostTokenFromSession, persistAuthToken, persistHostToken, persistStreamContext } from "../../../utils/streamContext";
@@ -56,7 +62,7 @@ function resolveHostTab(raw: string): HostTab {
 }
 
 const ERROR_DETAIL_MESSAGES: Record<string, string> = {
-  host_auth_failed: "Host authentication failed. Enter a valid Host Token and try again.",
+  host_auth_failed: "Host authorization failed. Sign in with an owner/admin/host account.",
   auth_required: "Please sign in first.",
   invalid_id_token: "Session expired. Please sign in again.",
   hard_cap_reached: "Monthly plan limit reached for this church. Please upgrade or wait for reset.",
@@ -147,11 +153,11 @@ export default function HostChurchPage() {
   const [sourceLang, setSourceLang] = useState("ko");
   const [targetLang, setTargetLang] = useState("en");
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
-  const [hostToken, setHostToken] = useState("");
   const [memberships, setMemberships] = useState<OrgMembership[]>([]);
   const [switchingOrg, setSwitchingOrg] = useState(false);
   const [selectedOrgId, setSelectedOrgId] = useState("");
   const [membershipRole, setMembershipRole] = useState("");
+  const [isMasterUser, setIsMasterUser] = useState(false);
   const [inviteRole, setInviteRole] = useState<InviteRoleChoice>("host");
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
@@ -167,6 +173,15 @@ export default function HostChurchPage() {
   const [serviceManageBusy, setServiceManageBusy] = useState(false);
   const [serviceManageError, setServiceManageError] = useState<string | null>(null);
   const [deletingServiceKey, setDeletingServiceKey] = useState("");
+  const [billingState, setBillingState] = useState<OrgBillingLimitsResponse | null>(null);
+  const [billingBusy, setBillingBusy] = useState(false);
+  const [billingError, setBillingError] = useState<string | null>(null);
+  const [billingNotice, setBillingNotice] = useState<string | null>(null);
+  const [sermonUsageState, setSermonUsageState] = useState<OrgSermonUsageResponse | null>(null);
+  const [sermonBudgetInput, setSermonBudgetInput] = useState("0");
+  const [sermonBudgetBusy, setSermonBudgetBusy] = useState(false);
+  const [sermonBudgetError, setSermonBudgetError] = useState<string | null>(null);
+  const [sermonBudgetNotice, setSermonBudgetNotice] = useState<string | null>(null);
   const normalizedServiceKey = serviceKey.trim();
   const activeTab = resolveHostTab(querySection);
   const resolvedOrgId = (orgData?.orgId || queryOrgId || "").trim();
@@ -174,14 +189,23 @@ export default function HostChurchPage() {
     const lowered = membershipRole.trim().toLowerCase();
     return lowered === "owner" || lowered === "admin";
   }, [membershipRole]);
+  const canManageBilling = useMemo(() => {
+    return isMasterUser;
+  }, [isMasterUser]);
   const canManageServices = useMemo(() => {
     const lowered = membershipRole.trim().toLowerCase();
     return lowered === "owner" || lowered === "admin" || lowered === "host";
   }, [membershipRole]);
 
   useEffect(() => {
-    if (resolvedOrgId) setSelectedOrgId(resolvedOrgId);
-  }, [resolvedOrgId]);
+    if (!resolvedOrgId) return;
+    if (!memberships.length) {
+      setSelectedOrgId(resolvedOrgId);
+      return;
+    }
+    const matchedMembership = memberships.find((row) => row.orgId === resolvedOrgId || row.slug === slug);
+    if (matchedMembership) setSelectedOrgId(matchedMembership.orgId);
+  }, [memberships, resolvedOrgId, slug]);
 
   useEffect(() => {
     setInviteLink("");
@@ -195,6 +219,15 @@ export default function HostChurchPage() {
     setNewServiceTitle("");
     setServiceManageError(null);
     setDeletingServiceKey("");
+    setBillingState(null);
+    setBillingBusy(false);
+    setBillingError(null);
+    setBillingNotice(null);
+    setSermonUsageState(null);
+    setSermonBudgetInput("0");
+    setSermonBudgetBusy(false);
+    setSermonBudgetError(null);
+    setSermonBudgetNotice(null);
   }, [resolvedOrgId]);
 
   useEffect(() => {
@@ -227,25 +260,43 @@ export default function HostChurchPage() {
       persistAuthToken(idToken);
       const me = await fetchAuthMe(idToken);
       if (cancelled) return;
+      setIsMasterUser(Boolean(me.user?.isMaster));
       const preferredOrgId = (me.currentOrgId || "").trim();
       const rows = me.memberships || [];
       setMemberships(rows);
-      setSelectedOrgId(preferredOrgId || rows[0]?.orgId || "");
-      const match =
-        rows.find((row) => row.orgId === resolvedOrgId || row.slug === slug) ||
-        rows.find((row) => row.orgId === preferredOrgId) ||
-        rows[0];
-      setMembershipRole((match?.role || "").trim());
-      if (match?.hostToken) {
-        const normalized = persistHostToken(match.hostToken) || "";
-        setHostToken((prev) => (normalized !== prev ? normalized : prev));
-      }
+      const preferredMembership = rows.find((row) => row.orgId === preferredOrgId) || rows[0];
+      const routeMembership = rows.find((row) => row.orgId === resolvedOrgId || row.slug === slug);
+      const effectiveMembership = routeMembership || preferredMembership;
+      setSelectedOrgId(effectiveMembership?.orgId || "");
+      setMembershipRole((effectiveMembership?.role || "").trim());
+
+      if (!preferredMembership) return;
+      const cleanSlug = (slug || "").trim();
+      const cleanQueryOrgId = (queryOrgId || "").trim();
+      const preferredSlug = (preferredMembership.slug || "").trim();
+      const preferredOrg = (preferredMembership.orgId || "").trim();
+      if (!preferredSlug || !preferredOrg) return;
+      if (cleanSlug === preferredSlug && cleanQueryOrgId === preferredOrg) return;
+
+      persistStreamContext({
+        orgId: preferredOrg,
+        serviceKey: queryServiceKey || undefined,
+        churchSlug: preferredSlug,
+        roomId: undefined,
+      });
+      const params = new URLSearchParams();
+      params.set("orgId", preferredOrg);
+      if (queryServiceKey) params.set("serviceKey", queryServiceKey);
+      const query = params.toString();
+      await router.replace(
+        `/host/c/${encodeURIComponent(preferredSlug)}/${activeTab}${query ? `?${query}` : ""}`,
+      );
     };
     hydrateMembershipToken().catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [authLoading, getIdToken, resolvedOrgId, slug, user]);
+  }, [activeTab, authLoading, getIdToken, queryOrgId, queryServiceKey, resolvedOrgId, router, slug, user]);
 
   useEffect(() => {
     if (typeof window !== "undefined") setOrigin(window.location.origin);
@@ -253,12 +304,8 @@ export default function HostChurchPage() {
 
   useEffect(() => {
     if (queryHostToken) {
-      const normalized = persistHostToken(queryHostToken) || "";
-      setHostToken(normalized);
-      return;
+      persistHostToken(queryHostToken);
     }
-    const saved = getHostTokenFromSession();
-    if (saved) setHostToken(saved);
   }, [queryHostToken]);
 
   const refreshServices = useCallback(
@@ -402,10 +449,6 @@ export default function HostChurchPage() {
         if (!idToken) throw new Error("Please sign in again.");
         persistAuthToken(idToken);
         await setCurrentOrg(idToken, cleanOrgId);
-        if (targetMembership.hostToken) {
-          const normalized = persistHostToken(targetMembership.hostToken) || "";
-          setHostToken(normalized);
-        }
         setMembershipRole((targetMembership.role || "").trim());
         persistStreamContext({
           orgId: cleanOrgId,
@@ -441,6 +484,63 @@ export default function HostChurchPage() {
     const listed = await listOrgInvites(idToken, resolvedOrgId, "active");
     setInviteRows(listed.invites || []);
   }, [canManageInvites, getIdToken, resolvedOrgId]);
+
+  const loadBillingLimits = useCallback(async () => {
+    if (!resolvedOrgId || !canManageBilling) {
+      setBillingState(null);
+      return;
+    }
+    const idToken = await getIdToken();
+    if (!idToken) throw new Error("Please sign in again.");
+    persistAuthToken(idToken);
+    const payload = await fetchOrgBillingLimits(idToken, resolvedOrgId);
+    setBillingState(payload);
+  }, [canManageBilling, getIdToken, resolvedOrgId]);
+
+  const loadSermonUsage = useCallback(async () => {
+    if (!resolvedOrgId || !canManageBilling) {
+      setSermonUsageState(null);
+      return;
+    }
+    const idToken = await getIdToken();
+    if (!idToken) throw new Error("Please sign in again.");
+    persistAuthToken(idToken);
+    const payload = await fetchOrgSermonUsage(idToken, resolvedOrgId, { limit: 8 });
+    setSermonUsageState(payload);
+    setSermonBudgetInput(String(payload.budgetUsd ?? 0));
+  }, [canManageBilling, getIdToken, resolvedOrgId]);
+
+  useEffect(() => {
+    if (activeTab !== "settings" || !canManageBilling || !resolvedOrgId || authLoading || !user) return;
+    let cancelled = false;
+    const run = async () => {
+      setBillingError(null);
+      setSermonBudgetError(null);
+      try {
+        const idToken = await getIdToken();
+        if (!idToken || cancelled) return;
+        persistAuthToken(idToken);
+        const [billingPayload, sermonPayload] = await Promise.all([
+          fetchOrgBillingLimits(idToken, resolvedOrgId),
+          fetchOrgSermonUsage(idToken, resolvedOrgId, { limit: 8 }),
+        ]);
+        if (cancelled) return;
+        setBillingState(billingPayload);
+        setSermonUsageState(sermonPayload);
+        setSermonBudgetInput(String(sermonPayload.budgetUsd ?? 0));
+      } catch (err: unknown) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          setBillingError(message || "Failed to load billing limits.");
+          setSermonBudgetError(message || "Failed to load Sermon Prep usage.");
+        }
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, authLoading, canManageBilling, getIdToken, resolvedOrgId, user]);
 
   useEffect(() => {
     if (!canManageInvites || !resolvedOrgId || authLoading || !user) return;
@@ -565,6 +665,71 @@ export default function HostChurchPage() {
     }
   };
 
+  const toggleBillingLimits = async () => {
+    if (!resolvedOrgId || !canManageBilling) return;
+    if (!billingState) {
+      await loadBillingLimits();
+      return;
+    }
+    const nextEnabled = !billingState.billingLimitsEnabled;
+    setBillingBusy(true);
+    setBillingError(null);
+    setBillingNotice(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const updated = await saveOrgBillingLimits(idToken, resolvedOrgId, nextEnabled);
+      setBillingState(updated);
+      setMemberships((rows) =>
+        rows.map((row) =>
+          row.orgId === resolvedOrgId
+            ? {
+                ...row,
+                billingLimitsEnabled: updated.billingLimitsEnabled,
+              }
+            : row,
+        ),
+      );
+      setBillingNotice(
+        updated.billingLimitsEnabled
+          ? "Monthly billing-limit enforcement is enabled for this church."
+          : "Monthly billing-limit enforcement is disabled for this church.",
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setBillingError(message || "Failed to update billing limits.");
+    } finally {
+      setBillingBusy(false);
+    }
+  };
+
+  const saveSermonBudget = async () => {
+    if (!resolvedOrgId || !canManageBilling) return;
+    const parsed = Number(sermonBudgetInput);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      setSermonBudgetError("Enter a valid non-negative budget amount.");
+      return;
+    }
+    setSermonBudgetBusy(true);
+    setSermonBudgetError(null);
+    setSermonBudgetNotice(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const updated = await saveOrgSermonBudget(idToken, resolvedOrgId, parsed);
+      setSermonUsageState(updated);
+      setSermonBudgetInput(String(updated.budgetUsd ?? parsed));
+      setSermonBudgetNotice("Sermon Prep monthly budget updated.");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setSermonBudgetError(message || "Failed to update Sermon Prep budget.");
+    } finally {
+      setSermonBudgetBusy(false);
+    }
+  };
+
   const addService = async () => {
     if (!resolvedOrgId) {
       setServiceManageError("Organization is not loaded yet.");
@@ -646,8 +811,7 @@ export default function HostChurchPage() {
     try {
       const idToken = await getIdToken();
       if (idToken) persistAuthToken(idToken);
-      const normalizedHostToken = persistHostToken(hostToken) || "";
-      if (normalizedHostToken !== hostToken) setHostToken(normalizedHostToken);
+      const normalizedHostToken = (getHostTokenFromSession() || "").trim();
       const path = resolvedOrgId
         ? `/api/org/${encodeURIComponent(resolvedOrgId)}/service/${encodeURIComponent(normalizedServiceKey)}/start`
         : `/api/c/${encodeURIComponent(slug)}/service/${encodeURIComponent(normalizedServiceKey)}/start`;
@@ -708,8 +872,7 @@ export default function HostChurchPage() {
     try {
       const idToken = await getIdToken();
       if (idToken) persistAuthToken(idToken);
-      const normalizedHostToken = persistHostToken(hostToken) || "";
-      if (normalizedHostToken !== hostToken) setHostToken(normalizedHostToken);
+      const normalizedHostToken = (getHostTokenFromSession() || "").trim();
       const res = await fetch(`${API_URL}/api/org/${encodeURIComponent(resolvedOrgId)}/room/${encodeURIComponent(activeRoomId)}/end`, {
         method: "POST",
         headers: {
@@ -921,19 +1084,6 @@ export default function HostChurchPage() {
                   <span style={{ fontSize: 12, opacity: 0.75 }}>Target</span>
                   <input value={targetLang} onChange={(e) => setTargetLang(e.target.value)} style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }} />
                 </label>
-                <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75 }}>Host Token</span>
-                  <input
-                    value={hostToken}
-                    onChange={(e) => {
-                      const next = e.target.value;
-                      setHostToken(next);
-                      persistHostToken(next);
-                    }}
-                    placeholder="Required if org hostToken is set"
-                    style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
-                  />
-                </label>
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, alignItems: "center" }}>
                 <button
@@ -977,11 +1127,157 @@ export default function HostChurchPage() {
                   Listener URL: <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: "#93c5fd" }}>{listenerUrl}</a>
                 </p>
               ) : null}
+              <p style={{ marginTop: 8, marginBottom: 0, fontSize: 12, opacity: 0.72 }}>
+                Signed-in hosts are authorized by account role. Manual host token entry is not required.
+              </p>
             </>
           ) : null}
           {activeTab === "settings" ? (
             canManageServices ? (
               <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12, display: "grid", gap: 8 }}>
+                <div style={{ border: "1px solid rgba(56,189,248,0.35)", borderRadius: 10, padding: 10, display: "grid", gap: 7, background: "rgba(8,16,35,0.75)" }}>
+                  <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Billing Limits</p>
+                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>
+                    Toggle monthly hard-cap enforcement for this church only.
+                  </p>
+                  {canManageBilling ? (
+                    <>
+                      <p style={{ margin: 0, fontSize: 13, opacity: 0.85 }}>
+                        Status:{" "}
+                        <strong>
+                          {billingState ? (billingState.billingLimitsEnabled ? "Enabled" : "Disabled") : "Loading..."}
+                        </strong>
+                        {billingState && !billingState.globalBillingLimitsEnabled ? " (global override currently disables all billing checks)" : ""}
+                      </p>
+                      {billingState ? (
+                        <p style={{ margin: 0, fontSize: 12, opacity: 0.78 }}>
+                          Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
+                          {" · "}
+                          Hard cap: {billingState.hardCapReached ? "reached" : "not reached"}
+                        </p>
+                      ) : null}
+                      {billingError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {billingError}</p> : null}
+                      {billingNotice ? <p style={{ margin: 0, color: "#86efac", fontSize: 13 }}>{billingNotice}</p> : null}
+                      <button
+                        onClick={toggleBillingLimits}
+                        disabled={billingBusy || !resolvedOrgId}
+                        style={{
+                          justifySelf: "start",
+                          borderRadius: 8,
+                          border: "none",
+                          background: billingState?.billingLimitsEnabled ? "#f59e0b" : "#22c55e",
+                          color: billingState?.billingLimitsEnabled ? "#431407" : "#052e16",
+                          fontWeight: 700,
+                          padding: "8px 12px",
+                          cursor: billingBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          opacity: billingBusy || !resolvedOrgId ? 0.6 : 1,
+                        }}
+                      >
+                        {billingBusy
+                          ? "Saving..."
+                          : billingState?.billingLimitsEnabled
+                            ? "Disable Billing Limits"
+                            : "Enable Billing Limits"}
+                      </button>
+                    </>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: 13, opacity: 0.78 }}>
+                      Super user is required to change billing limits. Set `MASTER_USER_UIDS` (or `MASTER_USER_UID`) in backend env with your Firebase UID.
+                    </p>
+                  )}
+                </div>
+                <div style={{ border: "1px solid rgba(34,197,94,0.35)", borderRadius: 10, padding: 10, display: "grid", gap: 7, background: "rgba(7,21,16,0.72)" }}>
+                  <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Sermon Prep Budget</p>
+                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>
+                    Track OpenAI token usage by sermon and cap monthly Sermon Prep spend for this church.
+                  </p>
+                  {sermonUsageState ? (
+                    <>
+                      <p style={{ margin: 0, fontSize: 13, opacity: 0.85 }}>
+                        Month {sermonUsageState.currentMonthKey}:{" "}
+                        <strong>${sermonUsageState.currentMonthEstimatedUsd.toFixed(4)}</strong>
+                        {sermonUsageState.effectiveBudgetEnabled ? ` / $${sermonUsageState.budgetUsd.toFixed(2)}` : " (budget disabled)"}
+                        {" · "}
+                        Tokens: {sermonUsageState.currentMonthTotalTokens.toLocaleString()}
+                        {" · "}
+                        Cap: {sermonUsageState.capReached ? "reached" : "not reached"}
+                      </p>
+                      {sermonUsageState.sermons.length ? (
+                        <div style={{ display: "grid", gap: 4 }}>
+                          {sermonUsageState.sermons.slice(0, 4).map((row) => (
+                            <p key={row.sermonId} style={{ margin: 0, fontSize: 12, opacity: 0.78 }}>
+                              {row.sermonId}: ${row.estimatedUsd.toFixed(4)} · {row.totalTokens.toLocaleString()} tokens
+                            </p>
+                          ))}
+                        </div>
+                      ) : (
+                        <p style={{ margin: 0, fontSize: 12, opacity: 0.72 }}>No Sermon Prep usage recorded this month yet.</p>
+                      )}
+                    </>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: 12, opacity: 0.72 }}>Loading usage…</p>
+                  )}
+                  {canManageBilling ? (
+                    <>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                        <label style={{ display: "grid", gap: 4 }}>
+                          <span style={{ fontSize: 12, opacity: 0.8 }}>Monthly budget (USD)</span>
+                          <input
+                            type="number"
+                            min={0}
+                            step={0.01}
+                            value={sermonBudgetInput}
+                            onChange={(e) => setSermonBudgetInput(e.target.value)}
+                            style={{
+                              borderRadius: 8,
+                              border: "1px solid rgba(255,255,255,0.24)",
+                              background: "rgba(2,6,23,0.72)",
+                              color: "#e2e8f0",
+                              padding: "7px 10px",
+                              minWidth: 140,
+                            }}
+                          />
+                        </label>
+                        <button
+                          onClick={saveSermonBudget}
+                          disabled={sermonBudgetBusy || !resolvedOrgId}
+                          style={{
+                            borderRadius: 8,
+                            border: "none",
+                            background: "#22c55e",
+                            color: "#052e16",
+                            fontWeight: 700,
+                            padding: "8px 12px",
+                            cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                          }}
+                        >
+                          {sermonBudgetBusy ? "Saving..." : "Save Sermon Budget"}
+                        </button>
+                        <button
+                          onClick={() => {
+                            void loadSermonUsage();
+                          }}
+                          disabled={sermonBudgetBusy || !resolvedOrgId}
+                          style={{
+                            borderRadius: 8,
+                            border: "1px solid rgba(255,255,255,0.24)",
+                            background: "rgba(148,163,184,0.18)",
+                            color: "#e2e8f0",
+                            fontWeight: 600,
+                            padding: "8px 12px",
+                            cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                          }}
+                        >
+                          Refresh Usage
+                        </button>
+                      </div>
+                      {sermonBudgetError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {sermonBudgetError}</p> : null}
+                      {sermonBudgetNotice ? <p style={{ margin: 0, color: "#86efac", fontSize: 13 }}>{sermonBudgetNotice}</p> : null}
+                    </>
+                  ) : null}
+                </div>
                 <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Service Schedule</p>
                 <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
                   Add service times for this church. Added services appear in the dropdown for all members.

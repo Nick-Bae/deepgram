@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from app.auth.firebase_auth import AuthenticatedUser
 from app.routes import script as script_routes
+from app.services import multichurch_store as multichurch_store_module
 from app.services.multichurch_store import InMemoryMultiChurchStore
 from app.services.script_store import ScriptStore
 
@@ -205,6 +206,78 @@ class ScriptRouteTests(unittest.TestCase):
         self.assertIsNotNone(stored)
         self.assertEqual((stored or {}).get("sermon_id"), "2026-03-08-pm")
         self.assertEqual(len((stored or {}).get("segments") or []), 2)
+
+    def test_sermon_usage_logged_and_budget_cap_blocks_next_draft(self) -> None:
+        org_id = _bootstrap_owner(self.members, owner_uid="owner-sermon-budget", slug="sermon-budget", name="Sermon Budget Org")
+        self.members._orgs[org_id]["sermonPrepBudgetUsd"] = 0.0005
+
+        async def fake_translate(text: str, *_args, **kwargs) -> str:
+            usage_out = kwargs.get("usage_out")
+            if isinstance(usage_out, dict):
+                usage_out["promptTokens"] = 200
+                usage_out["completionTokens"] = 120
+                usage_out["totalTokens"] = 320
+                usage_out["estimatedUsd"] = 0.0012
+                usage_out["model"] = "gpt-4o-mini"
+            return f"EN::{text}"
+
+        async def _run_first() -> dict:
+            with patch.object(script_routes, "translate_text", new=AsyncMock(side_effect=fake_translate)):
+                return await script_routes.draft_sermon(
+                    org_id=org_id,
+                    body=script_routes.SermonDraftRequest(
+                        sermon_id="2026-03-08-budget",
+                        korean="첫 문장입니다. 둘째 문장입니다.",
+                        auto_split=True,
+                    ),
+                    user=_user("owner-sermon-budget"),
+                )
+
+        first = asyncio.run(_run_first())
+        usage = first.get("usage") or {}
+        self.assertEqual((first.get("segments") or [])[0].get("en"), "EN::첫 문장입니다.")
+        self.assertGreater(float(usage.get("currentMonthEstimatedUsd") or 0.0), 0.0)
+        self.assertTrue(bool(usage.get("capReached")))
+
+        logged = script_routes.get_sermon_usage(org_id=org_id, user=_user("owner-sermon-budget"))
+        sermons = logged.get("sermons") or []
+        self.assertTrue(any(row.get("sermonId") == "2026-03-08-budget" for row in sermons))
+
+        async def _run_second() -> None:
+            with patch.object(script_routes, "translate_text", new=AsyncMock(side_effect=fake_translate)):
+                await script_routes.draft_sermon(
+                    org_id=org_id,
+                    body=script_routes.SermonDraftRequest(
+                        sermon_id="2026-03-08-budget-second",
+                        korean="다시 시도합니다.",
+                        auto_split=True,
+                    ),
+                    user=_user("owner-sermon-budget"),
+                )
+
+        with self.assertRaises(HTTPException) as blocked_ctx:
+            asyncio.run(_run_second())
+        self.assertEqual(blocked_ctx.exception.status_code, 402)
+        self.assertEqual(blocked_ctx.exception.detail, "sermon_prep_budget_reached")
+
+    def test_set_sermon_budget_requires_master_user(self) -> None:
+        org_id = _bootstrap_owner(self.members, owner_uid="owner-sermon-budget-admin", slug="sermon-budget-admin", name="Sermon Budget Admin")
+        with self.assertRaises(HTTPException) as forbidden_ctx:
+            script_routes.set_sermon_budget(
+                org_id=org_id,
+                body=script_routes.SermonBudgetRequest(budget_usd=15.5),
+                user=_user("owner-sermon-budget-admin"),
+            )
+        self.assertEqual(forbidden_ctx.exception.status_code, 403)
+        self.assertEqual(forbidden_ctx.exception.detail, "billing_admin_required")
+
+        with patch.object(multichurch_store_module, "MASTER_USER_UIDS", {"owner-sermon-budget-admin"}):
+            updated = script_routes.set_sermon_budget(
+                org_id=org_id,
+                body=script_routes.SermonBudgetRequest(budget_usd=15.5),
+                user=_user("owner-sermon-budget-admin"),
+            )
+        self.assertAlmostEqual(float(updated.get("budgetUsd") or 0.0), 15.5, places=4)
 
     def test_default_script_routes_use_current_org(self) -> None:
         owner_uid = "owner-script-default"

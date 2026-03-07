@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { bootstrapOwnerOrg, fetchAuthMe } from "../../lib/backendAuth";
 import { useAuth } from "../../lib/authContext";
 import { normalizeChurchSlug } from "../../lib/churchSlug";
-import { persistAuthToken, persistHostToken, persistStreamContext } from "../../utils/streamContext";
+import { clearHostToken, persistAuthToken, persistStreamContext } from "../../utils/streamContext";
 
 export default function CreateChurchOnboardingPage() {
   const router = useRouter();
@@ -42,7 +42,7 @@ export default function CreateChurchOnboardingPage() {
         const preferredOrgId = (me.currentOrgId || "").trim();
         const primary = me.memberships.find((row) => row.orgId === preferredOrgId) || me.memberships[0];
         if (!primary || cancelled) return;
-        if (primary.hostToken) persistHostToken(primary.hostToken);
+        clearHostToken();
         const params = new URLSearchParams();
         params.set("orgId", primary.orgId);
         await router.replace(`/host/c/${encodeURIComponent(primary.slug)}/broadcast?${params.toString()}`);
@@ -82,7 +82,7 @@ export default function CreateChurchOnboardingPage() {
       });
       const org = created.org;
       const serviceKey = created.services?.[0]?.serviceKey || "sun-11am";
-      if (created.hostToken) persistHostToken(created.hostToken);
+      clearHostToken();
       persistStreamContext({
         orgId: org.orgId,
         serviceKey,

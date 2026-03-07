@@ -6,3 +6,5 @@ __pycache__/
 
 # Secrets
 backend/google-translation.json
+backend/serviceAccountKey.json
+backend/*serviceAccount*.json

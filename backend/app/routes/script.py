@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.auth.guards import require_org_role, resolve_default_org_id_for_roles
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.services.multichurch_store import multichurch_store
 from app.services.script_store import script_store
@@ -64,45 +65,8 @@ class SermonFinalizeRequest(BaseModel):
     segments: list[SermonSegment] = Field(default_factory=list)
 
 
-def _require_script_editor(org_id: str, user: AuthenticatedUser) -> None:
-    clean_org_id = (org_id or "").strip()
-    if not clean_org_id:
-        raise HTTPException(status_code=404, detail="org_not_found")
-    memberships = multichurch_store.list_memberships(user.uid)
-    match = next((row for row in memberships if str(row.get("orgId") or "").strip() == clean_org_id), None)
-    if not match:
-        raise HTTPException(status_code=403, detail="org_access_denied")
-    role = str(match.get("role") or "").strip().lower()
-    if role not in SCRIPT_EDITOR_ROLES:
-        raise HTTPException(status_code=403, detail="forbidden")
-
-
-def _resolve_default_editor_org_id(user: AuthenticatedUser) -> str:
-    """
-    Resolve a default org for non-org-scoped script endpoints.
-    Priority:
-    1) User's current org (if script-edit capable)
-    2) First membership where role allows script editing
-    """
-    current_org_id = str(multichurch_store.get_current_org_id(user.uid) or "").strip()
-    if current_org_id:
-        try:
-            _require_script_editor(current_org_id, user)
-            return current_org_id
-        except HTTPException as exc:
-            if exc.status_code not in {403, 404}:
-                raise
-
-    memberships = multichurch_store.list_memberships(user.uid)
-    for row in memberships:
-        org_id = str(row.get("orgId") or "").strip()
-        role = str(row.get("role") or "").strip().lower()
-        if org_id and role in SCRIPT_EDITOR_ROLES:
-            return org_id
-
-    if memberships:
-        raise HTTPException(status_code=403, detail="forbidden")
-    raise HTTPException(status_code=404, detail="org_not_found")
+class SermonBudgetRequest(BaseModel):
+    budget_usd: float = Field(..., ge=0.0, le=1_000_000.0)
 
 
 def _split_korean_text(raw: str, auto_split: bool) -> list[str]:
@@ -128,12 +92,13 @@ async def _translate_segments(
     source_lang: str,
     target_lang: str,
     org_id: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     custom_prompt, service_prompt = _resolve_org_prompt_overrides(org_id)
     semaphore = asyncio.Semaphore(SERMON_TRANSLATION_CONCURRENCY)
 
-    async def _translate_one(idx: int, source_text: str) -> dict[str, Any]:
+    async def _translate_one(idx: int, source_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
         async with semaphore:
+            usage_out: dict[str, Any] = {}
             target_text = await translate_text(
                 source_text,
                 source_lang,
@@ -142,16 +107,39 @@ async def _translate_segments(
                 service_prompt=service_prompt,
                 compact_prompt=True,
                 model_override=SERMON_TRANSLATION_MODEL,
+                usage_out=usage_out,
             )
-            return {
+            row = {
                 "id": idx + 1,
                 "ko": source_text,
                 "en": (target_text or "").strip(),
             }
+            return row, usage_out
 
-    translated_rows = await asyncio.gather(*[_translate_one(idx, source_text) for idx, source_text in enumerate(segments)])
+    translated_rows: list[dict[str, Any]] = []
+    usage_totals: dict[str, Any] = {
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0,
+        "estimatedUsd": 0.0,
+        "requestsCount": 0,
+        "model": SERMON_TRANSLATION_MODEL,
+    }
+    translated_with_usage = await asyncio.gather(*[_translate_one(idx, source_text) for idx, source_text in enumerate(segments)])
+    for row, usage in translated_with_usage:
+        translated_rows.append(row)
+        usage_totals["promptTokens"] += int(usage.get("promptTokens") or 0)
+        usage_totals["completionTokens"] += int(usage.get("completionTokens") or 0)
+        usage_totals["totalTokens"] += int(usage.get("totalTokens") or 0)
+        usage_totals["estimatedUsd"] += float(usage.get("estimatedUsd") or 0.0)
+        usage_totals["requestsCount"] += 1
+        model_name = str(usage.get("model") or "").strip()
+        if model_name:
+            usage_totals["model"] = model_name
+
     translated_rows.sort(key=lambda row: int(row.get("id") or 0))
-    return translated_rows
+    usage_totals["estimatedUsd"] = round(max(0.0, float(usage_totals.get("estimatedUsd") or 0.0)), 6)
+    return translated_rows, usage_totals
 
 
 @router.get("/org/{org_id}/script")
@@ -159,7 +147,7 @@ def script_status(
     org_id: str,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    _require_script_editor(org_id, user)
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     count, threshold, version = script_store.stats(org_id=org_id)
     return {"count": count, "threshold": threshold, "version": version}
 
@@ -168,7 +156,7 @@ def script_status(
 def script_status_default_org(
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    org_id = _resolve_default_editor_org_id(user)
+    org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     return script_status(org_id=org_id, user=user)
 
 
@@ -178,7 +166,7 @@ def upload_script(
     body: UploadPayload,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    _require_script_editor(org_id, user)
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     pairs_raw = (body.payload or {}).get("pairs")
     if not isinstance(pairs_raw, list) or not pairs_raw:
         raise HTTPException(status_code=400, detail="payload.pairs must be a non-empty list")
@@ -211,7 +199,7 @@ def upload_script_default_org(
     body: UploadPayload,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    org_id = _resolve_default_editor_org_id(user)
+    org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     return upload_script(org_id=org_id, body=body, user=user)
 
 
@@ -220,7 +208,7 @@ def clear_script(
     org_id: str,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    _require_script_editor(org_id, user)
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     removed, version = script_store.clear(org_id=org_id)
     return {"cleared": True, "removed": removed, "version": version}
 
@@ -229,7 +217,7 @@ def clear_script(
 def clear_script_default_org(
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    org_id = _resolve_default_editor_org_id(user)
+    org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     return clear_script(org_id=org_id, user=user)
 
 
@@ -239,7 +227,20 @@ async def draft_sermon(
     body: SermonDraftRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    _require_script_editor(org_id, user)
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+    try:
+        budget_state = multichurch_store.ensure_sermon_prep_budget_not_reached(org_id=org_id)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "sermon_budget_check_failed") from exc
+    except PermissionError as exc:
+        detail = str(exc) or "forbidden"
+        if detail == "sermon_prep_budget_reached":
+            raise HTTPException(status_code=402, detail=detail) from exc
+        raise HTTPException(status_code=403, detail=detail) from exc
+
     sermon_id = body.sermon_id.strip()
     source_lang = body.lang_src.strip().lower() or "ko"
     target_lang = body.lang_tgt.strip().lower() or "en"
@@ -247,18 +248,38 @@ async def draft_sermon(
     if not parts:
         raise HTTPException(status_code=400, detail="No valid Korean segments found")
 
-    translated = await _translate_segments(
+    translated, usage_totals = await _translate_segments(
         segments=parts,
         source_lang=source_lang,
         target_lang=target_lang,
         org_id=org_id,
     )
+    try:
+        budget_state = multichurch_store.record_sermon_prep_usage(
+            org_id=org_id,
+            sermon_id=sermon_id,
+            prompt_tokens=int(usage_totals.get("promptTokens") or 0),
+            completion_tokens=int(usage_totals.get("completionTokens") or 0),
+            total_tokens=int(usage_totals.get("totalTokens") or 0),
+            estimated_usd=float(usage_totals.get("estimatedUsd") or 0.0),
+            requests_count=int(usage_totals.get("requestsCount") or len(parts)),
+            model=str(usage_totals.get("model") or SERMON_TRANSLATION_MODEL),
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        if detail == "invalid_sermon_id":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "sermon_usage_record_failed") from exc
+
     return {
         "sermon_id": sermon_id,
         "threshold": body.threshold,
         "lang_src": source_lang,
         "lang_tgt": target_lang,
         "segments": translated,
+        "usage": budget_state,
     }
 
 
@@ -267,7 +288,7 @@ async def draft_sermon_default_org(
     body: SermonDraftRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    org_id = _resolve_default_editor_org_id(user)
+    org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     return await draft_sermon(org_id=org_id, body=body, user=user)
 
 
@@ -277,7 +298,7 @@ def finalize_sermon(
     body: SermonFinalizeRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    _require_script_editor(org_id, user)
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     sermon_id = body.sermon_id.strip()
     source_lang = body.lang_src.strip().lower() or "ko"
     target_lang = body.lang_tgt.strip().lower() or "en"
@@ -317,5 +338,85 @@ def finalize_sermon_default_org(
     body: SermonFinalizeRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    org_id = _resolve_default_editor_org_id(user)
+    org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     return finalize_sermon(org_id=org_id, body=body, user=user)
+
+
+@router.get("/org/{org_id}/sermon/usage")
+def get_sermon_usage(
+    org_id: str,
+    periodKey: str | None = None,
+    sermonId: str | None = None,
+    limit: int = 25,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+    try:
+        return multichurch_store.get_org_sermon_prep_usage(
+            org_id=org_id,
+            requested_by_uid=user.uid,
+            period_key=periodKey,
+            sermon_id=sermonId,
+            limit=limit,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "invalid_uid":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "sermon_usage_fetch_failed") from exc
+    except PermissionError as exc:
+        detail = str(exc) or "forbidden"
+        raise HTTPException(status_code=403, detail=detail) from exc
+
+
+@router.get("/sermon/usage")
+def get_sermon_usage_default_org(
+    periodKey: str | None = None,
+    sermonId: str | None = None,
+    limit: int = 25,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+    return get_sermon_usage(
+        org_id=org_id,
+        periodKey=periodKey,
+        sermonId=sermonId,
+        limit=limit,
+        user=user,
+    )
+
+
+@router.post("/org/{org_id}/sermon/budget")
+def set_sermon_budget(
+    org_id: str,
+    body: SermonBudgetRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+    try:
+        return multichurch_store.set_org_sermon_prep_budget(
+            org_id=org_id,
+            requested_by_uid=user.uid,
+            budget_usd=float(body.budget_usd),
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"invalid_uid", "invalid_budget"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "sermon_budget_update_failed") from exc
+    except PermissionError as exc:
+        detail = str(exc) or "forbidden"
+        raise HTTPException(status_code=403, detail=detail) from exc
+
+
+@router.post("/sermon/budget")
+def set_sermon_budget_default_org(
+    body: SermonBudgetRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+    return set_sermon_budget(org_id=org_id, body=body, user=user)

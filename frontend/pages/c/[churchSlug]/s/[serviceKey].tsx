@@ -106,9 +106,16 @@ export default function ChurchServiceListenerPage() {
   const serviceTitle = resolveData?.service?.title || serviceKey || "Service";
   const lastKr = krLines[krLines.length - 1] || "";
   const lastEn = enLines[enLines.length - 1] || "";
-  const currentEn = lastEn || "— waiting —";
+  const waitingMessage = loading
+    ? "Resolving service..."
+    : !resolveData || !resolveData.activeRoomId || resolveData.roomStatus !== "live"
+      ? "Waiting for host to start translation."
+      : connected
+        ? "Live translation is connected. Waiting for the first line..."
+        : "Host started translation. Connecting now...";
+  const currentEn = lastEn || waitingMessage;
   const recentEn = enLines.slice(0, -1).slice(-2);
-  const connectionLabel = connected ? "Connected" : socketEnabled ? "Reconnecting..." : "Offline";
+  const connectionLabel = connected ? "Connection: Connected" : socketEnabled ? "Connection: Connecting..." : "Connection: Standby";
   const connectionColor = connected ? "#34d399" : socketEnabled ? "#f59e0b" : "#6b7280";
   const stageWidth = "min(92vw, calc(92vh * 16 / 9))";
 
@@ -255,11 +262,15 @@ export default function ChurchServiceListenerPage() {
                     <div
                       key={`${i}-${line.slice(0, 12)}`}
                       style={{
-                        fontSize: "clamp(22px, 4.1vw, 72px)",
+                        fontSize: isCurrent ? "clamp(26px, 4.7vw, 78px)" : "clamp(22px, 4.1vw, 70px)",
                         fontWeight: isCurrent ? 700 : 500,
                         wordBreak: "break-word",
-                        opacity: isCurrent ? 1 : 0.54,
-                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.72)",
+                        opacity: isCurrent ? 1 : 0.6,
+                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.76)",
+                        background: isCurrent ? "rgba(255,255,255,0.1)" : "transparent",
+                        borderRadius: isCurrent ? 12 : 0,
+                        padding: isCurrent ? "0.12em 0.28em" : "0",
+                        boxShadow: isCurrent ? "0 10px 26px rgba(0,0,0,0.35)" : "none",
                       }}
                     >
                       {line}
@@ -267,7 +278,7 @@ export default function ChurchServiceListenerPage() {
                   );
                 })
               ) : (
-                <div style={{ fontSize: "clamp(22px, 4.1vw, 72px)", opacity: 0.5 }}>— waiting —</div>
+                <div style={{ fontSize: "clamp(22px, 4.1vw, 58px)", opacity: 0.68 }}>{waitingMessage}</div>
               )}
             </div>
           </section>

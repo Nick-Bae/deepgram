@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 import os
+from threading import Lock
+import time
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException
@@ -21,6 +23,79 @@ class AuthenticatedUser(BaseModel):
     uid: str
     email: Optional[str] = None
     displayName: Optional[str] = None
+    isSuper: bool = False
+
+
+_SUPER_CLAIM_KEYS: tuple[str, ...] = (
+    "super_admin",
+    "superAdmin",
+    "is_super_user",
+    "isSuperUser",
+    "isMaster",
+    "master",
+)
+_SUPER_UID_CACHE_TTL_SECONDS = max(0, int((os.getenv("AUTH_SUPER_UID_CACHE_TTL_SECONDS") or "900").strip() or "900"))
+_ID_TOKEN_CLOCK_SKEW_SECONDS = max(
+    0,
+    min(
+        300,
+        int((os.getenv("AUTH_ID_TOKEN_CLOCK_SKEW_SECONDS") or "60").strip() or "60"),
+    ),
+)
+_super_uid_cache: dict[str, tuple[float, bool]] = {}
+_super_uid_lock = Lock()
+
+
+def _claim_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _decode_super_claim(decoded: dict) -> bool:
+    for key in _SUPER_CLAIM_KEYS:
+        if key in decoded and _claim_bool(decoded.get(key)):
+            return True
+    claims = decoded.get("claims")
+    if isinstance(claims, dict):
+        for key in _SUPER_CLAIM_KEYS:
+            if key in claims and _claim_bool(claims.get(key)):
+                return True
+    return False
+
+
+def _cache_super_uid(uid: str, is_super: bool) -> None:
+    clean_uid = str(uid or "").strip()
+    if not clean_uid:
+        return
+    if _SUPER_UID_CACHE_TTL_SECONDS <= 0:
+        return
+    with _super_uid_lock:
+        _super_uid_cache[clean_uid] = (time.monotonic() + _SUPER_UID_CACHE_TTL_SECONDS, bool(is_super))
+        if len(_super_uid_cache) > 10000:
+            cutoff = time.monotonic()
+            stale = [k for k, (expires_at, _) in _super_uid_cache.items() if expires_at <= cutoff]
+            for key in stale:
+                _super_uid_cache.pop(key, None)
+
+
+def is_super_uid(uid: Optional[str]) -> bool:
+    clean_uid = str(uid or "").strip()
+    if not clean_uid:
+        return False
+    with _super_uid_lock:
+        row = _super_uid_cache.get(clean_uid)
+        if not row:
+            return False
+        expires_at, is_super = row
+        if expires_at <= time.monotonic():
+            _super_uid_cache.pop(clean_uid, None)
+            return False
+        return bool(is_super)
 
 
 def _project_id() -> Optional[str]:
@@ -77,18 +152,28 @@ def verify_id_token_value(id_token: Optional[str]) -> Optional[AuthenticatedUser
     if not initialized:
         raise HTTPException(status_code=503, detail="firebase_admin_not_configured")
     try:
-        decoded = firebase_auth.verify_id_token(token)  # type: ignore[union-attr]
+        decoded = firebase_auth.verify_id_token(  # type: ignore[union-attr]
+            token,
+            clock_skew_seconds=_ID_TOKEN_CLOCK_SKEW_SECONDS,
+        )
     except Exception as exc:
+        err_name = type(exc).__name__
+        err_msg = str(exc).lower()
+        if "certificate" in err_name.lower() or "transport" in err_name.lower() or "connection" in err_msg:
+            raise HTTPException(status_code=503, detail="auth_provider_unavailable") from exc
         raise HTTPException(status_code=401, detail="invalid_id_token") from exc
     uid = str(decoded.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="invalid_id_token")
     email_raw = decoded.get("email")
     name_raw = decoded.get("name")
+    is_super = _decode_super_claim(decoded)
+    _cache_super_uid(uid, is_super)
     return AuthenticatedUser(
         uid=uid,
         email=str(email_raw).strip() if email_raw else None,
         displayName=str(name_raw).strip() if name_raw else None,
+        isSuper=is_super,
     )
 
 

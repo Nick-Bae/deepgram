@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
+import { useRouter } from "next/router";
 
 import { useAuth } from "../lib/authContext";
 import { draftOrgSermon, finalizeOrgSermon, type SermonDraftSegment } from "../lib/backendAuth";
@@ -18,7 +19,8 @@ function buildDefaultSermonId(): string {
 }
 
 export default function SermonPrep({ orgId }: Props) {
-  const { getIdToken } = useAuth();
+  const router = useRouter();
+  const { getIdToken, logout } = useAuth();
   const [sermonId, setSermonId] = useState(buildDefaultSermonId());
   const [korean, setKorean] = useState("");
   const [threshold, setThreshold] = useState(0.8);
@@ -34,12 +36,12 @@ export default function SermonPrep({ orgId }: Props) {
   const allRowsReady = segments.length > 0 && readyCount === segments.length;
 
   const statusTone = message?.startsWith("✅")
-    ? "text-emerald-200"
+    ? "text-emerald-700"
     : message?.startsWith("❌")
-      ? "text-rose-200"
+      ? "text-rose-700"
       : message?.startsWith("⏳")
-        ? "text-cyan-200"
-        : "text-white/70";
+        ? "text-cyan-700"
+        : "text-slate-600";
 
   const exportPayload = useMemo(
     () => ({
@@ -55,6 +57,23 @@ export default function SermonPrep({ orgId }: Props) {
     }),
     [langSrc, langTgt, segments, sermonId, threshold],
   );
+
+  const isSessionExpiredError = useCallback((raw: string): boolean => {
+    const msg = (raw || "").toLowerCase();
+    return (
+      msg.includes("sign in again") ||
+      msg.includes("session is invalid") ||
+      msg.includes("invalid id token") ||
+      msg.includes("invalid_id_token") ||
+      msg.includes("auth_required")
+    );
+  }, []);
+
+  const redirectToLogin = useCallback(async () => {
+    const nextPath = router.asPath || "/admin/sermon-prep";
+    await logout();
+    void router.replace(`/login?next=${encodeURIComponent(nextPath)}`);
+  }, [logout, router]);
 
   const onDownloadJson = () => {
     if (!segments.length) {
@@ -110,6 +129,11 @@ export default function SermonPrep({ orgId }: Props) {
       setMessage(`✅ Draft ready: ${drafted.segments.length} rows.`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (isSessionExpiredError(msg)) {
+        setMessage("❌ Session expired. Redirecting to login...");
+        await redirectToLogin();
+        return;
+      }
       setMessage(`❌ ${msg}`);
     } finally {
       setBusyDraft(false);
@@ -157,6 +181,11 @@ export default function SermonPrep({ orgId }: Props) {
       setMessage(`✅ Saved final JSON: ${finalized.sermon_id} (${finalized.loaded} rows loaded).`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (isSessionExpiredError(msg)) {
+        setMessage("❌ Session expired. Redirecting to login...");
+        await redirectToLogin();
+        return;
+      }
       setMessage(`❌ ${msg}`);
     } finally {
       setBusySave(false);
@@ -164,18 +193,18 @@ export default function SermonPrep({ orgId }: Props) {
   };
 
   return (
-    <section className="rounded-[32px] border border-white/10 bg-white/5 p-6 shadow-[0_35px_120px_rgba(3,7,18,0.55)] backdrop-blur">
+    <section className="rounded-[32px] border border-slate-200 bg-white p-6 shadow-[0_35px_120px_rgba(3,7,18,0.25)] backdrop-blur">
       <div className="space-y-1">
-        <p className="text-xs uppercase tracking-[0.35em] text-white/60">Sermon Prep</p>
-        <h2 className="text-xl font-semibold text-white">Before Sunday (KO → EN)</h2>
-        <p className="text-sm text-white/70">
+        <p className="text-xs uppercase tracking-[0.35em] text-slate-500">Sermon Prep</p>
+        <h2 className="text-xl font-semibold text-slate-900">Before Sunday (KO → EN)</h2>
+        <p className="text-sm text-slate-600">
           5-10 minute workflow: paste Korean, generate draft, polish English, save final.
         </p>
       </div>
 
       <div className="mt-5 grid gap-4 md:grid-cols-2">
-        <label className="space-y-1 text-sm text-white/80">
-          <span className="font-medium">Step 1: Sermon ID</span>
+        <label className="space-y-1 text-sm text-slate-700">
+          <span className="font-medium text-slate-700">Step 1: Sermon ID</span>
           <input
             value={sermonId}
             onChange={(e) => setSermonId(e.target.value)}
@@ -184,16 +213,16 @@ export default function SermonPrep({ orgId }: Props) {
           />
         </label>
 
-        <label className="space-y-1 text-sm text-white/80">
-          <span className="font-medium">Rows ready</span>
+        <label className="space-y-1 text-sm text-slate-700">
+          <span className="font-medium text-slate-700">Rows ready</span>
           <div className="rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white">
             {readyCount}/{segments.length || 0} EN rows
           </div>
         </label>
       </div>
 
-      <label className="mt-4 block space-y-2 text-sm text-white/80">
-        <span className="font-medium">Step 2: Korean sermon text (paste only Korean)</span>
+      <label className="mt-4 block space-y-2 text-sm text-slate-700">
+        <span className="font-medium text-slate-700">Step 2: Korean sermon text (paste only Korean)</span>
         <textarea
           value={korean}
           onChange={(e) => setKorean(e.target.value)}
@@ -203,8 +232,8 @@ export default function SermonPrep({ orgId }: Props) {
         />
       </label>
 
-      <details className="mt-3 rounded-2xl border border-white/10 bg-black/20 p-3 text-sm text-white/70">
-        <summary className="cursor-pointer font-medium text-white/80">Advanced options</summary>
+      <details className="mt-3 rounded-2xl border border-slate-200 bg-slate-100 p-3 text-sm text-slate-600">
+        <summary className="cursor-pointer font-medium text-slate-700">Advanced options</summary>
         <div className="mt-3 grid gap-3 md:grid-cols-3">
           <label className="space-y-1">
             <span>Threshold</span>
@@ -268,7 +297,7 @@ export default function SermonPrep({ orgId }: Props) {
           type="button"
           onClick={onDownloadJson}
           disabled={!segments.length}
-          className="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/20 px-5 py-2.5 text-sm font-semibold text-white transition hover:border-cyan-200/70 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-300 px-5 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-cyan-400 hover:text-cyan-700 disabled:cursor-not-allowed disabled:opacity-40"
         >
           Download JSON
         </button>
@@ -282,8 +311,8 @@ export default function SermonPrep({ orgId }: Props) {
 
       {segments.length ? (
         <div className="mt-4 overflow-x-auto rounded-2xl border border-white/10">
-          <table className="min-w-full border-collapse text-left text-sm text-white/90">
-            <thead className="bg-white/10 text-white/80">
+          <table className="min-w-full border-collapse text-left text-sm text-slate-800">
+            <thead className="bg-slate-100 text-slate-700">
               <tr>
                 <th className="w-16 border-b border-white/10 px-3 py-2">#</th>
                 <th className="w-1/2 border-b border-white/10 px-3 py-2">Korean (read-only)</th>
@@ -293,7 +322,7 @@ export default function SermonPrep({ orgId }: Props) {
             <tbody>
               {segments.map((row) => (
                 <tr key={row.id} className="align-top">
-                  <td className="border-b border-white/10 px-3 py-3 text-white/60">{row.id}</td>
+                  <td className="border-b border-white/10 px-3 py-3 text-slate-500">{row.id}</td>
                   <td className="border-b border-white/10 px-3 py-3">
                     <div className="min-h-[82px] rounded-xl border border-white/10 bg-black/35 px-3 py-2 leading-relaxed text-white/90">
                       {row.ko}
@@ -316,7 +345,7 @@ export default function SermonPrep({ orgId }: Props) {
 
       {segments.length ? (
         <div className="mt-4 rounded-2xl border border-white/10 bg-black/25 p-4">
-          <p className="text-xs uppercase tracking-[0.35em] text-white/55">Final JSON preview</p>
+          <p className="text-xs uppercase tracking-[0.35em] text-slate-500">Final JSON preview</p>
           <pre className="mt-3 max-h-64 overflow-auto rounded-xl bg-black/55 p-3 text-xs text-[#9efcff]">
             {JSON.stringify(exportPayload, null, 2)}
           </pre>

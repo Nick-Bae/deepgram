@@ -6,7 +6,7 @@ export type OrgMembership = {
   name: string;
   status?: string;
   role?: string;
-  hostToken?: string | null;
+  billingLimitsEnabled?: boolean;
 };
 
 export type AuthMeResponse = {
@@ -14,6 +14,7 @@ export type AuthMeResponse = {
     uid: string;
     email?: string | null;
     displayName?: string | null;
+    isMaster?: boolean;
   };
   currentOrgId?: string | null;
   memberships: OrgMembership[];
@@ -23,7 +24,6 @@ export type BootstrapOwnerResponse = {
   created: boolean;
   org: OrgMembership;
   services: Array<{ serviceKey: string; title: string }>;
-  hostToken?: string | null;
   memberships: OrgMembership[];
 };
 
@@ -53,7 +53,6 @@ export type InviteRedeemResponse = {
   created: boolean;
   alreadyMember: boolean;
   currentOrgId: string;
-  hostToken?: string | null;
 };
 
 export type SetCurrentOrgResponse = {
@@ -105,6 +104,18 @@ export type OrgPromptResponse = {
   updatedAt?: string | null;
 };
 
+export type OrgBillingLimitsResponse = {
+  orgId: string;
+  billingLimitsEnabled: boolean;
+  globalBillingLimitsEnabled: boolean;
+  effectiveBillingLimitsEnabled: boolean;
+  hardCapReached: boolean;
+  maxMinutesPerMonth: number;
+  currentMonthMinutes: number;
+  currentMonthKey: string;
+  updatedAt?: string | null;
+};
+
 export type ScriptPairPayload = {
   source: string;
   target: string;
@@ -140,12 +151,42 @@ export type OrgSermonDraftResponse = {
   lang_src: string;
   lang_tgt: string;
   segments: SermonDraftSegment[];
+  usage?: OrgSermonUsageResponse;
 };
 
 export type OrgSermonFinalizeResponse = OrgSermonDraftResponse & {
   saved: boolean;
   loaded: number;
   version: number;
+};
+
+export type SermonUsageRow = {
+  sermonId: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimatedUsd: number;
+  requestsCount: number;
+  lastModel?: string;
+  lastUsedAt?: string | null;
+};
+
+export type OrgSermonUsageResponse = {
+  orgId: string;
+  currentMonthKey: string;
+  budgetUsd: number;
+  globalBudgetsEnabled: boolean;
+  effectiveBudgetEnabled: boolean;
+  capReached: boolean;
+  remainingBudgetUsd: number;
+  currentMonthEstimatedUsd: number;
+  currentMonthPromptTokens: number;
+  currentMonthCompletionTokens: number;
+  currentMonthTotalTokens: number;
+  requestsCount: number;
+  inputCostPerMillionTokens: number;
+  outputCostPerMillionTokens: number;
+  sermons: SermonUsageRow[];
 };
 
 const AUTH_FETCH_TIMEOUT_MS = 15000;
@@ -192,6 +233,9 @@ function toErrorMessage(status: number, detail: string | undefined): string {
   if (detail === "org_not_found") return "Church organization was not found.";
   if (detail === "org_access_denied") return "You do not have access to that church.";
   if (detail === "forbidden") return "You do not have permission to perform that action.";
+  if (detail === "billing_admin_required") return "Only the configured super user can manage billing settings.";
+  if (detail === "sermon_prep_budget_reached") return "Sermon Prep monthly budget cap reached for this church.";
+  if (detail === "invalid_budget") return "Budget must be a non-negative amount.";
   if (detail === "service_exists") return "That service key already exists.";
   if (detail === "service_active") return "You cannot delete a service while its room is live.";
   if (detail === "invite_active_limit_reached") return "Too many active invites for this church. Revoke or wait for some to expire.";
@@ -356,6 +400,27 @@ export function revokeOrgInvite(idToken: string, orgId: string, inviteId: string
   );
 }
 
+export function fetchOrgBillingLimits(idToken: string, orgId: string): Promise<OrgBillingLimitsResponse> {
+  return authFetch<OrgBillingLimitsResponse>(`/api/auth/org/${encodeURIComponent(orgId)}/billing-limits`, idToken, {
+    method: "GET",
+  });
+}
+
+export function saveOrgBillingLimits(
+  idToken: string,
+  orgId: string,
+  enabled: boolean,
+): Promise<OrgBillingLimitsResponse> {
+  return authFetch<OrgBillingLimitsResponse>(`/api/auth/org/${encodeURIComponent(orgId)}/billing-limits`, idToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: Boolean(enabled) }),
+  }).then((result) => {
+    invalidateAuthMeCache(idToken);
+    return result;
+  });
+}
+
 export function createOrgService(
   idToken: string,
   orgId: string,
@@ -481,5 +546,32 @@ export function finalizeOrgSermon(
       lang_tgt: payload.lang_tgt || "en",
       segments: payload.segments || [],
     }),
+  });
+}
+
+export function fetchOrgSermonUsage(
+  idToken: string,
+  orgId: string,
+  options?: { periodKey?: string; sermonId?: string; limit?: number },
+): Promise<OrgSermonUsageResponse> {
+  const params = new URLSearchParams();
+  if (options?.periodKey) params.set("periodKey", options.periodKey);
+  if (options?.sermonId) params.set("sermonId", options.sermonId);
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    params.set("limit", String(Math.max(1, Math.floor(options.limit))));
+  }
+  const query = params.toString();
+  return authFetch<OrgSermonUsageResponse>(
+    `/api/org/${encodeURIComponent(orgId)}/sermon/usage${query ? `?${query}` : ""}`,
+    idToken,
+    { method: "GET" },
+  );
+}
+
+export function saveOrgSermonBudget(idToken: string, orgId: string, budgetUsd: number): Promise<OrgSermonUsageResponse> {
+  return authFetch<OrgSermonUsageResponse>(`/api/org/${encodeURIComponent(orgId)}/sermon/budget`, idToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ budget_usd: Math.max(0, Number.isFinite(budgetUsd) ? budgetUsd : 0) }),
   });
 }

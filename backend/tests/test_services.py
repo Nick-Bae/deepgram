@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+from app.services import multichurch_store as multichurch_store_module
 from app.services.multichurch_store import InMemoryMultiChurchStore
 
 
@@ -108,6 +110,44 @@ class ServiceManagementTests(unittest.TestCase):
                 service_key="wed-6pm",
                 requested_by_uid="owner-service-2",
             )
+
+    def test_org_billing_toggle_allows_start_when_hard_cap_reached(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(
+            store,
+            owner_uid="owner-service-3",
+            slug="service-org-c",
+            name="Service Org C",
+        )
+
+        store._orgs[org_id]["hardCapReached"] = True
+
+        with self.assertRaisesRegex(PermissionError, "hard_cap_reached"):
+            store.start_service(
+                org_id,
+                "sun-11am",
+                host_uid="owner-service-3",
+                source="ko",
+                target="en",
+            )
+
+        with patch.object(multichurch_store_module, "MASTER_USER_UIDS", {"owner-service-3"}):
+            updated = store.set_org_billing_limits(
+                org_id=org_id,
+                requested_by_uid="owner-service-3",
+                enabled=False,
+            )
+        self.assertFalse(bool(updated.get("billingLimitsEnabled")))
+        self.assertFalse(bool(updated.get("effectiveBillingLimitsEnabled")))
+
+        started = store.start_service(
+            org_id,
+            "sun-11am",
+            host_uid="owner-service-3",
+            source="ko",
+            target="en",
+        )
+        self.assertEqual(started.get("status"), "live")
 
 
 if __name__ == "__main__":

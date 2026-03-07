@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from app.auth.firebase_auth import AuthenticatedUser
 from app.routes import auth as auth_routes
 from app.routes import multichurch as multichurch_routes
+from app.services import multichurch_store as multichurch_store_module
 from app.services.multichurch_store import InMemoryMultiChurchStore
 
 
@@ -69,6 +70,7 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(redeemed.get("orgId"), org_id)
         self.assertTrue(bool(redeemed.get("created")))
         self.assertEqual(redeemed.get("currentOrgId"), org_id)
+        self.assertNotIn("hostToken", redeemed)
 
         me = auth_routes.auth_me(user=self._user("member-route-1"))
         self.assertEqual(me.get("currentOrgId"), org_id)
@@ -114,6 +116,42 @@ class AuthRouteTests(unittest.TestCase):
         me_after = auth_routes.auth_me(user=self._user("member-switch-route-1"))
         self.assertEqual(me_after.get("currentOrgId"), org_a)
 
+    def test_org_billing_limits_toggle_route_and_permissions(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-route-billing", slug="route-billing-a", name="Route Billing A")
+
+        invite = auth_routes.auth_create_invite(
+            org_id=org_id,
+            payload=auth_routes.CreateInviteRequest(role="viewer"),
+            user=self._user("owner-route-billing"),
+        )
+        auth_routes.auth_redeem_invite(code=str(invite.get("code") or ""), user=self._user("viewer-route-billing"))
+
+        with self.assertRaises(HTTPException) as forbidden_owner_ctx:
+            auth_routes.auth_get_org_billing_limits(org_id=org_id, user=self._user("owner-route-billing"))
+        self.assertEqual(forbidden_owner_ctx.exception.status_code, 403)
+        self.assertEqual(forbidden_owner_ctx.exception.detail, "billing_admin_required")
+
+        with patch.object(multichurch_store_module, "MASTER_USER_UIDS", {"owner-route-billing"}):
+            current = auth_routes.auth_get_org_billing_limits(org_id=org_id, user=self._user("owner-route-billing"))
+            self.assertTrue(bool(current.get("billingLimitsEnabled")))
+
+            disabled = auth_routes.auth_set_org_billing_limits(
+                org_id=org_id,
+                payload=auth_routes.SetOrgBillingLimitsRequest(enabled=False),
+                user=self._user("owner-route-billing"),
+            )
+            self.assertFalse(bool(disabled.get("billingLimitsEnabled")))
+            self.assertFalse(bool(disabled.get("effectiveBillingLimitsEnabled")))
+
+        with self.assertRaises(HTTPException) as forbidden_ctx:
+            auth_routes.auth_set_org_billing_limits(
+                org_id=org_id,
+                payload=auth_routes.SetOrgBillingLimitsRequest(enabled=True),
+                user=self._user("viewer-route-billing"),
+            )
+        self.assertEqual(forbidden_ctx.exception.status_code, 403)
+        self.assertEqual(forbidden_ctx.exception.detail, "billing_admin_required")
+
     def test_listener_services_is_public_without_login(self) -> None:
         payload = multichurch_routes.list_services("demo")
         self.assertEqual(payload.get("slug"), "demo")
@@ -137,6 +175,32 @@ class AuthRouteTests(unittest.TestCase):
                 )
             self.assertEqual(second_ctx.exception.status_code, 429)
             self.assertEqual(second_ctx.exception.detail, "invite_rate_limited")
+
+    def test_auth_me_memberships_do_not_expose_host_token(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-route-no-token", slug="route-no-token", name="Route No Token")
+        me = auth_routes.auth_me(user=self._user("owner-route-no-token"))
+        self.assertEqual(me.get("currentOrgId"), org_id)
+        memberships = me.get("memberships") or []
+        self.assertTrue(memberships)
+        owner_membership = next((row for row in memberships if row.get("orgId") == org_id), None)
+        self.assertIsNotNone(owner_membership)
+        self.assertNotIn("hostToken", owner_membership or {})
+
+    def test_bootstrap_owner_response_does_not_expose_host_token(self) -> None:
+        response = auth_routes.auth_bootstrap_owner(
+            auth_routes.BootstrapOwnerRequest(
+                churchName="Route No Token Bootstrap",
+                churchSlug="route-no-token-bootstrap",
+                timezone="America/Chicago",
+                source="ko",
+                target="en",
+            ),
+            user=self._user("owner-route-bootstrap-no-token"),
+        )
+        self.assertNotIn("hostToken", response)
+        memberships = response.get("memberships") or []
+        self.assertTrue(memberships)
+        self.assertTrue(all("hostToken" not in row for row in memberships))
 
 
 if __name__ == "__main__":

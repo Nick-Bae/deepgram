@@ -86,6 +86,14 @@ export function AuthProvider({ children }: Props) {
       clearAuthToken();
       clearStreamContext();
       setUser(null);
+      if (typeof window !== "undefined") {
+        try {
+          window.sessionStorage.clear();
+        } catch {}
+        if (window.location.pathname !== "/" || window.location.search) {
+          window.location.replace("/");
+        }
+      }
     }
   }, []);
 

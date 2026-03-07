@@ -16,12 +16,10 @@ export default function HostRedirectPage() {
     if (!slug) return "";
 
     const serviceKey = pickFirst(router.query.serviceKey) || pickFirst(router.query.service);
-    const hostToken = pickFirst(router.query.hostToken) || pickFirst(router.query.token);
     const orgId = pickFirst(router.query.orgId) || pickFirst(router.query.org);
 
     const params = new URLSearchParams();
     if (serviceKey) params.set("serviceKey", serviceKey);
-    if (hostToken) params.set("hostToken", hostToken);
     if (orgId) params.set("orgId", orgId);
 
     const query = params.toString();

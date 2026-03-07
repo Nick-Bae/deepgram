@@ -5,7 +5,7 @@ import pathlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from collections import deque
 from dotenv import load_dotenv
 
@@ -29,6 +29,15 @@ class TranslationContext:
     pronoun: str = ENV.CONTEXT_PRONOUN
     narration_mode: str = ENV.CONTEXT_MODE
     last_english: Optional[str] = None
+
+
+@dataclass
+class TranslationUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    model: str = ""
+    estimated_usd: float = 0.0
 
 # Soft glossary for key theological terms (you can expand this)
 THEOLOGICAL_TERMS: list[tuple[str, str]] = [
@@ -862,6 +871,7 @@ async def translate_text(
     service_prompt: Optional[str] = None,
     compact_prompt: bool = False,
     model_override: Optional[str] = None,
+    usage_out: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Async translator. Returns ONLY the translated text (no quotes/explanations).
@@ -934,6 +944,36 @@ async def translate_text(
             frequency_penalty=0,
             top_p=1.0,
         )
+        usage = TranslationUsage(model=str(getattr(resp, "model", None) or model_name))
+        resp_usage = getattr(resp, "usage", None)
+        if resp_usage is not None:
+            usage.prompt_tokens = int(getattr(resp_usage, "prompt_tokens", 0) or 0)
+            usage.completion_tokens = int(getattr(resp_usage, "completion_tokens", 0) or 0)
+            total_from_resp = int(getattr(resp_usage, "total_tokens", 0) or 0)
+            usage.total_tokens = total_from_resp or max(0, usage.prompt_tokens + usage.completion_tokens)
+            # Default to gpt-4o-mini rates; can be overridden via env for pricing updates.
+            try:
+                input_cost_per_million = float(os.getenv("SERMON_PREP_INPUT_COST_PER_MILLION", "0.15") or 0.15)
+            except ValueError:
+                input_cost_per_million = 0.15
+            try:
+                output_cost_per_million = float(os.getenv("SERMON_PREP_OUTPUT_COST_PER_MILLION", "0.60") or 0.60)
+            except ValueError:
+                output_cost_per_million = 0.60
+            usage.estimated_usd = (
+                (usage.prompt_tokens * input_cost_per_million) + (usage.completion_tokens * output_cost_per_million)
+            ) / 1_000_000.0
+        if usage_out is not None:
+            usage_out.clear()
+            usage_out.update(
+                {
+                    "promptTokens": usage.prompt_tokens,
+                    "completionTokens": usage.completion_tokens,
+                    "totalTokens": usage.total_tokens,
+                    "model": usage.model,
+                    "estimatedUsd": float(max(0.0, usage.estimated_usd)),
+                }
+            )
         out = (resp.choices[0].message.content or "").strip()
         out = out.strip('"\u201c\u201d')
         out = _unmask_hard_glossary(out, hard_map)
@@ -962,5 +1002,16 @@ async def translate_text(
 
         return out
     except Exception as e:
+        if usage_out is not None:
+            usage_out.clear()
+            usage_out.update(
+                {
+                    "promptTokens": 0,
+                    "completionTokens": 0,
+                    "totalTokens": 0,
+                    "model": (model_override or _MODEL or "gpt-4o-mini").strip() or "gpt-4o-mini",
+                    "estimatedUsd": 0.0,
+                }
+            )
         print(f"[TX] OpenAI error (model={model_override or _MODEL}): {e}")
         return text
