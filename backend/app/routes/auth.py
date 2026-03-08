@@ -180,6 +180,7 @@ def auth_get_org_billing_limits(
         return multichurch_store.get_org_billing_limits(
             org_id=org_id,
             requested_by_uid=user.uid,
+            requested_by_email=user.email,
         )
     except ValueError as exc:
         detail = str(exc)
@@ -204,6 +205,7 @@ def auth_set_org_billing_limits(
             org_id=org_id,
             requested_by_uid=user.uid,
             enabled=payload.enabled,
+            requested_by_email=user.email,
         )
     except ValueError as exc:
         detail = str(exc)

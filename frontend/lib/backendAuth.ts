@@ -116,6 +116,33 @@ export type OrgBillingLimitsResponse = {
   updatedAt?: string | null;
 };
 
+export type BillingPlanKey = "trial" | "starter" | "growth" | "premium";
+
+export type OrgBillingStatus = {
+  version?: number;
+  provider?: string;
+  planKey: BillingPlanKey | string;
+  status: string;
+  trialEndsAt?: string | null;
+  currentPeriodStart?: string | null;
+  currentPeriodEnd?: string | null;
+  graceEndsAt?: string | null;
+  cancelAtPeriodEnd?: boolean;
+  stripeCustomerId?: string | null;
+  stripeSubscriptionId?: string | null;
+  priceId?: string | null;
+  trialMinutesLimit?: number;
+  trialMinutesUsed?: number;
+  limits?: { maxServiceKeys?: number };
+  entitlements?: { canStartService?: boolean };
+  updatedAt?: string | null;
+};
+
+export type OrgBillingStatusResponse = {
+  orgId: string;
+  billing: OrgBillingStatus;
+};
+
 export type ScriptPairPayload = {
   source: string;
   target: string;
@@ -223,6 +250,7 @@ function isAbortError(err: unknown): boolean {
 
 function toErrorMessage(status: number, detail: string | undefined): string {
   if (detail === "auth_required") return "Please sign in again.";
+  if (detail === "anonymous_auth_disabled") return "Anonymous access is disabled. Please create an account and sign in.";
   if (detail === "invalid_id_token") return "Your session is invalid. Sign in again.";
   if (detail === "slug_taken") return "That church URL slug is already in use.";
   if (detail === "invalid_slug") return "Church slug is invalid.";
@@ -233,10 +261,17 @@ function toErrorMessage(status: number, detail: string | undefined): string {
   if (detail === "org_not_found") return "Church organization was not found.";
   if (detail === "org_access_denied") return "You do not have access to that church.";
   if (detail === "forbidden") return "You do not have permission to perform that action.";
-  if (detail === "billing_admin_required") return "Only the configured super user can manage billing settings.";
+  if (detail === "billing_admin_required") return "Only the configured billing admin account can manage billing settings.";
+  if (detail === "billing_not_configured") return "Billing is not configured yet. Ask the app owner to set Stripe keys.";
+  if (detail === "billing_customer_not_found") return "No billing customer exists yet for this church.";
+  if (detail === "invalid_plan") return "Selected billing plan is invalid.";
   if (detail === "sermon_prep_budget_reached") return "Sermon Prep monthly budget cap reached for this church.";
   if (detail === "invalid_budget") return "Budget must be a non-negative amount.";
   if (detail === "service_exists") return "That service key already exists.";
+  if (detail === "plan_limit_reached") return "Your current plan has reached its service limit. Upgrade to add more services.";
+  if (detail === "trial_expired") return "Your trial has expired. Add billing to continue.";
+  if (detail === "grace_expired") return "Your billing grace period has ended. Update payment to continue.";
+  if (detail === "subscription_required") return "An active subscription is required for this action.";
   if (detail === "service_active") return "You cannot delete a service while its room is live.";
   if (detail === "invite_active_limit_reached") return "Too many active invites for this church. Revoke or wait for some to expire.";
   if (detail === "invite_rate_limited") return "Too many invite requests right now. Please wait a moment and try again.";
@@ -406,6 +441,12 @@ export function fetchOrgBillingLimits(idToken: string, orgId: string): Promise<O
   });
 }
 
+export function fetchOrgBillingStatus(idToken: string, orgId: string): Promise<OrgBillingStatusResponse> {
+  return authFetch<OrgBillingStatusResponse>(`/api/billing/org/${encodeURIComponent(orgId)}/status`, idToken, {
+    method: "GET",
+  });
+}
+
 export function saveOrgBillingLimits(
   idToken: string,
   orgId: string,
@@ -418,6 +459,36 @@ export function saveOrgBillingLimits(
   }).then((result) => {
     invalidateAuthMeCache(idToken);
     return result;
+  });
+}
+
+export function createBillingCheckoutSession(
+  idToken: string,
+  payload: { orgId: string; planKey: Exclude<BillingPlanKey, "trial">; successUrl: string; cancelUrl: string },
+): Promise<{ url: string; sessionId: string }> {
+  return authFetch<{ url: string; sessionId: string }>("/api/billing/checkout-session", idToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      orgId: payload.orgId,
+      planKey: payload.planKey,
+      successUrl: payload.successUrl,
+      cancelUrl: payload.cancelUrl,
+    }),
+  });
+}
+
+export function createBillingPortalSession(
+  idToken: string,
+  payload: { orgId: string; returnUrl: string },
+): Promise<{ url: string }> {
+  return authFetch<{ url: string }>("/api/billing/portal-session", idToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      orgId: payload.orgId,
+      returnUrl: payload.returnUrl,
+    }),
   });
 }
 

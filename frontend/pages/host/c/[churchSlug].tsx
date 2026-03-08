@@ -4,25 +4,30 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import TranslationBox from "../../../components/TranslationBox";
 import { useAuth } from "../../../lib/authContext";
 import {
+  createBillingCheckoutSession,
+  createBillingPortalSession,
   createOrgService,
   createOrgInvite,
   deleteOrgService,
   fetchAuthMe,
   fetchOrgBillingLimits,
+  fetchOrgBillingStatus,
   fetchOrgSermonUsage,
   listOrgInvites,
   revokeOrgInvite,
   saveOrgBillingLimits,
   saveOrgSermonBudget,
   setCurrentOrg,
+  type BillingPlanKey,
   type InviteRole,
+  type OrgBillingStatus,
   type OrgBillingLimitsResponse,
   type OrgInviteSummary,
   type OrgMembership,
   type OrgSermonUsageResponse,
 } from "../../../lib/backendAuth";
 import { API_URL } from "../../../utils/urls";
-import { clearAuthToken, clearHostToken, clearRoomInSession, getHostTokenFromSession, persistAuthToken, persistHostToken, persistStreamContext } from "../../../utils/streamContext";
+import { clearAuthToken, clearHostToken, clearRoomInSession, persistAuthToken, persistHostToken, persistStreamContext } from "../../../utils/streamContext";
 
 type ServiceRow = {
   serviceKey: string;
@@ -50,10 +55,23 @@ type StartResponse = {
 
 const POLL_MS = 12000;
 const DEFAULT_SERVICE_KEY = "sun-11am";
+const BILLING_ADMIN_EMAILS = new Set(
+  `${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAILS || ""},${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAIL || ""}`
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 type HostAction = "load_services" | "start_service" | "end_service";
-type InviteRoleChoice = Extract<InviteRole, "admin" | "host" | "viewer">;
+type InviteRoleChoice = Extract<InviteRole, "admin" | "host">;
+type PaidPlanKey = Exclude<BillingPlanKey, "trial">;
 type HostTab = "broadcast" | "settings" | "team";
+
+const PLAN_LABELS: Record<PaidPlanKey, string> = {
+  starter: "Starter (5 services / $10)",
+  growth: "Growth (12 services / $20)",
+  premium: "Premium (Unlimited / $50+)",
+};
 
 function resolveHostTab(raw: string): HostTab {
   const token = (raw || "").trim().toLowerCase();
@@ -64,14 +82,22 @@ function resolveHostTab(raw: string): HostTab {
 const ERROR_DETAIL_MESSAGES: Record<string, string> = {
   host_auth_failed: "Host authorization failed. Sign in with an owner/admin/host account.",
   auth_required: "Please sign in first.",
+  anonymous_auth_disabled: "Anonymous access is disabled. Please create an account and sign in.",
   invalid_id_token: "Session expired. Please sign in again.",
   hard_cap_reached: "Monthly plan limit reached for this church. Please upgrade or wait for reset.",
+  plan_limit_reached: "Service limit reached for this plan. Upgrade to add another service.",
+  trial_expired: "Trial period has ended. Add billing to continue broadcasting.",
+  grace_expired: "Billing grace period has ended. Update payment to continue broadcasting.",
+  subscription_required: "An active subscription is required for this action.",
   concurrency_limit_reached: "Another service is already live for this plan. End it first, then start this one.",
   org_inactive: "This church account is inactive. Check subscription or billing status.",
   org_not_found: "Church organization was not found.",
   service_not_found: "This service key was not found for the church.",
   service_exists: "That service key already exists.",
   service_active: "You cannot delete a service while a room is live.",
+  billing_not_configured: "Billing is not configured yet. Ask the app owner to configure Stripe.",
+  billing_customer_not_found: "No billing customer exists yet for this church.",
+  invalid_plan: "Selected billing plan is invalid.",
   invalid_service_key: "Service key is invalid. Use letters, numbers, and hyphens.",
   room_not_found: "Live room was not found. Refresh and try again.",
 };
@@ -83,7 +109,7 @@ function fallbackMessage(action: HostAction): string {
 }
 
 function mapStatusMessage(status: number, action: HostAction): string | null {
-  if (status === 402) return ERROR_DETAIL_MESSAGES.hard_cap_reached;
+  if (status === 402) return "Billing limit reached. Upgrade or update billing to continue.";
   if (status === 403) return ERROR_DETAIL_MESSAGES.host_auth_failed;
   if (status === 404 && action === "load_services") return ERROR_DETAIL_MESSAGES.org_not_found;
   if (status === 404 && action === "start_service") return ERROR_DETAIL_MESSAGES.service_not_found;
@@ -109,6 +135,21 @@ function formatDateTime(raw?: string | null): string {
   const parsed = new Date(txt);
   if (Number.isNaN(parsed.getTime())) return txt;
   return parsed.toLocaleString();
+}
+
+function formatPlanLabel(planKey: string): string {
+  const token = (planKey || "").trim().toLowerCase();
+  if (token === "trial") return "Trial";
+  if (token === "starter") return "Starter";
+  if (token === "growth") return "Growth";
+  if (token === "premium") return "Premium";
+  return token || "Unknown";
+}
+
+function formatBillingStatus(status: string): string {
+  const token = (status || "").trim().toLowerCase();
+  if (!token) return "unknown";
+  return token.replace(/_/g, " ");
 }
 
 async function copyTextToClipboard(value: string): Promise<void> {
@@ -174,7 +215,11 @@ export default function HostChurchPage() {
   const [serviceManageError, setServiceManageError] = useState<string | null>(null);
   const [deletingServiceKey, setDeletingServiceKey] = useState("");
   const [billingState, setBillingState] = useState<OrgBillingLimitsResponse | null>(null);
+  const [billingProfile, setBillingProfile] = useState<OrgBillingStatus | null>(null);
+  const [selectedPlan, setSelectedPlan] = useState<PaidPlanKey>("starter");
   const [billingBusy, setBillingBusy] = useState(false);
+  const [billingCheckoutBusy, setBillingCheckoutBusy] = useState(false);
+  const [billingPortalBusy, setBillingPortalBusy] = useState(false);
   const [billingError, setBillingError] = useState<string | null>(null);
   const [billingNotice, setBillingNotice] = useState<string | null>(null);
   const [sermonUsageState, setSermonUsageState] = useState<OrgSermonUsageResponse | null>(null);
@@ -189,13 +234,29 @@ export default function HostChurchPage() {
     const lowered = membershipRole.trim().toLowerCase();
     return lowered === "owner" || lowered === "admin";
   }, [membershipRole]);
+  const billingAdminEmailAllowed = useMemo(() => {
+    if (BILLING_ADMIN_EMAILS.size === 0) return true;
+    const email = (user?.email || "").trim().toLowerCase();
+    if (!email) return false;
+    return BILLING_ADMIN_EMAILS.has(email);
+  }, [user?.email]);
   const canManageBilling = useMemo(() => {
-    return isMasterUser;
-  }, [isMasterUser]);
+    return isMasterUser && billingAdminEmailAllowed;
+  }, [billingAdminEmailAllowed, isMasterUser]);
   const canManageServices = useMemo(() => {
     const lowered = membershipRole.trim().toLowerCase();
     return lowered === "owner" || lowered === "admin" || lowered === "host";
   }, [membershipRole]);
+  const canManagePaidBilling = useMemo(() => {
+    const lowered = membershipRole.trim().toLowerCase();
+    return lowered === "owner" || lowered === "admin";
+  }, [membershipRole]);
+  const billingStatusToken = (billingProfile?.status || "").trim().toLowerCase();
+  const billingPlanToken = (billingProfile?.planKey || "trial").trim().toLowerCase();
+  const billingMaxServiceKeys = Number(billingProfile?.limits?.maxServiceKeys || 0);
+  const trialMinutesLimit = Number(billingProfile?.trialMinutesLimit || 0);
+  const trialMinutesUsed = Number(billingProfile?.trialMinutesUsed || 0);
+  const trialMinutesRemaining = trialMinutesLimit > 0 ? Math.max(0, trialMinutesLimit - trialMinutesUsed) : null;
 
   useEffect(() => {
     if (!resolvedOrgId) return;
@@ -220,7 +281,11 @@ export default function HostChurchPage() {
     setServiceManageError(null);
     setDeletingServiceKey("");
     setBillingState(null);
+    setBillingProfile(null);
+    setSelectedPlan("starter");
     setBillingBusy(false);
+    setBillingCheckoutBusy(false);
+    setBillingPortalBusy(false);
     setBillingError(null);
     setBillingNotice(null);
     setSermonUsageState(null);
@@ -497,6 +562,18 @@ export default function HostChurchPage() {
     setBillingState(payload);
   }, [canManageBilling, getIdToken, resolvedOrgId]);
 
+  const loadBillingProfile = useCallback(async () => {
+    if (!resolvedOrgId || !canManageServices) {
+      setBillingProfile(null);
+      return;
+    }
+    const idToken = await getIdToken();
+    if (!idToken) throw new Error("Please sign in again.");
+    persistAuthToken(idToken);
+    const payload = await fetchOrgBillingStatus(idToken, resolvedOrgId);
+    setBillingProfile(payload.billing || null);
+  }, [canManageServices, getIdToken, resolvedOrgId]);
+
   const loadSermonUsage = useCallback(async () => {
     if (!resolvedOrgId || !canManageBilling) {
       setSermonUsageState(null);
@@ -541,6 +618,30 @@ export default function HostChurchPage() {
       cancelled = true;
     };
   }, [activeTab, authLoading, canManageBilling, getIdToken, resolvedOrgId, user]);
+
+  useEffect(() => {
+    if (activeTab !== "settings" || !canManageServices || !resolvedOrgId || authLoading || !user) return;
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const idToken = await getIdToken();
+        if (!idToken || cancelled) return;
+        persistAuthToken(idToken);
+        const payload = await fetchOrgBillingStatus(idToken, resolvedOrgId);
+        if (cancelled) return;
+        setBillingProfile(payload.billing || null);
+      } catch (err: unknown) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          setBillingError(message || "Failed to load billing profile.");
+        }
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, authLoading, canManageServices, getIdToken, resolvedOrgId, user]);
 
   useEffect(() => {
     if (!canManageInvites || !resolvedOrgId || authLoading || !user) return;
@@ -704,6 +805,78 @@ export default function HostChurchPage() {
     }
   };
 
+  const openUpgradeCheckout = async () => {
+    if (!resolvedOrgId || !canManagePaidBilling) return;
+    setBillingCheckoutBusy(true);
+    setBillingError(null);
+    setBillingNotice(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const settingsPath =
+        buildTabHref("settings", {
+          orgId: resolvedOrgId,
+          serviceKey: normalizedServiceKey || undefined,
+          roomId: activeRoomId || undefined,
+        }) || `/host/c/${encodeURIComponent(slug || "demo")}/settings`;
+      const browserOrigin = (typeof window !== "undefined" && window.location.origin) || origin;
+      const returnUrl = browserOrigin ? `${browserOrigin}${settingsPath}` : settingsPath;
+      const checkout = await createBillingCheckoutSession(idToken, {
+        orgId: resolvedOrgId,
+        planKey: selectedPlan,
+        successUrl: returnUrl,
+        cancelUrl: returnUrl,
+      });
+      if (!checkout.url) throw new Error("Stripe checkout URL was not returned.");
+      if (typeof window !== "undefined") {
+        window.location.assign(checkout.url);
+      } else {
+        setBillingNotice(checkout.url);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setBillingError(message || "Failed to start Stripe checkout.");
+    } finally {
+      setBillingCheckoutBusy(false);
+    }
+  };
+
+  const openBillingPortal = async () => {
+    if (!resolvedOrgId || !canManagePaidBilling) return;
+    setBillingPortalBusy(true);
+    setBillingError(null);
+    setBillingNotice(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const settingsPath =
+        buildTabHref("settings", {
+          orgId: resolvedOrgId,
+          serviceKey: normalizedServiceKey || undefined,
+          roomId: activeRoomId || undefined,
+        }) || `/host/c/${encodeURIComponent(slug || "demo")}/settings`;
+      const browserOrigin = (typeof window !== "undefined" && window.location.origin) || origin;
+      const returnUrl = browserOrigin ? `${browserOrigin}${settingsPath}` : settingsPath;
+      const portal = await createBillingPortalSession(idToken, {
+        orgId: resolvedOrgId,
+        returnUrl,
+      });
+      if (!portal.url) throw new Error("Stripe billing portal URL was not returned.");
+      if (typeof window !== "undefined") {
+        window.location.assign(portal.url);
+      } else {
+        setBillingNotice(portal.url);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setBillingError(message || "Failed to open Stripe billing portal.");
+    } finally {
+      setBillingPortalBusy(false);
+    }
+  };
+
   const saveSermonBudget = async () => {
     if (!resolvedOrgId || !canManageBilling) return;
     const parsed = Number(sermonBudgetInput);
@@ -810,8 +983,8 @@ export default function HostChurchPage() {
     setBusy(true);
     try {
       const idToken = await getIdToken();
-      if (idToken) persistAuthToken(idToken);
-      const normalizedHostToken = (getHostTokenFromSession() || "").trim();
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
       const path = resolvedOrgId
         ? `/api/org/${encodeURIComponent(resolvedOrgId)}/service/${encodeURIComponent(normalizedServiceKey)}/start`
         : `/api/c/${encodeURIComponent(slug)}/service/${encodeURIComponent(normalizedServiceKey)}/start`;
@@ -819,16 +992,11 @@ export default function HostChurchPage() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-          ...(normalizedHostToken ? { "x-host-token": normalizedHostToken, "x-host-api-token": normalizedHostToken } : {}),
+          Authorization: `Bearer ${idToken}`,
         },
         body: JSON.stringify({
           source: sourceLang,
           target: targetLang,
-          hostUid: user?.uid || undefined,
-          hostToken: normalizedHostToken || undefined,
-          host_token: normalizedHostToken || undefined,
-          token: normalizedHostToken || undefined,
         }),
       });
       if (!res.ok) {
@@ -871,21 +1039,16 @@ export default function HostChurchPage() {
     setBusy(true);
     try {
       const idToken = await getIdToken();
-      if (idToken) persistAuthToken(idToken);
-      const normalizedHostToken = (getHostTokenFromSession() || "").trim();
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
       const res = await fetch(`${API_URL}/api/org/${encodeURIComponent(resolvedOrgId)}/room/${encodeURIComponent(activeRoomId)}/end`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-          ...(normalizedHostToken ? { "x-host-token": normalizedHostToken, "x-host-api-token": normalizedHostToken } : {}),
+          Authorization: `Bearer ${idToken}`,
         },
         body: JSON.stringify({
           reason: "host_end",
-          hostUid: user?.uid || undefined,
-          hostToken: normalizedHostToken || undefined,
-          host_token: normalizedHostToken || undefined,
-          token: normalizedHostToken || undefined,
         }),
       });
       if (!res.ok) {
@@ -1073,7 +1236,7 @@ export default function HostChurchPage() {
                     />
                   )}
                   {!loading && orgData && !orgData.services?.length ? (
-                    <span style={{ fontSize: 12, opacity: 0.75 }}>No predefined services found. Enter a service key to create/start one.</span>
+                    <span style={{ fontSize: 12, opacity: 0.75 }}>No services found. Create a service in Church Settings first, then start it here.</span>
                   ) : null}
                 </label>
                 <label style={{ display: "grid", gap: 4 }}>
@@ -1135,6 +1298,109 @@ export default function HostChurchPage() {
           {activeTab === "settings" ? (
             canManageServices ? (
               <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12, display: "grid", gap: 8 }}>
+                <div style={{ border: "1px solid rgba(125,211,252,0.35)", borderRadius: 10, padding: 10, display: "grid", gap: 7, background: "rgba(8,22,39,0.75)" }}>
+                  <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Subscription</p>
+                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>
+                    Plan: <strong>{formatPlanLabel(billingPlanToken)}</strong>
+                    {" · "}
+                    Status: <strong>{formatBillingStatus(billingStatusToken)}</strong>
+                    {" · "}
+                    Services: {billingMaxServiceKeys > 0 ? `up to ${billingMaxServiceKeys}` : "unlimited"}
+                  </p>
+                  {billingProfile ? (
+                    <div style={{ display: "grid", gap: 4 }}>
+                      <p style={{ margin: 0, fontSize: 12, opacity: 0.76 }}>
+                        Trial ends: {formatDateTime(billingProfile.trialEndsAt)}
+                        {" · "}
+                        Current period end: {formatDateTime(billingProfile.currentPeriodEnd)}
+                        {" · "}
+                        Grace ends: {formatDateTime(billingProfile.graceEndsAt)}
+                      </p>
+                      {billingPlanToken === "trial" && trialMinutesRemaining !== null ? (
+                        <p style={{ margin: 0, fontSize: 12, opacity: 0.86 }}>
+                          Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
+                          {" · "}
+                          Remaining: <strong>{trialMinutesRemaining}</strong> minutes
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: 12, opacity: 0.72 }}>Loading billing profile…</p>
+                  )}
+                  {canManagePaidBilling ? (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                      <select
+                        value={selectedPlan}
+                        onChange={(e) => setSelectedPlan(e.target.value as PaidPlanKey)}
+                        style={{
+                          borderRadius: 8,
+                          border: "1px solid rgba(255,255,255,0.24)",
+                          background: "rgba(2,6,23,0.72)",
+                          color: "#e2e8f0",
+                          padding: "8px 10px",
+                        }}
+                      >
+                        <option value="starter">{PLAN_LABELS.starter}</option>
+                        <option value="growth">{PLAN_LABELS.growth}</option>
+                        <option value="premium">{PLAN_LABELS.premium}</option>
+                      </select>
+                      <button
+                        onClick={openUpgradeCheckout}
+                        disabled={billingCheckoutBusy || !resolvedOrgId}
+                        style={{
+                          borderRadius: 8,
+                          border: "none",
+                          background: "#60a5fa",
+                          color: "#0c2644",
+                          fontWeight: 700,
+                          padding: "8px 12px",
+                          cursor: billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          opacity: billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
+                        }}
+                      >
+                        {billingCheckoutBusy ? "Opening Checkout..." : "Upgrade Plan"}
+                      </button>
+                      <button
+                        onClick={openBillingPortal}
+                        disabled={billingPortalBusy || !resolvedOrgId}
+                        style={{
+                          borderRadius: 8,
+                          border: "1px solid rgba(255,255,255,0.24)",
+                          background: "rgba(148,163,184,0.18)",
+                          color: "#e2e8f0",
+                          fontWeight: 600,
+                          padding: "8px 12px",
+                          cursor: billingPortalBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          opacity: billingPortalBusy || !resolvedOrgId ? 0.6 : 1,
+                        }}
+                      >
+                        {billingPortalBusy ? "Opening Portal..." : "Manage Billing"}
+                      </button>
+                      <button
+                        onClick={() => {
+                          void loadBillingProfile();
+                        }}
+                        disabled={billingPortalBusy || billingCheckoutBusy || !resolvedOrgId}
+                        style={{
+                          borderRadius: 8,
+                          border: "1px solid rgba(255,255,255,0.24)",
+                          background: "rgba(15,23,42,0.72)",
+                          color: "#cbd5e1",
+                          fontWeight: 600,
+                          padding: "8px 12px",
+                          cursor: billingPortalBusy || billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          opacity: billingPortalBusy || billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
+                        }}
+                      >
+                        Refresh Billing
+                      </button>
+                    </div>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: 13, opacity: 0.78 }}>
+                      Owner or admin role is required to manage subscription checkout and billing portal.
+                    </p>
+                  )}
+                </div>
                 <div style={{ border: "1px solid rgba(56,189,248,0.35)", borderRadius: 10, padding: 10, display: "grid", gap: 7, background: "rgba(8,16,35,0.75)" }}>
                   <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Billing Limits</p>
                   <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>
@@ -1182,7 +1448,7 @@ export default function HostChurchPage() {
                     </>
                   ) : (
                     <p style={{ margin: 0, fontSize: 13, opacity: 0.78 }}>
-                      Super user is required to change billing limits. Set `MASTER_USER_UIDS` (or `MASTER_USER_UID`) in backend env with your Firebase UID.
+                      Billing admin account is required to change billing limits.
                     </p>
                   )}
                 </div>
@@ -1422,7 +1688,6 @@ export default function HostChurchPage() {
                     >
                       <option value="host">host</option>
                       <option value="admin">admin</option>
-                      <option value="viewer">viewer</option>
                     </select>
                   </label>
                   <button

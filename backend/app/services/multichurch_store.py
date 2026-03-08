@@ -13,6 +13,12 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+from app.billing.config import BILLING_CONFIG
+from app.billing.models import (
+    default_billing_state as _default_billing_state_model,
+    normalize_billing_state as _normalize_billing_state_model,
+)
+
 try:
     from app.auth.firebase_auth import is_super_uid as _claim_is_super_uid
 except Exception:  # pragma: no cover - auth module may be unavailable in some test/bootstrap paths
@@ -87,6 +93,18 @@ def _env_uid_set(name: str) -> set[str]:
     return {part.strip() for part in raw.split(",") if part and part.strip()}
 
 
+def _env_email_set(name: str) -> set[str]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return set()
+    out: set[str] = set()
+    for part in raw.split(","):
+        token = str(part or "").strip().lower()
+        if token:
+            out.add(token)
+    return out
+
+
 DEFAULT_SERVICE_SEEDS: tuple[tuple[str, str], ...] = (
     ("sun-11am", "Sunday 11 AM"),
     ("sun-2pm", "Sunday 2 PM"),
@@ -138,12 +156,52 @@ _single_master_uid = _clean_token(os.getenv("MASTER_USER_UID"))
 if _single_master_uid:
     MASTER_USER_UIDS.add(_single_master_uid)
 
+BILLING_ADMIN_UIDS = _env_uid_set("BILLING_ADMIN_UIDS")
+_single_billing_admin_uid = _clean_token(os.getenv("BILLING_ADMIN_UID"))
+if _single_billing_admin_uid:
+    BILLING_ADMIN_UIDS.add(_single_billing_admin_uid)
+
+BILLING_ADMIN_EMAILS = _env_email_set("BILLING_ADMIN_EMAILS")
+_single_billing_admin_email = _clean_token(os.getenv("BILLING_ADMIN_EMAIL"))
+if _single_billing_admin_email:
+    BILLING_ADMIN_EMAILS.add(_single_billing_admin_email.lower())
+
 
 def _is_master_uid(uid: Optional[str]) -> bool:
     clean_uid = _clean_token(uid)
     if not clean_uid:
         return False
     return clean_uid in MASTER_USER_UIDS or bool(_claim_is_super_uid(clean_uid))
+
+
+def _is_billing_admin(uid: Optional[str], *, email: Optional[str] = None) -> bool:
+    clean_uid = _clean_token(uid)
+    clean_email = _clean_token(email)
+    clean_email = clean_email.lower() if clean_email else None
+    if BILLING_ADMIN_UIDS or BILLING_ADMIN_EMAILS:
+        if clean_uid and clean_uid in BILLING_ADMIN_UIDS:
+            return True
+        if clean_email and clean_email in BILLING_ADMIN_EMAILS:
+            return True
+        return False
+    return _is_master_uid(clean_uid)
+
+
+def _default_billing_state(*, now: Optional[datetime], plan_key: str) -> Dict[str, Any]:
+    return _default_billing_state_model(
+        now=now,
+        plan_key=plan_key,
+        trial_days=int(BILLING_CONFIG.trial_days),
+        trial_minutes=int(BILLING_CONFIG.trial_minutes),
+    )
+
+
+def _normalize_billing_state(raw: Optional[Dict[str, Any]], *, plan_key: str, now: Optional[datetime]) -> Dict[str, Any]:
+    return _normalize_billing_state_model(
+        raw,
+        now=now,
+        fallback_plan_key=plan_key,
+    )
 
 
 def _org_billing_limits_flag(org: Dict[str, Any]) -> bool:
@@ -169,6 +227,100 @@ def _billing_limits_payload(*, org_id: str, org: Dict[str, Any]) -> Dict[str, An
         "currentMonthKey": str(org.get("currentMonthKey") or ""),
         "updatedAt": org.get("updatedAt"),
     }
+
+
+_HARD_INACTIVE_ORG_STATUSES: set[str] = {"inactive", "disabled", "suspended", "deleted"}
+
+
+def _status_token(raw: Any) -> str:
+    return str(raw or "").strip().lower()
+
+
+def _safe_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _entitlements_v2_effective(org: Dict[str, Any]) -> bool:
+    return bool(BILLING_CONFIG.entitlements_v2_enabled and _org_billing_limits_enabled(org))
+
+
+def _legacy_org_start_allowed(org: Dict[str, Any]) -> bool:
+    return _status_token(org.get("status")) in {"active", "trial"}
+
+
+def _normalize_org_billing(org: Dict[str, Any], *, now: datetime) -> Dict[str, Any]:
+    return _normalize_billing_state(
+        org.get("billing"),
+        plan_key=str(org.get("plan") or "trial"),
+        now=now,
+    )
+
+
+def _billing_max_service_keys(billing: Dict[str, Any]) -> int:
+    limits = billing.get("limits")
+    if not isinstance(limits, dict):
+        return 0
+    parsed = _safe_int(limits.get("maxServiceKeys"), 0)
+    return max(0, parsed)
+
+
+def _is_trial_plan(billing: Dict[str, Any]) -> bool:
+    return _status_token(billing.get("planKey")) == "trial"
+
+
+def _billing_trial_minutes_limit(billing: Dict[str, Any]) -> int:
+    if not _is_trial_plan(billing):
+        return 0
+    parsed = _safe_int(billing.get("trialMinutesLimit"), 0)
+    return max(0, parsed)
+
+
+def _billing_trial_minutes_used(billing: Dict[str, Any]) -> int:
+    limit = _billing_trial_minutes_limit(billing)
+    parsed = _safe_int(billing.get("trialMinutesUsed"), 0)
+    used = max(0, parsed)
+    if limit > 0:
+        return min(limit, used)
+    return used
+
+
+def _billing_trial_minutes_remaining(billing: Dict[str, Any]) -> Optional[int]:
+    limit = _billing_trial_minutes_limit(billing)
+    if limit <= 0:
+        return None
+    used = _billing_trial_minutes_used(billing)
+    return max(0, limit - used)
+
+
+def _billing_trial_minutes_exhausted(billing: Dict[str, Any]) -> bool:
+    remaining = _billing_trial_minutes_remaining(billing)
+    return remaining is not None and remaining <= 0
+
+
+def _billing_start_denial_reason(*, billing: Dict[str, Any], now: datetime) -> Optional[str]:
+    status = _status_token(billing.get("status"))
+    trial_ends_at = billing.get("trialEndsAt")
+    grace_ends_at = billing.get("graceEndsAt")
+
+    if _billing_trial_minutes_exhausted(billing):
+        return "trial_expired"
+
+    if status in {"trialing", "active"}:
+        if status == "trialing" and isinstance(trial_ends_at, datetime) and now > trial_ends_at:
+            return "trial_expired"
+        return None
+    if status == "past_due":
+        if isinstance(grace_ends_at, datetime) and now <= grace_ends_at:
+            return None
+        return "grace_expired"
+    if status in {"canceled", "unpaid", "incomplete"}:
+        return "subscription_required"
+    if isinstance(trial_ends_at, datetime) and now > trial_ends_at:
+        return "trial_expired"
+    return "subscription_required"
 
 
 def _normalize_period_key(raw: Optional[str], *, now: Optional[datetime] = None) -> str:
@@ -382,6 +534,7 @@ class InMemoryMultiChurchStore:
         self._users: Dict[str, Dict[str, Any]] = {}
         self._org_invites: Dict[str, Dict[str, Any]] = {}
         self._invite_audits: List[Dict[str, Any]] = []
+        self._billing_events: Dict[str, Dict[str, Any]] = {}
         self._seed_dev_data()
 
     def _seed_dev_data(self) -> None:
@@ -408,6 +561,7 @@ class InMemoryMultiChurchStore:
             "name": name,
             "plan": "starter",
             "status": "active",
+            "billing": _default_billing_state(now=now, plan_key="starter"),
             "maxMinutesPerMonth": 500,
             "currentMonthMinutes": 0,
             "currentMonthKey": _yyyymm(),
@@ -584,6 +738,19 @@ class InMemoryMultiChurchStore:
             if row_key in self._services:
                 raise ValueError("service_exists")
             now = _utcnow()
+            billing = _normalize_org_billing(org, now=now)
+            org["billing"] = billing
+            if _billing_trial_minutes_exhausted(billing):
+                raise PermissionError("trial_expired")
+            if _entitlements_v2_effective(org):
+                denial = _billing_start_denial_reason(billing=billing, now=now)
+                if denial:
+                    raise PermissionError(denial)
+                max_service_keys = _billing_max_service_keys(billing)
+                if max_service_keys > 0:
+                    existing_count = sum(1 for (row_org, _service_key) in self._services.keys() if row_org == clean_org_id)
+                    if existing_count >= max_service_keys:
+                        raise PermissionError("plan_limit_reached")
             self._services[row_key] = {
                 "title": title_token,
                 "timezone": timezone_token,
@@ -727,9 +894,132 @@ class InMemoryMultiChurchStore:
     def is_master_user(self, uid: str) -> bool:
         return _is_master_uid(uid)
 
-    def get_org_billing_limits(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+    def get_org_billing_profile(self, *, org_id: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            billing = _normalize_billing_state(
+                org.get("billing"),
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            org["billing"] = billing
+            org["updatedAt"] = now
+            return dict(billing)
+
+    def set_org_billing_profile(self, *, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            merged = _normalize_billing_state(
+                billing or {},
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            org["billing"] = merged
+            org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
+            org["status"] = "trial" if str(merged.get("status") or "").strip().lower() == "trialing" else str(
+                merged.get("status") or org.get("status") or "active"
+            )
+            org["updatedAt"] = now
+            return dict(merged)
+
+    def ensure_org_can_start_service(self, *, org_id: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            self._roll_billing_period_if_needed(org, now)
+            org_status = _status_token(org.get("status"))
+            if org_status in _HARD_INACTIVE_ORG_STATUSES:
+                raise PermissionError("org_inactive")
+            if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
+                raise PermissionError("hard_cap_reached")
+            billing = _normalize_org_billing(org, now=now)
+            org["billing"] = billing
+            if _billing_trial_minutes_exhausted(billing):
+                raise PermissionError("trial_expired")
+            if _entitlements_v2_effective(org):
+                denial = _billing_start_denial_reason(billing=billing, now=now)
+                if denial:
+                    raise PermissionError(denial)
+            elif not _legacy_org_start_allowed(org):
+                raise PermissionError("org_inactive")
+            return {
+                "orgId": clean_org_id,
+                "allowed": True,
+                "billing": dict(billing),
+                "entitlementsV2": _entitlements_v2_effective(org),
+            }
+
+    def find_org_id_by_billing_refs(
+        self,
+        *,
+        stripe_customer_id: Optional[str] = None,
+        stripe_subscription_id: Optional[str] = None,
+    ) -> Optional[str]:
+        clean_customer = _clean_token(stripe_customer_id)
+        clean_subscription = _clean_token(stripe_subscription_id)
+        if not clean_customer and not clean_subscription:
+            return None
+        with self._lock:
+            for org_id, org in self._orgs.items():
+                billing = _normalize_billing_state(
+                    org.get("billing"),
+                    plan_key=str(org.get("plan") or "trial"),
+                    now=_utcnow(),
+                )
+                if clean_subscription and str(billing.get("stripeSubscriptionId") or "").strip() == clean_subscription:
+                    return org_id
+                if clean_customer and str(billing.get("stripeCustomerId") or "").strip() == clean_customer:
+                    return org_id
+        return None
+
+    def try_mark_billing_event(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        with self._lock:
+            if clean_event_id in self._billing_events:
+                return False
+            self._billing_events[clean_event_id] = {
+                "eventId": clean_event_id,
+                "eventType": str(event_type or "").strip(),
+                "payload": dict(payload or {}),
+                "createdAt": _utcnow(),
+            }
+            return True
+
+    def get_org_billing_limits(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        requested_by_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
+        clean_email = _clean_token(requested_by_email)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
@@ -738,13 +1028,21 @@ class InMemoryMultiChurchStore:
             org = self._orgs.get(clean_org_id)
             if not org:
                 raise ValueError("org_not_found")
-            if not _is_master_uid(clean_uid):
+            if not _is_billing_admin(clean_uid, email=clean_email):
                 raise PermissionError("billing_admin_required")
             return _billing_limits_payload(org_id=clean_org_id, org=org)
 
-    def set_org_billing_limits(self, *, org_id: str, requested_by_uid: str, enabled: bool) -> Dict[str, Any]:
+    def set_org_billing_limits(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        enabled: bool,
+        requested_by_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
+        clean_email = _clean_token(requested_by_email)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
@@ -753,7 +1051,7 @@ class InMemoryMultiChurchStore:
             org = self._orgs.get(clean_org_id)
             if not org:
                 raise ValueError("org_not_found")
-            if not _is_master_uid(clean_uid):
+            if not _is_billing_admin(clean_uid, email=clean_email):
                 raise PermissionError("billing_admin_required")
             org["billingLimitsEnabled"] = bool(enabled)
             org["updatedAt"] = _utcnow()
@@ -828,9 +1126,17 @@ class InMemoryMultiChurchStore:
             payload["sermons"] = (payload.get("sermons") or [])[:safe_limit]
             return payload
 
-    def set_org_sermon_prep_budget(self, *, org_id: str, requested_by_uid: str, budget_usd: float) -> Dict[str, Any]:
+    def set_org_sermon_prep_budget(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        budget_usd: float,
+        requested_by_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
+        clean_email = _clean_token(requested_by_email)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
@@ -842,7 +1148,7 @@ class InMemoryMultiChurchStore:
             org = self._orgs.get(clean_org_id)
             if not org:
                 raise ValueError("org_not_found")
-            if not _is_master_uid(clean_uid):
+            if not _is_billing_admin(clean_uid, email=clean_email):
                 raise PermissionError("billing_admin_required")
             now = _utcnow()
             org["sermonPrepBudgetUsd"] = float(parsed_budget)
@@ -1434,6 +1740,7 @@ class InMemoryMultiChurchStore:
                 "name": clean_name,
                 "plan": "trial",
                 "status": "active",
+                "billing": _default_billing_state(now=now, plan_key="trial"),
                 "maxMinutesPerMonth": 500,
                 "currentMonthMinutes": 0,
                 "currentMonthKey": _yyyymm(now),
@@ -1500,25 +1807,25 @@ class InMemoryMultiChurchStore:
             if not org:
                 raise ValueError("org_not_found")
             self._roll_billing_period_if_needed(org, now)
-            status = (org.get("status") or "").lower()
-            if status not in {"active", "trial"}:
+            org_status = _status_token(org.get("status"))
+            if org_status in _HARD_INACTIVE_ORG_STATUSES:
                 raise PermissionError("org_inactive")
             if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
                 raise PermissionError("hard_cap_reached")
+            billing = _normalize_org_billing(org, now=now)
+            org["billing"] = billing
+            if _billing_trial_minutes_exhausted(billing):
+                raise PermissionError("trial_expired")
+            if _entitlements_v2_effective(org):
+                denial = _billing_start_denial_reason(billing=billing, now=now)
+                if denial:
+                    raise PermissionError(denial)
+            elif not _legacy_org_start_allowed(org):
+                raise PermissionError("org_inactive")
 
             service = self._services.get((org_id, service_key))
             if not service:
-                # Allow on-the-fly service creation for easier onboarding.
-                service = {
-                    "title": service_key,
-                    "timezone": "UTC",
-                    "rrule": None,
-                    "defaultLanguagePair": {"source": source, "target": target},
-                    "activeRoomId": None,
-                    "lastRoomId": None,
-                    "updatedAt": now,
-                }
-                self._services[(org_id, service_key)] = service
+                raise ValueError("service_not_found")
 
             active_room_id = service.get("activeRoomId")
             if active_room_id:
@@ -1660,22 +1967,27 @@ class InMemoryMultiChurchStore:
         return out
 
     def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
-        if not BILLING_LIMITS_ENABLED:
-            return []
         now = _utcnow()
         period_key = _yyyymm(now)
         tick_min = _tick_minutes(tick_seconds)
         out: List[Dict[str, Any]] = []
         with self._lock:
-            flagged: set[tuple[str, str]] = set()
+            flagged: Dict[tuple[str, str], str] = {}
             for org_id, org in self._orgs.items():
                 self._roll_billing_period_if_needed(org, now)
-                if not _org_billing_limits_enabled(org):
+                billing_limits_enabled = _org_billing_limits_enabled(org)
+                billing = _normalize_org_billing(org, now=now)
+                org["billing"] = billing
+                has_trial_cap = _billing_trial_minutes_limit(billing) > 0
+                if not billing_limits_enabled and not has_trial_cap:
                     continue
-                if bool(org.get("hardCapReached")):
+                monthly_reached = bool(org.get("hardCapReached")) if billing_limits_enabled else False
+                trial_reached = _billing_trial_minutes_exhausted(billing)
+                if monthly_reached or trial_reached:
+                    reason = "trial_expired" if trial_reached else "monthly_limit_reached"
                     for (room_org_id, room_id), room in self._rooms.items():
                         if room_org_id == org_id and room.get("status") == "live":
-                            flagged.add((org_id, room_id))
+                            flagged[(org_id, room_id)] = reason
 
             for (org_id, room_id), room in self._rooms.items():
                 if room.get("status") != "live":
@@ -1683,11 +1995,24 @@ class InMemoryMultiChurchStore:
                 org = self._orgs.get(org_id)
                 if not org:
                     continue
-                if not _org_billing_limits_enabled(org):
-                    continue
+                billing_limits_enabled = _org_billing_limits_enabled(org)
+
+                billing = org.get("billing")
+                if not isinstance(billing, dict):
+                    billing = _normalize_org_billing(org, now=now)
+                    org["billing"] = billing
 
                 max_minutes = int(org.get("maxMinutesPerMonth") or 0)
-                if max_minutes <= 0:
+                has_monthly_cap = billing_limits_enabled and max_minutes > 0
+                trial_limit = _billing_trial_minutes_limit(billing)
+                has_trial_cap = trial_limit > 0
+                if not has_monthly_cap and not has_trial_cap:
+                    continue
+
+                monthly_reached_now = has_monthly_cap and bool(org.get("hardCapReached"))
+                trial_reached_now = _billing_trial_minutes_exhausted(billing)
+                if monthly_reached_now or trial_reached_now:
+                    flagged[(org_id, room_id)] = "trial_expired" if trial_reached_now else "monthly_limit_reached"
                     continue
 
                 last_tick_at = room.get("lastUsageTickAt") or room.get("startedAt") or now
@@ -1714,13 +2039,21 @@ class InMemoryMultiChurchStore:
                 usage["minutesTranslated"] += delta_minutes
                 usage["updatedAt"] = now
 
-                org["currentMonthMinutes"] = int(org.get("currentMonthMinutes") or 0) + delta_minutes
-                if int(org.get("currentMonthMinutes") or 0) >= max_minutes:
-                    org["hardCapReached"] = True
-                    flagged.add((org_id, room_id))
+                if has_monthly_cap:
+                    org["currentMonthMinutes"] = int(org.get("currentMonthMinutes") or 0) + delta_minutes
+                if has_trial_cap:
+                    used = _billing_trial_minutes_used(billing)
+                    billing["trialMinutesUsed"] = min(trial_limit, used + delta_minutes)
 
-            for org_id, room_id in sorted(flagged):
-                out.append({"orgId": org_id, "roomId": room_id, "reason": "monthly_limit_reached"})
+                monthly_reached = has_monthly_cap and int(org.get("currentMonthMinutes") or 0) >= max_minutes
+                trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(billing)
+                if monthly_reached:
+                    org["hardCapReached"] = True
+                if monthly_reached or trial_reached:
+                    flagged[(org_id, room_id)] = "trial_expired" if trial_reached else "monthly_limit_reached"
+
+            for (org_id, room_id), reason in sorted(flagged.items()):
+                out.append({"orgId": org_id, "roomId": room_id, "reason": reason})
         return out
 
 
@@ -1866,6 +2199,9 @@ class FirestoreMultiChurchStore:
 
     def _org_invite_audit_ref(self, event_id: str):
         return self._db.collection("orgInviteAudits").document(event_id)
+
+    def _billing_event_ref(self, event_id: str):
+        return self._db.collection("billingEvents").document(event_id)
 
     def _write_invite_audit(
         self,
@@ -2055,6 +2391,7 @@ class FirestoreMultiChurchStore:
         org_snap = self._org_ref(clean_org_id).get()
         if not org_snap.exists:
             raise ValueError("org_not_found")
+        org = org_snap.to_dict() or {}
         role = self._member_role(clean_org_id, clean_uid)
         if role not in {"owner", "admin", "host"}:
             raise PermissionError("forbidden")
@@ -2062,6 +2399,22 @@ class FirestoreMultiChurchStore:
         service_ref = self._service_ref(clean_org_id, normalized_key)
         if service_ref.get().exists:
             raise ValueError("service_exists")
+
+        now = _utcnow()
+        billing = _normalize_org_billing(org, now=now)
+        if _billing_trial_minutes_exhausted(billing):
+            raise PermissionError("trial_expired")
+        if _entitlements_v2_effective(org):
+            denial = _billing_start_denial_reason(billing=billing, now=now)
+            if denial:
+                raise PermissionError(denial)
+            max_service_keys = _billing_max_service_keys(billing)
+            if max_service_keys > 0:
+                service_query = self._org_ref(clean_org_id).collection("services").limit(max_service_keys)
+                existing_count = sum(1 for _ in service_query.stream())
+                if existing_count >= max_service_keys:
+                    raise PermissionError("plan_limit_reached")
+
         service_ref.set(
             {
                 "title": title_token,
@@ -2296,9 +2649,144 @@ class FirestoreMultiChurchStore:
     def is_master_user(self, uid: str) -> bool:
         return _is_master_uid(uid)
 
-    def get_org_billing_limits(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+    def get_org_billing_profile(self, *, org_id: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        org = org_snap.to_dict() or {}
+        billing = _normalize_billing_state(
+            org.get("billing"),
+            plan_key=str(org.get("plan") or "trial"),
+            now=now,
+        )
+        if not isinstance(org.get("billing"), dict):
+            org_ref.set(
+                {
+                    "billing": billing,
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        return dict(billing)
+
+    def set_org_billing_profile(self, *, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        org = org_snap.to_dict() or {}
+        merged = _normalize_billing_state(
+            billing or {},
+            plan_key=str(org.get("plan") or "trial"),
+            now=now,
+        )
+        normalized_status = str(merged.get("status") or "").strip().lower()
+        org_ref.set(
+            {
+                "billing": merged,
+                "plan": str(merged.get("planKey") or org.get("plan") or "trial"),
+                "status": "trial" if normalized_status == "trialing" else (normalized_status or str(org.get("status") or "active")),
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return dict(merged)
+
+    def ensure_org_can_start_service(self, *, org_id: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        org = self._roll_billing_period_if_needed(clean_org_id, org_snap.to_dict() or {}, now=now)
+        org_status = _status_token(org.get("status"))
+        if org_status in _HARD_INACTIVE_ORG_STATUSES:
+            raise PermissionError("org_inactive")
+        if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
+            raise PermissionError("hard_cap_reached")
+        billing = _normalize_org_billing(org, now=now)
+        if _billing_trial_minutes_exhausted(billing):
+            raise PermissionError("trial_expired")
+        if _entitlements_v2_effective(org):
+            denial = _billing_start_denial_reason(billing=billing, now=now)
+            if denial:
+                raise PermissionError(denial)
+        elif not _legacy_org_start_allowed(org):
+            raise PermissionError("org_inactive")
+        return {
+            "orgId": clean_org_id,
+            "allowed": True,
+            "billing": dict(billing),
+            "entitlementsV2": _entitlements_v2_effective(org),
+        }
+
+    def find_org_id_by_billing_refs(
+        self,
+        *,
+        stripe_customer_id: Optional[str] = None,
+        stripe_subscription_id: Optional[str] = None,
+    ) -> Optional[str]:
+        clean_customer = _clean_token(stripe_customer_id)
+        clean_subscription = _clean_token(stripe_subscription_id)
+        if clean_subscription:
+            query = self._where(self._db.collection("organizations"), "billing.stripeSubscriptionId", "==", clean_subscription).limit(1)
+            snap = next(query.stream(), None)
+            if snap is not None:
+                return snap.id
+        if clean_customer:
+            query = self._where(self._db.collection("organizations"), "billing.stripeCustomerId", "==", clean_customer).limit(1)
+            snap = next(query.stream(), None)
+            if snap is not None:
+                return snap.id
+        return None
+
+    def try_mark_billing_event(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        ref = self._billing_event_ref(clean_event_id)
+        snap = ref.get()
+        if snap.exists:
+            return False
+        ref.set(
+            {
+                "eventId": clean_event_id,
+                "eventType": str(event_type or "").strip(),
+                "payload": dict(payload or {}),
+                "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return True
+
+    def get_org_billing_limits(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        requested_by_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
+        clean_email = _clean_token(requested_by_email)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
@@ -2307,15 +2795,23 @@ class FirestoreMultiChurchStore:
         org_snap = self._org_ref(clean_org_id).get()
         if not org_snap.exists:
             raise ValueError("org_not_found")
-        if not _is_master_uid(clean_uid):
+        if not _is_billing_admin(clean_uid, email=clean_email):
             raise PermissionError("billing_admin_required")
 
         org = org_snap.to_dict() or {}
         return _billing_limits_payload(org_id=clean_org_id, org=org)
 
-    def set_org_billing_limits(self, *, org_id: str, requested_by_uid: str, enabled: bool) -> Dict[str, Any]:
+    def set_org_billing_limits(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        enabled: bool,
+        requested_by_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
+        clean_email = _clean_token(requested_by_email)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
@@ -2325,7 +2821,7 @@ class FirestoreMultiChurchStore:
         org_snap = org_ref.get()
         if not org_snap.exists:
             raise ValueError("org_not_found")
-        if not _is_master_uid(clean_uid):
+        if not _is_billing_admin(clean_uid, email=clean_email):
             raise PermissionError("billing_admin_required")
 
         org_ref.set(
@@ -2407,9 +2903,17 @@ class FirestoreMultiChurchStore:
         payload["sermons"] = (payload.get("sermons") or [])[:safe_limit]
         return payload
 
-    def set_org_sermon_prep_budget(self, *, org_id: str, requested_by_uid: str, budget_usd: float) -> Dict[str, Any]:
+    def set_org_sermon_prep_budget(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        budget_usd: float,
+        requested_by_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
+        clean_email = _clean_token(requested_by_email)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
@@ -2422,7 +2926,7 @@ class FirestoreMultiChurchStore:
         org_snap = org_ref.get()
         if not org_snap.exists:
             raise ValueError("org_not_found")
-        if not _is_master_uid(clean_uid):
+        if not _is_billing_admin(clean_uid, email=clean_email):
             raise PermissionError("billing_admin_required")
 
         org_ref.set(
@@ -2940,6 +3444,7 @@ class FirestoreMultiChurchStore:
                 "name": clean_name,
                 "plan": "trial",
                 "status": "active",
+                "billing": _default_billing_state(now=now, plan_key="trial"),
                 "maxMinutesPerMonth": 500,
                 "currentMonthMinutes": 0,
                 "currentMonthKey": _yyyymm(now),
@@ -3148,25 +3653,26 @@ class FirestoreMultiChurchStore:
                     },
                     merge=True,
                 )
-            status = (org.get("status") or "").lower()
-            if status not in {"active", "trial"}:
+            org_status = _status_token(org.get("status"))
+            if org_status in _HARD_INACTIVE_ORG_STATUSES:
                 raise PermissionError("org_inactive")
             if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
                 raise PermissionError("hard_cap_reached")
+            billing = _normalize_org_billing(org, now=now)
+            if _billing_trial_minutes_exhausted(billing):
+                raise PermissionError("trial_expired")
+            if _entitlements_v2_effective(org):
+                denial = _billing_start_denial_reason(billing=billing, now=now)
+                if denial:
+                    raise PermissionError(denial)
+            elif not _legacy_org_start_allowed(org):
+                raise PermissionError("org_inactive")
 
             service_snap = service_ref.get(transaction=transaction)
             if service_snap.exists:
                 service = service_snap.to_dict() or {}
             else:
-                service = {
-                    "title": service_key,
-                    "timezone": "UTC",
-                    "rrule": None,
-                    "defaultLanguagePair": {"source": source, "target": target},
-                    "activeRoomId": None,
-                    "lastRoomId": None,
-                }
-                transaction.set(service_ref, {**service, "updatedAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True)
+                raise ValueError("service_not_found")
 
             existing_room_id = service.get("activeRoomId")
             if existing_room_id:
@@ -3341,8 +3847,6 @@ class FirestoreMultiChurchStore:
         return out
 
     def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
-        if not BILLING_LIMITS_ENABLED:
-            return []
         now = _utcnow()
         period_key = _yyyymm(now)
         tick_min = _tick_minutes(tick_seconds)
@@ -3351,25 +3855,38 @@ class FirestoreMultiChurchStore:
         for org_snap in self._db.collection("organizations").stream():
             org_id = org_snap.id
             org = self._roll_billing_period_if_needed(org_id, org_snap.to_dict() or {}, now=now)
-            if not _org_billing_limits_enabled(org):
-                continue
+            billing_limits_enabled = _org_billing_limits_enabled(org)
+
+            billing = _normalize_org_billing(org, now=now)
             max_minutes = int(org.get("maxMinutesPerMonth") or 0)
-            if max_minutes <= 0:
+            has_monthly_cap = billing_limits_enabled and max_minutes > 0
+            trial_limit = _billing_trial_minutes_limit(billing)
+            has_trial_cap = trial_limit > 0
+            if not has_monthly_cap and not has_trial_cap:
                 continue
 
             current_minutes = int(org.get("currentMonthMinutes") or 0)
-            cap_reached = bool(org.get("hardCapReached"))
+            cap_reached = bool(org.get("hardCapReached")) if has_monthly_cap else False
+            trial_used = _billing_trial_minutes_used(billing)
+            trial_reached = has_trial_cap and trial_used >= trial_limit
 
             room_snaps = list(self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream())
             live_room_ids = [snap.id for snap in room_snaps]
             if not live_room_ids:
                 continue
 
+            if cap_reached or trial_reached:
+                reason = "trial_expired" if trial_reached else "monthly_limit_reached"
+                for room_id in live_room_ids:
+                    out.append({"orgId": org_id, "roomId": room_id, "reason": reason})
+                continue
+
             org_delta = 0
             usage_delta = 0
+            trial_delta = 0
             for room_snap in room_snaps:
                 room = room_snap.to_dict() or {}
-                if cap_reached:
+                if cap_reached or trial_reached:
                     break
                 last_tick_at = room.get("lastUsageTickAt") or room.get("startedAt")
                 if not isinstance(last_tick_at, datetime):
@@ -3379,21 +3896,33 @@ class FirestoreMultiChurchStore:
                 if increments <= 0:
                     continue
                 delta_minutes = increments * tick_min
-                org_delta += delta_minutes
+                if has_monthly_cap:
+                    org_delta += delta_minutes
                 usage_delta += delta_minutes
+                if has_trial_cap:
+                    trial_delta += delta_minutes
 
                 next_tick_at = last_tick_at + timedelta(seconds=increments * tick_seconds)
                 self._room_ref(org_id, room_snap.id).set({"lastUsageTickAt": next_tick_at}, merge=True)
 
-                if (current_minutes + org_delta) >= max_minutes:
+                if has_monthly_cap and (current_minutes + org_delta) >= max_minutes:
                     cap_reached = True
+                if has_trial_cap and (trial_used + trial_delta) >= trial_limit:
+                    trial_reached = True
 
-            if org_delta > 0 or cap_reached:
+            trial_used_next = trial_used
+            if has_trial_cap and trial_delta > 0:
+                trial_used_next = min(trial_limit, trial_used + trial_delta)
+
+            if org_delta > 0 or cap_reached or (has_trial_cap and trial_used_next != trial_used):
                 org_update: Dict[str, Any] = {}
                 if org_delta > 0:
                     org_update["currentMonthMinutes"] = gcf_firestore.Increment(org_delta)
                 if cap_reached:
                     org_update["hardCapReached"] = True
+                if has_trial_cap:
+                    org_update["billing.trialMinutesLimit"] = trial_limit
+                    org_update["billing.trialMinutesUsed"] = trial_used_next
                 if org_update:
                     self._org_ref(org_id).set(org_update, merge=True)
 
@@ -3406,9 +3935,10 @@ class FirestoreMultiChurchStore:
                     merge=True,
                 )
 
-            if cap_reached:
+            if cap_reached or trial_reached:
+                reason = "trial_expired" if trial_reached else "monthly_limit_reached"
                 for room_id in live_room_ids:
-                    out.append({"orgId": org_id, "roomId": room_id, "reason": "monthly_limit_reached"})
+                    out.append({"orgId": org_id, "roomId": room_id, "reason": reason})
 
         return out
 

@@ -50,10 +50,15 @@ DISABLE_BILLING_LIMITS=1
 MASTER_USER_UIDS=your_firebase_uid
 # or single value:
 # MASTER_USER_UID=your_firebase_uid
+
+# Optional: lock billing controls to specific account(s)
+BILLING_ADMIN_EMAILS=namjubae@gmail.com
+# BILLING_ADMIN_UIDS=your_firebase_uid
 ```
 
 - `DISABLE_BILLING_LIMITS=1` skips monthly cap enforcement (`hardCapReached`).
 - `MASTER_USER_UIDS` gives global owner-level access across organizations.
+- `BILLING_ADMIN_EMAILS`/`BILLING_ADMIN_UIDS` (if set) override default behavior and restrict billing settings access to those identities only.
 - Preferred production approach: assign Firebase custom claim(s) such as `super_admin=true` to your admin account instead of long-lived env UID lists.
 - Restart backend after changing env vars.
 
@@ -61,6 +66,13 @@ Per-org toggle (recommended for temporary exceptions):
 
 - Super user can open `/host/c/{churchSlug}?section=settings` and use the **Billing Limits** card.
 - Backend API for automation: `GET/POST /api/auth/org/{orgId}/billing-limits` with `{ "enabled": true|false }`.
+
+Frontend visibility lock (optional, UX-only):
+
+```bash
+# frontend env
+NEXT_PUBLIC_BILLING_ADMIN_EMAILS=namjubae@gmail.com
+```
 
 ### Sermon Prep usage logging + budget cap
 

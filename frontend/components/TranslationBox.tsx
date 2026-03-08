@@ -4,6 +4,7 @@ import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
 import { API_URL } from '../utils/urls'
+import { getAuthTokenFromSession } from '../utils/streamContext'
 import { useDeepgramProducer } from '../lib/useDeepgramProducer'
 import type { DeepgramProducerController } from '../lib/useDeepgramProducer'
 
@@ -363,9 +364,13 @@ export default function TranslationBox() {
     });
 
     try {
+      const idToken = getAuthTokenFromSession();
       const res = await fetch(`${API_URL}/api/translate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
         body: JSON.stringify(body),
       });
       const txt = await res.text().catch(() => '');
@@ -559,10 +564,14 @@ export default function TranslationBox() {
         if (voicePreference !== 'auto') {
           body.voice = voicePreference
         }
+        const idToken = getAuthTokenFromSession();
 
         const response = await fetch(`${API_URL}/api/tts`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
           body: JSON.stringify(body),
           signal: controller.signal,
         });

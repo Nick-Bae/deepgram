@@ -165,6 +165,12 @@ def verify_id_token_value(id_token: Optional[str]) -> Optional[AuthenticatedUser
     uid = str(decoded.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="invalid_id_token")
+    sign_in_provider = ""
+    firebase_meta = decoded.get("firebase")
+    if isinstance(firebase_meta, dict):
+        sign_in_provider = str(firebase_meta.get("sign_in_provider") or "").strip().lower()
+    if sign_in_provider == "anonymous":
+        raise HTTPException(status_code=401, detail="anonymous_auth_disabled")
     email_raw = decoded.get("email")
     name_raw = decoded.get("name")
     is_super = _decode_super_claim(decoded)

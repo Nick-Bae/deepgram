@@ -42,6 +42,7 @@ from app.routes import script as script_routes
 from app.routes import prompt as prompt_routes
 from app.routes import multichurch as multichurch_routes
 from app.routes import auth as auth_routes
+from app.routes import billing as billing_routes
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 
@@ -185,6 +186,7 @@ app.include_router(script_routes.router, prefix="/api")
 app.include_router(prompt_routes.router, prefix="/api")
 app.include_router(multichurch_routes.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
+app.include_router(billing_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
@@ -517,7 +519,11 @@ async def _room_sweeper_loop() -> None:
                             "roomStatus": "ended",
                             "viewerCount": 0,
                             "reason": reason,
-                            "message": "Monthly limit reached. Please contact your admin." if reason == "monthly_limit_reached" else None,
+                            "message": (
+                                "Trial minutes exhausted. Upgrade to continue."
+                                if reason == "trial_expired"
+                                else ("Monthly limit reached. Please contact your admin." if reason == "monthly_limit_reached" else None)
+                            ),
                         },
                     )
                 except Exception:

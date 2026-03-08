@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.auth.firebase_auth import AuthenticatedUser, get_current_user_optional, get_current_user_required
+from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.services.multichurch_store import multichurch_store
 
 router = APIRouter()
@@ -35,41 +35,15 @@ class CreateServiceRequest(BaseModel):
     target: str = Field(default="en", min_length=2, max_length=20)
 
 
-def _host_claims(
-    *,
-    host_uid_payload: str | None,
-    host_uid_header: str | None,
-    host_token_payload: str | None,
-    host_token_payload_snake: str | None,
-    host_token_payload_legacy: str | None,
-    host_token_header: str | None,
-    host_api_token_header: str | None,
-) -> tuple[str | None, str | None]:
-    host_uid = host_uid_payload or host_uid_header
-    host_token = host_token_payload or host_token_payload_snake or host_token_payload_legacy or host_token_header or host_api_token_header
-    return host_uid, host_token
-
-
 def _start_service_for_org(
     *,
     org_id: str,
     service_key: str,
     payload: StartServiceRequest,
-    x_host_token: str | None,
-    x_host_api_token: str | None,
-    x_host_uid: str | None,
-    current_user_uid: str | None,
+    current_user: AuthenticatedUser,
 ):
-    host_uid, host_token = _host_claims(
-        host_uid_payload=current_user_uid or payload.hostUid,
-        host_uid_header=x_host_uid,
-        host_token_payload=payload.hostToken,
-        host_token_payload_snake=payload.host_token,
-        host_token_payload_legacy=payload.token,
-        host_token_header=x_host_token,
-        host_api_token_header=x_host_api_token,
-    )
-    allowed = multichurch_store.authorize_host(org_id, host_uid=host_uid, host_token=host_token)
+    host_uid = current_user.uid
+    allowed = multichurch_store.authorize_host(org_id, host_uid=host_uid, host_token=None)
     if not allowed:
         raise HTTPException(status_code=403, detail="host_auth_failed")
     try:
@@ -82,7 +56,13 @@ def _start_service_for_org(
         )
     except PermissionError as exc:
         detail = str(exc)
-        if detail == "hard_cap_reached":
+        if detail in {
+            "hard_cap_reached",
+            "subscription_required",
+            "trial_expired",
+            "grace_expired",
+            "plan_limit_reached",
+        }:
             raise HTTPException(status_code=402, detail=detail) from exc
         if detail == "concurrency_limit_reached":
             raise HTTPException(status_code=429, detail=detail) from exc
@@ -134,7 +114,15 @@ def create_service(
             raise HTTPException(status_code=409, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "service_create_failed") from exc
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
+        detail = str(exc) or "forbidden"
+        if detail in {
+            "subscription_required",
+            "trial_expired",
+            "grace_expired",
+            "plan_limit_reached",
+        }:
+            raise HTTPException(status_code=402, detail=detail) from exc
+        raise HTTPException(status_code=403, detail=detail) from exc
 
 
 @router.delete("/org/{org_id}/services/{service_key}")
@@ -167,19 +155,13 @@ def start_service(
     org_id: str,
     service_key: str,
     payload: StartServiceRequest,
-    x_host_token: str | None = Header(default=None),
-    x_host_api_token: str | None = Header(default=None),
-    x_host_uid: str | None = Header(default=None),
-    current_user: AuthenticatedUser | None = Depends(get_current_user_optional),
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     return _start_service_for_org(
         org_id=org_id,
         service_key=service_key,
         payload=payload,
-        x_host_token=x_host_token,
-        x_host_api_token=x_host_api_token,
-        x_host_uid=x_host_uid,
-        current_user_uid=current_user.uid if current_user else None,
+        current_user=current_user,
     )
 
 
@@ -188,10 +170,7 @@ def start_service_by_slug(
     slug: str,
     service_key: str,
     payload: StartServiceRequest,
-    x_host_token: str | None = Header(default=None),
-    x_host_api_token: str | None = Header(default=None),
-    x_host_uid: str | None = Header(default=None),
-    current_user: AuthenticatedUser | None = Depends(get_current_user_optional),
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     data = multichurch_store.list_services(slug=slug)
     if not data:
@@ -203,10 +182,7 @@ def start_service_by_slug(
         org_id=org_id,
         service_key=service_key,
         payload=payload,
-        x_host_token=x_host_token,
-        x_host_api_token=x_host_api_token,
-        x_host_uid=x_host_uid,
-        current_user_uid=current_user.uid if current_user else None,
+        current_user=current_user,
     )
 
 
@@ -215,15 +191,12 @@ def end_room(
     org_id: str,
     room_id: str,
     payload: EndRoomRequest,
-    x_host_token: str | None = Header(default=None),
-    x_host_api_token: str | None = Header(default=None),
-    x_host_uid: str | None = Header(default=None),
-    current_user: AuthenticatedUser | None = Depends(get_current_user_optional),
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     allowed = multichurch_store.authorize_host(
         org_id,
-        host_uid=((current_user.uid if current_user else None) or payload.hostUid or x_host_uid),
-        host_token=(payload.hostToken or payload.host_token or payload.token or x_host_token or x_host_api_token),
+        host_uid=current_user.uid,
+        host_token=None,
     )
     if not allowed:
         raise HTTPException(status_code=403, detail="host_auth_failed")

@@ -400,6 +400,7 @@ def set_sermon_budget(
             org_id=org_id,
             requested_by_uid=user.uid,
             budget_usd=float(body.budget_usd),
+            requested_by_email=user.email,
         )
     except ValueError as exc:
         detail = str(exc)

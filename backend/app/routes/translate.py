@@ -3,10 +3,11 @@ import io
 import logging
 from time import perf_counter
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.services.google_tts import synthesize_async as synthesize_google_tts
 from app.services.gemini_flash_tts import synthesize_async as synthesize_gemini_tts
 from app.services.multichurch_store import multichurch_store
@@ -32,8 +33,7 @@ class TTSRequest(BaseModel):
 @router.post("/translate")
 async def translate(
     data: dict,
-    x_host_token: str | None = Header(default=None),
-    x_host_uid: str | None = Header(default=None),
+    user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     text = (data.get("text") or "").trim() if hasattr(str, "trim") else (data.get("text") or "").strip()
     source = (data.get("source") or "ko").strip()
@@ -46,8 +46,8 @@ async def translate(
         raise HTTPException(status_code=400, detail="No text provided for translation")
 
     if org_id and room_id:
-        host_uid = (data.get("hostUid") or data.get("host_uid") or x_host_uid or "").strip() or None
-        host_token = (data.get("hostToken") or data.get("host_token") or x_host_token or "").strip() or None
+        host_uid = (user.uid or "").strip() or None
+        host_token = None
         if not multichurch_store.authorize_host(org_id, host_uid=host_uid, host_token=host_token):
             raise HTTPException(status_code=403, detail="host_auth_failed")
 
@@ -120,7 +120,11 @@ async def translate(
 
 
 @router.post("/tts")
-async def synthesize_tts(payload: TTSRequest):
+async def synthesize_tts(
+    payload: TTSRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    _ = user  # Ensures authenticated access for TTS usage.
     provider = (payload.provider or "google").strip().lower()
     if provider in {"google", "google_cloud", "gcp"}:
         synthesize = synthesize_google_tts
