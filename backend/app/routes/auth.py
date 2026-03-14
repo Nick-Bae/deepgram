@@ -151,6 +151,19 @@ def auth_bootstrap_owner(
     }
 
 
+@router.get("/auth/slug-availability")
+def auth_slug_availability(
+    slug: str = Query(..., min_length=1, max_length=120),
+):
+    try:
+        return multichurch_store.check_org_slug_availability(slug=slug, max_suggestions=3)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "invalid_slug":
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "slug_check_failed") from exc
+
+
 @router.post("/auth/current-org")
 def auth_set_current_org(
     payload: SetCurrentOrgRequest,

@@ -202,6 +202,27 @@ class AuthRouteTests(unittest.TestCase):
         self.assertTrue(memberships)
         self.assertTrue(all("hostToken" not in row for row in memberships))
 
+    def test_slug_availability_reports_taken_and_suggests_alternatives(self) -> None:
+        self._bootstrap_owner(uid="owner-route-slug-1", slug="route-slug", name="Route Slug")
+        payload = auth_routes.auth_slug_availability(slug="route-slug")
+        self.assertEqual(payload.get("slug"), "route-slug")
+        self.assertFalse(bool(payload.get("available")))
+        suggestions = payload.get("suggestions") or []
+        self.assertTrue(isinstance(suggestions, list))
+        self.assertTrue(bool(suggestions))
+        self.assertTrue(all(str(row).startswith("route-slug-") for row in suggestions))
+
+        available_payload = auth_routes.auth_slug_availability(slug="route-slug-new")
+        self.assertEqual(available_payload.get("slug"), "route-slug-new")
+        self.assertTrue(bool(available_payload.get("available")))
+        self.assertEqual(available_payload.get("suggestions"), [])
+
+    def test_slug_availability_rejects_invalid_slug(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            auth_routes.auth_slug_availability(slug="!!!")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.detail, "invalid_slug")
+
 
 if __name__ == "__main__":
     unittest.main()

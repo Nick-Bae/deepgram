@@ -704,6 +704,21 @@ class InMemoryMultiChurchStore:
                 "services": rows,
             }
 
+    def check_org_slug_availability(self, *, slug: str, max_suggestions: int = 3) -> Dict[str, Any]:
+        normalized = _normalize_slug(slug)
+        safe_limit = max(0, min(10, int(max_suggestions)))
+        suggestions: List[str] = []
+        with self._lock:
+            available = normalized not in self._slug_to_org
+            if not available and safe_limit > 0:
+                suffix = 2
+                while len(suggestions) < safe_limit and suffix <= 9999:
+                    candidate = f"{normalized}-{suffix}"
+                    if candidate not in self._slug_to_org:
+                        suggestions.append(candidate)
+                    suffix += 1
+        return {"slug": normalized, "available": available, "suggestions": suggestions}
+
     def create_service(
         self,
         *,
@@ -2364,6 +2379,20 @@ class FirestoreMultiChurchStore:
             )
         rows.sort(key=lambda r: r["serviceKey"])
         return {"orgId": org_id, "slug": slug, "name": (org or {}).get("name", slug), "services": rows}
+
+    def check_org_slug_availability(self, *, slug: str, max_suggestions: int = 3) -> Dict[str, Any]:
+        normalized = _normalize_slug(slug)
+        safe_limit = max(0, min(10, int(max_suggestions)))
+        available = self._resolve_org_id_by_slug(normalized) is None
+        suggestions: List[str] = []
+        if not available and safe_limit > 0:
+            suffix = 2
+            while len(suggestions) < safe_limit and suffix <= 9999:
+                candidate = f"{normalized}-{suffix}"
+                if self._resolve_org_id_by_slug(candidate) is None:
+                    suggestions.append(candidate)
+                suffix += 1
+        return {"slug": normalized, "available": available, "suggestions": suggestions}
 
     def create_service(
         self,

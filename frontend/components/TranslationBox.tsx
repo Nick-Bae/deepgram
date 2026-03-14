@@ -132,7 +132,15 @@ type CancelableFn<Args extends unknown[] = unknown[]> = ((...args: Args) => void
 }
 
 export default function TranslationBox() {
-  const { connected, last, sendDisplayConfig } = useTranslationSocket({ isProducer: true })
+  const {
+    connected,
+    connectionState,
+    reconnectAttempt,
+    lastSeenAt,
+    disconnectStartedAt,
+    last,
+    sendDisplayConfig,
+  } = useTranslationSocket({ isProducer: true })
 
   // UI state
   const [text, setText] = useState('')
@@ -148,6 +156,7 @@ export default function TranslationBox() {
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
   const [displaySpeed, setDisplaySpeed] = useState(1)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
+  const [socketClock, setSocketClock] = useState(() => Date.now())
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
   const targetBaseLang = (targetLang || 'en').split('-')[0]
@@ -195,6 +204,11 @@ export default function TranslationBox() {
   }, [])
 
   useEffect(() => {
+    const timer = window.setInterval(() => setSocketClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
     if (!connected) return
     sendDisplayConfig(displaySpeed)
   }, [connected, displaySpeed, sendDisplayConfig])
@@ -213,7 +227,7 @@ export default function TranslationBox() {
 
   // Deepgram mic producer
   const dgController: DeepgramProducerController & { finalize?: () => void } = useDeepgramProducer()
-  const { start: dgStart, stop: dgStop, status, partial, errorMsg, finalize } = dgController
+  const { start: dgStart, stop: dgStop, status, partial, errorMsg, inputLevel, finalize } = dgController
   const startProducer = useCallback(async () => {
     const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string; earlyCommit?: boolean }) => Promise<void>
     await startWithOptions({ sourceLang, targetLang, earlyCommit: earlyCommitEnabled })
@@ -886,19 +900,52 @@ export default function TranslationBox() {
 
   const ttsAudienceEnabled = !isMuted
   const latencyLabel = latencyMs !== null ? `${Math.max(latencyMs, 0).toFixed(0)} ms` : 'Calibrating…'
+  const socketStatusLabel =
+    connectionState === 'connected'
+      ? 'Connected'
+      : connectionState === 'disconnected'
+      ? 'Disconnected'
+      : 'Reconnecting...'
+  const socketStatusClasses =
+    connectionState === 'connected'
+      ? 'border-[#668c4a]/60 text-[#f2f5e3]'
+      : connectionState === 'disconnected'
+      ? 'border-[#ff8a5b]/60 text-[#ffb28f]'
+      : 'border-[#f2c53d]/60 text-[#f2c53d]'
+  const socketDotClasses =
+    connectionState === 'connected'
+      ? 'bg-[#668c4a] animate-pulse'
+      : connectionState === 'disconnected'
+      ? 'bg-[#ff8a5b]'
+      : 'bg-[#f2c53d] animate-pulse'
+  const lastHeartbeatLabel = useMemo(() => {
+    if (!lastSeenAt) return 'Waiting'
+    const ageSeconds = Math.max(0, Math.floor((socketClock - lastSeenAt) / 1000))
+    return ageSeconds <= 0 ? 'Just now' : `${ageSeconds}s ago`
+  }, [lastSeenAt, socketClock])
+  const socketDowntimeLabel = useMemo(() => {
+    if (!disconnectStartedAt || connected) return '0s'
+    const ageSeconds = Math.max(1, Math.floor((socketClock - disconnectStartedAt) / 1000))
+    return `${ageSeconds}s`
+  }, [connected, disconnectStartedAt, socketClock])
+  const reconnectAttemptLabel = reconnectAttempt > 0 ? `#${reconnectAttempt}` : '0'
   const micActive = isListening && status === 'streaming'
+  const waveformActivity = micActive ? Math.min(1, Math.pow(inputLevel * 18, 0.8)) : 0
   const waveformBars = Array.from({ length: 5 }, (_, idx) => {
     const baseHeight = 12 + idx * 7
+    const barBoost = [0.45, 0.78, 1.08, 0.8, 0.52][idx] ?? 0.6
+    const barScale = micActive ? Math.min(1.18, 0.18 + waveformActivity * barBoost) : 0.18
+    const barOpacity = micActive ? 0.35 + waveformActivity * 0.65 : 0.3
     return (
       <span
         key={idx}
-        className="voice-bar inline-flex w-1 rounded-full bg-gradient-to-t from-[#1d1e22]/0 via-[#f2c53d]/80 to-[#feda6a] shadow-[0_6px_18px_rgba(254,218,106,0.45)]"
+        className="inline-flex w-1 rounded-full bg-gradient-to-t from-[#1d1e22]/0 via-[#f2c53d]/80 to-[#feda6a] shadow-[0_6px_18px_rgba(254,218,106,0.45)]"
         style={{
           height: `${baseHeight}px`,
-          animationDelay: `${idx * 0.12}s`,
-          animationPlayState: micActive ? 'running' : 'paused',
-          transform: micActive ? undefined : 'scaleY(0.25)',
-          opacity: micActive ? 1 : 0.45,
+          transform: `scaleY(${barScale})`,
+          transformOrigin: 'center bottom',
+          opacity: barOpacity,
+          transition: 'transform 90ms ease-out, opacity 120ms ease-out',
         }}
       />
     )
@@ -920,9 +967,9 @@ export default function TranslationBox() {
               <p className="text-sm text-[#d4d4dc]">Monitor, refine, and broadcast translations without leaving this console.</p>
             </div>
             <div className="flex flex-col items-start gap-3 text-sm md:flex-row md:items-center md:gap-4">
-              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 ${connected ? 'border-[#668c4a]/60 text-[#f2f5e3]' : 'border-[#f2c53d]/60 text-[#f2c53d]'}`}>
-                <span className={`h-2 w-2 rounded-full ${connected ? 'bg-[#668c4a] animate-ping' : 'bg-[#f2c53d]'}`} />
-                WebSocket {connected ? 'Connected' : 'Offline'}
+              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 ${socketStatusClasses}`}>
+                <span className={`h-2 w-2 rounded-full ${socketDotClasses}`} />
+                Producer socket · {socketStatusLabel}
               </span>
               <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 ${status === 'streaming' ? 'border-[#feda6a]/60 text-[#feda6a]' : 'border-[#d4d4dc]/40 text-[#d4d4dc]'}`}>
                 <span className={`h-2 w-2 rounded-full ${status === 'streaming' ? 'bg-[#feda6a] animate-pulse' : 'bg-[#d4d4dc]'}`} />
@@ -1100,8 +1147,16 @@ export default function TranslationBox() {
                 <p className="mb-3 text-xs uppercase tracking-wide text-[#b1b1ac]">System status</p>
                 <div className="space-y-2 text-[#d4d4dc]">
                   <div className="flex items-center justify-between">
-                    <span>Producer socket</span>
-                    <span className="font-semibold text-[#f2f5e3]">{connected ? 'Connected' : 'Reconnecting'}</span>
+                    <span>Last heartbeat</span>
+                    <span className="font-semibold text-[#f2f5e3]">{lastHeartbeatLabel}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Reconnect attempt</span>
+                    <span className="font-semibold text-[#f2f5e3]">{reconnectAttemptLabel}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Socket downtime</span>
+                    <span className="font-semibold text-[#f2f5e3]">{socketDowntimeLabel}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span>Deepgram engine</span>

@@ -807,6 +807,20 @@ async def ws_translate(ws: WebSocket):
 
             mtype = str(msg.get("type") or "").strip()
             mtype_l = mtype.lower()
+            if mtype_l == "ping":
+                try:
+                    await ws.send_json(
+                        {
+                            "type": "pong",
+                            "clientTs": msg.get("clientTs"),
+                            "serverTs": int(time.time() * 1000),
+                        }
+                    )
+                except Exception:
+                    pass
+                continue
+            if mtype_l == "pong":
+                continue
             if mtype_l in {"consumer_join", "join"}:
                 joined_service_key = _clean_token(msg.get("serviceKey") or msg.get("service_key")) or joined_service_key
                 joined_church_slug = _clean_token(msg.get("churchSlug") or msg.get("church_slug") or msg.get("slug")) or joined_church_slug

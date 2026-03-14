@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 from app.auth.firebase_auth import AuthenticatedUser
 from app.billing.config import BillingConfig
+from app.billing.stripe_client import StripeClientError
 from app.routes import auth as auth_routes
 from app.routes import billing as billing_routes
 from app.services.multichurch_store import InMemoryMultiChurchStore
@@ -62,6 +63,25 @@ class _FakeStripeClient:
 
     def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> dict:
         return {"url": f"https://billing.stripe.test/portal/{customer_id}?return={return_url}"}
+
+    def retrieve_subscription(self, *, subscription_id: str) -> dict:
+        now_ts = int(time.time())
+        return {
+            "id": subscription_id,
+            "customer": "cus_test_123",
+            "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": now_ts,
+            "current_period_end": now_ts + 30 * 86400,
+            "items": {"data": [{"price": {"id": "price_starter"}}]},
+        }
+
+    def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> dict:
+        return {
+            "data": [
+                self.retrieve_subscription(subscription_id=f"sub_for_{customer_id}")
+            ]
+        }
 
 
 class BillingRouteTests(unittest.TestCase):
@@ -143,6 +163,241 @@ class BillingRouteTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
         self.assertEqual(ctx.exception.detail, "billing_customer_not_found")
 
+    def test_checkout_session_recreates_customer_when_saved_customer_missing(self) -> None:
+        class _MissingCustomerStripeClient(_FakeStripeClient):
+            def __init__(self) -> None:
+                self._customer_created_count = 0
+
+            def create_customer(self, *, email: str | None, name: str | None, metadata: dict | None = None) -> dict:
+                self._customer_created_count += 1
+                return {"id": f"cus_test_retry_{self._customer_created_count}"}
+
+            def create_checkout_session(
+                self,
+                *,
+                customer_id: str,
+                price_id: str,
+                success_url: str,
+                cancel_url: str,
+                trial_days: int,
+                allow_no_payment_method: bool = True,
+                metadata: dict | None = None,
+            ) -> dict:
+                if customer_id == "cus_old_live_mode":
+                    raise StripeClientError("stripe_http_400:No such customer: 'cus_old_live_mode'")
+                return super().create_checkout_session(
+                    customer_id=customer_id,
+                    price_id=price_id,
+                    success_url=success_url,
+                    cancel_url=cancel_url,
+                    trial_days=trial_days,
+                    allow_no_payment_method=allow_no_payment_method,
+                    metadata=metadata,
+                )
+
+        org_id = self._bootstrap_owner(uid="owner-billing-2b", slug="billing-route-b2", name="Billing Route B2")
+        existing = self.store.get_org_billing_profile(org_id=org_id)
+        existing["stripeCustomerId"] = "cus_old_live_mode"
+        self.store.set_org_billing_profile(org_id=org_id, billing=existing)
+
+        fake = _MissingCustomerStripeClient()
+        with patch.object(billing_routes, "_stripe_client", lambda: fake):
+            result = billing_routes.create_checkout_session(
+                billing_routes.CheckoutSessionRequest(
+                    orgId=org_id,
+                    planKey="starter",
+                    successUrl="https://example.com/success",
+                    cancelUrl="https://example.com/cancel",
+                ),
+                user=self._user("owner-billing-2b"),
+            )
+        self.assertIn("url", result)
+        updated = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(str(updated.get("stripeCustomerId") or ""), "cus_test_retry_1")
+
+    def test_billing_status_hydrates_subscription_period_when_missing(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2c", slug="billing-route-b3", name="Billing Route B3")
+        existing = self.store.get_org_billing_profile(org_id=org_id)
+        existing["planKey"] = "starter"
+        existing["status"] = "active"
+        existing["stripeCustomerId"] = "cus_test_hydrate"
+        existing["stripeSubscriptionId"] = "sub_test_hydrate"
+        existing["currentPeriodStart"] = None
+        existing["currentPeriodEnd"] = None
+        self.store.set_org_billing_profile(org_id=org_id, billing=existing)
+
+        class _HydrateStripeClient(_FakeStripeClient):
+            def retrieve_subscription(self, *, subscription_id: str) -> dict:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id,
+                    "customer": "cus_test_hydrate",
+                    "status": "active",
+                    "cancel_at_period_end": False,
+                    "current_period_start": None,
+                    "current_period_end": None,
+                    "items": {
+                        "data": [
+                            {
+                                "price": {"id": "price_growth"},
+                                "current_period_start": now_ts,
+                                "current_period_end": now_ts + 31 * 86400,
+                            }
+                        ]
+                    },
+                }
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _HydrateStripeClient()):
+            payload = billing_routes.billing_status(org_id=org_id, user=self._user("owner-billing-2c"))
+
+        billing = payload.get("billing") or {}
+        self.assertEqual(str(billing.get("planKey") or ""), "growth")
+        self.assertEqual(str(billing.get("status") or ""), "active")
+        self.assertIsInstance(billing.get("currentPeriodStart"), datetime)
+        self.assertIsInstance(billing.get("currentPeriodEnd"), datetime)
+        self.assertEqual(str(billing.get("priceId") or ""), "price_growth")
+
+    def test_billing_status_hydrates_from_customer_when_subscription_id_missing(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2d", slug="billing-route-b4", name="Billing Route B4")
+        existing = self.store.get_org_billing_profile(org_id=org_id)
+        existing["planKey"] = "starter"
+        existing["status"] = "active"
+        existing["stripeCustomerId"] = "cus_test_lookup"
+        existing["stripeSubscriptionId"] = None
+        existing["currentPeriodStart"] = None
+        existing["currentPeriodEnd"] = None
+        self.store.set_org_billing_profile(org_id=org_id, billing=existing)
+
+        test_case = self
+
+        class _CustomerLookupStripeClient(_FakeStripeClient):
+            def retrieve_subscription(self, *, subscription_id: str) -> dict:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id,
+                    "customer": "cus_test_lookup",
+                    "status": "active",
+                    "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 32 * 86400,
+                    "items": {"data": [{"price": {"id": "price_premium"}}]},
+                }
+
+            def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> dict:
+                test_case.assertEqual(customer_id, "cus_test_lookup")
+                test_case.assertEqual(status, "all")
+                return {
+                    "data": [
+                        self.retrieve_subscription(subscription_id="sub_test_lookup"),
+                    ]
+                }
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _CustomerLookupStripeClient()):
+            payload = billing_routes.billing_status(org_id=org_id, user=self._user("owner-billing-2d"))
+
+        billing = payload.get("billing") or {}
+        self.assertEqual(str(billing.get("planKey") or ""), "premium")
+        self.assertEqual(str(billing.get("stripeSubscriptionId") or ""), "sub_test_lookup")
+        self.assertIsInstance(billing.get("currentPeriodStart"), datetime)
+        self.assertIsInstance(billing.get("currentPeriodEnd"), datetime)
+
+    def test_billing_status_refresh_forces_stripe_sync(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2e", slug="billing-route-b5", name="Billing Route B5")
+        existing = self.store.get_org_billing_profile(org_id=org_id)
+        existing["planKey"] = "starter"
+        existing["status"] = "active"
+        existing["stripeCustomerId"] = "cus_test_refresh"
+        existing["stripeSubscriptionId"] = "sub_test_refresh"
+        existing["currentPeriodStart"] = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        existing["currentPeriodEnd"] = datetime(2024, 2, 1, tzinfo=timezone.utc)
+        existing["priceId"] = "price_starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=existing)
+
+        test_case = self
+
+        class _ForceRefreshStripeClient(_FakeStripeClient):
+            def retrieve_subscription(self, *, subscription_id: str) -> dict:
+                test_case.assertEqual(subscription_id, "sub_test_refresh")
+                return {
+                    "id": subscription_id,
+                    "customer": "cus_test_refresh",
+                    "status": "active",
+                    "cancel_at_period_end": True,
+                    "current_period_start": int(datetime(2024, 3, 1, tzinfo=timezone.utc).timestamp()),
+                    "current_period_end": int(datetime(2024, 4, 1, tzinfo=timezone.utc).timestamp()),
+                    "items": {"data": [{"price": {"id": "price_growth"}}]},
+                }
+
+            def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> dict:
+                test_case.assertEqual(customer_id, "cus_test_refresh")
+                return {
+                    "data": [
+                        self.retrieve_subscription(subscription_id="sub_test_refresh"),
+                    ]
+                }
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _ForceRefreshStripeClient()):
+            payload = billing_routes.billing_status(
+                org_id=org_id,
+                refresh=True,
+                user=self._user("owner-billing-2e"),
+            )
+
+        billing = payload.get("billing") or {}
+        self.assertEqual(str(billing.get("planKey") or ""), "growth")
+        self.assertEqual(str(billing.get("priceId") or ""), "price_growth")
+        self.assertEqual(bool(billing.get("cancelAtPeriodEnd")), True)
+        self.assertEqual(
+            billing.get("currentPeriodEnd"),
+            datetime(2024, 4, 1, tzinfo=timezone.utc),
+        )
+
+    def test_billing_status_refresh_falls_back_when_saved_subscription_id_is_stale(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2f", slug="billing-route-b6", name="Billing Route B6")
+        existing = self.store.get_org_billing_profile(org_id=org_id)
+        existing["planKey"] = "starter"
+        existing["status"] = "active"
+        existing["stripeCustomerId"] = "cus_test_stale"
+        existing["stripeSubscriptionId"] = "sub_stale_missing"
+        existing["currentPeriodStart"] = None
+        existing["currentPeriodEnd"] = None
+        self.store.set_org_billing_profile(org_id=org_id, billing=existing)
+
+        class _StaleSubscriptionStripeClient(_FakeStripeClient):
+            def retrieve_subscription(self, *, subscription_id: str) -> dict:
+                if subscription_id == "sub_stale_missing":
+                    raise StripeClientError("stripe_http_404:No such subscription: 'sub_stale_missing'")
+                return super().retrieve_subscription(subscription_id=subscription_id)
+
+            def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> dict:
+                now_ts = int(time.time())
+                return {
+                    "data": [
+                        {
+                            "id": "sub_latest_active",
+                            "customer": customer_id,
+                            "status": "active",
+                            "cancel_at_period_end": False,
+                            "current_period_start": now_ts,
+                            "current_period_end": now_ts + 28 * 86400,
+                            "items": {"data": [{"price": {"id": "price_growth"}}]},
+                        }
+                    ]
+                }
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _StaleSubscriptionStripeClient()):
+            payload = billing_routes.billing_status(
+                org_id=org_id,
+                refresh=True,
+                user=self._user("owner-billing-2f"),
+            )
+
+        billing = payload.get("billing") or {}
+        self.assertEqual(str(billing.get("stripeSubscriptionId") or ""), "sub_latest_active")
+        self.assertEqual(str(billing.get("planKey") or ""), "growth")
+        self.assertIsInstance(billing.get("currentPeriodStart"), datetime)
+        self.assertIsInstance(billing.get("currentPeriodEnd"), datetime)
+
     def test_webhook_updates_status_and_is_idempotent(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-billing-3", slug="billing-route-c", name="Billing Route C")
         existing = self.store.get_org_billing_profile(org_id=org_id)
@@ -182,6 +437,7 @@ class BillingRouteTests(unittest.TestCase):
 
         updated = self.store.get_org_billing_profile(org_id=org_id)
         self.assertEqual(str(updated.get("status") or ""), "past_due")
+        self.assertIsNone(updated.get("trialEndsAt"))
         self.assertIsInstance(updated.get("graceEndsAt"), datetime)
         self.assertEqual(bool((updated.get("entitlements") or {}).get("canStartService")), True)
 

@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { useRouter } from "next/router";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-import { bootstrapOwnerOrg } from "../lib/backendAuth";
+import { bootstrapOwnerOrg, checkChurchSlugAvailability } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
 import { normalizeChurchSlug } from "../lib/churchSlug";
 import { clearHostToken, persistAuthToken, persistStreamContext } from "../utils/streamContext";
@@ -23,23 +23,71 @@ export default function SignupPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [churchName, setChurchName] = useState("");
   const [churchSlug, setChurchSlug] = useState("");
   const [slugTouched, setSlugTouched] = useState(false);
+  const [slugAvailabilityBusy, setSlugAvailabilityBusy] = useState(false);
+  const [slugAvailable, setSlugAvailable] = useState<boolean | null>(null);
+  const [slugSuggestions, setSlugSuggestions] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const slugCheckSeqRef = useRef(0);
   const nextPath = useMemo(() => {
     const raw = typeof router.query.next === "string" ? router.query.next : "";
     if (!raw.startsWith("/") || raw.startsWith("//")) return "";
     return raw;
   }, [router.query.next]);
   const inviteJoinFlow = nextPath.startsWith("/join?");
+  const passwordMismatch = Boolean(confirmPassword) && password !== confirmPassword;
+  const normalizedSlug = normalizeChurchSlug(churchSlug);
 
   useEffect(() => {
     if (inviteJoinFlow) return;
     if (slugTouched) return;
     setChurchSlug(normalizeChurchSlug(churchName));
   }, [churchName, inviteJoinFlow, slugTouched]);
+
+  useEffect(() => {
+    if (inviteJoinFlow) {
+      setSlugAvailabilityBusy(false);
+      setSlugAvailable(null);
+      setSlugSuggestions([]);
+      return;
+    }
+    if (!normalizedSlug) {
+      setSlugAvailabilityBusy(false);
+      setSlugAvailable(null);
+      setSlugSuggestions([]);
+      return;
+    }
+    setSlugAvailabilityBusy(true);
+    const seq = slugCheckSeqRef.current + 1;
+    slugCheckSeqRef.current = seq;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const payload = await checkChurchSlugAvailability(normalizedSlug);
+          if (slugCheckSeqRef.current !== seq) return;
+          setSlugAvailable(Boolean(payload.available));
+          const suggestions = (payload.suggestions || [])
+            .map((value) => normalizeChurchSlug(value))
+            .filter((value, index, rows) => Boolean(value) && value !== normalizedSlug && rows.indexOf(value) === index)
+            .slice(0, 3);
+          setSlugSuggestions(suggestions);
+        } catch {
+          if (slugCheckSeqRef.current !== seq) return;
+          setSlugAvailable(null);
+          setSlugSuggestions([]);
+        } finally {
+          if (slugCheckSeqRef.current === seq) {
+            setSlugAvailabilityBusy(false);
+          }
+        }
+      })();
+    }, 260);
+    return () => clearTimeout(timer);
+  }, [inviteJoinFlow, normalizedSlug]);
 
   useEffect(() => {
     if (loading || !user || !configured || busy) return;
@@ -52,8 +100,23 @@ export default function SignupPage() {
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    setBusy(true);
     setErrorMsg(null);
+    if (password !== confirmPassword) {
+      setErrorMsg("Passwords do not match.");
+      return;
+    }
+    const safeSlug = normalizeChurchSlug(churchSlug);
+    if (!inviteJoinFlow) {
+      if (!safeSlug) {
+        setErrorMsg("Church slug is required.");
+        return;
+      }
+      if (slugAvailable === false) {
+        setErrorMsg("That church URL slug is already in use. Choose one of the suggestions.");
+        return;
+      }
+    }
+    setBusy(true);
     try {
       const authUser = await signup(email.trim(), password, name.trim());
       const token = await authUser.getIdToken(true);
@@ -62,8 +125,6 @@ export default function SignupPage() {
         await router.replace(nextPath);
         return;
       }
-      const safeSlug = normalizeChurchSlug(churchSlug);
-      if (!safeSlug) throw new Error("Church slug is required.");
       const created = await bootstrapOwnerOrg(token, {
         churchName: churchName.trim(),
         churchSlug: safeSlug,
@@ -86,11 +147,26 @@ export default function SignupPage() {
       params.set("serviceKey", serviceKey);
       await router.replace(`/host/c/${encodeURIComponent(org.slug)}/broadcast?${params.toString()}`);
     } catch (err) {
+      if (!inviteJoinFlow && err instanceof Error && err.message.toLowerCase().includes("slug")) {
+        try {
+          const payload = await checkChurchSlugAvailability(safeSlug);
+          setSlugAvailable(Boolean(payload.available));
+          const suggestions = (payload.suggestions || [])
+            .map((value) => normalizeChurchSlug(value))
+            .filter((value, index, rows) => Boolean(value) && value !== safeSlug && rows.indexOf(value) === index)
+            .slice(0, 3);
+          setSlugSuggestions(suggestions);
+        } catch {
+          // no-op; keep original error message.
+        }
+      }
       setErrorMsg(mapFirebaseError(err));
     } finally {
       setBusy(false);
     }
   };
+
+  const slugBlocked = !inviteJoinFlow && (!normalizedSlug || slugAvailabilityBusy || slugAvailable === false);
 
   return (
     <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc", padding: 18 }}>
@@ -99,6 +175,11 @@ export default function SignupPage() {
         <p style={{ marginTop: 0, marginBottom: 14, opacity: 0.82 }}>
           {inviteJoinFlow ? "Sign up to continue joining your invited church workspace." : "Sign up and create your church workspace."}
         </p>
+        {!inviteJoinFlow ? (
+          <p style={{ marginTop: -2, marginBottom: 14, fontSize: 13, color: "#86efac" }}>
+            New church signup includes a 30-minute free host broadcast trial.
+          </p>
+        ) : null}
 
         {!configured ? (
           <div style={{ borderRadius: 10, border: "1px solid rgba(252,165,165,0.45)", background: "rgba(127,29,29,0.3)", padding: 12, color: "#fecaca", fontSize: 13 }}>
@@ -144,6 +225,19 @@ export default function SignupPage() {
               style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
             />
           </label>
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 13, opacity: 0.84 }}>Confirm password</span>
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              autoComplete="new-password"
+              minLength={6}
+              required
+              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
+            />
+            {passwordMismatch ? <span style={{ fontSize: 12, color: "#fca5a5" }}>Passwords do not match.</span> : null}
+          </label>
           {!inviteJoinFlow ? (
             <>
               <label style={{ display: "grid", gap: 4 }}>
@@ -168,13 +262,44 @@ export default function SignupPage() {
                   title="Use lowercase letters, numbers, and hyphens."
                   style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
                 />
+                {slugAvailabilityBusy ? <span style={{ fontSize: 12, opacity: 0.76 }}>Checking slug availability…</span> : null}
+                {!slugAvailabilityBusy && slugAvailable === true ? <span style={{ fontSize: 12, color: "#86efac" }}>Slug is available.</span> : null}
+                {!slugAvailabilityBusy && slugAvailable === false ? (
+                  <span style={{ fontSize: 12, color: "#fca5a5" }}>That slug is already taken.</span>
+                ) : null}
+                {!slugAvailabilityBusy && slugAvailable === false && slugSuggestions.length ? (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {slugSuggestions.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        onClick={() => {
+                          setSlugTouched(true);
+                          setChurchSlug(suggestion);
+                          setErrorMsg(null);
+                        }}
+                        style={{
+                          borderRadius: 999,
+                          border: "1px solid rgba(147,197,253,0.5)",
+                          background: "rgba(30,58,138,0.35)",
+                          color: "#bfdbfe",
+                          fontSize: 12,
+                          padding: "4px 10px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Use {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </label>
             </>
           ) : null}
 
           <button
             type="submit"
-            disabled={!configured || busy}
+            disabled={!configured || busy || passwordMismatch || slugBlocked}
             style={{
               marginTop: 4,
               borderRadius: 10,
@@ -183,8 +308,8 @@ export default function SignupPage() {
               fontWeight: 700,
               background: "#22c55e",
               color: "#052e16",
-              cursor: !configured || busy ? "not-allowed" : "pointer",
-              opacity: !configured || busy ? 0.6 : 1,
+              cursor: !configured || busy || passwordMismatch || slugBlocked ? "not-allowed" : "pointer",
+              opacity: !configured || busy || passwordMismatch || slugBlocked ? 0.6 : 1,
             }}
           >
             {busy ? "Creating account..." : inviteJoinFlow ? "Sign up and continue" : "Sign up and create church"}

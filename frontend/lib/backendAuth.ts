@@ -27,6 +27,12 @@ export type BootstrapOwnerResponse = {
   memberships: OrgMembership[];
 };
 
+export type ChurchSlugAvailabilityResponse = {
+  slug: string;
+  available: boolean;
+  suggestions: string[];
+};
+
 export type InviteRole = "admin" | "host" | "viewer";
 
 export type InvitePreviewResponse = {
@@ -217,6 +223,7 @@ export type OrgSermonUsageResponse = {
 };
 
 const AUTH_FETCH_TIMEOUT_MS = 15000;
+const SLUG_FETCH_TIMEOUT_MS = 8000;
 const PROMPT_FETCH_TIMEOUT_MS = 30000;
 const SERMON_FETCH_TIMEOUT_MS = 120000;
 const AUTH_ME_CACHE_TTL_MS = 10000;
@@ -374,6 +381,43 @@ export function bootstrapOwnerOrg(
   });
 }
 
+export async function checkChurchSlugAvailability(slug: string): Promise<ChurchSlugAvailabilityResponse> {
+  const cleanSlug = (slug || "").trim();
+  if (!cleanSlug) {
+    return { slug: "", available: false, suggestions: [] };
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SLUG_FETCH_TIMEOUT_MS);
+  try {
+    const params = new URLSearchParams();
+    params.set("slug", cleanSlug);
+    const res = await fetch(`${API_URL}/api/auth/slug-availability?${params.toString()}`, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw await parseError(res);
+    const payload = (await res.json()) as Partial<ChurchSlugAvailabilityResponse>;
+    const suggestions = Array.isArray(payload.suggestions)
+      ? payload.suggestions.map((row) => String(row || "").trim()).filter((row) => Boolean(row))
+      : [];
+    return {
+      slug: String(payload.slug || cleanSlug),
+      available: Boolean(payload.available),
+      suggestions,
+    };
+  } catch (err: unknown) {
+    if (isAbortError(err)) {
+      throw new Error(`Request timed out after ${Math.floor(SLUG_FETCH_TIMEOUT_MS / 1000)}s. Check backend API at ${API_URL}.`);
+    }
+    if (err instanceof TypeError) {
+      throw new Error(`Cannot reach backend API at ${API_URL}.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export function setCurrentOrg(idToken: string, orgId: string): Promise<SetCurrentOrgResponse> {
   return authFetch<SetCurrentOrgResponse>("/api/auth/current-org", idToken, {
     method: "POST",
@@ -441,10 +485,22 @@ export function fetchOrgBillingLimits(idToken: string, orgId: string): Promise<O
   });
 }
 
-export function fetchOrgBillingStatus(idToken: string, orgId: string): Promise<OrgBillingStatusResponse> {
-  return authFetch<OrgBillingStatusResponse>(`/api/billing/org/${encodeURIComponent(orgId)}/status`, idToken, {
-    method: "GET",
-  });
+export function fetchOrgBillingStatus(
+  idToken: string,
+  orgId: string,
+  options?: { refresh?: boolean },
+): Promise<OrgBillingStatusResponse> {
+  const params = new URLSearchParams();
+  if (options?.refresh) params.set("refresh", "true");
+  const query = params.toString();
+  return authFetch<OrgBillingStatusResponse>(
+    `/api/billing/org/${encodeURIComponent(orgId)}/status${query ? `?${query}` : ""}`,
+    idToken,
+    {
+      method: "GET",
+      cache: "no-store",
+    },
+  );
 }
 
 export function saveOrgBillingLimits(

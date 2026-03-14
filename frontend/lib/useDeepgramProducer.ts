@@ -23,10 +23,16 @@ export type DeepgramProducerController = {
   partial: string;
   lastCommit: string;
   errorMsg: string | null;
+  inputLevel: number;
   start: (options?: StartOptions) => Promise<void>;
   stop: () => void;
   finalize: () => void;
 };
+
+const INPUT_LEVEL_NOISE_FLOOR = 0.012;
+const INPUT_LEVEL_RELEASE = 0.72;
+const INPUT_LEVEL_ATTACK = 0.42;
+const INPUT_LEVEL_EMIT_INTERVAL_MS = 50;
 
 function sanitizeLang(code?: string) {
   if (!code) return "";
@@ -125,6 +131,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
   const [partial, setPartial] = useState("");
   const [lastCommit, setLastCommit] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [inputLevel, setInputLevel] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const portRef = useRef<MessagePort | null>(null);
@@ -135,6 +142,43 @@ export function useDeepgramProducer(): DeepgramProducerController {
   const shouldRunRef = useRef(false);
   const startOptionsRef = useRef<StartOptions | undefined>(undefined);
   const streamContextRef = useRef<StreamContext>({});
+  const inputLevelRef = useRef(0);
+  const lastInputLevelEmitRef = useRef(0);
+
+  function resetInputLevel() {
+    inputLevelRef.current = 0;
+    lastInputLevelEmitRef.current = 0;
+    setInputLevel(0);
+  }
+
+  function updateInputLevel(pcmBuffer: ArrayBuffer) {
+    const samples = new Int16Array(pcmBuffer);
+    if (!samples.length) return;
+
+    let sumSquares = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const normalized = samples[i] / 0x8000;
+      sumSquares += normalized * normalized;
+    }
+
+    const rms = Math.sqrt(sumSquares / samples.length);
+    const gated = rms <= INPUT_LEVEL_NOISE_FLOOR ? 0 : rms;
+    const previous = inputLevelRef.current;
+    const attack = gated > previous ? INPUT_LEVEL_ATTACK : 1 - INPUT_LEVEL_RELEASE;
+    const smoothed = previous + (gated - previous) * attack;
+    const nextLevel = smoothed < 0.004 ? 0 : smoothed;
+
+    inputLevelRef.current = nextLevel;
+
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (
+      now - lastInputLevelEmitRef.current >= INPUT_LEVEL_EMIT_INTERVAL_MS ||
+      (nextLevel === 0 && previous !== 0)
+    ) {
+      lastInputLevelEmitRef.current = now;
+      setInputLevel(nextLevel);
+    }
+  }
 
   function clearReconnectTimer() {
     if (reconnectTimerRef.current) {
@@ -150,6 +194,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
     ctxRef.current = null;
     try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch {}
     streamRef.current = null;
+    resetInputLevel();
   }
 
   function scheduleReconnect() {
@@ -293,6 +338,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
       portRef.current = worklet.port;
 
       portRef.current.onmessage = (evt: MessageEvent) => {
+        updateInputLevel(evt.data as ArrayBuffer);
         const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) ws.send(evt.data); // 16-bit PCM @ 48k
       };
@@ -330,5 +376,5 @@ export function useDeepgramProducer(): DeepgramProducerController {
     } catch {}
   }
 
-  return { status, partial, lastCommit, errorMsg, start, stop, finalize: finalizeCurrentUtterance };
+  return { status, partial, lastCommit, errorMsg, inputLevel, start, stop, finalize: finalizeCurrentUtterance };
 }

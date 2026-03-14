@@ -1,5 +1,5 @@
 import { useRouter } from "next/router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import TranslationBox from "../../../components/TranslationBox";
 import { useAuth } from "../../../lib/authContext";
@@ -66,11 +66,12 @@ type HostAction = "load_services" | "start_service" | "end_service";
 type InviteRoleChoice = Extract<InviteRole, "admin" | "host">;
 type PaidPlanKey = Exclude<BillingPlanKey, "trial">;
 type HostTab = "broadcast" | "settings" | "team";
+const PAID_PLAN_KEYS: PaidPlanKey[] = ["starter", "growth", "premium"];
 
 const PLAN_LABELS: Record<PaidPlanKey, string> = {
-  starter: "Starter (5 services / $10)",
-  growth: "Growth (12 services / $20)",
-  premium: "Premium (Unlimited / $50+)",
+  starter: "Starter (5 services / $20)",
+  growth: "Growth (12 services / $40)",
+  premium: "Premium (Unlimited / $60)",
 };
 
 function resolveHostTab(raw: string): HostTab {
@@ -152,6 +153,14 @@ function formatBillingStatus(status: string): string {
   return token.replace(/_/g, " ");
 }
 
+function formatCountdownMinutes(rawMinutes: number): string {
+  const minutes = Math.max(0, Math.floor(Number.isFinite(rawMinutes) ? rawMinutes : 0));
+  const totalSeconds = minutes * 60;
+  const mm = Math.floor(totalSeconds / 60);
+  const ss = totalSeconds % 60;
+  return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
 async function copyTextToClipboard(value: string): Promise<void> {
   const text = value.trim();
   if (!text) throw new Error("empty_text");
@@ -220,8 +229,10 @@ export default function HostChurchPage() {
   const [billingBusy, setBillingBusy] = useState(false);
   const [billingCheckoutBusy, setBillingCheckoutBusy] = useState(false);
   const [billingPortalBusy, setBillingPortalBusy] = useState(false);
+  const [billingRefreshBusy, setBillingRefreshBusy] = useState(false);
   const [billingError, setBillingError] = useState<string | null>(null);
   const [billingNotice, setBillingNotice] = useState<string | null>(null);
+  const [trialBroadcastNotice, setTrialBroadcastNotice] = useState<string | null>(null);
   const [sermonUsageState, setSermonUsageState] = useState<OrgSermonUsageResponse | null>(null);
   const [sermonBudgetInput, setSermonBudgetInput] = useState("0");
   const [sermonBudgetBusy, setSermonBudgetBusy] = useState(false);
@@ -253,10 +264,20 @@ export default function HostChurchPage() {
   }, [membershipRole]);
   const billingStatusToken = (billingProfile?.status || "").trim().toLowerCase();
   const billingPlanToken = (billingProfile?.planKey || "trial").trim().toLowerCase();
+  const isTrialPlan = billingPlanToken === "trial";
+  const hasSubscriptionPeriod = Boolean(billingProfile?.currentPeriodStart && billingProfile?.currentPeriodEnd);
   const billingMaxServiceKeys = Number(billingProfile?.limits?.maxServiceKeys || 0);
   const trialMinutesLimit = Number(billingProfile?.trialMinutesLimit || 0);
   const trialMinutesUsed = Number(billingProfile?.trialMinutesUsed || 0);
   const trialMinutesRemaining = trialMinutesLimit > 0 ? Math.max(0, trialMinutesLimit - trialMinutesUsed) : null;
+  const isTrialExpired = isTrialPlan && trialMinutesRemaining !== null && trialMinutesRemaining <= 0;
+  const trialNoticeCheckpointRef = useRef<"" | "warn5" | "warn1" | "expired">("");
+  const hasPaidPlan = PAID_PLAN_KEYS.includes(billingPlanToken as PaidPlanKey);
+  const hasActiveLikeSubscription = billingStatusToken === "active" || billingStatusToken === "trialing" || billingStatusToken === "past_due";
+  const selectablePaidPlans = useMemo(() => {
+    if (!hasPaidPlan || !hasActiveLikeSubscription) return PAID_PLAN_KEYS;
+    return PAID_PLAN_KEYS.filter((plan) => plan !== (billingPlanToken as PaidPlanKey));
+  }, [billingPlanToken, hasActiveLikeSubscription, hasPaidPlan]);
 
   useEffect(() => {
     if (!resolvedOrgId) return;
@@ -267,6 +288,11 @@ export default function HostChurchPage() {
     const matchedMembership = memberships.find((row) => row.orgId === resolvedOrgId || row.slug === slug);
     if (matchedMembership) setSelectedOrgId(matchedMembership.orgId);
   }, [memberships, resolvedOrgId, slug]);
+
+  useEffect(() => {
+    if (selectablePaidPlans.includes(selectedPlan)) return;
+    setSelectedPlan(selectablePaidPlans[0] || "starter");
+  }, [selectablePaidPlans, selectedPlan]);
 
   useEffect(() => {
     setInviteLink("");
@@ -286,8 +312,11 @@ export default function HostChurchPage() {
     setBillingBusy(false);
     setBillingCheckoutBusy(false);
     setBillingPortalBusy(false);
+    setBillingRefreshBusy(false);
     setBillingError(null);
     setBillingNotice(null);
+    setTrialBroadcastNotice(null);
+    trialNoticeCheckpointRef.current = "";
     setSermonUsageState(null);
     setSermonBudgetInput("0");
     setSermonBudgetBusy(false);
@@ -562,17 +591,35 @@ export default function HostChurchPage() {
     setBillingState(payload);
   }, [canManageBilling, getIdToken, resolvedOrgId]);
 
-  const loadBillingProfile = useCallback(async () => {
+  const loadBillingProfile = useCallback(async (options?: { refresh?: boolean }) => {
     if (!resolvedOrgId || !canManageServices) {
       setBillingProfile(null);
       return;
     }
-    const idToken = await getIdToken();
-    if (!idToken) throw new Error("Please sign in again.");
-    persistAuthToken(idToken);
-    const payload = await fetchOrgBillingStatus(idToken, resolvedOrgId);
-    setBillingProfile(payload.billing || null);
-  }, [canManageServices, getIdToken, resolvedOrgId]);
+    const forceRefresh = Boolean(options?.refresh);
+    if (forceRefresh) {
+      setBillingRefreshBusy(true);
+      setBillingError(null);
+      setBillingNotice(null);
+    }
+    try {
+      const idToken = await getIdToken();
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const payload = await fetchOrgBillingStatus(idToken, resolvedOrgId, { refresh: forceRefresh });
+      setBillingProfile(payload.billing || null);
+      if (forceRefresh) {
+        setBillingNotice("Billing details refreshed.");
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (forceRefresh || activeTab === "settings") {
+        setBillingError(message || "Failed to load billing profile.");
+      }
+    } finally {
+      if (forceRefresh) setBillingRefreshBusy(false);
+    }
+  }, [activeTab, canManageServices, getIdToken, resolvedOrgId]);
 
   const loadSermonUsage = useCallback(async () => {
     if (!resolvedOrgId || !canManageBilling) {
@@ -620,7 +667,7 @@ export default function HostChurchPage() {
   }, [activeTab, authLoading, canManageBilling, getIdToken, resolvedOrgId, user]);
 
   useEffect(() => {
-    if (activeTab !== "settings" || !canManageServices || !resolvedOrgId || authLoading || !user) return;
+    if (!canManageServices || !resolvedOrgId || authLoading || !user) return;
     let cancelled = false;
     const run = async () => {
       try {
@@ -631,15 +678,19 @@ export default function HostChurchPage() {
         if (cancelled) return;
         setBillingProfile(payload.billing || null);
       } catch (err: unknown) {
-        if (!cancelled) {
+        if (!cancelled && activeTab === "settings") {
           const message = err instanceof Error ? err.message : String(err);
           setBillingError(message || "Failed to load billing profile.");
         }
       }
     };
-    run();
+    void run();
+    const timer = window.setInterval(() => {
+      void run();
+    }, POLL_MS);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, [activeTab, authLoading, canManageServices, getIdToken, resolvedOrgId, user]);
 
@@ -670,6 +721,39 @@ export default function HostChurchPage() {
       cancelled = true;
     };
   }, [authLoading, canManageInvites, getIdToken, resolvedOrgId, user]);
+
+  useEffect(() => {
+    if (billingPlanToken !== "trial" || trialMinutesRemaining === null) {
+      trialNoticeCheckpointRef.current = "";
+      setTrialBroadcastNotice(null);
+      return;
+    }
+    if (trialMinutesRemaining <= 0) {
+      if (trialNoticeCheckpointRef.current !== "expired") {
+        trialNoticeCheckpointRef.current = "expired";
+        setTrialBroadcastNotice("Your 30-minute trial has ended. Upgrade to continue broadcasting.");
+      }
+      return;
+    }
+    if (trialMinutesRemaining <= 1) {
+      if (trialNoticeCheckpointRef.current !== "warn1" && trialNoticeCheckpointRef.current !== "expired") {
+        trialNoticeCheckpointRef.current = "warn1";
+        setTrialBroadcastNotice("Trial: 1 minute remaining. Broadcast will stop automatically when time runs out.");
+      }
+      return;
+    }
+    if (trialMinutesRemaining <= 5) {
+      if (trialNoticeCheckpointRef.current === "") {
+        trialNoticeCheckpointRef.current = "warn5";
+        setTrialBroadcastNotice("Trial: 5 minutes remaining. Upgrade anytime to avoid interruption.");
+      }
+      return;
+    }
+    if (trialNoticeCheckpointRef.current) {
+      trialNoticeCheckpointRef.current = "";
+      setTrialBroadcastNotice(null);
+    }
+  }, [billingPlanToken, trialMinutesRemaining]);
 
   const generateInviteLink = async () => {
     if (!resolvedOrgId) {
@@ -1284,7 +1368,38 @@ export default function HostChurchPage() {
                 <span style={{ opacity: 0.84, fontSize: 14 }}>
                   {activeRoomId ? `Live room: ${activeRoomId}` : "No live room"}
                 </span>
+                {billingPlanToken === "trial" && trialMinutesRemaining !== null ? (
+                  <span
+                    style={{
+                      borderRadius: 999,
+                      border: isTrialExpired ? "1px solid rgba(252,165,165,0.8)" : "1px solid rgba(251,191,36,0.7)",
+                      background: isTrialExpired ? "rgba(127,29,29,0.35)" : "rgba(120,53,15,0.35)",
+                      color: isTrialExpired ? "#fecaca" : "#fde68a",
+                      fontSize: 12,
+                      fontWeight: 700,
+                      padding: "6px 10px",
+                    }}
+                  >
+                    Trial remaining: {formatCountdownMinutes(trialMinutesRemaining)}
+                  </span>
+                ) : null}
               </div>
+              {trialBroadcastNotice ? (
+                <div
+                  style={{
+                    marginTop: 10,
+                    borderRadius: 10,
+                    border: isTrialExpired ? "1px solid rgba(252,165,165,0.7)" : "1px solid rgba(251,191,36,0.65)",
+                    background: isTrialExpired ? "rgba(127,29,29,0.28)" : "rgba(120,53,15,0.28)",
+                    color: isTrialExpired ? "#fecaca" : "#fde68a",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    padding: "9px 11px",
+                  }}
+                >
+                  {trialBroadcastNotice}
+                </div>
+              ) : null}
               {listenerUrl ? (
                 <p style={{ marginTop: 10, marginBottom: 0, fontSize: 13, opacity: 0.84 }}>
                   Listener URL: <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: "#93c5fd" }}>{listenerUrl}</a>
@@ -1309,18 +1424,30 @@ export default function HostChurchPage() {
                   </p>
                   {billingProfile ? (
                     <div style={{ display: "grid", gap: 4 }}>
-                      <p style={{ margin: 0, fontSize: 12, opacity: 0.76 }}>
-                        Trial ends: {formatDateTime(billingProfile.trialEndsAt)}
-                        {" · "}
-                        Current period end: {formatDateTime(billingProfile.currentPeriodEnd)}
-                        {" · "}
-                        Grace ends: {formatDateTime(billingProfile.graceEndsAt)}
-                      </p>
-                      {billingPlanToken === "trial" && trialMinutesRemaining !== null ? (
+                      {hasSubscriptionPeriod ? (
+                        <p style={{ margin: 0, fontSize: 12, opacity: 0.82 }}>
+                          Subscription period:{" "}
+                          <strong>{formatDateTime(billingProfile.currentPeriodStart)}</strong>
+                          {" → "}
+                          <strong>{formatDateTime(billingProfile.currentPeriodEnd)}</strong>
+                          {billingProfile.cancelAtPeriodEnd ? " · Cancels at period end" : ""}
+                        </p>
+                      ) : null}
+                      {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining !== null ? (
                         <p style={{ margin: 0, fontSize: 12, opacity: 0.86 }}>
                           Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
                           {" · "}
                           Remaining: <strong>{trialMinutesRemaining}</strong> minutes
+                        </p>
+                      ) : null}
+                      {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining === null ? (
+                        <p style={{ margin: 0, fontSize: 12, opacity: 0.78 }}>
+                          Trial usage details will appear after the next usage tick.
+                        </p>
+                      ) : null}
+                      {!isTrialPlan && !hasSubscriptionPeriod ? (
+                        <p style={{ margin: 0, fontSize: 12, opacity: 0.76 }}>
+                          Subscription period is syncing from Stripe. Click refresh in a few seconds.
                         </p>
                       ) : null}
                     </div>
@@ -1340,9 +1467,11 @@ export default function HostChurchPage() {
                           padding: "8px 10px",
                         }}
                       >
-                        <option value="starter">{PLAN_LABELS.starter}</option>
-                        <option value="growth">{PLAN_LABELS.growth}</option>
-                        <option value="premium">{PLAN_LABELS.premium}</option>
+                        {selectablePaidPlans.map((plan) => (
+                          <option key={plan} value={plan}>
+                            {PLAN_LABELS[plan]}
+                          </option>
+                        ))}
                       </select>
                       <button
                         onClick={openUpgradeCheckout}
@@ -1378,9 +1507,9 @@ export default function HostChurchPage() {
                       </button>
                       <button
                         onClick={() => {
-                          void loadBillingProfile();
+                          void loadBillingProfile({ refresh: true });
                         }}
-                        disabled={billingPortalBusy || billingCheckoutBusy || !resolvedOrgId}
+                        disabled={billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId}
                         style={{
                           borderRadius: 8,
                           border: "1px solid rgba(255,255,255,0.24)",
@@ -1388,11 +1517,11 @@ export default function HostChurchPage() {
                           color: "#cbd5e1",
                           fontWeight: 600,
                           padding: "8px 12px",
-                          cursor: billingPortalBusy || billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          opacity: billingPortalBusy || billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
+                          cursor: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          opacity: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? 0.6 : 1,
                         }}
                       >
-                        Refresh Billing
+                        {billingRefreshBusy ? "Refreshing..." : "Refresh Billing"}
                       </button>
                     </div>
                   ) : (
@@ -1574,6 +1703,8 @@ export default function HostChurchPage() {
                         const qs = new URLSearchParams();
                         qs.set("orgId", resolvedOrgId);
                         if (slug) qs.set("churchSlug", slug);
+                        const returnTo = (router.asPath || "").trim();
+                        if (returnTo.startsWith("/") && !returnTo.startsWith("//")) qs.set("returnTo", returnTo);
                         void router.push(`/admin/sermon-prep?${qs.toString()}`);
                       }}
                       style={{

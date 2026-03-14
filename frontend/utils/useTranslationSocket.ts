@@ -60,6 +60,8 @@ type ServerLive = {
   tgt?: { lang?: string };
 };
 
+export type SocketConnectionState = 'connected' | 'reconnecting' | 'disconnected'
+
 export type LastState = {
   text: string;
   lang: string;
@@ -77,6 +79,10 @@ export type LastState = {
 
 export type TranslationSocketHook = {
   connected: boolean;
+  connectionState: SocketConnectionState;
+  reconnectAttempt: number;
+  lastSeenAt: number | null;
+  disconnectStartedAt: number | null;
   last: LastState;
   sendProducerText: (
     text: string,
@@ -90,9 +96,18 @@ export type TranslationSocketHook = {
   sendDisplayConfig: (speed: number) => void;
 };
 
+const HEARTBEAT_INTERVAL_MS = 10000
+const HEARTBEAT_TIMEOUT_MS = 18000
+const RECONNECTING_UI_DELAY_MS = 2000
+const DISCONNECTED_UI_DELAY_MS = 3000
+
 export function useTranslationSocket({ isProducer = false }: { isProducer?: boolean } = {}): TranslationSocketHook {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
+  const [connectionState, setConnectionState] = useState<SocketConnectionState>('reconnecting')
+  const [reconnectAttempt, setReconnectAttempt] = useState(0)
+  const [lastSeenAt, setLastSeenAt] = useState<number | null>(null)
+  const [disconnectStartedAt, setDisconnectStartedAt] = useState<number | null>(null)
   const [last, setLast] = useState<LastState>({
     text: '',
     lang: 'en',
@@ -105,8 +120,14 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
 
   const retryRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const reconnectingStateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disconnectStateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
   const contextRef = useRef<StreamContext>({});
+  const lastSeenAtRef = useRef<number | null>(null)
+  const disconnectStartedAtRef = useRef<number | null>(null)
+  const hasConnectedRef = useRef(false)
 
   const seqRef = useRef(0);
   const nextSeq = () => ++seqRef.current;
@@ -133,23 +154,124 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
       console.warn('[ws] Suspicious WS_URL:', wsConnectUrl);
     }
 
+    const clearHeartbeatTimer = () => {
+      if (heartbeatTimerRef.current) {
+        clearInterval(heartbeatTimerRef.current)
+        heartbeatTimerRef.current = null
+      }
+    }
+
+    const clearDisconnectStateTimer = () => {
+      if (disconnectStateTimerRef.current) {
+        clearTimeout(disconnectStateTimerRef.current)
+        disconnectStateTimerRef.current = null
+      }
+    }
+
+    const clearReconnectingStateTimer = () => {
+      if (reconnectingStateTimerRef.current) {
+        clearTimeout(reconnectingStateTimerRef.current)
+        reconnectingStateTimerRef.current = null
+      }
+    }
+
+    const markSeen = (seenAt = Date.now()) => {
+      lastSeenAtRef.current = seenAt
+      setLastSeenAt(seenAt)
+    }
+
+    const setHealthy = (seenAt = Date.now()) => {
+      hasConnectedRef.current = true
+      clearReconnectingStateTimer()
+      clearDisconnectStateTimer()
+      disconnectStartedAtRef.current = null
+      setDisconnectStartedAt(null)
+      setConnected(true)
+      setConnectionState('connected')
+      markSeen(seenAt)
+    }
+
+    const markUnhealthy = (startedAt = disconnectStartedAtRef.current ?? Date.now()) => {
+      setConnected(false)
+      disconnectStartedAtRef.current = startedAt
+      setDisconnectStartedAt(startedAt)
+      clearReconnectingStateTimer()
+      clearDisconnectStateTimer()
+      const elapsed = Date.now() - startedAt
+      if (hasConnectedRef.current && elapsed < RECONNECTING_UI_DELAY_MS) {
+        setConnectionState('connected')
+        reconnectingStateTimerRef.current = setTimeout(() => {
+          const activeWs = wsRef.current
+          const socketOpen = !!activeWs && activeWs.readyState === WebSocket.OPEN
+          if (!socketOpen && disconnectStartedAtRef.current === startedAt) {
+            setConnectionState('reconnecting')
+          }
+        }, Math.max(0, RECONNECTING_UI_DELAY_MS - elapsed))
+      } else if (elapsed < DISCONNECTED_UI_DELAY_MS) {
+        setConnectionState('reconnecting')
+      } else {
+        setConnectionState('disconnected')
+      }
+      const remaining = Math.max(0, DISCONNECTED_UI_DELAY_MS - (Date.now() - startedAt))
+      disconnectStateTimerRef.current = setTimeout(() => {
+        const activeWs = wsRef.current
+        const socketOpen = !!activeWs && activeWs.readyState === WebSocket.OPEN
+        if (!socketOpen && disconnectStartedAtRef.current === startedAt) {
+          setConnectionState('disconnected')
+        }
+      }, remaining)
+    }
+
+    const startHeartbeat = (ws: WebSocket) => {
+      clearHeartbeatTimer()
+      heartbeatTimerRef.current = setInterval(() => {
+        if (!aliveRef.current || wsRef.current !== ws || ws.readyState !== WebSocket.OPEN) {
+          clearHeartbeatTimer()
+          return
+        }
+        const now = Date.now()
+        const lastSeen = lastSeenAtRef.current ?? now
+        if (now - lastSeen > HEARTBEAT_TIMEOUT_MS) {
+          console.warn('[ws] heartbeat timeout', {
+            url: wsConnectUrl,
+            retryAttempt: retryRef.current,
+            idleMs: now - lastSeen,
+          })
+          try {
+            ws.close(4001, 'heartbeat_timeout')
+          } catch {}
+          return
+        }
+        try {
+          ws.send(JSON.stringify({ type: 'ping', clientTs: now }))
+        } catch (err) {
+          d('ws', 'heartbeat send failed', err)
+        }
+      }, HEARTBEAT_INTERVAL_MS)
+    }
+
     const connect = () => {
       if (!aliveRef.current) return;
       if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
-
-      try { wsRef.current?.close(); } catch {}
+      const current = wsRef.current
+      if (current && (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)) {
+        return
+      }
+      markUnhealthy()
       const ws = new WebSocket(wsConnectUrl);
       wsRef.current = ws;
 
       d('ws', 'connecting ' + wsConnectUrl);
-      setConnected(false);
 
       ws.onopen = () => {
+        if (wsRef.current !== ws) return
         d('ws', 'open');
-        setConnected(true);
+        setHealthy()
         retryRef.current = 0;
+        setReconnectAttempt(0)
         // reset local seq on a fresh connection so effects re-run on first message
         seqRef.current = 0;
+        startHeartbeat(ws)
         try {
           const payload: Record<string, string> = { type: 'consumer_join', role: isProducer ? 'host' : 'listener' };
           if (streamContext.orgId) payload.orgId = streamContext.orgId;
@@ -165,25 +287,48 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         } catch {}
       };
 
-      ws.onclose = () => {
-        d('ws', 'closed');
-        setConnected(false);
+      ws.onclose = (evt) => {
+        if (wsRef.current !== ws) return
+        wsRef.current = null
+        clearHeartbeatTimer()
+        d('ws', 'closed', { code: evt.code, reason: evt.reason, wasClean: evt.wasClean });
+        console.warn('[ws] closed', {
+          url: wsConnectUrl,
+          code: evt.code,
+          reason: evt.reason,
+          wasClean: evt.wasClean,
+          retryAttempt: retryRef.current,
+        })
+        markUnhealthy()
         if (!aliveRef.current) return;
-        const delay = Math.min(30000, 1000 * Math.pow(2, retryRef.current++));
+        const nextAttempt = retryRef.current + 1
+        retryRef.current = nextAttempt
+        setReconnectAttempt(nextAttempt)
+        const delay = Math.min(30000, 1000 * Math.pow(2, nextAttempt - 1));
         d('ws', `reconnect in ${delay}ms`);
         retryTimerRef.current = setTimeout(connect, delay);
       };
 
       ws.onerror = (e) => {
+        if (wsRef.current !== ws) return
         d('ws', 'error', e);
       };
 
       ws.onmessage = (evt: MessageEvent) => {
+        if (wsRef.current !== ws) return
+        markSeen()
         // helpful one-line peek at traffic shape:
         // d('ws<-', (evt.data as string).slice(0, 200));
         let raw: any;
         try { raw = JSON.parse(evt.data as string); } catch { return; }
         if (!raw || typeof raw !== 'object') return;
+        if (raw.type === 'pong') return;
+        if (raw.type === 'ping') {
+          try {
+            ws.send(JSON.stringify({ type: 'pong', clientTs: raw.clientTs, serverTs: Date.now() }))
+          } catch {}
+          return
+        }
 
         // Shape 3: { mode: 'live'|'pre'|'realtime', text, seq?, src?, tgt? }
         if (typeof raw.text === 'string' && raw.mode) {
@@ -276,8 +421,13 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
 
     return () => {
       aliveRef.current = false;
+      clearHeartbeatTimer()
+      clearReconnectingStateTimer()
+      clearDisconnectStateTimer()
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
       try { wsRef.current?.close(); } catch {}
+      wsRef.current = null
+      setConnected(false)
     };
   }, [isProducer]);
 
@@ -315,5 +465,14 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     ws.send(JSON.stringify(payload));
   }, []);
 
-  return { connected, last, sendProducerText, sendDisplayConfig };
+  return {
+    connected,
+    connectionState,
+    reconnectAttempt,
+    lastSeenAt,
+    disconnectStartedAt,
+    last,
+    sendProducerText,
+    sendDisplayConfig,
+  };
 }

@@ -7,7 +7,7 @@ import json
 import os
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
@@ -59,6 +59,24 @@ def _resolve_plan_from_price_id(price_id: str, *, fallback_plan_key: str) -> str
     return plan_spec(fallback_plan_key).key
 
 
+def _is_valid_price_id(price_id: str) -> bool:
+    return _clean(price_id).startswith("price_")
+
+
+def _is_missing_customer_error(exc: StripeClientError) -> bool:
+    token = _clean(str(exc)).lower()
+    if not token:
+        return False
+    return "no such customer" in token or ("customer" in token and "not found" in token)
+
+
+def _is_missing_subscription_error(exc: StripeClientError) -> bool:
+    token = _clean(str(exc)).lower()
+    if not token:
+        return False
+    return "no such subscription" in token or ("subscription" in token and "not found" in token)
+
+
 def _status_from_stripe(raw_status: str, *, fallback_status: str) -> str:
     token = _clean(raw_status).lower()
     if token in {"trialing", "active", "past_due", "canceled", "incomplete", "unpaid"}:
@@ -76,6 +94,198 @@ def _to_datetime(raw_unix: Any) -> Optional[datetime]:
     if value <= 0:
         return None
     return datetime.fromtimestamp(value, tz=timezone.utc)
+
+
+def _to_positive_int(raw_value: Any) -> int:
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def _price_id_from_subscription(subscription: Dict[str, Any]) -> str:
+    items = subscription.get("items")
+    if not isinstance(items, dict):
+        return ""
+    rows = items.get("data")
+    if not isinstance(rows, list):
+        return ""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        price = row.get("price")
+        if isinstance(price, dict):
+            token = _clean(price.get("id"))
+            if token:
+                return token
+        else:
+            token = _clean(price)
+            if token:
+                return token
+    return ""
+
+
+def _first_subscription_item(subscription: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    items = subscription.get("items")
+    if not isinstance(items, dict):
+        return None
+    rows = items.get("data")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if isinstance(row, dict):
+            return row
+    return None
+
+
+def _subscription_period_datetime(subscription: Dict[str, Any], field_name: str) -> Optional[datetime]:
+    direct_value = _to_datetime(subscription.get(field_name))
+    if direct_value is not None:
+        return direct_value
+    first_item = _first_subscription_item(subscription)
+    if not isinstance(first_item, dict):
+        return None
+    return _to_datetime(first_item.get(field_name))
+
+
+def _merge_subscription_snapshot(
+    *,
+    billing: Dict[str, Any],
+    stripe_subscription: Dict[str, Any],
+    now: datetime,
+) -> Dict[str, Any]:
+    next_billing = dict(billing or {})
+    stripe_status = _status_from_stripe(
+        str(stripe_subscription.get("status") or ""),
+        fallback_status=str(next_billing.get("status") or "trialing"),
+    )
+    subscription_id = _clean(stripe_subscription.get("id"))
+    customer_id = _clean(stripe_subscription.get("customer"))
+    cancel_at_period_end = bool(stripe_subscription.get("cancel_at_period_end"))
+    current_period_start = _subscription_period_datetime(stripe_subscription, "current_period_start")
+    current_period_end = _subscription_period_datetime(stripe_subscription, "current_period_end")
+    trial_end = _to_datetime(stripe_subscription.get("trial_end"))
+    price_id = _price_id_from_subscription(stripe_subscription)
+    requested_plan = plan_spec(
+        _resolve_plan_from_price_id(
+            price_id,
+            fallback_plan_key=str(next_billing.get("planKey") or "trial"),
+        )
+    )
+
+    next_billing["status"] = stripe_status
+    next_billing["cancelAtPeriodEnd"] = cancel_at_period_end
+    next_billing["currentPeriodStart"] = current_period_start
+    next_billing["currentPeriodEnd"] = current_period_end
+    next_billing["trialEndsAt"] = trial_end if stripe_status == "trialing" else None
+    next_billing["priceId"] = price_id or next_billing.get("priceId")
+    next_billing["planKey"] = requested_plan.key
+    next_billing.setdefault("limits", {})
+    next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
+    if customer_id:
+        next_billing["stripeCustomerId"] = customer_id
+    if subscription_id:
+        next_billing["stripeSubscriptionId"] = subscription_id
+
+    if stripe_status == "past_due":
+        next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
+    elif stripe_status in {"active", "trialing"}:
+        next_billing["graceEndsAt"] = None
+
+    next_billing.setdefault("entitlements", {})
+    next_billing["entitlements"]["canStartService"] = _can_start_from_status(
+        status=str(next_billing.get("status") or ""),
+        grace_ends_at=next_billing.get("graceEndsAt") if isinstance(next_billing.get("graceEndsAt"), datetime) else None,
+        now=now,
+    )
+    next_billing["updatedAt"] = now
+    return next_billing
+
+
+def _subscription_sort_key(subscription: Dict[str, Any]) -> tuple[int, int, int]:
+    status = _status_from_stripe(
+        str(subscription.get("status") or ""),
+        fallback_status="canceled",
+    )
+    status_rank = {
+        "active": 0,
+        "trialing": 1,
+        "past_due": 2,
+        "incomplete": 3,
+        "unpaid": 4,
+        "canceled": 5,
+    }.get(status, 99)
+    current_period_end = _to_positive_int(subscription.get("current_period_end"))
+    created_at = _to_positive_int(subscription.get("created"))
+    return (status_rank, -current_period_end, -created_at)
+
+
+def _pick_customer_subscription(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return None
+    candidates = [row for row in rows if isinstance(row, dict)]
+    if not candidates:
+        return None
+    return min(candidates, key=_subscription_sort_key)
+
+
+def _lookup_customer_subscription(client: StripeBillingClient, *, customer_id: str) -> Optional[Dict[str, Any]]:
+    clean_customer_id = _clean(customer_id)
+    if not clean_customer_id:
+        return None
+    return _pick_customer_subscription(
+        client.list_subscriptions(customer_id=clean_customer_id, status="all", limit=10)
+    )
+
+
+def _should_sync_billing_from_stripe(*, billing: Dict[str, Any], force_refresh: bool) -> bool:
+    if force_refresh:
+        return True
+    has_current_period = bool((billing or {}).get("currentPeriodStart")) and bool((billing or {}).get("currentPeriodEnd"))
+    plan_token = _clean((billing or {}).get("planKey")).lower()
+    return (not has_current_period) or plan_token == "trial"
+
+
+def _hydrate_billing_from_stripe(
+    *,
+    org_id: str,
+    billing: Dict[str, Any],
+    force_refresh: bool,
+) -> Dict[str, Any]:
+    if not _clean(BILLING_CONFIG.stripe_secret_key):
+        return billing
+    if not _should_sync_billing_from_stripe(billing=billing, force_refresh=force_refresh):
+        return billing
+
+    client = _stripe_client()
+    subscription_id = _clean((billing or {}).get("stripeSubscriptionId"))
+    customer_id = _clean((billing or {}).get("stripeCustomerId"))
+    stripe_subscription: Optional[Dict[str, Any]] = None
+
+    if force_refresh and customer_id:
+        stripe_subscription = _lookup_customer_subscription(client, customer_id=customer_id)
+
+    if not stripe_subscription and subscription_id:
+        try:
+            stripe_subscription = client.retrieve_subscription(subscription_id=subscription_id)
+        except StripeClientError as exc:
+            if not customer_id or not _is_missing_subscription_error(exc):
+                raise
+
+    if not stripe_subscription and customer_id:
+        stripe_subscription = _lookup_customer_subscription(client, customer_id=customer_id)
+
+    if not stripe_subscription:
+        return billing
+
+    next_billing = _merge_subscription_snapshot(
+        billing=billing,
+        stripe_subscription=stripe_subscription,
+        now=_utcnow(),
+    )
+    return multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
 
 
 def _can_start_from_status(*, status: str, grace_ends_at: Optional[datetime], now: datetime) -> bool:
@@ -142,6 +352,7 @@ def _resolve_org_id_from_event(event_type: str, stripe_obj: Dict[str, Any]) -> O
 @router.get("/billing/org/{org_id}/status")
 def billing_status(
     org_id: str,
+    refresh: bool = Query(default=False),
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     require_org_role(org_id=org_id, user=user, roles={"owner", "admin", "host"}, store=multichurch_store, missing_membership_detail="forbidden")
@@ -152,6 +363,20 @@ def billing_status(
         if detail == "org_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_status_fetch_failed") from exc
+    try:
+        billing = _hydrate_billing_from_stripe(
+            org_id=org_id,
+            billing=billing,
+            force_refresh=bool(refresh),
+        )
+    except StripeClientError as exc:
+        if refresh:
+            raise HTTPException(status_code=502, detail=str(exc) or "stripe_sync_failed") from exc
+        # Keep returning local billing snapshot even if Stripe sync is temporarily unavailable.
+    except ValueError as exc:
+        if refresh:
+            raise HTTPException(status_code=400, detail=str(exc) or "billing_status_sync_failed") from exc
+        # Keep returning local billing snapshot even if Stripe sync is temporarily unavailable.
     return {"orgId": org_id, "billing": billing}
 
 
@@ -166,6 +391,8 @@ def create_checkout_session(
         raise HTTPException(status_code=400, detail="invalid_plan")
     price_id = _clean(BILLING_CONFIG.stripe_price_ids.get(target_plan.key))
     if not price_id:
+        raise HTTPException(status_code=503, detail="billing_not_configured")
+    if not _is_valid_price_id(price_id):
         raise HTTPException(status_code=503, detail="billing_not_configured")
     if not _clean(BILLING_CONFIG.stripe_secret_key):
         raise HTTPException(status_code=503, detail="billing_not_configured")
@@ -198,12 +425,37 @@ def create_checkout_session(
             price_id=price_id,
             success_url=body.successUrl,
             cancel_url=body.cancelUrl,
-            trial_days=int(BILLING_CONFIG.trial_days),
+            trial_days=0,
             allow_no_payment_method=True,
             metadata={"orgId": body.orgId, "planKey": target_plan.key, "requestedByUid": user.uid},
         )
     except StripeClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # If the stored Stripe customer belongs to a different account/mode, recreate and retry once.
+        if customer_id and _is_missing_customer_error(exc):
+            try:
+                customer = client.create_customer(
+                    email=user.email,
+                    name=user.displayName,
+                    metadata={"orgId": body.orgId, "createdByUid": user.uid},
+                )
+                customer_id = _clean((customer or {}).get("id"))
+                if not customer_id:
+                    raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
+                billing["stripeCustomerId"] = customer_id
+                multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+                session = client.create_checkout_session(
+                    customer_id=customer_id,
+                    price_id=price_id,
+                    success_url=body.successUrl,
+                    cancel_url=body.cancelUrl,
+                    trial_days=0,
+                    allow_no_payment_method=True,
+                    metadata={"orgId": body.orgId, "planKey": target_plan.key, "requestedByUid": user.uid},
+                )
+            except StripeClientError as retry_exc:
+                raise HTTPException(status_code=502, detail=str(retry_exc)) from retry_exc
+        else:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     checkout_url = _clean((session or {}).get("url"))
     session_id = _clean((session or {}).get("id"))
@@ -307,41 +559,21 @@ async def stripe_webhook(
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
 
     elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
-        stripe_status = _status_from_stripe(str(payload_obj.get("status") or ""), fallback_status=str(next_billing.get("status") or "trialing"))
-        if event_type == "customer.subscription.deleted":
-            stripe_status = "canceled"
-
-        subscription_id = _clean(payload_obj.get("id"))
-        customer_id = _clean(payload_obj.get("customer"))
-        cancel_at_period_end = bool(payload_obj.get("cancel_at_period_end"))
-        current_period_start = _to_datetime(payload_obj.get("current_period_start"))
-        current_period_end = _to_datetime(payload_obj.get("current_period_end"))
-        trial_end = _to_datetime(payload_obj.get("trial_end"))
-
-        items = (payload_obj.get("items") or {}).get("data") if isinstance(payload_obj.get("items"), dict) else None
-        price_id = ""
-        if isinstance(items, list) and items:
-            first = items[0] or {}
-            if isinstance(first, dict):
-                price = first.get("price") or {}
-                if isinstance(price, dict):
-                    price_id = _clean(price.get("id"))
-
-        requested_plan = plan_spec(metadata.get("planKey") or _resolve_plan_from_price_id(price_id, fallback_plan_key=str(next_billing.get("planKey") or "trial")))
-
-        next_billing["status"] = stripe_status
-        next_billing["cancelAtPeriodEnd"] = cancel_at_period_end
-        next_billing["currentPeriodStart"] = current_period_start
-        next_billing["currentPeriodEnd"] = current_period_end
-        next_billing["trialEndsAt"] = trial_end if stripe_status == "trialing" else next_billing.get("trialEndsAt")
-        next_billing["priceId"] = price_id or next_billing.get("priceId")
+        next_billing = _merge_subscription_snapshot(
+            billing=next_billing,
+            stripe_subscription=payload_obj,
+            now=now,
+        )
+        stripe_status = _clean(next_billing.get("status")).lower()
+        requested_plan = plan_spec(str(metadata.get("planKey") or next_billing.get("planKey") or "trial"))
         next_billing["planKey"] = requested_plan.key
         next_billing.setdefault("limits", {})
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
-        if customer_id:
-            next_billing["stripeCustomerId"] = customer_id
-        if subscription_id:
-            next_billing["stripeSubscriptionId"] = subscription_id
+
+        if event_type == "customer.subscription.deleted":
+            next_billing["status"] = "canceled"
+            next_billing["trialEndsAt"] = None
+            stripe_status = "canceled"
         if stripe_status == "past_due":
             next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
         elif stripe_status in {"active", "trialing"}:

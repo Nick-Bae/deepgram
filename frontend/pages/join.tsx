@@ -26,12 +26,6 @@ export default function JoinByInvitePage() {
   }, [router.query.code]);
 
   useEffect(() => {
-    if (!router.isReady || loading || !configured || user || !inviteCode) return;
-    const nextPath = `/join?code=${encodeURIComponent(inviteCode)}`;
-    router.replace(`/login?next=${encodeURIComponent(nextPath)}`);
-  }, [configured, inviteCode, loading, router, user]);
-
-  useEffect(() => {
     if (!router.isReady || loading || !configured || !user || !inviteCode) return;
     let cancelled = false;
     const run = async () => {
@@ -83,6 +77,7 @@ export default function JoinByInvitePage() {
   };
 
   const showJoinButton = Boolean(preview && user && configured);
+  const nextJoinPath = `/join?code=${encodeURIComponent(inviteCode || "")}`;
 
   return (
     <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc", padding: 18 }}>
@@ -137,10 +132,38 @@ export default function JoinByInvitePage() {
           </button>
         ) : null}
 
-        {!user && configured ? (
-          <p style={{ marginTop: 12, marginBottom: 0, opacity: 0.85 }}>
-            Please <Link href={`/login?next=${encodeURIComponent(`/join?code=${encodeURIComponent(inviteCode || "")}`)}`} style={{ color: "#93c5fd" }}>sign in</Link> first.
-          </p>
+        {!user && configured && inviteCode ? (
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            <p style={{ margin: 0, opacity: 0.85 }}>
+              This invite requires an account.
+            </p>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              <Link
+                href={`/login?next=${encodeURIComponent(nextJoinPath)}`}
+                style={{
+                  borderRadius: 8,
+                  background: "#22c55e",
+                  color: "#052e16",
+                  fontWeight: 700,
+                  padding: "8px 12px",
+                }}
+              >
+                Sign in to join
+              </Link>
+              <Link
+                href={`/signup?next=${encodeURIComponent(nextJoinPath)}`}
+                style={{
+                  borderRadius: 8,
+                  border: "1px solid rgba(255,255,255,0.28)",
+                  color: "#e2e8f0",
+                  fontWeight: 700,
+                  padding: "8px 12px",
+                }}
+              >
+                Create account to join
+              </Link>
+            </div>
+          </div>
         ) : null}
       </section>
     </main>

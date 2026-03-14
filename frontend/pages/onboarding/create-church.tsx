@@ -1,7 +1,7 @@
 import { useRouter } from "next/router";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
-import { bootstrapOwnerOrg, fetchAuthMe } from "../../lib/backendAuth";
+import { bootstrapOwnerOrg, checkChurchSlugAvailability, fetchAuthMe } from "../../lib/backendAuth";
 import { useAuth } from "../../lib/authContext";
 import { normalizeChurchSlug } from "../../lib/churchSlug";
 import { clearHostToken, persistAuthToken, persistStreamContext } from "../../utils/streamContext";
@@ -15,12 +15,52 @@ export default function CreateChurchOnboardingPage() {
   const [churchName, setChurchName] = useState("");
   const [churchSlug, setChurchSlug] = useState("");
   const [slugTouched, setSlugTouched] = useState(false);
+  const [slugAvailabilityBusy, setSlugAvailabilityBusy] = useState(false);
+  const [slugAvailable, setSlugAvailable] = useState<boolean | null>(null);
+  const [slugSuggestions, setSlugSuggestions] = useState<string[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const slugCheckSeqRef = useRef(0);
+  const normalizedSlug = normalizeChurchSlug(churchSlug);
 
   useEffect(() => {
     if (slugTouched) return;
     setChurchSlug(normalizeChurchSlug(churchName));
   }, [churchName, slugTouched]);
+
+  useEffect(() => {
+    if (!normalizedSlug) {
+      setSlugAvailabilityBusy(false);
+      setSlugAvailable(null);
+      setSlugSuggestions([]);
+      return;
+    }
+    setSlugAvailabilityBusy(true);
+    const seq = slugCheckSeqRef.current + 1;
+    slugCheckSeqRef.current = seq;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const payload = await checkChurchSlugAvailability(normalizedSlug);
+          if (slugCheckSeqRef.current !== seq) return;
+          setSlugAvailable(Boolean(payload.available));
+          const suggestions = (payload.suggestions || [])
+            .map((value) => normalizeChurchSlug(value))
+            .filter((value, index, rows) => Boolean(value) && value !== normalizedSlug && rows.indexOf(value) === index)
+            .slice(0, 3);
+          setSlugSuggestions(suggestions);
+        } catch {
+          if (slugCheckSeqRef.current !== seq) return;
+          setSlugAvailable(null);
+          setSlugSuggestions([]);
+        } finally {
+          if (slugCheckSeqRef.current === seq) {
+            setSlugAvailabilityBusy(false);
+          }
+        }
+      })();
+    }, 260);
+    return () => clearTimeout(timer);
+  }, [normalizedSlug]);
 
   useEffect(() => {
     if (loading) return;
@@ -63,6 +103,15 @@ export default function CreateChurchOnboardingPage() {
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!configured) return;
+    const safeSlug = normalizeChurchSlug(churchSlug);
+    if (!safeSlug) {
+      setErrorMsg("Church slug is required.");
+      return;
+    }
+    if (slugAvailable === false) {
+      setErrorMsg("That church URL slug is already in use. Choose one of the suggestions.");
+      return;
+    }
     setBusy(true);
     setErrorMsg(null);
     try {
@@ -71,8 +120,6 @@ export default function CreateChurchOnboardingPage() {
         throw new Error("Please sign in again.");
       }
       persistAuthToken(token);
-      const safeSlug = normalizeChurchSlug(churchSlug);
-      if (!safeSlug) throw new Error("Church slug is required.");
       const created = await bootstrapOwnerOrg(token, {
         churchName: churchName.trim(),
         churchSlug: safeSlug,
@@ -93,13 +140,26 @@ export default function CreateChurchOnboardingPage() {
       params.set("serviceKey", serviceKey);
       await router.replace(`/host/c/${encodeURIComponent(org.slug)}/broadcast?${params.toString()}`);
     } catch (err) {
+      if (err instanceof Error && err.message.toLowerCase().includes("slug")) {
+        try {
+          const payload = await checkChurchSlugAvailability(safeSlug);
+          setSlugAvailable(Boolean(payload.available));
+          const suggestions = (payload.suggestions || [])
+            .map((value) => normalizeChurchSlug(value))
+            .filter((value, index, rows) => Boolean(value) && value !== safeSlug && rows.indexOf(value) === index)
+            .slice(0, 3);
+          setSlugSuggestions(suggestions);
+        } catch {
+          // no-op; keep original error message.
+        }
+      }
       setErrorMsg(err instanceof Error ? err.message : "Failed to create church.");
     } finally {
       setBusy(false);
     }
   };
 
-  const disabled = !configured || busy || checkingMembership;
+  const disabled = !configured || busy || checkingMembership || !normalizedSlug || slugAvailabilityBusy || slugAvailable === false;
 
   return (
     <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc", padding: 18 }}>
@@ -140,6 +200,37 @@ export default function CreateChurchOnboardingPage() {
               title="Use lowercase letters, numbers, and hyphens."
               style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
             />
+            {slugAvailabilityBusy ? <span style={{ fontSize: 12, opacity: 0.76 }}>Checking slug availability…</span> : null}
+            {!slugAvailabilityBusy && slugAvailable === true ? <span style={{ fontSize: 12, color: "#86efac" }}>Slug is available.</span> : null}
+            {!slugAvailabilityBusy && slugAvailable === false ? (
+              <span style={{ fontSize: 12, color: "#fca5a5" }}>That slug is already taken.</span>
+            ) : null}
+            {!slugAvailabilityBusy && slugAvailable === false && slugSuggestions.length ? (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {slugSuggestions.map((suggestion) => (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    onClick={() => {
+                      setSlugTouched(true);
+                      setChurchSlug(suggestion);
+                      setErrorMsg(null);
+                    }}
+                    style={{
+                      borderRadius: 999,
+                      border: "1px solid rgba(147,197,253,0.5)",
+                      background: "rgba(30,58,138,0.35)",
+                      color: "#bfdbfe",
+                      fontSize: 12,
+                      padding: "4px 10px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Use {suggestion}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </label>
           <button
             type="submit"

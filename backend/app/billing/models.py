@@ -23,9 +23,9 @@ PREMIUM_PLAN_KEY = "premium"
 
 PLAN_SPECS: Dict[str, PlanSpec] = {
     TRIAL_PLAN_KEY: PlanSpec(key=TRIAL_PLAN_KEY, max_service_keys=2, amount_usd=0),
-    STARTER_PLAN_KEY: PlanSpec(key=STARTER_PLAN_KEY, max_service_keys=5, amount_usd=10),
-    GROWTH_PLAN_KEY: PlanSpec(key=GROWTH_PLAN_KEY, max_service_keys=12, amount_usd=20),
-    PREMIUM_PLAN_KEY: PlanSpec(key=PREMIUM_PLAN_KEY, max_service_keys=0, amount_usd=50),
+    STARTER_PLAN_KEY: PlanSpec(key=STARTER_PLAN_KEY, max_service_keys=5, amount_usd=20),
+    GROWTH_PLAN_KEY: PlanSpec(key=GROWTH_PLAN_KEY, max_service_keys=12, amount_usd=40),
+    PREMIUM_PLAN_KEY: PlanSpec(key=PREMIUM_PLAN_KEY, max_service_keys=0, amount_usd=60),
 }
 
 

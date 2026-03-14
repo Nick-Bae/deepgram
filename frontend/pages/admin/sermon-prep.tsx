@@ -9,10 +9,18 @@ import { fetchAuthMe, type OrgMembership } from "../../lib/backendAuth";
 
 const SCRIPT_MANAGER_ROLES = new Set(["owner", "admin", "host"]);
 
+function safeRelativeHref(raw: string): string {
+  const token = (raw || "").trim();
+  if (!token.startsWith("/") || token.startsWith("//")) return "";
+  return token;
+}
+
 export default function AdminSermonPrepPage() {
   const router = useRouter();
   const { user, loading: authLoading, getIdToken, logout } = useAuth();
   const queryOrgId = typeof router.query.orgId === "string" ? router.query.orgId : "";
+  const queryChurchSlug = typeof router.query.churchSlug === "string" ? router.query.churchSlug : "";
+  const queryReturnTo = typeof router.query.returnTo === "string" ? router.query.returnTo : "";
   const [memberships, setMemberships] = useState<OrgMembership[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState("");
   const [membershipLoading, setMembershipLoading] = useState(true);
@@ -26,6 +34,19 @@ export default function AdminSermonPrepPage() {
     const role = (selectedMembership?.role || "").trim().toLowerCase();
     return SCRIPT_MANAGER_ROLES.has(role);
   }, [selectedMembership?.role]);
+  const dashboardHref = useMemo(() => {
+    const explicitReturn = safeRelativeHref(queryReturnTo);
+    if (explicitReturn && (!selectedOrgId || !queryOrgId || selectedOrgId === queryOrgId)) {
+      return explicitReturn;
+    }
+    const churchSlug = (selectedMembership?.slug || queryChurchSlug || "").trim();
+    if (!churchSlug) return "";
+    const params = new URLSearchParams();
+    if (selectedOrgId) params.set("orgId", selectedOrgId);
+    const query = params.toString();
+    const base = `/host/c/${encodeURIComponent(churchSlug)}/broadcast`;
+    return query ? `${base}?${query}` : base;
+  }, [queryChurchSlug, queryOrgId, queryReturnTo, selectedMembership?.slug, selectedOrgId]);
 
   useEffect(() => {
     if (authLoading) return;
@@ -117,6 +138,11 @@ export default function AdminSermonPrepPage() {
                 </p>
               </div>
               <div className="flex gap-2">
+                {dashboardHref ? (
+                  <Link href={dashboardHref} className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white">
+                    Back to Dashboard
+                  </Link>
+                ) : null}
                 <Link href="/admin" className="rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700">
                   Admin Home
                 </Link>
