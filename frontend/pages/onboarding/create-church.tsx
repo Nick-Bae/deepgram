@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { bootstrapOwnerOrg, checkChurchSlugAvailability, fetchAuthMe } from "../../lib/backendAuth";
 import { useAuth } from "../../lib/authContext";
 import { normalizeChurchSlug } from "../../lib/churchSlug";
+import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../../lib/dashboardRoute";
 import { clearHostToken, persistAuthToken, persistStreamContext } from "../../utils/streamContext";
 
 export default function CreateChurchOnboardingPage() {
@@ -79,13 +80,10 @@ export default function CreateChurchOnboardingPage() {
         if (!token || cancelled) return;
         persistAuthToken(token);
         const me = await fetchAuthMe(token);
-        const preferredOrgId = (me.currentOrgId || "").trim();
-        const primary = me.memberships.find((row) => row.orgId === preferredOrgId) || me.memberships[0];
+        const primary = pickPreferredMembership(me);
         if (!primary || cancelled) return;
-        clearHostToken();
-        const params = new URLSearchParams();
-        params.set("orgId", primary.orgId);
-        await router.replace(`/host/c/${encodeURIComponent(primary.slug)}/broadcast?${params.toString()}`);
+        persistDashboardContext(primary);
+        await router.replace(buildDashboardHref(primary));
       } catch (err) {
         if (!cancelled && err instanceof Error) {
           setErrorMsg(err.message);

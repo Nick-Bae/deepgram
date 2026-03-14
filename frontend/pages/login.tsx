@@ -4,7 +4,8 @@ import { FormEvent, useMemo, useState } from "react";
 
 import { fetchAuthMe, type OrgMembership } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
-import { clearHostToken, persistAuthToken, persistStreamContext } from "../utils/streamContext";
+import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../lib/dashboardRoute";
+import { clearHostToken, persistAuthToken } from "../utils/streamContext";
 
 function mapFirebaseError(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
@@ -70,8 +71,7 @@ export default function LoginPage() {
   const redirectFromMembership = async (idToken: string) => {
     const me = await fetchAuthMe(idToken);
     const memberships = me.memberships || [];
-    const preferredOrgId = (me.currentOrgId || "").trim();
-    const primary = memberships.find((row) => row.orgId === preferredOrgId) || memberships[0];
+    const primary = pickPreferredMembership(me);
     const target = parseNextRouteTarget(nextPath);
     const targetMembership = membershipForTarget(target, memberships);
     const hasOrgScopedTarget = Boolean(target.orgId || target.slug);
@@ -79,13 +79,7 @@ export default function LoginPage() {
     if (nextPath && nextPath !== "/login" && !nextPath.startsWith("/login?") && (!hasOrgScopedTarget || targetMembership)) {
       const sessionMembership = targetMembership || primary;
       if (sessionMembership) {
-        clearHostToken();
-        persistStreamContext({
-          orgId: sessionMembership.orgId,
-          roomId: undefined,
-          serviceKey: undefined,
-          churchSlug: sessionMembership.slug,
-        });
+        persistDashboardContext(sessionMembership);
       }
       await router.replace(nextPath);
       return;
@@ -95,16 +89,8 @@ export default function LoginPage() {
       await router.replace("/onboarding/create-church");
       return;
     }
-    clearHostToken();
-    persistStreamContext({
-      orgId: primary.orgId,
-      roomId: undefined,
-      serviceKey: undefined,
-      churchSlug: primary.slug,
-    });
-    const params = new URLSearchParams();
-    params.set("orgId", primary.orgId);
-    await router.replace(`/host/c/${encodeURIComponent(primary.slug)}/broadcast?${params.toString()}`);
+    persistDashboardContext(primary);
+    await router.replace(buildDashboardHref(primary));
   };
 
   const redirectWithFreshSession = async () => {

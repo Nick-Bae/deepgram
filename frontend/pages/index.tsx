@@ -1,7 +1,11 @@
 import Head from "next/head";
 import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
 
+import { fetchAuthMe } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
+import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../lib/dashboardRoute";
+import { persistAuthToken } from "../utils/streamContext";
 
 const publicQuickLinks = [
   {
@@ -31,7 +35,6 @@ const signedInQuickLinks = [
   {
     title: "Continue Dashboard",
     desc: "Open your organization dashboard and continue hosting.",
-    href: "/onboarding/create-church",
     cta: "Open dashboard",
     tone: "#22c55e",
   },
@@ -61,10 +64,53 @@ function toEmbedVideoUrl(raw: string): string {
 }
 
 export default function HomePage() {
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, configured, getIdToken } = useAuth();
+  const [dashboardHref, setDashboardHref] = useState("/onboarding/create-church");
+  const [resolvingDashboard, setResolvingDashboard] = useState(false);
   const isLoggedIn = Boolean(user);
-  const quickLinks = isLoggedIn ? signedInQuickLinks : publicQuickLinks;
+  const quickLinks = useMemo(
+    () =>
+      isLoggedIn
+        ? signedInQuickLinks.map((card) => ({ ...card, href: dashboardHref }))
+        : publicQuickLinks,
+    [dashboardHref, isLoggedIn],
+  );
   const embedVideoUrl = toEmbedVideoUrl(VIDEO_URL);
+
+  useEffect(() => {
+    if (authLoading || !user || !configured) {
+      setResolvingDashboard(false);
+      return;
+    }
+    let cancelled = false;
+    setResolvingDashboard(true);
+    void (async () => {
+      try {
+        const token = await getIdToken(true);
+        if (!token || cancelled) return;
+        persistAuthToken(token);
+        const me = await fetchAuthMe(token);
+        const membership = pickPreferredMembership(me);
+        if (!membership || cancelled) {
+          setDashboardHref("/onboarding/create-church");
+          return;
+        }
+        persistDashboardContext(membership);
+        setDashboardHref(buildDashboardHref(membership));
+      } catch {
+        if (!cancelled) {
+          setDashboardHref("/login");
+        }
+      } finally {
+        if (!cancelled) {
+          setResolvingDashboard(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, configured, getIdToken, user]);
 
   return (
     <>
@@ -101,9 +147,11 @@ export default function HomePage() {
             <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 14 }}>
               {authLoading ? (
                 <span style={{ fontSize: 13, opacity: 0.8 }}>Checking your session...</span>
+              ) : isLoggedIn && resolvingDashboard ? (
+                <span style={{ fontSize: 13, opacity: 0.8 }}>Locating your dashboard...</span>
               ) : isLoggedIn ? (
                 <Link
-                  href="/onboarding/create-church"
+                  href={dashboardHref}
                   style={{
                     borderRadius: 10,
                     background: "#22c55e",
