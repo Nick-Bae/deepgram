@@ -322,6 +322,12 @@ export default function SignupPage() {
             Sign in
           </Link>
         </p>
+        <p style={{ fontSize: 13, marginBottom: 0, marginTop: 8, opacity: 0.8 }}>
+          Need help getting set up?{" "}
+          <Link href="/contact" style={{ color: "#93c5fd" }}>
+            Contact us
+          </Link>
+        </p>
       </section>
     </main>
   );

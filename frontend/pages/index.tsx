@@ -115,6 +115,22 @@ export default function HomePage() {
     [dashboardHref, isLoggedIn],
   );
   const embedVideoUrl = toEmbedVideoUrl(VIDEO_URL);
+  const glassCardStyle = {
+    position: "relative" as const,
+    overflow: "hidden" as const,
+    border: "1px solid rgba(255,255,255,0.56)",
+    background: "linear-gradient(180deg, rgba(248,251,255,0.6) 0%, rgba(220,229,241,0.3) 100%)",
+    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.38), inset 0 -1px 0 rgba(101,121,152,0.08), 0 24px 48px rgba(88,106,137,0.14)",
+    backdropFilter: "blur(18px)",
+  } as const;
+  const glassInnerCardStyle = {
+    position: "relative" as const,
+    overflow: "hidden" as const,
+    border: "1px solid rgba(255,255,255,0.5)",
+    background: "linear-gradient(180deg, rgba(255,255,255,0.44) 0%, rgba(225,234,245,0.22) 100%)",
+    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.42), 0 14px 28px rgba(102,120,151,0.1)",
+    backdropFilter: "blur(12px)",
+  } as const;
 
   useEffect(() => {
     if (authLoading || !user || !configured) {
@@ -293,9 +309,9 @@ export default function HomePage() {
               </div>
 
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-                {authLoading ? (
-                  <span
-                    style={{
+              {authLoading ? (
+                <span
+                  style={{
                       borderRadius: 999,
                       padding: "12px 16px",
                       background: "rgba(255,255,255,0.08)",
@@ -340,6 +356,19 @@ export default function HomePage() {
                 ) : (
                   <>
                     <Link
+                      href="/contact"
+                      style={{
+                        borderRadius: 999,
+                        padding: "12px 18px",
+                        background: "rgba(255,255,255,0.08)",
+                        border: "1px solid rgba(255,255,255,0.14)",
+                        color: "#d9e3f2",
+                        fontWeight: 700,
+                      }}
+                    >
+                      Contact Us
+                    </Link>
+                    <Link
                       href="/c/demo/s/sun-11am"
                       style={{
                         borderRadius: 999,
@@ -381,10 +410,8 @@ export default function HomePage() {
           >
             <article
               style={{
+                ...glassCardStyle,
                 borderRadius: 34,
-                border: "1px solid rgba(255,255,255,0.78)",
-                background: "linear-gradient(145deg, rgba(248,251,255,0.96), rgba(225,233,244,0.92))",
-                boxShadow: "28px 28px 60px rgba(122,138,163,0.16), -18px -18px 34px rgba(255,255,255,0.7)",
                 padding: "30px 28px",
                 display: "grid",
                 gap: 22,
@@ -467,6 +494,8 @@ export default function HomePage() {
                         color: "#42556f",
                         fontWeight: 700,
                         padding: "14px 20px",
+                        display:"flex",
+                        alignItems: "center"
                       }}
                     >
                       Try Listener Demo
@@ -486,11 +515,9 @@ export default function HomePage() {
                   <div
                     key={stat.label}
                     style={{
+                      ...glassInnerCardStyle,
                       borderRadius: 22,
-                      border: "1px solid rgba(255,255,255,0.8)",
-                      background: "rgba(255,255,255,0.58)",
                       padding: "16px 18px",
-                      boxShadow: "12px 12px 24px rgba(122,138,163,0.12), -10px -10px 20px rgba(255,255,255,0.78)",
                     }}
                   >
                     <p style={{ margin: 0, fontSize: 28, fontWeight: 800, letterSpacing: "-0.05em" }}>{stat.value}</p>
@@ -502,10 +529,8 @@ export default function HomePage() {
 
             <article
               style={{
+                ...glassCardStyle,
                 borderRadius: 34,
-                border: "1px solid rgba(255,255,255,0.84)",
-                background: "linear-gradient(145deg, rgba(240,245,251,0.96), rgba(220,228,239,0.9))",
-                boxShadow: "28px 28px 60px rgba(122,138,163,0.16), -18px -18px 34px rgba(255,255,255,0.7)",
                 padding: "24px 22px",
                 display: "grid",
                 gap: 18,
@@ -540,9 +565,8 @@ export default function HomePage() {
               >
                 <div
                   style={{
+                    ...glassInnerCardStyle,
                     borderRadius: 26,
-                    border: "1px solid rgba(255,255,255,0.84)",
-                    background: "rgba(255,255,255,0.54)",
                     padding: 18,
                     display: "grid",
                     gap: 16,
@@ -572,9 +596,8 @@ export default function HomePage() {
 
                   <div
                     style={{
+                      ...glassInnerCardStyle,
                       borderRadius: 20,
-                      background: "rgba(248,250,253,0.78)",
-                      border: "1px solid rgba(228,233,241,0.92)",
                       minHeight: 150,
                       padding: 18,
                     }}
@@ -608,9 +631,8 @@ export default function HomePage() {
                 <div style={{ display: "grid", gap: 14 }}>
                   <div
                     style={{
+                      ...glassInnerCardStyle,
                       borderRadius: 24,
-                      border: "1px solid rgba(255,255,255,0.84)",
-                      background: "rgba(255,255,255,0.58)",
                       padding: 18,
                       display: "grid",
                       gap: 10,
@@ -634,9 +656,8 @@ export default function HomePage() {
 
                   <div
                     style={{
+                      ...glassInnerCardStyle,
                       borderRadius: 24,
-                      border: "1px solid rgba(255,255,255,0.84)",
-                      background: "rgba(255,255,255,0.58)",
                       padding: 18,
                       display: "grid",
                       gap: 10,
@@ -670,10 +691,8 @@ export default function HomePage() {
               <article
                 key={card.title}
                 style={{
+                  ...glassCardStyle,
                   borderRadius: 24,
-                  border: "1px solid rgba(255,255,255,0.82)",
-                  background: "linear-gradient(145deg, rgba(248,251,254,0.96), rgba(228,235,244,0.9))",
-                  boxShadow: "20px 20px 40px rgba(122,138,163,0.12), -14px -14px 28px rgba(255,255,255,0.76)",
                   padding: 18,
                   display: "grid",
                   gap: 12,
@@ -689,11 +708,12 @@ export default function HomePage() {
                     justifySelf: "start",
                     borderRadius: 999,
                     padding: "11px 16px",
-                    background: "rgba(247,250,253,0.84)",
-                    border: "1px solid rgba(189,200,217,0.94)",
+                    background: "linear-gradient(180deg, rgba(255,255,255,0.5) 0%, rgba(236,242,249,0.28) 100%)",
+                    border: "1px solid rgba(255,255,255,0.48)",
                     color: "#33465f",
                     fontSize: 13,
                     fontWeight: 800,
+                    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.48), 0 10px 18px rgba(100,119,149,0.08)",
                   }}
                 >
                   {card.cta}
@@ -701,6 +721,14 @@ export default function HomePage() {
               </article>
             ))}
           </section>
+
+          <p style={{ margin: "-4px 0 0", textAlign: "center", fontSize: 14, color: "#5d6d84" }}>
+            Need help before you start?{" "}
+            <Link href="/contact" style={{ color: "#3f6093", fontWeight: 700 }}>
+              Contact support
+            </Link>
+            .
+          </p>
 
           <section
             style={{
@@ -711,10 +739,8 @@ export default function HomePage() {
           >
             <article
               style={{
+                ...glassCardStyle,
                 borderRadius: 30,
-                border: "1px solid rgba(255,255,255,0.82)",
-                background: "linear-gradient(145deg, rgba(248,251,254,0.96), rgba(228,235,244,0.9))",
-                boxShadow: "24px 24px 48px rgba(122,138,163,0.14), -16px -16px 30px rgba(255,255,255,0.76)",
                 padding: 22,
                 display: "grid",
                 gap: 16,
@@ -722,18 +748,18 @@ export default function HomePage() {
             >
               <div
                 style={{
+                  ...glassInnerCardStyle,
                   borderRadius: 20,
                   padding: "14px 16px",
-                  background: "linear-gradient(145deg, rgba(225,236,250,0.96), rgba(212,225,243,0.9))",
+                  background: "linear-gradient(180deg, rgba(246,239,227,0.62) 0%, rgba(236,227,209,0.34) 100%)",
                   border: "1px solid rgba(204,218,238,0.92)",
-                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.34)",
                 }}
               >
                 <p style={{ margin: 0, fontSize: 11, color: "#7386a2", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
                   How It Works
                 </p>
                 <h2 style={{ margin: "10px 0 0", fontSize: 30, lineHeight: 1.05, letterSpacing: "-0.05em" }}>
-                  One host workflow. Clear listener experience.
+                  Host workflow. Clear listener experience.
                 </h2>
               </div>
               <div style={{ display: "grid", gap: 14 }}>
@@ -786,10 +812,8 @@ export default function HomePage() {
 
             <article
               style={{
+                ...glassCardStyle,
                 borderRadius: 30,
-                border: "1px solid rgba(255,255,255,0.82)",
-                background: "linear-gradient(145deg, rgba(248,251,254,0.96), rgba(228,235,244,0.9))",
-                boxShadow: "24px 24px 48px rgba(122,138,163,0.14), -16px -16px 30px rgba(255,255,255,0.76)",
                 padding: 22,
                 display: "grid",
                 gap: 16,
@@ -797,11 +821,11 @@ export default function HomePage() {
             >
               <div
                 style={{
+                  ...glassInnerCardStyle,
                   borderRadius: 20,
                   padding: "14px 16px",
-                  background: "linear-gradient(145deg, rgba(246,239,227,0.96), rgba(236,227,209,0.9))",
+                  background: "linear-gradient(180deg, rgba(246,239,227,0.62) 0%, rgba(236,227,209,0.34) 100%)",
                   border: "1px solid rgba(225,214,191,0.92)",
-                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.3)",
                 }}
               >
                 <p style={{ margin: 0, fontSize: 11, color: "#7386a2", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
