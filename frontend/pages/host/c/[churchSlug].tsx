@@ -1157,57 +1157,313 @@ export default function HostChurchPage() {
     }
   };
 
+  const hostPageStyle = {
+    minHeight: "100vh",
+    background: "linear-gradient(180deg, #e9edf4 0%, #dde4ee 56%, #d4dce8 100%)",
+    color: "#0f172a",
+    padding: "20px 14px 34px",
+  } as const;
+  const hostTopPanelStyle = {
+    border: "1px solid rgba(255,255,255,0.88)",
+    borderRadius: 24,
+    background: "linear-gradient(145deg, rgba(242,246,251,0.98), rgba(220,228,240,0.94))",
+    boxShadow: "24px 24px 56px rgba(122,138,163,0.18), -18px -18px 38px rgba(255,255,255,0.78)",
+    padding: 16,
+  } as const;
+  const hostFieldStyle = {
+    borderRadius: 10,
+    border: "1px solid rgba(189,200,217,0.92)",
+    background: "rgba(247,250,253,0.9)",
+    color: "#20324a",
+    padding: "9px 10px",
+    boxShadow: "inset 2px 2px 6px rgba(122,138,163,0.1)",
+  } as const;
+  const hostTabRailStyle = {
+    position: "sticky" as const,
+    top: 8,
+    zIndex: 5,
+    display: "flex",
+    flexWrap: "wrap" as const,
+    gap: 8,
+    marginBottom: 12,
+    padding: 6,
+    borderRadius: 14,
+    border: "1px solid rgba(255,255,255,0.88)",
+    background: "rgba(230,236,244,0.94)",
+    backdropFilter: "blur(8px)",
+    boxShadow: "inset 5px 5px 12px rgba(122,138,163,0.12), inset -5px -5px 12px rgba(255,255,255,0.82)",
+  } as const;
+  const studioHeaderStyle = {
+    borderRadius: 34,
+    position: "relative" as const,
+    overflow: "hidden",
+    border: "1px solid rgba(255,255,255,0.14)",
+    background: "linear-gradient(135deg, #4a5d79 0%, #2f3b4f 32%, #1d2430 68%, #161b24 100%)",
+    boxShadow: "0 24px 54px rgba(15,23,42,0.22), inset 0 1px 0 rgba(255,255,255,0.08)",
+    padding: "18px 20px",
+    color: "#f8fafc",
+  } as const;
+  const studioUserPanelStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: 16,
+    borderRadius: 26,
+    background: "linear-gradient(145deg, rgba(255,255,255,0.1), rgba(255,255,255,0.04))",
+    padding: "10px 14px 10px 18px",
+    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.08), 0 12px 24px rgba(15,23,42,0.14)",
+  } as const;
+  const studioLogoutButtonStyle = {
+    borderRadius: 18,
+    border: "1px solid rgba(255,255,255,0.18)",
+    background: "rgba(13,20,32,0.2)",
+    color: "#f8fafc",
+    fontSize: 12,
+    fontWeight: 800,
+    letterSpacing: "0.16em",
+    textTransform: "uppercase" as const,
+    padding: "12px 22px",
+    cursor: "pointer",
+  } as const;
+  const studioBrandTileStyle = {
+    height: 72,
+    width: 72,
+    borderRadius: 22,
+    background: "linear-gradient(145deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02))",
+    boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.1), 0 12px 24px rgba(15,23,42,0.18)",
+    display: "grid",
+    placeItems: "center",
+    color: "#ffb703",
+    fontSize: 22,
+    fontWeight: 900,
+    fontStyle: "italic",
+  } as const;
+  const accentPrimaryGradient = "linear-gradient(145deg, #7fa5db, #4f73aa)";
+  const accentPrimaryShadow = "0 14px 30px rgba(79,115,170,0.28)";
+  const accentDangerGradient = "linear-gradient(145deg, #e38888, #bc5f6f)";
+  const accentDangerShadow = "0 14px 28px rgba(188,95,111,0.22)";
+  const settingsShellStyle = {
+    marginTop: 12,
+    display: "grid",
+    gap: 16,
+  } as const;
+  const settingsGridStyle = {
+    display: "grid",
+    gap: 16,
+    gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+  } as const;
+  const settingsCardStyle = {
+    border: "1px solid rgba(255,255,255,0.88)",
+    borderRadius: 22,
+    padding: 18,
+    background: "linear-gradient(145deg, rgba(248,250,253,0.96), rgba(230,236,244,0.92))",
+    boxShadow: "20px 20px 40px rgba(122,138,163,0.12), -14px -14px 28px rgba(255,255,255,0.72)",
+    display: "grid",
+    gap: 12,
+  } as const;
+  const settingsSubscriptionCardStyle = {
+    ...settingsCardStyle,
+    background: "linear-gradient(145deg, rgba(237,243,251,0.98), rgba(216,227,243,0.94))",
+  } as const;
+  const settingsBudgetCardStyle = {
+    ...settingsCardStyle,
+    background: "linear-gradient(145deg, rgba(240,246,243,0.98), rgba(219,231,226,0.94))",
+  } as const;
+  const settingsSectionLabelStyle = {
+    margin: 0,
+    fontSize: 11,
+    fontWeight: 800,
+    letterSpacing: "0.22em",
+    textTransform: "uppercase" as const,
+    color: "#7c8ba3",
+  } as const;
+  const settingsTitleStyle = {
+    margin: 0,
+    fontSize: 18,
+    fontWeight: 800,
+    color: "#20324a",
+  } as const;
+  const settingsBodyTextStyle = {
+    margin: 0,
+    fontSize: 13,
+    color: "#5f6f86",
+    lineHeight: 1.6,
+  } as const;
+  const settingsPillBaseStyle = {
+    display: "inline-flex",
+    alignItems: "center",
+    borderRadius: 999,
+    padding: "6px 10px",
+    fontSize: 12,
+    fontWeight: 700,
+  } as const;
+  const settingsButtonPrimaryStyle = {
+    borderRadius: 12,
+    border: "1px solid rgba(79,115,170,0.28)",
+    background: accentPrimaryGradient,
+    color: "#f8fafc",
+    fontWeight: 800,
+    padding: "10px 14px",
+    cursor: "pointer",
+    boxShadow: accentPrimaryShadow,
+  } as const;
+  const settingsButtonNeutralStyle = {
+    borderRadius: 12,
+    border: "1px solid rgba(189,200,217,0.95)",
+    background: "rgba(247,250,253,0.82)",
+    color: "#42556f",
+    fontWeight: 700,
+    padding: "10px 14px",
+    cursor: "pointer",
+    boxShadow: "8px 8px 18px rgba(122,138,163,0.1), -8px -8px 18px rgba(255,255,255,0.76)",
+  } as const;
+  const settingsButtonDangerStyle = {
+    borderRadius: 12,
+    border: "1px solid rgba(188,95,111,0.3)",
+    background: accentDangerGradient,
+    color: "#f8fafc",
+    fontWeight: 800,
+    padding: "10px 14px",
+    cursor: "pointer",
+    boxShadow: accentDangerShadow,
+  } as const;
+  const settingsInlineFieldStyle = {
+    ...hostFieldStyle,
+    minWidth: 160,
+  } as const;
+  const settingsServiceRowStyle = {
+    display: "grid",
+    gridTemplateColumns: "minmax(0,1fr) auto",
+    gap: 12,
+    alignItems: "center",
+    border: "1px solid rgba(215,223,235,0.9)",
+    borderRadius: 16,
+    padding: "14px 16px",
+    background: "rgba(255,255,255,0.72)",
+  } as const;
+  const currentUserName = (
+    user?.displayName ||
+    (user?.email ? user.email.split("@")[0].replace(/[._-]+/g, " ") : "") ||
+    "Host"
+  ).trim();
+  const currentUserInitial = currentUserName.charAt(0).toUpperCase() || "H";
+  const currentChurchLabel = (orgData?.name || slug || "Current Church").trim();
+
   if (!user && !authLoading) {
     return (
-      <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc" }}>
+      <main style={{ ...hostPageStyle, display: "grid", placeItems: "center" }}>
         Redirecting to login...
       </main>
     );
   }
 
   return (
-    <main style={{ minHeight: "100vh", background: "#0b1220", color: "#f8fafc", padding: "20px 14px 34px" }}>
+    <main style={hostPageStyle}>
       <div style={{ maxWidth: 1240, margin: "0 auto", display: "grid", gap: 18 }}>
-        <section style={{ border: "1px solid rgba(255,255,255,0.12)", borderRadius: 16, background: "rgba(255,255,255,0.05)", padding: 16 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 8 }}>
-            <span style={{ fontSize: 12, opacity: 0.78 }}>{user?.email || user?.uid || "Host"}</span>
-            <button
-              onClick={async () => {
-                clearHostToken();
-                clearAuthToken();
-                await logout();
-              }}
-              style={{
-                borderRadius: 8,
-                border: "1px solid rgba(255,255,255,0.2)",
-                background: "transparent",
-                color: "#fff",
-                fontSize: 12,
-                padding: "6px 10px",
-                cursor: "pointer",
-              }}
-            >
-              Logout
-            </button>
+        <section style={studioHeaderStyle}>
+          <div
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              inset: "-40% auto auto -8%",
+              height: 180,
+              width: 260,
+              borderRadius: 999,
+              background: "radial-gradient(circle, rgba(145, 177, 220, 0.34) 0%, rgba(145, 177, 220, 0) 72%)",
+              filter: "blur(8px)",
+            }}
+          />
+          <div
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              inset: "auto -6% -120px auto",
+              height: 220,
+              width: 280,
+              borderRadius: 999,
+              background: "radial-gradient(circle, rgba(226, 234, 246, 0.18) 0%, rgba(226, 234, 246, 0) 74%)",
+              filter: "blur(10px)",
+            }}
+          />
+          <div style={{ position: "relative", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 18 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
+              <div style={studioBrandTileStyle}>{currentUserInitial}</div>
+              <div style={{ fontFamily: "Inter, 'Segoe UI', system-ui, sans-serif" }}>
+                <h1
+                  style={{
+                    margin: 0,
+                    color: "#f8fafc",
+                    fontSize: "clamp(30px, 3.8vw, 35px)",
+                    lineHeight: 1,
+                    fontWeight: 800,
+                    letterSpacing: "-0.05em",
+                  }}
+                >
+                  {currentUserName}
+                </h1>
+                <p
+                  style={{
+                    margin: "8px 0 0",
+                    color: "#b8c4da",
+                    fontSize: 12,
+                    letterSpacing: "0.34em",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Translation Studio
+                </p>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
+                <span
+                  style={{
+                    color: "#e1e8f4",
+                    fontSize: 16,
+                    fontWeight: 700,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    maxWidth: 280,
+                  }}
+                >
+                  {currentChurchLabel}
+                </span>
+              </div>
+
+              <button
+                onClick={async () => {
+                  clearHostToken();
+                  clearAuthToken();
+                  await logout();
+                }}
+                style={studioLogoutButtonStyle}
+              >
+                Logout
+              </button>
+            </div>
           </div>
-          <h1 style={{ marginTop: 0, marginBottom: 8, fontSize: 26 }}>{orgData?.name || slug || "Host"}</h1>
-          <p style={{ marginTop: 0, opacity: 0.8, marginBottom: 14 }}>
+        </section>
+
+        <section style={hostTopPanelStyle}>
+          <h1 style={{ marginTop: 0, marginBottom: 8, fontSize: 26, color: "#0f172a" }}>{orgData?.name || slug || "Host"}</h1>
+          <p style={{ marginTop: 0, opacity: 0.75, marginBottom: 14, color: "#475569" }}>
             Start a room for a recurring service, then begin microphone streaming.
           </p>
-          <p style={{ marginTop: 0, marginBottom: 10, opacity: 0.76, fontSize: 13 }}>
+          <p style={{ marginTop: 0, marginBottom: 10, opacity: 0.76, fontSize: 13, color: "#475569" }}>
             {resolvedOrgId ? `Org: ${resolvedOrgId}` : loading ? "Loading church organization..." : "Organization not loaded yet."}
           </p>
-          {errorMsg ? <p style={{ color: "#fca5a5", marginTop: 0 }}>Error: {errorMsg}</p> : null}
+          {errorMsg ? <p style={{ color: "#b91c1c", marginTop: 0 }}>Error: {errorMsg}</p> : null}
           {memberships.length > 1 ? (
             <div style={{ marginBottom: 12, display: "grid", gap: 4, maxWidth: 380 }}>
-              <span style={{ fontSize: 12, opacity: 0.75 }}>Current Church</span>
+              <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Current Church</span>
               <select
                 value={selectedOrgId || resolvedOrgId}
                 onChange={(e) => {
                   void switchOrganization(e.target.value);
                 }}
                 disabled={switchingOrg || busy}
-                style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
+                style={hostFieldStyle}
               >
                 {memberships.map((row) => (
                   <option key={row.orgId} value={row.orgId}>
@@ -1218,34 +1474,21 @@ export default function HostChurchPage() {
               {switchingOrg ? <span style={{ fontSize: 12, opacity: 0.75 }}>Switching church...</span> : null}
             </div>
           ) : null}
-          <div
-            style={{
-              position: "sticky",
-              top: 8,
-              zIndex: 5,
-              display: "flex",
-              flexWrap: "wrap",
-              gap: 8,
-              marginBottom: 12,
-              padding: 6,
-              borderRadius: 12,
-              border: "1px solid rgba(56,189,248,0.35)",
-              background: "rgba(8,16,35,0.92)",
-              backdropFilter: "blur(8px)",
-            }}
-          >
+          <div style={hostTabRailStyle}>
             <button
               onClick={() => navigateToTab("broadcast")}
               style={{
                 borderRadius: 10,
-                border: activeTab === "broadcast" ? "2px solid rgba(56,189,248,1)" : "1px solid rgba(255,255,255,0.2)",
-                background: activeTab === "broadcast" ? "rgba(56,189,248,0.95)" : "rgba(15,23,42,0.8)",
-                color: activeTab === "broadcast" ? "#082f49" : "#e2e8f0",
+                border: activeTab === "broadcast" ? "1px solid rgba(79,115,170,0.38)" : "1px solid rgba(189,200,217,0.92)",
+                background: activeTab === "broadcast" ? accentPrimaryGradient : "rgba(247,250,253,0.78)",
+                color: activeTab === "broadcast" ? "#f8fafc" : "#42556f",
                 fontSize: 13,
                 fontWeight: 800,
                 padding: "8px 12px",
                 cursor: "pointer",
-                boxShadow: activeTab === "broadcast" ? "inset 0 -3px 0 rgba(8,47,73,0.5)" : "none",
+                boxShadow: activeTab === "broadcast"
+                  ? accentPrimaryShadow
+                  : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
               }}
             >
               Live Broadcast
@@ -1254,14 +1497,16 @@ export default function HostChurchPage() {
               onClick={() => navigateToTab("settings")}
               style={{
                 borderRadius: 10,
-                border: activeTab === "settings" ? "2px solid rgba(56,189,248,1)" : "1px solid rgba(255,255,255,0.2)",
-                background: activeTab === "settings" ? "rgba(56,189,248,0.95)" : "rgba(15,23,42,0.8)",
-                color: activeTab === "settings" ? "#082f49" : "#e2e8f0",
+                border: activeTab === "settings" ? "1px solid rgba(79,115,170,0.38)" : "1px solid rgba(189,200,217,0.92)",
+                background: activeTab === "settings" ? accentPrimaryGradient : "rgba(247,250,253,0.78)",
+                color: activeTab === "settings" ? "#f8fafc" : "#42556f",
                 fontSize: 13,
                 fontWeight: 800,
                 padding: "8px 12px",
                 cursor: "pointer",
-                boxShadow: activeTab === "settings" ? "inset 0 -3px 0 rgba(8,47,73,0.5)" : "none",
+                boxShadow: activeTab === "settings"
+                  ? accentPrimaryShadow
+                  : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
               }}
             >
               Church Settings
@@ -1270,14 +1515,16 @@ export default function HostChurchPage() {
               onClick={() => navigateToTab("team")}
               style={{
                 borderRadius: 10,
-                border: activeTab === "team" ? "2px solid rgba(56,189,248,1)" : "1px solid rgba(255,255,255,0.2)",
-                background: activeTab === "team" ? "rgba(56,189,248,0.95)" : "rgba(15,23,42,0.8)",
-                color: activeTab === "team" ? "#082f49" : "#e2e8f0",
+                border: activeTab === "team" ? "1px solid rgba(79,115,170,0.38)" : "1px solid rgba(189,200,217,0.92)",
+                background: activeTab === "team" ? accentPrimaryGradient : "rgba(247,250,253,0.78)",
+                color: activeTab === "team" ? "#f8fafc" : "#42556f",
                 fontSize: 13,
                 fontWeight: 800,
                 padding: "8px 12px",
                 cursor: "pointer",
-                boxShadow: activeTab === "team" ? "inset 0 -3px 0 rgba(8,47,73,0.5)" : "none",
+                boxShadow: activeTab === "team"
+                  ? accentPrimaryShadow
+                  : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
               }}
             >
               Team
@@ -1287,7 +1534,7 @@ export default function HostChurchPage() {
             <>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 10 }}>
                 <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75 }}>Service</span>
+                  <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Service</span>
                   {orgData?.services?.length ? (
                     <select
                       value={serviceKey}
@@ -1298,7 +1545,7 @@ export default function HostChurchPage() {
                         persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
                       }}
                       disabled={loading}
-                      style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
+                      style={hostFieldStyle}
                     >
                       {orgData?.services?.map((row) => (
                         <option key={row.serviceKey} value={row.serviceKey}>
@@ -1316,20 +1563,20 @@ export default function HostChurchPage() {
                         persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
                       }}
                       placeholder={DEFAULT_SERVICE_KEY}
-                      style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }}
+                      style={hostFieldStyle}
                     />
                   )}
                   {!loading && orgData && !orgData.services?.length ? (
-                    <span style={{ fontSize: 12, opacity: 0.75 }}>No services found. Create a service in Church Settings first, then start it here.</span>
+                    <span style={{ fontSize: 12, opacity: 0.75, color: "#64748b" }}>No services found. Create a service in Church Settings first, then start it here.</span>
                   ) : null}
                 </label>
                 <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75 }}>Source</span>
-                  <input value={sourceLang} onChange={(e) => setSourceLang(e.target.value)} style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }} />
+                  <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Source</span>
+                  <input value={sourceLang} onChange={(e) => setSourceLang(e.target.value)} style={hostFieldStyle} />
                 </label>
                 <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75 }}>Target</span>
-                  <input value={targetLang} onChange={(e) => setTargetLang(e.target.value)} style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "9px 10px" }} />
+                  <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Target</span>
+                  <input value={targetLang} onChange={(e) => setTargetLang(e.target.value)} style={hostFieldStyle} />
                 </label>
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, alignItems: "center" }}>
@@ -1338,13 +1585,14 @@ export default function HostChurchPage() {
                   disabled={busy}
                   style={{
                     borderRadius: 10,
-                    border: "none",
-                    background: "#22c55e",
-                    color: "#052e16",
+                    border: "1px solid rgba(79,115,170,0.3)",
+                    background: accentPrimaryGradient,
+                    color: "#f8fafc",
                     fontWeight: 700,
                     padding: "9px 14px",
                     cursor: busy ? "not-allowed" : "pointer",
                     opacity: busy ? 0.6 : 1,
+                    boxShadow: accentPrimaryShadow,
                   }}
                 >
                   {activeRoomId ? "Restart / Rejoin Room" : "Start Service"}
@@ -1354,13 +1602,14 @@ export default function HostChurchPage() {
                   disabled={busy || !orgData?.orgId || !activeRoomId}
                   style={{
                     borderRadius: 10,
-                    border: "none",
-                    background: "#f43f5e",
-                    color: "#fff",
+                    border: "1px solid rgba(188,95,111,0.3)",
+                    background: accentDangerGradient,
+                    color: "#f8fafc",
                     fontWeight: 700,
                     padding: "9px 14px",
                     cursor: busy || !orgData?.orgId || !activeRoomId ? "not-allowed" : "pointer",
                     opacity: busy || !orgData?.orgId || !activeRoomId ? 0.6 : 1,
+                    boxShadow: accentDangerShadow,
                   }}
                 >
                   End Service
@@ -1402,7 +1651,7 @@ export default function HostChurchPage() {
               ) : null}
               {listenerUrl ? (
                 <p style={{ marginTop: 10, marginBottom: 0, fontSize: 13, opacity: 0.84 }}>
-                  Listener URL: <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: "#93c5fd" }}>{listenerUrl}</a>
+                  Listener URL: <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: "#2563eb" }}>{listenerUrl}</a>
                 </p>
               ) : null}
               <p style={{ marginTop: 8, marginBottom: 0, fontSize: 12, opacity: 0.72 }}>
@@ -1412,392 +1661,368 @@ export default function HostChurchPage() {
           ) : null}
           {activeTab === "settings" ? (
             canManageServices ? (
-              <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12, display: "grid", gap: 8 }}>
-                <div style={{ border: "1px solid rgba(125,211,252,0.35)", borderRadius: 10, padding: 10, display: "grid", gap: 7, background: "rgba(8,22,39,0.75)" }}>
-                  <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Subscription</p>
-                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>
-                    Plan: <strong>{formatPlanLabel(billingPlanToken)}</strong>
-                    {" · "}
-                    Status: <strong>{formatBillingStatus(billingStatusToken)}</strong>
-                    {" · "}
-                    Services: {billingMaxServiceKeys > 0 ? `up to ${billingMaxServiceKeys}` : "unlimited"}
-                  </p>
-                  {billingProfile ? (
-                    <div style={{ display: "grid", gap: 4 }}>
-                      {hasSubscriptionPeriod ? (
-                        <p style={{ margin: 0, fontSize: 12, opacity: 0.82 }}>
-                          Subscription period:{" "}
-                          <strong>{formatDateTime(billingProfile.currentPeriodStart)}</strong>
-                          {" → "}
-                          <strong>{formatDateTime(billingProfile.currentPeriodEnd)}</strong>
-                          {billingProfile.cancelAtPeriodEnd ? " · Cancels at period end" : ""}
-                        </p>
-                      ) : null}
-                      {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining !== null ? (
-                        <p style={{ margin: 0, fontSize: 12, opacity: 0.86 }}>
-                          Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
-                          {" · "}
-                          Remaining: <strong>{trialMinutesRemaining}</strong> minutes
-                        </p>
-                      ) : null}
-                      {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining === null ? (
-                        <p style={{ margin: 0, fontSize: 12, opacity: 0.78 }}>
-                          Trial usage details will appear after the next usage tick.
-                        </p>
-                      ) : null}
-                      {!isTrialPlan && !hasSubscriptionPeriod ? (
-                        <p style={{ margin: 0, fontSize: 12, opacity: 0.76 }}>
-                          Subscription period is syncing from Stripe. Click refresh in a few seconds.
-                        </p>
-                      ) : null}
-                    </div>
-                  ) : (
-                    <p style={{ margin: 0, fontSize: 12, opacity: 0.72 }}>Loading billing profile…</p>
-                  )}
-                  {canManagePaidBilling ? (
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                      <select
-                        value={selectedPlan}
-                        onChange={(e) => setSelectedPlan(e.target.value as PaidPlanKey)}
-                        style={{
-                          borderRadius: 8,
-                          border: "1px solid rgba(255,255,255,0.24)",
-                          background: "rgba(2,6,23,0.72)",
-                          color: "#e2e8f0",
-                          padding: "8px 10px",
-                        }}
-                      >
-                        {selectablePaidPlans.map((plan) => (
-                          <option key={plan} value={plan}>
-                            {PLAN_LABELS[plan]}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        onClick={openUpgradeCheckout}
-                        disabled={billingCheckoutBusy || !resolvedOrgId}
-                        style={{
-                          borderRadius: 8,
-                          border: "none",
-                          background: "#60a5fa",
-                          color: "#0c2644",
-                          fontWeight: 700,
-                          padding: "8px 12px",
-                          cursor: billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          opacity: billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
-                        }}
-                      >
-                        {billingCheckoutBusy ? "Opening Checkout..." : "Upgrade Plan"}
-                      </button>
-                      <button
-                        onClick={openBillingPortal}
-                        disabled={billingPortalBusy || !resolvedOrgId}
-                        style={{
-                          borderRadius: 8,
-                          border: "1px solid rgba(255,255,255,0.24)",
-                          background: "rgba(148,163,184,0.18)",
-                          color: "#e2e8f0",
-                          fontWeight: 600,
-                          padding: "8px 12px",
-                          cursor: billingPortalBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          opacity: billingPortalBusy || !resolvedOrgId ? 0.6 : 1,
-                        }}
-                      >
-                        {billingPortalBusy ? "Opening Portal..." : "Manage Billing"}
-                      </button>
-                      <button
-                        onClick={() => {
-                          void loadBillingProfile({ refresh: true });
-                        }}
-                        disabled={billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId}
-                        style={{
-                          borderRadius: 8,
-                          border: "1px solid rgba(255,255,255,0.24)",
-                          background: "rgba(15,23,42,0.72)",
-                          color: "#cbd5e1",
-                          fontWeight: 600,
-                          padding: "8px 12px",
-                          cursor: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          opacity: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? 0.6 : 1,
-                        }}
-                      >
-                        {billingRefreshBusy ? "Refreshing..." : "Refresh Billing"}
-                      </button>
-                    </div>
-                  ) : (
-                    <p style={{ margin: 0, fontSize: 13, opacity: 0.78 }}>
-                      Owner or admin role is required to manage subscription checkout and billing portal.
+              <div style={settingsShellStyle}>
+                <div style={settingsGridStyle}>
+                  <section style={settingsSubscriptionCardStyle}>
+                    <p style={settingsSectionLabelStyle}>Billing Overview</p>
+                    <h3 style={settingsTitleStyle}>Subscription</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Review the current plan, Stripe sync status, and billing actions for this church.
                     </p>
-                  )}
-                </div>
-                <div style={{ border: "1px solid rgba(56,189,248,0.35)", borderRadius: 10, padding: 10, display: "grid", gap: 7, background: "rgba(8,16,35,0.75)" }}>
-                  <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Billing Limits</p>
-                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>
-                    Toggle monthly hard-cap enforcement for this church only.
-                  </p>
-                  {canManageBilling ? (
-                    <>
-                      <p style={{ margin: 0, fontSize: 13, opacity: 0.85 }}>
-                        Status:{" "}
-                        <strong>
-                          {billingState ? (billingState.billingLimitsEnabled ? "Enabled" : "Disabled") : "Loading..."}
-                        </strong>
-                        {billingState && !billingState.globalBillingLimitsEnabled ? " (global override currently disables all billing checks)" : ""}
-                      </p>
-                      {billingState ? (
-                        <p style={{ margin: 0, fontSize: 12, opacity: 0.78 }}>
-                          Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
-                          {" · "}
-                          Hard cap: {billingState.hardCapReached ? "reached" : "not reached"}
-                        </p>
-                      ) : null}
-                      {billingError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {billingError}</p> : null}
-                      {billingNotice ? <p style={{ margin: 0, color: "#86efac", fontSize: 13 }}>{billingNotice}</p> : null}
-                      <button
-                        onClick={toggleBillingLimits}
-                        disabled={billingBusy || !resolvedOrgId}
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                      <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(79,115,170,0.18)", background: "rgba(127,165,219,0.16)", color: "#3e5d8d" }}>
+                        Plan · {formatPlanLabel(billingPlanToken)}
+                      </span>
+                      <span
                         style={{
-                          justifySelf: "start",
-                          borderRadius: 8,
-                          border: "none",
-                          background: billingState?.billingLimitsEnabled ? "#f59e0b" : "#22c55e",
-                          color: billingState?.billingLimitsEnabled ? "#431407" : "#052e16",
-                          fontWeight: 700,
-                          padding: "8px 12px",
-                          cursor: billingBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          opacity: billingBusy || !resolvedOrgId ? 0.6 : 1,
+                          ...settingsPillBaseStyle,
+                          border: billingStatusToken === "active"
+                            ? "1px solid rgba(91,179,130,0.22)"
+                            : billingStatusToken === "past_due"
+                              ? "1px solid rgba(224,163,86,0.26)"
+                              : "1px solid rgba(189,200,217,0.9)",
+                          background: billingStatusToken === "active"
+                            ? "rgba(91,179,130,0.14)"
+                            : billingStatusToken === "past_due"
+                              ? "rgba(224,163,86,0.16)"
+                              : "rgba(247,250,253,0.8)",
+                          color: billingStatusToken === "active"
+                            ? "#3b7d5c"
+                            : billingStatusToken === "past_due"
+                              ? "#9a6433"
+                              : "#55657d",
                         }}
                       >
-                        {billingBusy
-                          ? "Saving..."
-                          : billingState?.billingLimitsEnabled
-                            ? "Disable Billing Limits"
-                            : "Enable Billing Limits"}
-                      </button>
-                    </>
-                  ) : (
-                    <p style={{ margin: 0, fontSize: 13, opacity: 0.78 }}>
-                      Billing admin account is required to change billing limits.
-                    </p>
-                  )}
-                </div>
-                <div style={{ border: "1px solid rgba(34,197,94,0.35)", borderRadius: 10, padding: 10, display: "grid", gap: 7, background: "rgba(7,21,16,0.72)" }}>
-                  <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Sermon Prep Budget</p>
-                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>
-                    Track OpenAI token usage by sermon and cap monthly Sermon Prep spend for this church.
-                  </p>
-                  {sermonUsageState ? (
-                    <>
-                      <p style={{ margin: 0, fontSize: 13, opacity: 0.85 }}>
-                        Month {sermonUsageState.currentMonthKey}:{" "}
-                        <strong>${sermonUsageState.currentMonthEstimatedUsd.toFixed(4)}</strong>
-                        {sermonUsageState.effectiveBudgetEnabled ? ` / $${sermonUsageState.budgetUsd.toFixed(2)}` : " (budget disabled)"}
-                        {" · "}
-                        Tokens: {sermonUsageState.currentMonthTotalTokens.toLocaleString()}
-                        {" · "}
-                        Cap: {sermonUsageState.capReached ? "reached" : "not reached"}
-                      </p>
-                      {sermonUsageState.sermons.length ? (
-                        <div style={{ display: "grid", gap: 4 }}>
-                          {sermonUsageState.sermons.slice(0, 4).map((row) => (
-                            <p key={row.sermonId} style={{ margin: 0, fontSize: 12, opacity: 0.78 }}>
-                              {row.sermonId}: ${row.estimatedUsd.toFixed(4)} · {row.totalTokens.toLocaleString()} tokens
+                        Status · {formatBillingStatus(billingStatusToken)}
+                      </span>
+                      <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(189,200,217,0.95)", background: "rgba(247,250,253,0.8)", color: "#55657d" }}>
+                        Services · {billingMaxServiceKeys > 0 ? `up to ${billingMaxServiceKeys}` : "unlimited"}
+                      </span>
+                    </div>
+
+                    {billingProfile ? (
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {hasSubscriptionPeriod ? (
+                          <div style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.8)", background: "rgba(255,255,255,0.7)", padding: "12px 14px" }}>
+                            <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Subscription Period</p>
+                            <p style={{ margin: "6px 0 0", fontSize: 13, color: "#334155" }}>
+                              <strong>{formatDateTime(billingProfile.currentPeriodStart)}</strong>
+                              {" → "}
+                              <strong>{formatDateTime(billingProfile.currentPeriodEnd)}</strong>
+                              {billingProfile.cancelAtPeriodEnd ? " · Cancels at period end" : ""}
                             </p>
+                          </div>
+                        ) : null}
+                        {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining !== null ? (
+                          <p style={settingsBodyTextStyle}>
+                            Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
+                            {" · "}
+                            Remaining: <strong>{trialMinutesRemaining}</strong> minutes
+                          </p>
+                        ) : null}
+                        {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining === null ? (
+                          <p style={settingsBodyTextStyle}>Trial usage details will appear after the next usage tick.</p>
+                        ) : null}
+                        {!isTrialPlan && !hasSubscriptionPeriod ? (
+                          <p style={settingsBodyTextStyle}>Subscription period is syncing from Stripe. Click refresh in a few seconds.</p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <p style={settingsBodyTextStyle}>Loading billing profile…</p>
+                    )}
+
+                    {canManagePaidBilling ? (
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+                        <select
+                          value={selectedPlan}
+                          onChange={(e) => setSelectedPlan(e.target.value as PaidPlanKey)}
+                          style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
+                        >
+                          {selectablePaidPlans.map((plan) => (
+                            <option key={plan} value={plan}>
+                              {PLAN_LABELS[plan]}
+                            </option>
                           ))}
-                        </div>
-                      ) : (
-                        <p style={{ margin: 0, fontSize: 12, opacity: 0.72 }}>No Sermon Prep usage recorded this month yet.</p>
-                      )}
-                    </>
-                  ) : (
-                    <p style={{ margin: 0, fontSize: 12, opacity: 0.72 }}>Loading usage…</p>
-                  )}
-                  {canManageBilling ? (
-                    <>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                        <label style={{ display: "grid", gap: 4 }}>
-                          <span style={{ fontSize: 12, opacity: 0.8 }}>Monthly budget (USD)</span>
-                          <input
-                            type="number"
-                            min={0}
-                            step={0.01}
-                            value={sermonBudgetInput}
-                            onChange={(e) => setSermonBudgetInput(e.target.value)}
-                            style={{
-                              borderRadius: 8,
-                              border: "1px solid rgba(255,255,255,0.24)",
-                              background: "rgba(2,6,23,0.72)",
-                              color: "#e2e8f0",
-                              padding: "7px 10px",
-                              minWidth: 140,
-                            }}
-                          />
-                        </label>
+                        </select>
                         <button
-                          onClick={saveSermonBudget}
-                          disabled={sermonBudgetBusy || !resolvedOrgId}
+                          onClick={openUpgradeCheckout}
+                          disabled={billingCheckoutBusy || !resolvedOrgId}
                           style={{
-                            borderRadius: 8,
-                            border: "none",
-                            background: "#22c55e",
-                            color: "#052e16",
-                            fontWeight: 700,
-                            padding: "8px 12px",
-                            cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                            opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                            ...settingsButtonPrimaryStyle,
+                            opacity: billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
+                            cursor: billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
                           }}
                         >
-                          {sermonBudgetBusy ? "Saving..." : "Save Sermon Budget"}
+                          {billingCheckoutBusy ? "Opening Checkout..." : "Upgrade Plan"}
+                        </button>
+                        <button
+                          onClick={openBillingPortal}
+                          disabled={billingPortalBusy || !resolvedOrgId}
+                          style={{
+                            ...settingsButtonNeutralStyle,
+                            opacity: billingPortalBusy || !resolvedOrgId ? 0.6 : 1,
+                            cursor: billingPortalBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          {billingPortalBusy ? "Opening Portal..." : "Manage Billing"}
                         </button>
                         <button
                           onClick={() => {
-                            void loadSermonUsage();
+                            void loadBillingProfile({ refresh: true });
                           }}
-                          disabled={sermonBudgetBusy || !resolvedOrgId}
+                          disabled={billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId}
                           style={{
-                            borderRadius: 8,
-                            border: "1px solid rgba(255,255,255,0.24)",
-                            background: "rgba(148,163,184,0.18)",
-                            color: "#e2e8f0",
-                            fontWeight: 600,
-                            padding: "8px 12px",
-                            cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                            opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                            ...settingsButtonNeutralStyle,
+                            opacity: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? 0.6 : 1,
+                            cursor: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? "not-allowed" : "pointer",
                           }}
                         >
-                          Refresh Usage
+                          {billingRefreshBusy ? "Refreshing..." : "Refresh Billing"}
                         </button>
                       </div>
-                      {sermonBudgetError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {sermonBudgetError}</p> : null}
-                      {sermonBudgetNotice ? <p style={{ margin: 0, color: "#86efac", fontSize: 13 }}>{sermonBudgetNotice}</p> : null}
-                    </>
-                  ) : null}
+                    ) : (
+                      <p style={settingsBodyTextStyle}>
+                        Owner or admin role is required to manage subscription checkout and billing portal.
+                      </p>
+                    )}
+                  </section>
+
+                  <section style={settingsCardStyle}>
+                    <p style={settingsSectionLabelStyle}>Policy Controls</p>
+                    <h3 style={settingsTitleStyle}>Billing Limits</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Toggle monthly hard-cap enforcement for this church only.
+                    </p>
+                    {canManageBilling ? (
+                      <>
+                        <div style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.84)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
+                          <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
+                            Status:{" "}
+                            <strong>{billingState ? (billingState.billingLimitsEnabled ? "Enabled" : "Disabled") : "Loading..."}</strong>
+                            {billingState && !billingState.globalBillingLimitsEnabled ? " · Global override currently disables all billing checks" : ""}
+                          </p>
+                          {billingState ? (
+                            <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
+                              Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
+                              {" · "}
+                              Hard cap: {billingState.hardCapReached ? "reached" : "not reached"}
+                            </p>
+                          ) : null}
+                        </div>
+                        {billingError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {billingError}</p> : null}
+                        {billingNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{billingNotice}</p> : null}
+                        <div>
+                          <button
+                            onClick={toggleBillingLimits}
+                            disabled={billingBusy || !resolvedOrgId}
+                            style={{
+                              ...(billingState?.billingLimitsEnabled ? settingsButtonDangerStyle : settingsButtonPrimaryStyle),
+                              opacity: billingBusy || !resolvedOrgId ? 0.6 : 1,
+                              cursor: billingBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {billingBusy
+                              ? "Saving..."
+                              : billingState?.billingLimitsEnabled
+                                ? "Disable Billing Limits"
+                                : "Enable Billing Limits"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <p style={settingsBodyTextStyle}>Billing admin account is required to change billing limits.</p>
+                    )}
+                  </section>
+
+                  <section style={settingsBudgetCardStyle}>
+                    <p style={settingsSectionLabelStyle}>AI Budget</p>
+                    <h3 style={settingsTitleStyle}>Sermon Prep Budget</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Track OpenAI token usage by sermon and cap monthly Sermon Prep spend for this church.
+                    </p>
+                    {sermonUsageState ? (
+                      <>
+                        <div style={{ borderRadius: 16, border: "1px solid rgba(184,204,194,0.88)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
+                          <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
+                            Month {sermonUsageState.currentMonthKey}: <strong>${sermonUsageState.currentMonthEstimatedUsd.toFixed(4)}</strong>
+                            {sermonUsageState.effectiveBudgetEnabled ? ` / $${sermonUsageState.budgetUsd.toFixed(2)}` : " (budget disabled)"}
+                            {" · "}
+                            Tokens: {sermonUsageState.currentMonthTotalTokens.toLocaleString()}
+                            {" · "}
+                            Cap: {sermonUsageState.capReached ? "reached" : "not reached"}
+                          </p>
+                          {sermonUsageState.sermons.length ? (
+                            <div style={{ display: "grid", gap: 4 }}>
+                              {sermonUsageState.sermons.slice(0, 4).map((row) => (
+                                <p key={row.sermonId} style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
+                                  {row.sermonId}: ${row.estimatedUsd.toFixed(4)} · {row.totalTokens.toLocaleString()} tokens
+                                </p>
+                              ))}
+                            </div>
+                          ) : (
+                            <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>No Sermon Prep usage recorded this month yet.</p>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <p style={settingsBodyTextStyle}>Loading usage…</p>
+                    )}
+                    {canManageBilling ? (
+                      <>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "end" }}>
+                          <label style={{ display: "grid", gap: 6 }}>
+                            <span style={{ fontSize: 12, color: "#5f6f86" }}>Monthly budget (USD)</span>
+                            <input
+                              type="number"
+                              min={0}
+                              step={0.01}
+                              value={sermonBudgetInput}
+                              onChange={(e) => setSermonBudgetInput(e.target.value)}
+                              style={{ ...settingsInlineFieldStyle, minWidth: 150 }}
+                            />
+                          </label>
+                          <button
+                            onClick={saveSermonBudget}
+                            disabled={sermonBudgetBusy || !resolvedOrgId}
+                            style={{
+                              ...settingsButtonPrimaryStyle,
+                              opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                              cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {sermonBudgetBusy ? "Saving..." : "Save Sermon Budget"}
+                          </button>
+                          <button
+                            onClick={() => {
+                              void loadSermonUsage();
+                            }}
+                            disabled={sermonBudgetBusy || !resolvedOrgId}
+                            style={{
+                              ...settingsButtonNeutralStyle,
+                              opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                              cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            Refresh Usage
+                          </button>
+                        </div>
+                        {sermonBudgetError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {sermonBudgetError}</p> : null}
+                        {sermonBudgetNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{sermonBudgetNotice}</p> : null}
+                      </>
+                    ) : null}
+                  </section>
                 </div>
-                <p style={{ margin: 0, fontWeight: 700, fontSize: 14 }}>Service Schedule</p>
-                <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
-                  Add service times for this church. Added services appear in the dropdown for all members.
-                </p>
-                {resolvedOrgId ? (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+
+                <section style={settingsCardStyle}>
+                  <div style={{ display: "flex", flexWrap: "wrap", alignItems: "start", justifyContent: "space-between", gap: 12 }}>
+                    <div style={{ display: "grid", gap: 8 }}>
+                      <p style={settingsSectionLabelStyle}>Operations</p>
+                      <h3 style={settingsTitleStyle}>Service Schedule</h3>
+                      <p style={settingsBodyTextStyle}>
+                        Add service times for this church. Added services appear in the dropdown for all members.
+                      </p>
+                    </div>
+                    {resolvedOrgId ? (
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                        <button
+                          onClick={() => {
+                            const qs = new URLSearchParams();
+                            qs.set("orgId", resolvedOrgId);
+                            if (slug) qs.set("churchSlug", slug);
+                            void router.push(`/admin/prompt?${qs.toString()}`);
+                          }}
+                          style={settingsButtonNeutralStyle}
+                        >
+                          Open Prompt Settings
+                        </button>
+                        <button
+                          onClick={() => {
+                            const qs = new URLSearchParams();
+                            qs.set("orgId", resolvedOrgId);
+                            if (slug) qs.set("churchSlug", slug);
+                            const returnTo = (router.asPath || "").trim();
+                            if (returnTo.startsWith("/") && !returnTo.startsWith("//")) qs.set("returnTo", returnTo);
+                            void router.push(`/admin/sermon-prep?${qs.toString()}`);
+                          }}
+                          style={settingsButtonNeutralStyle}
+                        >
+                          Open Sermon Prep
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                    <input
+                      value={newServiceKey}
+                      onChange={(e) => setNewServiceKey(e.target.value)}
+                      placeholder="service key (example: sun-9am)"
+                      style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
+                    />
+                    <input
+                      value={newServiceTitle}
+                      onChange={(e) => setNewServiceTitle(e.target.value)}
+                      placeholder="title (optional)"
+                      style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
+                    />
                     <button
-                      onClick={() => {
-                        const qs = new URLSearchParams();
-                        qs.set("orgId", resolvedOrgId);
-                        if (slug) qs.set("churchSlug", slug);
-                        void router.push(`/admin/prompt?${qs.toString()}`);
-                      }}
+                      onClick={addService}
+                      disabled={serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId}
                       style={{
-                        borderRadius: 8,
-                        border: "1px solid rgba(255,255,255,0.24)",
-                        background: "rgba(148,163,184,0.18)",
-                        color: "#e2e8f0",
-                        fontWeight: 600,
-                        padding: "7px 10px",
-                        cursor: "pointer",
+                        ...settingsButtonPrimaryStyle,
+                        opacity: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? 0.6 : 1,
+                        cursor: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? "not-allowed" : "pointer",
                       }}
                     >
-                      Open Prompt Settings
-                    </button>
-                    <button
-                      onClick={() => {
-                        const qs = new URLSearchParams();
-                        qs.set("orgId", resolvedOrgId);
-                        if (slug) qs.set("churchSlug", slug);
-                        const returnTo = (router.asPath || "").trim();
-                        if (returnTo.startsWith("/") && !returnTo.startsWith("//")) qs.set("returnTo", returnTo);
-                        void router.push(`/admin/sermon-prep?${qs.toString()}`);
-                      }}
-                      style={{
-                        borderRadius: 8,
-                        border: "1px solid rgba(255,255,255,0.24)",
-                        background: "rgba(148,163,184,0.18)",
-                        color: "#e2e8f0",
-                        fontWeight: 600,
-                        padding: "7px 10px",
-                        cursor: "pointer",
-                      }}
-                    >
-                      Open Sermon Prep
+                      {serviceManageBusy ? "Adding..." : "Add Service"}
                     </button>
                   </div>
-                ) : null}
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                  <input
-                    value={newServiceKey}
-                    onChange={(e) => setNewServiceKey(e.target.value)}
-                    placeholder="service key (example: sun-9am)"
-                    style={{ flex: "1 1 220px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "8px 10px" }}
-                  />
-                  <input
-                    value={newServiceTitle}
-                    onChange={(e) => setNewServiceTitle(e.target.value)}
-                    placeholder="title (optional)"
-                    style={{ flex: "1 1 220px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "8px 10px" }}
-                  />
-                  <button
-                    onClick={addService}
-                    disabled={serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId}
-                    style={{
-                      borderRadius: 8,
-                      border: "none",
-                      background: "#38bdf8",
-                      color: "#082f49",
-                      fontWeight: 700,
-                      padding: "8px 12px",
-                      cursor: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? "not-allowed" : "pointer",
-                      opacity: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? 0.6 : 1,
-                    }}
-                  >
-                    {serviceManageBusy ? "Adding..." : "Add Service"}
-                  </button>
-                </div>
-                {serviceManageError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {serviceManageError}</p> : null}
-                <div style={{ display: "grid", gap: 6 }}>
-                  {(orgData?.services || []).map((row) => {
-                    const isSelected = row.serviceKey === serviceKey;
-                    const isLive = Boolean(row.activeRoomId);
-                    const deleting = deletingServiceKey === row.serviceKey;
-                    return (
-                      <div
-                        key={row.serviceKey}
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "1fr auto",
-                          gap: 8,
-                          alignItems: "center",
-                          border: "1px solid rgba(255,255,255,0.12)",
-                          borderRadius: 9,
-                          padding: "7px 9px",
-                        }}
-                      >
-                        <p style={{ margin: 0, fontSize: 13, opacity: 0.88 }}>
-                          <strong>{row.title}</strong> ({row.serviceKey})
-                          {isSelected ? " • selected" : ""}
-                          {isLive ? " • live" : ""}
-                        </p>
-                        <button
-                          onClick={() => removeService(row.serviceKey)}
-                          disabled={serviceManageBusy || deletingServiceKey.length > 0 || isLive}
-                          style={{
-                            borderRadius: 8,
-                            border: "1px solid rgba(252,165,165,0.55)",
-                            background: "rgba(127,29,29,0.36)",
-                            color: "#fecaca",
-                            fontWeight: 700,
-                            padding: "6px 10px",
-                            cursor: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? "not-allowed" : "pointer",
-                            opacity: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? 0.55 : 1,
-                          }}
-                        >
-                          {deleting ? "Deleting..." : "Delete"}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
+                  {serviceManageError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {serviceManageError}</p> : null}
+
+                  <div style={{ display: "grid", gap: 10 }}>
+                    {(orgData?.services || []).map((row) => {
+                      const isSelected = row.serviceKey === serviceKey;
+                      const isLive = Boolean(row.activeRoomId);
+                      const deleting = deletingServiceKey === row.serviceKey;
+                      return (
+                        <div key={row.serviceKey} style={settingsServiceRowStyle}>
+                          <div style={{ minWidth: 0 }}>
+                            <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#23354d" }}>{row.title}</p>
+                            <p style={{ margin: "4px 0 0", fontSize: 13, color: "#5f6f86" }}>{row.serviceKey}</p>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                              {isSelected ? (
+                                <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(79,115,170,0.18)", background: "rgba(127,165,219,0.16)", color: "#3e5d8d" }}>
+                                  Selected
+                                </span>
+                              ) : null}
+                              {isLive ? (
+                                <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(91,179,130,0.24)", background: "rgba(91,179,130,0.14)", color: "#3b7d5c" }}>
+                                  Live
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => removeService(row.serviceKey)}
+                            disabled={serviceManageBusy || deletingServiceKey.length > 0 || isLive}
+                            style={{
+                              ...settingsButtonDangerStyle,
+                              padding: "9px 12px",
+                              opacity: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? 0.55 : 1,
+                              cursor: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {deleting ? "Deleting..." : "Delete"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
               </div>
             ) : (
-              <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.12)", borderRadius: 12, padding: 12, fontSize: 13, opacity: 0.82 }}>
+              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: "#5f6f86" }}>
                 You do not have permission to manage service schedules for this church.
               </div>
             )

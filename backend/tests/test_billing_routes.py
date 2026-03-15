@@ -163,6 +163,55 @@ class BillingRouteTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
         self.assertEqual(ctx.exception.detail, "billing_customer_not_found")
 
+    def test_portal_session_sanitizes_saved_customer_id(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2a", slug="billing-route-b1", name="Billing Route B1")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_test_portal`"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        test_case = self
+
+        class _SanitizedPortalStripeClient(_FakeStripeClient):
+            def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> dict:
+                test_case.assertEqual(customer_id, "cus_test_portal")
+                return super().create_billing_portal_session(customer_id=customer_id, return_url=return_url)
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _SanitizedPortalStripeClient()):
+            result = billing_routes.create_portal_session(
+                billing_routes.PortalSessionRequest(orgId=org_id, returnUrl="https://example.com/settings"),
+                user=self._user("owner-billing-2a"),
+            )
+
+        self.assertIn("url", result)
+        updated = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(str(updated.get("stripeCustomerId") or ""), "cus_test_portal")
+
+    def test_portal_session_clears_stale_customer_refs_on_missing_customer(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2aa", slug="billing-route-b1a", name="Billing Route B1A")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_test_mode_mismatch`"
+        billing["stripeSubscriptionId"] = "sub_test_mode_mismatch"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        class _MissingPortalCustomerStripeClient(_FakeStripeClient):
+            def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> dict:
+                raise StripeClientError(
+                    "stripe_http_400: No such customer 'cus_test_mode_mismatch' a similar object exists in test mode, but a live mode key was used"
+                )
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _MissingPortalCustomerStripeClient()):
+            with self.assertRaises(HTTPException) as ctx:
+                billing_routes.create_portal_session(
+                    billing_routes.PortalSessionRequest(orgId=org_id, returnUrl="https://example.com/settings"),
+                    user=self._user("owner-billing-2aa"),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.detail, "billing_customer_not_found")
+        updated = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertIsNone(updated.get("stripeCustomerId"))
+        self.assertIsNone(updated.get("stripeSubscriptionId"))
+
     def test_checkout_session_recreates_customer_when_saved_customer_missing(self) -> None:
         class _MissingCustomerStripeClient(_FakeStripeClient):
             def __init__(self) -> None:
@@ -256,6 +305,34 @@ class BillingRouteTests(unittest.TestCase):
         self.assertIsInstance(billing.get("currentPeriodStart"), datetime)
         self.assertIsInstance(billing.get("currentPeriodEnd"), datetime)
         self.assertEqual(str(billing.get("priceId") or ""), "price_growth")
+
+    def test_billing_status_refresh_clears_stale_customer_refs_on_missing_customer(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2ca", slug="billing-route-b3a", name="Billing Route B3A")
+        existing = self.store.get_org_billing_profile(org_id=org_id)
+        existing["stripeCustomerId"] = "cus_test_refresh_bad`"
+        existing["stripeSubscriptionId"] = "sub_test_refresh_bad`"
+        existing["currentPeriodStart"] = datetime.now(timezone.utc)
+        existing["currentPeriodEnd"] = datetime.now(timezone.utc)
+        self.store.set_org_billing_profile(org_id=org_id, billing=existing)
+
+        class _MissingRefreshCustomerStripeClient(_FakeStripeClient):
+            def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> dict:
+                raise StripeClientError(
+                    "stripe_http_400: No such customer 'cus_test_refresh_bad' a similar object exists in test mode, but a live mode key was used"
+                )
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _MissingRefreshCustomerStripeClient()):
+            payload = billing_routes.billing_status(
+                org_id=org_id,
+                refresh=True,
+                user=self._user("owner-billing-2ca"),
+            )
+
+        billing = payload.get("billing") or {}
+        self.assertIsNone(billing.get("stripeCustomerId"))
+        self.assertIsNone(billing.get("stripeSubscriptionId"))
+        self.assertIsNone(billing.get("currentPeriodStart"))
+        self.assertIsNone(billing.get("currentPeriodEnd"))
 
     def test_billing_status_hydrates_from_customer_when_subscription_id_missing(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-billing-2d", slug="billing-route-b4", name="Billing Route B4")

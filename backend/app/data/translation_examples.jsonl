@@ -451,3 +451,5 @@
 {"timestamp": "2026-03-14T02:45:59.168Z", "source_lang": "ko", "target_lang": "en", "stt_text": "테스트 합니다 테스트합니다테스트", "auto_translation": "We are conducting a test.", "final_translation": "We are conducting a test.", "corrected": false}
 {"timestamp": "2026-03-14T02:46:02.665Z", "source_lang": "ko", "target_lang": "en", "stt_text": "테스트를 한다고 잘되네요 테스트를한다고잘되네요네.", "auto_translation": "It seems to be working well when testing. Yes.", "final_translation": "It seems to be working well when testing. Yes.", "corrected": false}
 {"timestamp": "2026-03-14T02:46:02.937Z", "source_lang": "ko", "target_lang": "en", "stt_text": "테스트를 한다고 잘되네요 테스트를한다고잘되네요네.", "auto_translation": "It's going well as we conduct the test. Yes.", "final_translation": "It's going well as we conduct the test. Yes.", "corrected": false}
+{"timestamp": "2026-03-14T14:57:48.002Z", "source_lang": "ko", "target_lang": "en", "stt_text": "테스트", "auto_translation": "Test", "final_translation": "Test", "corrected": false}
+{"timestamp": "2026-03-14T15:04:53.886Z", "source_lang": "ko", "target_lang": "en", "stt_text": "테스트", "auto_translation": "Test", "final_translation": "Test", "corrected": false}

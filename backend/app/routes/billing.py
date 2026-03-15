@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -41,6 +42,29 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _clean_stripe_ref(value: Any, *, prefixes: tuple[str, ...]) -> str:
+    raw = _clean(value).strip("`'\"")
+    if not raw:
+        return ""
+    for prefix in prefixes:
+        match = re.search(rf"({re.escape(prefix)}[A-Za-z0-9_]+)", raw)
+        if match:
+            return match.group(1)
+    return raw
+
+
+def _clean_customer_id(value: Any) -> str:
+    return _clean_stripe_ref(value, prefixes=("cus_",))
+
+
+def _clean_subscription_id(value: Any) -> str:
+    return _clean_stripe_ref(value, prefixes=("sub_",))
+
+
+def _clean_price_id(value: Any) -> str:
+    return _clean_stripe_ref(value, prefixes=("price_",))
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -50,17 +74,17 @@ def _stripe_client() -> StripeBillingClient:
 
 
 def _resolve_plan_from_price_id(price_id: str, *, fallback_plan_key: str) -> str:
-    clean = _clean(price_id)
+    clean = _clean_price_id(price_id)
     if not clean:
         return plan_spec(fallback_plan_key).key
     for plan_key, configured_price in BILLING_CONFIG.stripe_price_ids.items():
-        if _clean(configured_price) and _clean(configured_price) == clean:
+        if _clean_price_id(configured_price) and _clean_price_id(configured_price) == clean:
             return plan_key
     return plan_spec(fallback_plan_key).key
 
 
 def _is_valid_price_id(price_id: str) -> bool:
-    return _clean(price_id).startswith("price_")
+    return _clean_price_id(price_id).startswith("price_")
 
 
 def _is_missing_customer_error(exc: StripeClientError) -> bool:
@@ -116,14 +140,47 @@ def _price_id_from_subscription(subscription: Dict[str, Any]) -> str:
             continue
         price = row.get("price")
         if isinstance(price, dict):
-            token = _clean(price.get("id"))
+            token = _clean_price_id(price.get("id"))
             if token:
                 return token
         else:
-            token = _clean(price)
+            token = _clean_price_id(price)
             if token:
                 return token
     return ""
+
+
+def _normalize_billing_refs(*, billing: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    next_billing = dict(billing or {})
+    changed = False
+    for key, cleaner in (
+        ("stripeCustomerId", _clean_customer_id),
+        ("stripeSubscriptionId", _clean_subscription_id),
+        ("priceId", _clean_price_id),
+    ):
+        raw_value = next_billing.get(key)
+        normalized = cleaner(raw_value)
+        if normalized:
+            if normalized != raw_value:
+                next_billing[key] = normalized
+                changed = True
+        elif raw_value not in (None, ""):
+            next_billing[key] = None
+            changed = True
+    return next_billing, changed
+
+
+def _clear_stale_stripe_refs(*, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+    next_billing = dict(billing or {})
+    changed = False
+    for key in ("stripeCustomerId", "stripeSubscriptionId", "priceId", "currentPeriodStart", "currentPeriodEnd"):
+        if next_billing.get(key) not in (None, ""):
+            next_billing[key] = None
+            changed = True
+    if not changed:
+        return billing
+    next_billing["updatedAt"] = _utcnow()
+    return multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
 
 
 def _first_subscription_item(subscription: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -160,13 +217,13 @@ def _merge_subscription_snapshot(
         str(stripe_subscription.get("status") or ""),
         fallback_status=str(next_billing.get("status") or "trialing"),
     )
-    subscription_id = _clean(stripe_subscription.get("id"))
-    customer_id = _clean(stripe_subscription.get("customer"))
+    subscription_id = _clean_subscription_id(stripe_subscription.get("id"))
+    customer_id = _clean_customer_id(stripe_subscription.get("customer"))
     cancel_at_period_end = bool(stripe_subscription.get("cancel_at_period_end"))
     current_period_start = _subscription_period_datetime(stripe_subscription, "current_period_start")
     current_period_end = _subscription_period_datetime(stripe_subscription, "current_period_end")
     trial_end = _to_datetime(stripe_subscription.get("trial_end"))
-    price_id = _price_id_from_subscription(stripe_subscription)
+    price_id = _clean_price_id(_price_id_from_subscription(stripe_subscription))
     requested_plan = plan_spec(
         _resolve_plan_from_price_id(
             price_id,
@@ -232,7 +289,7 @@ def _pick_customer_subscription(payload: Dict[str, Any]) -> Optional[Dict[str, A
 
 
 def _lookup_customer_subscription(client: StripeBillingClient, *, customer_id: str) -> Optional[Dict[str, Any]]:
-    clean_customer_id = _clean(customer_id)
+    clean_customer_id = _clean_customer_id(customer_id)
     if not clean_customer_id:
         return None
     return _pick_customer_subscription(
@@ -260,12 +317,28 @@ def _hydrate_billing_from_stripe(
         return billing
 
     client = _stripe_client()
-    subscription_id = _clean((billing or {}).get("stripeSubscriptionId"))
-    customer_id = _clean((billing or {}).get("stripeCustomerId"))
+    subscription_id = _clean_subscription_id((billing or {}).get("stripeSubscriptionId"))
+    customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
     stripe_subscription: Optional[Dict[str, Any]] = None
+    customer_refs_invalid = False
+
+    def _lookup_by_customer() -> Optional[Dict[str, Any]]:
+        nonlocal billing, customer_refs_invalid, customer_id, subscription_id
+        try:
+            return _lookup_customer_subscription(client, customer_id=customer_id)
+        except StripeClientError as exc:
+            if _is_missing_customer_error(exc):
+                billing = _clear_stale_stripe_refs(org_id=org_id, billing=billing)
+                customer_refs_invalid = True
+                customer_id = ""
+                subscription_id = ""
+                return None
+            raise
 
     if force_refresh and customer_id:
-        stripe_subscription = _lookup_customer_subscription(client, customer_id=customer_id)
+        stripe_subscription = _lookup_by_customer()
+        if customer_refs_invalid:
+            return billing
 
     if not stripe_subscription and subscription_id:
         try:
@@ -275,7 +348,9 @@ def _hydrate_billing_from_stripe(
                 raise
 
     if not stripe_subscription and customer_id:
-        stripe_subscription = _lookup_customer_subscription(client, customer_id=customer_id)
+        stripe_subscription = _lookup_by_customer()
+        if customer_refs_invalid:
+            return billing
 
     if not stripe_subscription:
         return billing
@@ -339,10 +414,10 @@ def _resolve_org_id_from_event(event_type: str, stripe_obj: Dict[str, Any]) -> O
         org_id = _clean(metadata.get("orgId") or metadata.get("org_id"))
         if org_id:
             return org_id
-    customer_id = _clean(stripe_obj.get("customer"))
-    subscription_id = _clean(stripe_obj.get("subscription"))
+    customer_id = _clean_customer_id(stripe_obj.get("customer"))
+    subscription_id = _clean_subscription_id(stripe_obj.get("subscription"))
     if event_type.startswith("customer.subscription."):
-        subscription_id = _clean(stripe_obj.get("id")) or subscription_id
+        subscription_id = _clean_subscription_id(stripe_obj.get("id")) or subscription_id
     return multichurch_store.find_org_id_by_billing_refs(
         stripe_customer_id=customer_id or None,
         stripe_subscription_id=subscription_id or None,
@@ -363,6 +438,10 @@ def billing_status(
         if detail == "org_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_status_fetch_failed") from exc
+    billing, refs_changed = _normalize_billing_refs(billing=billing)
+    if refs_changed:
+        billing = multichurch_store.set_org_billing_profile(org_id=org_id, billing=billing)
+
     try:
         billing = _hydrate_billing_from_stripe(
             org_id=org_id,
@@ -389,7 +468,7 @@ def create_checkout_session(
     target_plan = plan_spec(body.planKey)
     if target_plan.key == "trial":
         raise HTTPException(status_code=400, detail="invalid_plan")
-    price_id = _clean(BILLING_CONFIG.stripe_price_ids.get(target_plan.key))
+    price_id = _clean_price_id(BILLING_CONFIG.stripe_price_ids.get(target_plan.key))
     if not price_id:
         raise HTTPException(status_code=503, detail="billing_not_configured")
     if not _is_valid_price_id(price_id):
@@ -405,8 +484,12 @@ def create_checkout_session(
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
 
+    billing, refs_changed = _normalize_billing_refs(billing=billing)
+    if refs_changed:
+        billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+
     client = _stripe_client()
-    customer_id = _clean((billing or {}).get("stripeCustomerId"))
+    customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
     try:
         if not customer_id:
             customer = client.create_customer(
@@ -414,7 +497,7 @@ def create_checkout_session(
                 name=user.displayName,
                 metadata={"orgId": body.orgId, "createdByUid": user.uid},
             )
-            customer_id = _clean((customer or {}).get("id"))
+            customer_id = _clean_customer_id((customer or {}).get("id"))
             if not customer_id:
                 raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
             billing["stripeCustomerId"] = customer_id
@@ -438,7 +521,7 @@ def create_checkout_session(
                     name=user.displayName,
                     metadata={"orgId": body.orgId, "createdByUid": user.uid},
                 )
-                customer_id = _clean((customer or {}).get("id"))
+                customer_id = _clean_customer_id((customer or {}).get("id"))
                 if not customer_id:
                     raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
                 billing["stripeCustomerId"] = customer_id
@@ -481,13 +564,20 @@ def create_portal_session(
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
 
-    customer_id = _clean((billing or {}).get("stripeCustomerId"))
+    billing, refs_changed = _normalize_billing_refs(billing=billing)
+    if refs_changed:
+        billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+
+    customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
     if not customer_id:
         raise HTTPException(status_code=404, detail="billing_customer_not_found")
 
     try:
         session = _stripe_client().create_billing_portal_session(customer_id=customer_id, return_url=body.returnUrl)
     except StripeClientError as exc:
+        if _is_missing_customer_error(exc):
+            _clear_stale_stripe_refs(org_id=body.orgId, billing=billing)
+            raise HTTPException(status_code=404, detail="billing_customer_not_found") from exc
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     portal_url = _clean((session or {}).get("url"))
