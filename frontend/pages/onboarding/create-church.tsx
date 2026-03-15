@@ -1,6 +1,15 @@
 import { useRouter } from "next/router";
 import { FormEvent, useEffect, useRef, useState } from "react";
 
+import StudioAccessLayout, {
+  buildStudioButtonStyle,
+  buildStudioNoticeStyle,
+  studioChipStyle,
+  studioFieldStyle,
+  studioHelperTextStyle,
+  studioLabelStyle,
+  studioLabelTextStyle,
+} from "../../components/StudioAccessLayout";
 import { bootstrapOwnerOrg, checkChurchSlugAvailability, fetchAuthMe } from "../../lib/backendAuth";
 import { useAuth } from "../../lib/authContext";
 import { normalizeChurchSlug } from "../../lib/churchSlug";
@@ -160,95 +169,87 @@ export default function CreateChurchOnboardingPage() {
   const disabled = !configured || busy || checkingMembership || !normalizedSlug || slugAvailabilityBusy || slugAvailable === false;
 
   return (
-    <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc", padding: 18 }}>
-      <section style={{ width: "100%", maxWidth: 470, borderRadius: 14, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(255,255,255,0.04)", padding: 18 }}>
-        <h1 style={{ marginTop: 0, marginBottom: 8 }}>Create Your Church</h1>
-        <p style={{ marginTop: 0, marginBottom: 14, opacity: 0.82 }}>Create your organization before starting services.</p>
+    <StudioAccessLayout
+      pageTitle="Create Church | Worship"
+      pageDescription="Create your church organization before starting services."
+      panelEyebrow="Organization Setup"
+      panelTitle="Create Your Church"
+      panelDescription="Create your organization before starting services."
+      infoEyebrow="First-Time Setup"
+      infoTitle="Reserve the church URL and open the dashboard in one step."
+      infoDescription="This is the first-time organization setup flow for signed-in users who do not belong to a church yet."
+      infoItems={[
+        {
+          title: "Church URL validation",
+          description: "The slug check runs before the workspace is created so the public-facing URL is safe to use immediately.",
+        },
+        {
+          title: "Immediate host routing",
+          description: "As soon as the organization is created, the session stores the first service and routes into the broadcast dashboard.",
+        },
+        {
+          title: "No duplicate onboarding",
+          description: "If the account already belongs to a church, this page redirects back to the correct dashboard instead of creating another org.",
+        },
+      ]}
+      headerActions={[
+        { href: "/", label: "Back Home" },
+        { href: "/contact", label: "Contact Us", accent: true },
+      ]}
+    >
+      {!configured ? (
+        <div style={buildStudioNoticeStyle("error")}>
+          Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
+        </div>
+      ) : null}
 
-        {!configured ? (
-          <div style={{ borderRadius: 10, border: "1px solid rgba(252,165,165,0.45)", background: "rgba(127,29,29,0.3)", padding: 12, color: "#fecaca", fontSize: 13 }}>
-            Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
-          </div>
-        ) : null}
+      {checkingMembership ? <p style={buildStudioNoticeStyle("info")}>Checking existing memberships...</p> : null}
+      {errorMsg ? <p style={buildStudioNoticeStyle("error")}>Error: {errorMsg}</p> : null}
 
-        {errorMsg ? (
-          <p style={{ color: "#fca5a5", marginTop: 12, marginBottom: 0 }}>Error: {errorMsg}</p>
-        ) : null}
-
-        <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, marginTop: 12 }}>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Church name</span>
-            <input
-              value={churchName}
-              onChange={(e) => setChurchName(e.target.value)}
-              required
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-          </label>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Church URL slug</span>
-            <input
-              value={churchSlug}
-              onChange={(e) => {
-                setSlugTouched(true);
-                setChurchSlug(normalizeChurchSlug(e.target.value));
-              }}
-              required
-              pattern="[a-z0-9-]+"
-              title="Use lowercase letters, numbers, and hyphens."
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-            {slugAvailabilityBusy ? <span style={{ fontSize: 12, opacity: 0.76 }}>Checking slug availability…</span> : null}
-            {!slugAvailabilityBusy && slugAvailable === true ? <span style={{ fontSize: 12, color: "#86efac" }}>Slug is available.</span> : null}
-            {!slugAvailabilityBusy && slugAvailable === false ? (
-              <span style={{ fontSize: 12, color: "#fca5a5" }}>That slug is already taken.</span>
-            ) : null}
-            {!slugAvailabilityBusy && slugAvailable === false && slugSuggestions.length ? (
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {slugSuggestions.map((suggestion) => (
-                  <button
-                    key={suggestion}
-                    type="button"
-                    onClick={() => {
-                      setSlugTouched(true);
-                      setChurchSlug(suggestion);
-                      setErrorMsg(null);
-                    }}
-                    style={{
-                      borderRadius: 999,
-                      border: "1px solid rgba(147,197,253,0.5)",
-                      background: "rgba(30,58,138,0.35)",
-                      color: "#bfdbfe",
-                      fontSize: 12,
-                      padding: "4px 10px",
-                      cursor: "pointer",
-                    }}
-                  >
-                    Use {suggestion}
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </label>
-          <button
-            type="submit"
-            disabled={disabled}
-            style={{
-              marginTop: 4,
-              borderRadius: 10,
-              border: "none",
-              padding: "10px 12px",
-              fontWeight: 700,
-              background: "#22c55e",
-              color: "#052e16",
-              cursor: disabled ? "not-allowed" : "pointer",
-              opacity: disabled ? 0.6 : 1,
+      <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
+        <label style={studioLabelStyle}>
+          <span style={studioLabelTextStyle}>Church name</span>
+          <input value={churchName} onChange={(e) => setChurchName(e.target.value)} required style={studioFieldStyle} />
+        </label>
+        <label style={studioLabelStyle}>
+          <span style={studioLabelTextStyle}>Church URL slug</span>
+          <input
+            value={churchSlug}
+            onChange={(e) => {
+              setSlugTouched(true);
+              setChurchSlug(normalizeChurchSlug(e.target.value));
             }}
-          >
-            {busy ? "Creating church..." : checkingMembership ? "Checking..." : "Create church"}
-          </button>
-        </form>
-      </section>
-    </main>
+            required
+            pattern="[a-z0-9-]+"
+            title="Use lowercase letters, numbers, and hyphens."
+            style={studioFieldStyle}
+          />
+          {slugAvailabilityBusy ? <span style={studioHelperTextStyle}>Checking slug availability...</span> : null}
+          {!slugAvailabilityBusy && slugAvailable === true ? <span style={{ ...studioHelperTextStyle, color: "#2f6d4f" }}>Slug is available.</span> : null}
+          {!slugAvailabilityBusy && slugAvailable === false ? <span style={{ ...studioHelperTextStyle, color: "#a33d51" }}>That slug is already taken.</span> : null}
+          {!slugAvailabilityBusy && slugAvailable === false && slugSuggestions.length ? (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {slugSuggestions.map((suggestion) => (
+                <button
+                  key={suggestion}
+                  type="button"
+                  onClick={() => {
+                    setSlugTouched(true);
+                    setChurchSlug(suggestion);
+                    setErrorMsg(null);
+                  }}
+                  style={{ ...studioChipStyle, cursor: "pointer" }}
+                >
+                  Use {suggestion}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </label>
+        <button type="submit" disabled={disabled} style={buildStudioButtonStyle({ disabled })}>
+          {busy ? "Creating Church..." : checkingMembership ? "Checking..." : "Create Church"}
+        </button>
+      </form>
+    </StudioAccessLayout>
   );
 }

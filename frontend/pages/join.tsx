@@ -2,6 +2,12 @@ import Link from "next/link";
 import { useRouter } from "next/router";
 import { useEffect, useMemo, useState } from "react";
 
+import StudioAccessLayout, {
+  buildStudioButtonStyle,
+  buildStudioNoticeStyle,
+  studioReadOnlyCardStyle,
+  studioSubtleTextStyle,
+} from "../components/StudioAccessLayout";
 import { previewOrgInvite, redeemOrgInvite, type InvitePreviewResponse } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
 import { clearHostToken, persistAuthToken, persistStreamContext } from "../utils/streamContext";
@@ -80,92 +86,82 @@ export default function JoinByInvitePage() {
   const nextJoinPath = `/join?code=${encodeURIComponent(inviteCode || "")}`;
 
   return (
-    <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc", padding: 18 }}>
-      <section style={{ width: "100%", maxWidth: 560, borderRadius: 14, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(255,255,255,0.04)", padding: 18 }}>
-        <h1 style={{ marginTop: 0, marginBottom: 8 }}>Join Church Workspace</h1>
-        <p style={{ marginTop: 0, marginBottom: 12, opacity: 0.84 }}>Use your invite link to join a church organization.</p>
+    <StudioAccessLayout
+      pageTitle="Join Church Workspace | Worship"
+      pageDescription="Use an invite link to join a church workspace."
+      panelEyebrow="Invite Access"
+      panelTitle="Join Church Workspace"
+      panelDescription="Use your invite link to join a church organization."
+      infoEyebrow="Invite Flow"
+      infoTitle="Accept the invite and land in the right workspace."
+      infoDescription="Invite links preserve church context so the account can be attached to the correct organization before routing into the dashboard."
+      infoItems={[
+        {
+          title: "Single-use join flow",
+          description: "The invite preview confirms the church, role, and destination before the membership is attached to your account.",
+        },
+        {
+          title: "Account required",
+          description: "If you are not signed in yet, the invite path is preserved through login or signup so you can continue where you left off.",
+        },
+        {
+          title: "Direct to dashboard",
+          description: "After redemption, the session moves directly into the church host dashboard with the org context already stored.",
+        },
+      ]}
+      headerActions={[
+        { href: "/", label: "Back Home" },
+        { href: "/contact", label: "Contact Us", accent: true },
+      ]}
+    >
+      {!configured ? (
+        <div style={buildStudioNoticeStyle("error")}>
+          Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
+        </div>
+      ) : null}
 
-        {!configured ? (
-          <div style={{ borderRadius: 10, border: "1px solid rgba(252,165,165,0.45)", background: "rgba(127,29,29,0.3)", padding: 12, color: "#fecaca", fontSize: 13 }}>
-            Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
+      {!inviteCode ? <div style={buildStudioNoticeStyle("error")}>Invite code is missing in the URL. Open the full invite link.</div> : null}
+
+      {previewBusy ? <p style={buildStudioNoticeStyle("info")}>Checking invite...</p> : null}
+
+      {preview ? (
+        <div style={studioReadOnlyCardStyle}>
+          <p style={{ marginTop: 0, marginBottom: 6, ...studioSubtleTextStyle }}>
+            <strong style={{ color: "#22344c" }}>Church:</strong> {preview.name}
+          </p>
+          <p style={{ marginTop: 0, marginBottom: 6, ...studioSubtleTextStyle }}>
+            <strong style={{ color: "#22344c" }}>Slug:</strong> {preview.slug}
+          </p>
+          <p style={{ marginTop: 0, marginBottom: 6, ...studioSubtleTextStyle }}>
+            <strong style={{ color: "#22344c" }}>Role:</strong> {preview.role}
+          </p>
+          <p style={{ marginTop: 0, marginBottom: 0, ...studioSubtleTextStyle }}>
+            {preview.alreadyMember ? "You are already a member. Continue to dashboard." : "Click below to join this church workspace."}
+          </p>
+        </div>
+      ) : null}
+
+      {errorMsg ? <p style={buildStudioNoticeStyle("error")}>Error: {errorMsg}</p> : null}
+
+      {showJoinButton ? (
+        <button onClick={onJoin} disabled={joinBusy} style={buildStudioButtonStyle({ disabled: joinBusy })}>
+          {joinBusy ? "Joining..." : preview?.alreadyMember ? "Go to Dashboard" : "Join Church"}
+        </button>
+      ) : null}
+
+      {!user && configured && inviteCode ? (
+        <div style={{ display: "grid", gap: 10 }}>
+          <p style={studioSubtleTextStyle}>This invite requires an account.</p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+            <Link href={`/login?next=${encodeURIComponent(nextJoinPath)}`} style={buildStudioButtonStyle()}>
+              Sign In to Join
+            </Link>
+            <Link href={`/signup?next=${encodeURIComponent(nextJoinPath)}`} style={buildStudioButtonStyle({ tone: "secondary" })}>
+              Create Account to Join
+            </Link>
           </div>
-        ) : null}
-
-        {!inviteCode ? (
-          <div style={{ borderRadius: 10, border: "1px solid rgba(252,165,165,0.45)", background: "rgba(127,29,29,0.3)", padding: 12, color: "#fecaca" }}>
-            Invite code is missing in the URL. Open the full invite link.
-          </div>
-        ) : null}
-
-        {previewBusy ? <p style={{ marginTop: 12, marginBottom: 0, opacity: 0.82 }}>Checking invite...</p> : null}
-
-        {preview ? (
-          <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12 }}>
-            <p style={{ marginTop: 0, marginBottom: 6 }}><strong>Church:</strong> {preview.name}</p>
-            <p style={{ marginTop: 0, marginBottom: 6 }}><strong>Slug:</strong> {preview.slug}</p>
-            <p style={{ marginTop: 0, marginBottom: 6 }}><strong>Role:</strong> {preview.role}</p>
-            <p style={{ marginTop: 0, marginBottom: 0, opacity: 0.82 }}>
-              {preview.alreadyMember ? "You are already a member. Continue to dashboard." : "Click below to join this church workspace."}
-            </p>
-          </div>
-        ) : null}
-
-        {errorMsg ? <p style={{ color: "#fca5a5", marginTop: 12, marginBottom: 0 }}>Error: {errorMsg}</p> : null}
-
-        {showJoinButton ? (
-          <button
-            onClick={onJoin}
-            disabled={joinBusy}
-            style={{
-              marginTop: 14,
-              borderRadius: 10,
-              border: "none",
-              padding: "10px 14px",
-              fontWeight: 700,
-              background: "#22c55e",
-              color: "#052e16",
-              cursor: joinBusy ? "not-allowed" : "pointer",
-              opacity: joinBusy ? 0.6 : 1,
-            }}
-          >
-            {joinBusy ? "Joining..." : preview?.alreadyMember ? "Go to dashboard" : "Join church"}
-          </button>
-        ) : null}
-
-        {!user && configured && inviteCode ? (
-          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
-            <p style={{ margin: 0, opacity: 0.85 }}>
-              This invite requires an account.
-            </p>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-              <Link
-                href={`/login?next=${encodeURIComponent(nextJoinPath)}`}
-                style={{
-                  borderRadius: 8,
-                  background: "#22c55e",
-                  color: "#052e16",
-                  fontWeight: 700,
-                  padding: "8px 12px",
-                }}
-              >
-                Sign in to join
-              </Link>
-              <Link
-                href={`/signup?next=${encodeURIComponent(nextJoinPath)}`}
-                style={{
-                  borderRadius: 8,
-                  border: "1px solid rgba(255,255,255,0.28)",
-                  color: "#e2e8f0",
-                  fontWeight: 700,
-                  padding: "8px 12px",
-                }}
-              >
-                Create account to join
-              </Link>
-            </div>
-          </div>
-        ) : null}
-      </section>
-    </main>
+        </div>
+      ) : null}
+    </StudioAccessLayout>
   );
 }

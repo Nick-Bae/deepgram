@@ -2,6 +2,15 @@ import Link from "next/link";
 import { useRouter } from "next/router";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
+import StudioAccessLayout, {
+  buildStudioButtonStyle,
+  buildStudioNoticeStyle,
+  studioChipStyle,
+  studioFieldStyle,
+  studioHelperTextStyle,
+  studioLabelStyle,
+  studioLabelTextStyle,
+} from "../components/StudioAccessLayout";
 import { bootstrapOwnerOrg, checkChurchSlugAvailability } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
 import { normalizeChurchSlug } from "../lib/churchSlug";
@@ -169,166 +178,171 @@ export default function SignupPage() {
   const slugBlocked = !inviteJoinFlow && (!normalizedSlug || slugAvailabilityBusy || slugAvailable === false);
 
   return (
-    <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc", padding: 18 }}>
-      <section style={{ width: "100%", maxWidth: 470, borderRadius: 14, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(255,255,255,0.04)", padding: 18 }}>
-        <h1 style={{ marginTop: 0, marginBottom: 8 }}>Create Host Account</h1>
-        <p style={{ marginTop: 0, marginBottom: 14, opacity: 0.82 }}>
-          {inviteJoinFlow ? "Sign up to continue joining your invited church workspace." : "Sign up and create your church workspace."}
-        </p>
+    <StudioAccessLayout
+      pageTitle="Create Account | Worship"
+      pageDescription="Create a host account and start a church workspace."
+      panelEyebrow={inviteJoinFlow ? "Join Existing Church" : "Create Workspace"}
+      panelTitle="Create Host Account"
+      panelDescription={
+        inviteJoinFlow
+          ? "Sign up to continue joining your invited church workspace."
+          : "Create your host account and set up your church workspace."
+      }
+      infoEyebrow="Setup Flow"
+      infoTitle={inviteJoinFlow ? "Create an account, then finish joining the invited church." : "Start a church workspace with the first service already ready."}
+      infoDescription={
+        inviteJoinFlow
+          ? "The invite flow keeps the join target so the new account can land inside the right church immediately after signup."
+          : "New church signup creates the organization, the initial service slot, and the host context in one step."
+      }
+      infoItems={
+        inviteJoinFlow
+          ? [
+              {
+                title: "Join-safe signup",
+                description: "The invite redirect is preserved so the new account continues into the church join flow automatically.",
+              },
+              {
+                title: "One account, multiple churches",
+                description: "You can later accept more invites without creating separate logins for each organization.",
+              },
+              {
+                title: "Need help first?",
+                description: "Support is available before you create the account if setup or access looks wrong.",
+              },
+            ]
+          : [
+              {
+                title: "30-minute host trial",
+                description: "New church signup includes the built-in host broadcast trial so you can test the full workflow immediately.",
+              },
+              {
+                title: "Church URL reserved",
+                description: "Slug checks happen during signup so the listener-facing URL is validated before the workspace is created.",
+              },
+              {
+                title: "Ready for broadcast",
+                description: "After signup, the first service is created and the host is routed straight into the dashboard.",
+              },
+            ]
+      }
+      headerActions={[
+        { href: "/", label: "Back Home" },
+        { href: "/contact", label: "Contact Us", accent: true },
+      ]}
+    >
+      {!inviteJoinFlow ? <p style={buildStudioNoticeStyle("success")}>New church signup includes a 30-minute free host broadcast trial.</p> : null}
+
+      {!configured ? (
+        <div style={buildStudioNoticeStyle("error")}>
+          Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
+        </div>
+      ) : null}
+
+      {errorMsg ? <p style={buildStudioNoticeStyle("error")}>Error: {errorMsg}</p> : null}
+
+      <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
+        <label style={studioLabelStyle}>
+          <span style={studioLabelTextStyle}>Your name</span>
+          <input value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" required style={studioFieldStyle} />
+        </label>
+        <label style={studioLabelStyle}>
+          <span style={studioLabelTextStyle}>Email</span>
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required style={studioFieldStyle} />
+        </label>
+        <label style={studioLabelStyle}>
+          <span style={studioLabelTextStyle}>Password</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="new-password"
+            minLength={6}
+            required
+            style={studioFieldStyle}
+          />
+        </label>
+        <label style={studioLabelStyle}>
+          <span style={studioLabelTextStyle}>Confirm password</span>
+          <input
+            type="password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            autoComplete="new-password"
+            minLength={6}
+            required
+            style={studioFieldStyle}
+          />
+          {passwordMismatch ? <span style={{ ...studioHelperTextStyle, color: "#a33d51" }}>Passwords do not match.</span> : null}
+        </label>
+
         {!inviteJoinFlow ? (
-          <p style={{ marginTop: -2, marginBottom: 14, fontSize: 13, color: "#86efac" }}>
-            New church signup includes a 30-minute free host broadcast trial.
-          </p>
+          <>
+            <label style={studioLabelStyle}>
+              <span style={studioLabelTextStyle}>Church name</span>
+              <input value={churchName} onChange={(e) => setChurchName(e.target.value)} required style={studioFieldStyle} />
+            </label>
+            <label style={studioLabelStyle}>
+              <span style={studioLabelTextStyle}>Church URL slug</span>
+              <input
+                value={churchSlug}
+                onChange={(e) => {
+                  setSlugTouched(true);
+                  setChurchSlug(normalizeChurchSlug(e.target.value));
+                }}
+                required
+                pattern="[a-z0-9-]+"
+                title="Use lowercase letters, numbers, and hyphens."
+                style={studioFieldStyle}
+              />
+              {slugAvailabilityBusy ? <span style={studioHelperTextStyle}>Checking slug availability...</span> : null}
+              {!slugAvailabilityBusy && slugAvailable === true ? <span style={{ ...studioHelperTextStyle, color: "#2f6d4f" }}>Slug is available.</span> : null}
+              {!slugAvailabilityBusy && slugAvailable === false ? <span style={{ ...studioHelperTextStyle, color: "#a33d51" }}>That slug is already taken.</span> : null}
+              {!slugAvailabilityBusy && slugAvailable === false && slugSuggestions.length ? (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {slugSuggestions.map((suggestion) => (
+                    <button
+                      key={suggestion}
+                      type="button"
+                      onClick={() => {
+                        setSlugTouched(true);
+                        setChurchSlug(suggestion);
+                        setErrorMsg(null);
+                      }}
+                      style={{ ...studioChipStyle, cursor: "pointer" }}
+                    >
+                      Use {suggestion}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </label>
+          </>
         ) : null}
 
-        {!configured ? (
-          <div style={{ borderRadius: 10, border: "1px solid rgba(252,165,165,0.45)", background: "rgba(127,29,29,0.3)", padding: 12, color: "#fecaca", fontSize: 13 }}>
-            Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
-          </div>
-        ) : null}
+        <button
+          type="submit"
+          disabled={!configured || busy || passwordMismatch || slugBlocked}
+          style={buildStudioButtonStyle({ disabled: !configured || busy || passwordMismatch || slugBlocked })}
+        >
+          {busy ? "Creating Account..." : inviteJoinFlow ? "Sign Up and Continue" : "Sign Up and Create Church"}
+        </button>
+      </form>
 
-        {errorMsg ? (
-          <p style={{ color: "#fca5a5", marginTop: 12, marginBottom: 0 }}>Error: {errorMsg}</p>
-        ) : null}
-
-        <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, marginTop: 12 }}>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Your name</span>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              autoComplete="name"
-              required
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-          </label>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Email</span>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              autoComplete="email"
-              required
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-          </label>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Password</span>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="new-password"
-              minLength={6}
-              required
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-          </label>
-          <label style={{ display: "grid", gap: 4 }}>
-            <span style={{ fontSize: 13, opacity: 0.84 }}>Confirm password</span>
-            <input
-              type="password"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              autoComplete="new-password"
-              minLength={6}
-              required
-              style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-            />
-            {passwordMismatch ? <span style={{ fontSize: 12, color: "#fca5a5" }}>Passwords do not match.</span> : null}
-          </label>
-          {!inviteJoinFlow ? (
-            <>
-              <label style={{ display: "grid", gap: 4 }}>
-                <span style={{ fontSize: 13, opacity: 0.84 }}>Church name</span>
-                <input
-                  value={churchName}
-                  onChange={(e) => setChurchName(e.target.value)}
-                  required
-                  style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-                />
-              </label>
-              <label style={{ display: "grid", gap: 4 }}>
-                <span style={{ fontSize: 13, opacity: 0.84 }}>Church URL slug</span>
-                <input
-                  value={churchSlug}
-                  onChange={(e) => {
-                    setSlugTouched(true);
-                    setChurchSlug(normalizeChurchSlug(e.target.value));
-                  }}
-                  required
-                  pattern="[a-z0-9-]+"
-                  title="Use lowercase letters, numbers, and hyphens."
-                  style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-                />
-                {slugAvailabilityBusy ? <span style={{ fontSize: 12, opacity: 0.76 }}>Checking slug availability…</span> : null}
-                {!slugAvailabilityBusy && slugAvailable === true ? <span style={{ fontSize: 12, color: "#86efac" }}>Slug is available.</span> : null}
-                {!slugAvailabilityBusy && slugAvailable === false ? (
-                  <span style={{ fontSize: 12, color: "#fca5a5" }}>That slug is already taken.</span>
-                ) : null}
-                {!slugAvailabilityBusy && slugAvailable === false && slugSuggestions.length ? (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                    {slugSuggestions.map((suggestion) => (
-                      <button
-                        key={suggestion}
-                        type="button"
-                        onClick={() => {
-                          setSlugTouched(true);
-                          setChurchSlug(suggestion);
-                          setErrorMsg(null);
-                        }}
-                        style={{
-                          borderRadius: 999,
-                          border: "1px solid rgba(147,197,253,0.5)",
-                          background: "rgba(30,58,138,0.35)",
-                          color: "#bfdbfe",
-                          fontSize: 12,
-                          padding: "4px 10px",
-                          cursor: "pointer",
-                        }}
-                      >
-                        Use {suggestion}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </label>
-            </>
-          ) : null}
-
-          <button
-            type="submit"
-            disabled={!configured || busy || passwordMismatch || slugBlocked}
-            style={{
-              marginTop: 4,
-              borderRadius: 10,
-              border: "none",
-              padding: "10px 12px",
-              fontWeight: 700,
-              background: "#22c55e",
-              color: "#052e16",
-              cursor: !configured || busy || passwordMismatch || slugBlocked ? "not-allowed" : "pointer",
-              opacity: !configured || busy || passwordMismatch || slugBlocked ? 0.6 : 1,
-            }}
-          >
-            {busy ? "Creating account..." : inviteJoinFlow ? "Sign up and continue" : "Sign up and create church"}
-          </button>
-        </form>
-
-        <p style={{ fontSize: 13, marginBottom: 0, marginTop: 12, opacity: 0.85 }}>
+      <div style={{ display: "grid", gap: 8 }}>
+        <p style={studioHelperTextStyle}>
           Already have an account?{" "}
-          <Link href={nextPath ? `/login?next=${encodeURIComponent(nextPath)}` : "/login"} style={{ color: "#93c5fd" }}>
+          <Link href={nextPath ? `/login?next=${encodeURIComponent(nextPath)}` : "/login"} style={{ color: "#3f6093", fontWeight: 700 }}>
             Sign in
           </Link>
         </p>
-        <p style={{ fontSize: 13, marginBottom: 0, marginTop: 8, opacity: 0.8 }}>
+        <p style={studioHelperTextStyle}>
           Need help getting set up?{" "}
-          <Link href="/contact" style={{ color: "#93c5fd" }}>
+          <Link href="/contact" style={{ color: "#3f6093", fontWeight: 700 }}>
             Contact us
           </Link>
         </p>
-      </section>
-    </main>
+      </div>
+    </StudioAccessLayout>
   );
 }

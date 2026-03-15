@@ -2,6 +2,15 @@ import Link from "next/link";
 import { useRouter } from "next/router";
 import { FormEvent, useMemo, useState } from "react";
 
+import StudioAccessLayout, {
+  buildStudioButtonStyle,
+  buildStudioNoticeStyle,
+  studioFieldStyle,
+  studioHelperTextStyle,
+  studioLabelStyle,
+  studioLabelTextStyle,
+  studioReadOnlyCardStyle,
+} from "../components/StudioAccessLayout";
 import { fetchAuthMe, type OrgMembership } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
 import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../lib/dashboardRoute";
@@ -164,123 +173,115 @@ export default function LoginPage() {
   };
 
   return (
-    <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "#0b1220", color: "#f8fafc", padding: 18 }}>
-      <section style={{ width: "100%", maxWidth: 420, borderRadius: 14, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(255,255,255,0.04)", padding: 18 }}>
-        <h1 style={{ marginTop: 0, marginBottom: 8 }}>Host Login</h1>
-        <p style={{ marginTop: 0, marginBottom: 14, opacity: 0.82 }}>Sign in to manage your church services.</p>
+    <StudioAccessLayout
+      pageTitle="Host Login | Worship"
+      pageDescription="Sign in to manage church services, rooms, and team access."
+      panelEyebrow="Host Access"
+      panelTitle="Host Login"
+      panelDescription="Sign in to manage your church services and continue where you left off."
+      infoEyebrow="Access Flow"
+      infoTitle="Route back to the right church dashboard."
+      infoDescription="If your account already belongs to one or more churches, the session is routed back to the most relevant dashboard automatically."
+      infoItems={[
+        {
+          title: "Fast continuation",
+          description: "Existing members go straight back into the host workflow instead of repeating onboarding.",
+        },
+        {
+          title: "Multi-church support",
+          description: "If you belong to several organizations, the session keeps the right org context attached to your account.",
+        },
+        {
+          title: "Support path",
+          description: "If access or billing is blocked, the contact flow is available from here without leaving the auth flow.",
+        },
+      ]}
+      headerActions={[
+        { href: "/", label: "Back Home" },
+        { href: "/contact", label: "Contact Us", accent: true },
+      ]}
+    >
+      {!configured ? (
+        <div style={buildStudioNoticeStyle("error")}>
+          Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
+        </div>
+      ) : null}
 
-        {!configured ? (
-          <div style={{ borderRadius: 10, border: "1px solid rgba(252,165,165,0.45)", background: "rgba(127,29,29,0.3)", padding: 12, color: "#fecaca", fontSize: 13 }}>
-            Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
-          </div>
-        ) : null}
+      {errorMsg ? <p style={buildStudioNoticeStyle("error")}>Error: {errorMsg}</p> : null}
 
-        {errorMsg ? (
-          <p style={{ color: "#fca5a5", marginTop: 12, marginBottom: 0 }}>Error: {errorMsg}</p>
-        ) : null}
-
-        {user ? (
-          <section style={{ marginTop: 12, display: "grid", gap: 10 }}>
-            <p style={{ margin: 0, fontSize: 13, opacity: 0.84 }}>
-              Already signed in as <strong>{user.email || user.uid}</strong>.
+      {user ? (
+        <section style={{ display: "grid", gap: 12 }}>
+          <div style={studioReadOnlyCardStyle}>
+            <p style={{ margin: 0, fontSize: 13, color: "#5f6f86" }}>
+              Already signed in as <strong style={{ color: "#22344c" }}>{user.email || user.uid}</strong>.
             </p>
-            <button
-              type="button"
-              onClick={() => {
-                void continueExistingSession();
-              }}
-              disabled={!configured || sessionBusy}
-              style={{
-                borderRadius: 10,
-                border: "none",
-                padding: "10px 12px",
-                fontWeight: 700,
-                background: "#22c55e",
-                color: "#052e16",
-                cursor: !configured || sessionBusy ? "not-allowed" : "pointer",
-                opacity: !configured || sessionBusy ? 0.6 : 1,
-              }}
-            >
-              {sessionBusy ? "Continuing..." : "Continue to dashboard"}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                void switchAccount();
-              }}
-              disabled={sessionBusy}
-              style={{
-                borderRadius: 10,
-                border: "1px solid rgba(255,255,255,0.3)",
-                padding: "10px 12px",
-                fontWeight: 600,
-                background: "transparent",
-                color: "#e2e8f0",
-                cursor: sessionBusy ? "not-allowed" : "pointer",
-                opacity: sessionBusy ? 0.6 : 1,
-              }}
-            >
-              Use a different account
-            </button>
-          </section>
-        ) : (
-          <form onSubmit={onSubmit} style={{ display: "grid", gap: 10, marginTop: 12 }}>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 13, opacity: 0.84 }}>Email</span>
-              <input
-                type="email"
-                autoComplete="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                required
-                style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-              />
-            </label>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 13, opacity: 0.84 }}>Password</span>
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.24)", background: "#0f172a", color: "#fff", padding: "10px 12px" }}
-              />
-            </label>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              void continueExistingSession();
+            }}
+            disabled={!configured || sessionBusy}
+            style={buildStudioButtonStyle({ disabled: !configured || sessionBusy })}
+          >
+            {sessionBusy ? "Continuing..." : "Continue to Dashboard"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void switchAccount();
+            }}
+            disabled={sessionBusy}
+            style={buildStudioButtonStyle({ tone: "secondary", disabled: sessionBusy })}
+          >
+            Use a Different Account
+          </button>
+        </section>
+      ) : (
+        <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
+          <label style={studioLabelStyle}>
+            <span style={studioLabelTextStyle}>Email</span>
+            <input
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              style={studioFieldStyle}
+            />
+          </label>
+          <label style={studioLabelStyle}>
+            <span style={studioLabelTextStyle}>Password</span>
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              style={studioFieldStyle}
+            />
+          </label>
 
-            <button
-              type="submit"
-              disabled={!configured || busy}
-              style={{
-                marginTop: 4,
-                borderRadius: 10,
-                border: "none",
-                padding: "10px 12px",
-                fontWeight: 700,
-                background: "#22c55e",
-                color: "#052e16",
-                cursor: !configured || busy ? "not-allowed" : "pointer",
-                opacity: !configured || busy ? 0.6 : 1,
-              }}
-            >
-              {busy ? "Signing in..." : "Sign in"}
-            </button>
-          </form>
-        )}
+          <button type="submit" disabled={!configured || busy} style={buildStudioButtonStyle({ disabled: !configured || busy })}>
+            {busy ? "Signing In..." : "Sign In"}
+          </button>
+        </form>
+      )}
 
-        <p style={{ fontSize: 13, marginBottom: 0, marginTop: 12, opacity: 0.85 }}>
+      <div style={{ display: "grid", gap: 8 }}>
+        <p style={studioHelperTextStyle}>
           Need an account?{" "}
-          <Link href={nextPath ? `/signup?next=${encodeURIComponent(nextPath)}` : "/signup"} style={{ color: "#93c5fd" }}>
+          <Link href={nextPath ? `/signup?next=${encodeURIComponent(nextPath)}` : "/signup"} style={{ color: "#3f6093", fontWeight: 700 }}>
             Create one
           </Link>
         </p>
-        <p style={{ fontSize: 13, marginBottom: 0, marginTop: 8, opacity: 0.8 }}>
+        <p style={studioHelperTextStyle}>
           Need help with access or billing?{" "}
-          <Link href="/contact" style={{ color: "#93c5fd" }}>
+          <Link href="/contact" style={{ color: "#3f6093", fontWeight: 700 }}>
             Contact us
           </Link>
         </p>
-      </section>
-    </main>
+      </div>
+    </StudioAccessLayout>
   );
 }

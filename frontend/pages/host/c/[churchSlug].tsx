@@ -2029,142 +2029,121 @@ export default function HostChurchPage() {
           ) : null}
           {activeTab === "team" ? (
             canManageInvites ? (
-              <div style={{ marginTop: 14, border: "1px solid rgba(255,255,255,0.16)", borderRadius: 12, padding: 12, display: "grid", gap: 8 }}>
-                <p style={{ margin: 0, fontWeight: 700 }}>Invite Team Member</p>
-                <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
-                  Create a one-time invite link for another user to join this church.
-                </p>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                  <label style={{ display: "grid", gap: 4 }}>
-                    <span style={{ fontSize: 12, opacity: 0.75 }}>Role</span>
-                    <select
-                      value={inviteRole}
-                      onChange={(e) => setInviteRole(e.target.value as InviteRoleChoice)}
-                      style={{ borderRadius: 8, border: "1px solid rgba(255,255,255,0.25)", background: "#0f172a", color: "#fff", padding: "8px 10px" }}
-                    >
-                      <option value="host">host</option>
-                      <option value="admin">admin</option>
-                    </select>
-                  </label>
-                  <button
-                    onClick={generateInviteLink}
-                    disabled={inviteBusy || !resolvedOrgId}
-                    style={{
-                      marginTop: 18,
-                      borderRadius: 8,
-                      border: "none",
-                      background: "#38bdf8",
-                      color: "#082f49",
-                      fontWeight: 700,
-                      padding: "8px 12px",
-                      cursor: inviteBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                      opacity: inviteBusy || !resolvedOrgId ? 0.6 : 1,
-                    }}
-                  >
-                    {inviteBusy ? "Generating..." : "Generate Invite Link"}
-                  </button>
-                </div>
-                {inviteError ? <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {inviteError}</p> : null}
-                {inviteNotice ? <p style={{ margin: 0, color: "#86efac", fontSize: 13 }}>{inviteNotice}</p> : null}
-                {inviteLink ? (
+              <div style={settingsShellStyle}>
+                <section style={settingsCardStyle}>
                   <div style={{ display: "grid", gap: 8 }}>
-                    <label style={{ display: "grid", gap: 4 }}>
-                      <span style={{ margin: 0, fontSize: 13 }}>Invite URL</span>
-                      <input
-                        readOnly
-                        value={inviteLink}
-                        style={{
-                          borderRadius: 8,
-                          border: "1px solid rgba(255,255,255,0.25)",
-                          background: "rgba(15,23,42,0.8)",
-                          color: "#cbd5e1",
-                          fontSize: 13,
-                          padding: "8px 10px",
-                        }}
-                      />
-                    </label>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                      <button
-                        onClick={copyInviteLink}
-                        disabled={copyBusy || shareBusy || inviteBusy}
-                        style={{
-                          borderRadius: 8,
-                          border: "1px solid rgba(255,255,255,0.22)",
-                          background: "rgba(148,163,184,0.18)",
-                          color: "#e2e8f0",
-                          fontWeight: 600,
-                          padding: "7px 10px",
-                          cursor: copyBusy || shareBusy || inviteBusy ? "not-allowed" : "pointer",
-                          opacity: copyBusy || shareBusy || inviteBusy ? 0.6 : 1,
-                        }}
-                      >
-                        {copyBusy ? "Copying..." : "Copy Link"}
-                      </button>
-                      <button
-                        onClick={shareInviteLink}
-                        disabled={copyBusy || shareBusy || inviteBusy}
-                        style={{
-                          borderRadius: 8,
-                          border: "1px solid rgba(56,189,248,0.52)",
-                          background: "rgba(56,189,248,0.22)",
-                          color: "#e0f2fe",
-                          fontWeight: 600,
-                          padding: "7px 10px",
-                          cursor: copyBusy || shareBusy || inviteBusy ? "not-allowed" : "pointer",
-                          opacity: copyBusy || shareBusy || inviteBusy ? 0.6 : 1,
-                        }}
-                      >
-                        {shareBusy ? "Sharing..." : "Share via..."}
-                      </button>
-                    </div>
+                    <p style={settingsSectionLabelStyle}>Team Access</p>
+                    <h3 style={settingsTitleStyle}>Invite Team Member</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Create a one-time invite link for another user to join this church as host or admin.
+                    </p>
                   </div>
-                ) : null}
-                <div style={{ marginTop: 4, borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: 10 }}>
-                  <p style={{ margin: 0, fontSize: 13, opacity: 0.82 }}>Active Invites</p>
-                  {invitesLoading ? (
-                    <p style={{ marginTop: 6, marginBottom: 0, fontSize: 13, opacity: 0.8 }}>Loading invites...</p>
-                  ) : null}
-                  {!invitesLoading && !inviteRows.length ? (
-                    <p style={{ marginTop: 6, marginBottom: 0, fontSize: 13, opacity: 0.8 }}>No active invites.</p>
-                  ) : null}
-                  {inviteRows.length ? (
-                    <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
-                      {inviteRows.map((row) => (
-                        <div
-                          key={row.inviteId}
+
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "end" }}>
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Role</span>
+                      <select
+                        value={inviteRole}
+                        onChange={(e) => setInviteRole(e.target.value as InviteRoleChoice)}
+                        style={{ ...settingsInlineFieldStyle, minWidth: 180 }}
+                      >
+                        <option value="host">host</option>
+                        <option value="admin">admin</option>
+                      </select>
+                    </label>
+                    <button
+                      onClick={generateInviteLink}
+                      disabled={inviteBusy || !resolvedOrgId}
+                      style={{
+                        ...settingsButtonPrimaryStyle,
+                        opacity: inviteBusy || !resolvedOrgId ? 0.6 : 1,
+                        cursor: inviteBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                      }}
+                    >
+                      {inviteBusy ? "Generating..." : "Generate Invite Link"}
+                    </button>
+                  </div>
+
+                  {inviteError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {inviteError}</p> : null}
+                  {inviteNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{inviteNotice}</p> : null}
+
+                  {inviteLink ? (
+                    <div
+                      style={{
+                        borderRadius: 16,
+                        border: "1px solid rgba(189,200,217,0.84)",
+                        background: "rgba(255,255,255,0.68)",
+                        padding: "12px 14px",
+                        display: "grid",
+                        gap: 10,
+                      }}
+                    >
+                      <label style={{ display: "grid", gap: 6 }}>
+                        <span style={{ fontSize: 13, color: "#42556f", fontWeight: 700 }}>Invite URL</span>
+                        <input readOnly value={inviteLink} style={{ ...settingsInlineFieldStyle, width: "100%" }} />
+                      </label>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                        <button
+                          onClick={copyInviteLink}
+                          disabled={copyBusy || shareBusy || inviteBusy}
                           style={{
-                            display: "grid",
-                            gridTemplateColumns: "1fr auto",
-                            gap: 8,
-                            alignItems: "center",
-                            border: "1px solid rgba(255,255,255,0.12)",
-                            borderRadius: 10,
-                            padding: "8px 10px",
+                            ...settingsButtonNeutralStyle,
+                            opacity: copyBusy || shareBusy || inviteBusy ? 0.6 : 1,
+                            cursor: copyBusy || shareBusy || inviteBusy ? "not-allowed" : "pointer",
                           }}
                         >
+                          {copyBusy ? "Copying..." : "Copy Link"}
+                        </button>
+                        <button
+                          onClick={shareInviteLink}
+                          disabled={copyBusy || shareBusy || inviteBusy}
+                          style={{
+                            ...settingsButtonPrimaryStyle,
+                            opacity: copyBusy || shareBusy || inviteBusy ? 0.6 : 1,
+                            cursor: copyBusy || shareBusy || inviteBusy ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          {shareBusy ? "Sharing..." : "Share via..."}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </section>
+
+                <section style={settingsCardStyle}>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <p style={settingsSectionLabelStyle}>Active Access</p>
+                    <h3 style={settingsTitleStyle}>Active Invites</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Review one-time invite links that are still active for this church.
+                    </p>
+                  </div>
+
+                  {invitesLoading ? <p style={settingsBodyTextStyle}>Loading invites...</p> : null}
+                  {!invitesLoading && !inviteRows.length ? <p style={settingsBodyTextStyle}>No active invites.</p> : null}
+                  {inviteRows.length ? (
+                    <div style={{ display: "grid", gap: 10 }}>
+                      {inviteRows.map((row) => (
+                        <div key={row.inviteId} style={settingsServiceRowStyle}>
                           <div style={{ minWidth: 0 }}>
-                            <p style={{ margin: 0, fontSize: 13 }}>
-                              Role: <strong>{row.role}</strong>
-                            </p>
-                            <p style={{ margin: 0, fontSize: 12, opacity: 0.75 }}>
-                              Expires: {formatDateTime(row.expiresAt || null)}
-                            </p>
-                            <p style={{ margin: 0, fontSize: 12, opacity: 0.75 }}>
-                              Created: {formatDateTime(row.createdAt || null)}
-                            </p>
+                            <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#23354d" }}>Role: {row.role}</p>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                              <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(79,115,170,0.18)", background: "rgba(127,165,219,0.16)", color: "#3e5d8d" }}>
+                                Expires {formatDateTime(row.expiresAt || null)}
+                              </span>
+                              <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(189,200,217,0.66)", background: "rgba(247,250,253,0.74)", color: "#5f6f86" }}>
+                                Created {formatDateTime(row.createdAt || null)}
+                              </span>
+                            </div>
                           </div>
                           <button
                             onClick={() => revokeInvite(row.inviteId)}
                             disabled={Boolean(revokingInviteId) || inviteBusy}
                             style={{
-                              borderRadius: 8,
-                              border: "1px solid rgba(252,165,165,0.6)",
-                              background: "rgba(127,29,29,0.35)",
-                              color: "#fecaca",
-                              fontWeight: 700,
-                              padding: "7px 10px",
-                              cursor: Boolean(revokingInviteId) || inviteBusy ? "not-allowed" : "pointer",
+                              ...settingsButtonDangerStyle,
+                              padding: "9px 12px",
                               opacity: Boolean(revokingInviteId) || inviteBusy ? 0.6 : 1,
+                              cursor: Boolean(revokingInviteId) || inviteBusy ? "not-allowed" : "pointer",
                             }}
                           >
                             {revokingInviteId === row.inviteId ? "Revoking..." : "Revoke"}
@@ -2173,10 +2152,10 @@ export default function HostChurchPage() {
                       ))}
                     </div>
                   ) : null}
-                </div>
+                </section>
               </div>
             ) : (
-              <div style={{ marginTop: 12, border: "1px solid rgba(255,255,255,0.12)", borderRadius: 12, padding: 12, fontSize: 13, opacity: 0.82 }}>
+              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: "#5f6f86" }}>
                 You do not have permission to manage team invites for this church.
               </div>
             )

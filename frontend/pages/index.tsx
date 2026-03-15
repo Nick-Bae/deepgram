@@ -118,18 +118,22 @@ export default function HomePage() {
   const glassCardStyle = {
     position: "relative" as const,
     overflow: "hidden" as const,
-    border: "1px solid rgba(255,255,255,0.56)",
-    background: "linear-gradient(180deg, rgba(248,251,255,0.6) 0%, rgba(220,229,241,0.3) 100%)",
-    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.38), inset 0 -1px 0 rgba(101,121,152,0.08), 0 24px 48px rgba(88,106,137,0.14)",
-    backdropFilter: "blur(18px)",
+    border: "1px solid rgba(255,255,255,0.66)",
+    background:
+      "radial-gradient(circle at 14% 12%, rgba(255,255,255,0.34) 0%, rgba(255,255,255,0) 32%), linear-gradient(180deg, rgba(248,251,255,0.68) 0%, rgba(230,237,246,0.42) 54%, rgba(213,223,236,0.26) 100%)",
+    boxShadow:
+      "inset 0 1px 0 rgba(255,255,255,0.54), inset 0 -20px 28px rgba(108,126,156,0.08), 0 0 0 1px rgba(255,255,255,0.2), 0 28px 54px rgba(88,106,137,0.16)",
+    backdropFilter: "blur(24px)",
   } as const;
   const glassInnerCardStyle = {
     position: "relative" as const,
     overflow: "hidden" as const,
-    border: "1px solid rgba(255,255,255,0.5)",
-    background: "linear-gradient(180deg, rgba(255,255,255,0.44) 0%, rgba(225,234,245,0.22) 100%)",
-    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.42), 0 14px 28px rgba(102,120,151,0.1)",
-    backdropFilter: "blur(12px)",
+    border: "1px solid rgba(255,255,255,0.58)",
+    background:
+      "radial-gradient(circle at 16% 10%, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0) 30%), linear-gradient(180deg, rgba(255,255,255,0.52) 0%, rgba(235,241,249,0.34) 58%, rgba(217,227,239,0.2) 100%)",
+    boxShadow:
+      "inset 0 1px 0 rgba(255,255,255,0.54), inset 0 -14px 22px rgba(110,128,158,0.06), 0 18px 30px rgba(102,120,151,0.1)",
+    backdropFilter: "blur(16px)",
   } as const;
 
   useEffect(() => {
