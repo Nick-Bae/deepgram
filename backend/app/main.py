@@ -34,7 +34,7 @@ from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
-from app.utils.translate import translate_text, TranslationContext  # async wrapper you already have
+from app.utils.translate import _preprocess_source_text, translate_text, TranslationContext  # async wrapper you already have
 from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 from app.routes import examples as examples_routes
@@ -685,6 +685,9 @@ async def ws_translate(ws: WebSocket):
         tgt_lang_full = _clean_lang(payload.get("target"), "en")
         src_lang = _normalize_lang(src_lang_full, "ko")
         tgt_lang = _normalize_lang(tgt_lang_full, "en")
+        src_text = _preprocess_source_text(src_text, src_lang_full).strip()
+        if not src_text:
+            return
 
         payload_org_id = _clean_token(payload.get("orgId") or payload.get("org_id")) or joined_org_id
         payload_room_id = _clean_token(payload.get("roomId") or payload.get("room_id")) or joined_room_id
@@ -733,7 +736,7 @@ async def ws_translate(ws: WebSocket):
                     "threshold": script_threshold,
                 }
             )
-            translation_ctx.last_english = translated
+            translation_ctx.remember(src_text, translated)
         elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
             translated = src_text
         else:
@@ -752,8 +755,6 @@ async def ws_translate(ws: WebSocket):
                 )
                 if limit_meta:
                     meta_payload.update(limit_meta)
-                else:
-                    translation_ctx.last_english = translated
             except Exception as exc:
                 print("[WS translate][producer_commit][error]", exc)
                 translated = src_text
@@ -1164,7 +1165,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         ) -> None:
             nonlocal seq
 
-            clean_src = norm_ws(src_text_raw)
+            clean_src = norm_ws(_preprocess_source_text(src_text_raw, src_lang_full))
             if not clean_src:
                 return
 
@@ -1223,6 +1224,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         }
                     )
                     print(f"[SCRIPTURE] matched {scripture_hit.reference}")
+                    if update_ctx:
+                        translation_ctx.remember(clean_src, translated)
                 elif script_match:
                     translated = script_match.target
                     live_mode = "pre"
@@ -1237,7 +1240,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         }
                     )
                     if update_ctx:
-                        translation_ctx.last_english = translated
+                        translation_ctx.remember(clean_src, translated)
                 elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
                     translated = clean_src
                 else:
@@ -1256,8 +1259,6 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         )
                         if limit_meta:
                             meta_payload.update(limit_meta)
-                        elif update_ctx:
-                            translation_ctx.last_english = translated
                     except Exception as e:
                         print("[TX] error:", e)
                         translated = clean_src
@@ -1286,8 +1287,6 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         print("[TX][preview] error:", e)
                         translated = clean_src
                         meta_payload.update(_fail_open_meta(e))
-                if update_ctx:
-                    translation_ctx.last_english = translated
 
             live_msg_new = {
                 "mode": live_mode,

@@ -153,6 +153,25 @@ If `PASSWORD_RESET_FROM_EMAIL` is not set, the backend falls back to `CONTACT_FR
 `FIREBASE_ADMIN_CREDENTIALS` should point to a Firebase Admin SDK service account with Firebase Auth permissions. If it is not set, the backend falls back to `GOOGLE_APPLICATION_CREDENTIALS`.
 If your custom sender domain is not verified in Resend yet, `RESEND_FALLBACK_FROM_EMAIL` can temporarily use `onboarding@resend.dev`.
 
+### Backend env for OpenAI translation models
+
+Use one canonical env for live translation:
+
+```bash
+OPENAI_TRANSLATION_MODEL=gpt-4o
+```
+
+Optional sermon-only override:
+
+```bash
+OPENAI_SERMON_TRANSLATION_MODEL=gpt-4o-mini
+```
+
+Compatibility note:
+- `OPENAI_TRANSLATION_MODEL` is preferred for the live translation path.
+- `OPENAI_SERMON_TRANSLATION_MODEL` is preferred for sermon prep/script translation.
+- Older env names `TRANSLATION_MODEL`, `OPENAI_MODEL`, and `OPENAI_SERMON_MODEL` still work as fallbacks.
+
 ## Firestore bootstrap
 
 Seed one org + default services:

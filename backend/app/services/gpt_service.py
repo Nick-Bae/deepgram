@@ -4,11 +4,10 @@ load_dotenv()  # This loads the .env file so os.getenv() works
 
 import openai
 from openai import OpenAI
+from app.env import ENV
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=ENV.OPENAI_API_KEY)
 # openai.api_key = os.getenv("OPENAI_API_KEY")
-
-model = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 def translate_text(text: str, source: str, target: str) -> str:
     system_prompt = (
@@ -18,7 +17,7 @@ def translate_text(text: str, source: str, target: str) -> str:
     )
 
     response = client.chat.completions.create(
-        model=model,
+        model=ENV.resolve_translation_model(),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text}

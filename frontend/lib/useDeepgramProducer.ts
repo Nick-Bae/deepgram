@@ -73,8 +73,14 @@ function wsDeepgramURL(opts?: StartOptions, streamContext?: StreamContext) {
 
 const PCM_WORKLET_INLINE = `
 class PCMWorkletProcessor extends AudioWorkletProcessor {
-  process(inputs) {
+  process(inputs, outputs) {
     const input = inputs[0];
+    const output = outputs[0];
+    if (output) {
+      for (const channel of output) {
+        channel.fill(0);
+      }
+    }
     if (!input || !input[0]) return true;
     const samples = input[0];
     const buffer = new ArrayBuffer(samples.length * 2);
@@ -333,8 +339,16 @@ export function useDeepgramProducer(): DeepgramProducerController {
       streamRef.current = stream;
 
       const src = ctx.createMediaStreamSource(stream);
-      const worklet = new AudioWorkletNode(ctx, "pcm-worklet", { numberOfInputs: 1, numberOfOutputs: 0 });
+      const worklet = new AudioWorkletNode(ctx, "pcm-worklet", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      const mutedMonitor = ctx.createGain();
+      mutedMonitor.gain.value = 0;
       src.connect(worklet);
+      worklet.connect(mutedMonitor);
+      mutedMonitor.connect(ctx.destination);
       portRef.current = worklet.port;
 
       portRef.current.onmessage = (evt: MessageEvent) => {
@@ -342,6 +356,13 @@ export function useDeepgramProducer(): DeepgramProducerController {
         const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) ws.send(evt.data); // 16-bit PCM @ 48k
       };
+
+      if (ctx.state !== "running") {
+        await ctx.resume();
+      }
+      if (ctx.state !== "running") {
+        throw new Error("Microphone audio context did not start");
+      }
       connectWebSocket();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);

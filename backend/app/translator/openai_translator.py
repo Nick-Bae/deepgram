@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Optional
 import httpx
 from ..env import ENV
-from ..utils.translate import _infer_subject_from_english
+from ..utils.translate import _infer_subject_from_english, _openai_chat_options
 import re
 
 FIRST_PERSON_KO_MARKERS = [
@@ -337,10 +337,10 @@ async def translate_ko_to_en_chunk(ko: str, ctx: Optional[TranslationContext] = 
             last_english=context.last_english,
         )
     body = {
-        "model": ENV.TRANSLATION_MODEL,
-        "temperature": 0.2,
+        "model": ENV.resolve_translation_model(),
         "messages": _build_messages(ko, prompt_ctx),
     }
+    body.update(_openai_chat_options(ENV.resolve_translation_model()))
     headers = {"Authorization": f"Bearer {ENV.OPENAI_API_KEY}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post("https://api.openai.com/v1/chat/completions", json=body, headers=headers)

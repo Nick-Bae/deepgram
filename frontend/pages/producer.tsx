@@ -50,9 +50,24 @@ export default function Producer() {
       streamRef.current = stream;
 
       const src = ctx.createMediaStreamSource(stream);
-      const worklet = new AudioWorkletNode(ctx, "pcm-worklet", { numberOfInputs: 1, numberOfOutputs: 0 });
+      const worklet = new AudioWorkletNode(ctx, "pcm-worklet", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      const mutedMonitor = ctx.createGain();
+      mutedMonitor.gain.value = 0;
       src.connect(worklet);
+      worklet.connect(mutedMonitor);
+      mutedMonitor.connect(ctx.destination);
       portRef.current = worklet.port;
+
+      if (ctx.state !== "running") {
+        await ctx.resume();
+      }
+      if (ctx.state !== "running") {
+        throw new Error("Microphone audio context did not start");
+      }
 
       const url = wsDeepgramURL();
       const ws = new WebSocket(url);

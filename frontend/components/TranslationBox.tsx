@@ -855,11 +855,12 @@ export default function TranslationBox() {
 
   // ---------- Keep isListening in sync with Deepgram ----------
   useEffect(() => {
-    setIsListening(status === 'streaming')
-    if (status !== 'streaming') {
+    const sessionActive = status === 'streaming' || status === 'starting'
+    setIsListening(sessionActive)
+    if (!sessionActive) {
       lastFinalizeAtRef.current = 0
     }
-    if (status !== 'streaming' && clauseRef.current.trim()) {
+    if (!sessionActive && clauseRef.current.trim()) {
       sendFinalNow(clauseRef.current)
       clauseRef.current = ''
     }
@@ -936,7 +937,7 @@ export default function TranslationBox() {
     return `${ageSeconds}s`
   }, [connected, disconnectStartedAt, socketClock])
   const reconnectAttemptLabel = reconnectAttempt > 0 ? `#${reconnectAttempt}` : '0'
-  const micActive = isListening && status === 'streaming'
+  const micActive = isListening || inputLevel > 0.004
   const waveformActivity = micActive ? Math.min(1, Math.pow(inputLevel * 18, 0.8)) : 0
   const waveformBars = Array.from({ length: 5 }, (_, idx) => {
     const baseHeight = [10, 16, 13, 20, 11][idx] ?? 12
@@ -1214,25 +1215,46 @@ export default function TranslationBox() {
                 <summary className="cursor-pointer text-xs font-black uppercase tracking-[0.3em] text-slate-400">
                   Advanced Controls
                 </summary>
-                <div className="mt-4 space-y-3">
-                  <div className="flex items-center justify-between rounded-[1.1rem] border border-white/80 px-4 py-3" style={panelStyle}>
-                    <span>Early commit (preview)</span>
+                <div className="mt-4 space-y-4">
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-[1.1rem] border border-white/80 px-4 py-4" style={panelStyle}>
+                    <div className="min-w-0">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="text-sm font-semibold text-slate-800">Early Preview</span>
+                        <span
+                          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white/75 text-[10px] font-black text-slate-500"
+                          title="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
+                          aria-label="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
+                        >
+                          ?
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                        Shows translation sooner, but the wording may shift before the final sentence is committed.
+                      </p>
+                    </div>
                     <button
                       onClick={() => setEarlyCommitEnabled(v => !v)}
-                      className={`relative inline-flex h-7 w-12 items-center rounded-full ${earlyCommitEnabled ? 'bg-slate-900' : 'bg-slate-300'}`}
+                      title="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
+                      aria-label="Toggle early preview translation"
+                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${earlyCommitEnabled ? 'bg-slate-900' : 'bg-slate-300'}`}
                       aria-pressed={earlyCommitEnabled}
                     >
-                      <span className={`inline-block h-5 w-5 rounded-full bg-white transition ${earlyCommitEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                      <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${earlyCommitEnabled ? 'translate-x-7' : 'translate-x-1'}`} />
                     </button>
                   </div>
-                  <div className="flex items-center justify-between rounded-[1.1rem] border border-white/80 px-4 py-3" style={panelStyle}>
-                    <span>Audience TTS</span>
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-[1.1rem] border border-white/80 px-4 py-4" style={panelStyle}>
+                    <div className="min-w-0">
+                      <span className="text-sm font-semibold text-slate-800">Audience TTS</span>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                        Plays the translated sentence through the local monitor output as each final line is committed.
+                      </p>
+                    </div>
                     <button
                       onClick={() => setIsMuted(m => !m)}
-                      className={`relative inline-flex h-7 w-12 items-center rounded-full ${ttsAudienceEnabled ? 'bg-slate-900' : 'bg-slate-300'}`}
+                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${ttsAudienceEnabled ? 'bg-slate-900' : 'bg-slate-300'}`}
                       aria-pressed={ttsAudienceEnabled}
                     >
-                      <span className={`inline-block h-5 w-5 rounded-full bg-white transition ${ttsAudienceEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                      <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${ttsAudienceEnabled ? 'translate-x-7' : 'translate-x-1'}`} />
                     </button>
                   </div>
                   <div className="rounded-[1.1rem] border border-white/80 px-4 py-3" style={panelStyle}>
@@ -1279,17 +1301,17 @@ export default function TranslationBox() {
                       className="mt-3 w-full accent-slate-900"
                     />
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="grid gap-2">
                     <button
                       onClick={() => triggerFinalize('manual operator button')}
-                      className="flex-1 rounded-xl border border-white/80 px-4 py-2 text-xs font-semibold text-slate-700"
+                      className="w-full rounded-xl border border-white/80 px-4 py-2 text-xs font-semibold text-slate-700"
                       style={pillStyle}
                     >
                       Pulse finalize
                     </button>
                     <button
                       onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')}
-                      className="flex-1 rounded-xl border border-white/80 px-4 py-2 text-xs font-semibold text-slate-700"
+                      className="w-full rounded-xl border border-white/80 px-4 py-2 text-xs font-semibold text-slate-700"
                       style={pillStyle}
                     >
                       Test TTS

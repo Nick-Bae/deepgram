@@ -70,6 +70,7 @@ def default_billing_state(
         "priceId": None,
         "trialMinutesLimit": trial_minutes_limit,
         "trialMinutesUsed": 0,
+        "trialSecondsUsed": 0,
         "limits": {"maxServiceKeys": resolved_plan.max_service_keys},
         "entitlements": {"canStartService": True},
         "updatedAt": dt,
@@ -115,10 +116,22 @@ def normalize_billing_state(
         trial_used = int(trial_used_raw)
     except (TypeError, ValueError):
         trial_used = int(base.get("trialMinutesUsed") or 0)
+    trial_seconds_raw = merged.get("trialSecondsUsed")
+    try:
+        trial_seconds_used = int(trial_seconds_raw)
+    except (TypeError, ValueError):
+        trial_seconds_used = trial_used * 60
     trial_limit = max(0, trial_limit)
     trial_used = max(0, trial_used)
+    trial_seconds_used = max(max(0, trial_seconds_used), trial_used * 60)
     if trial_limit > 0:
-        trial_used = min(trial_limit, trial_used)
+        trial_seconds_limit = trial_limit * 60
+        trial_seconds_used = min(trial_seconds_limit, trial_seconds_used)
+        trial_used = min(trial_limit, trial_seconds_used // 60)
+    else:
+        trial_seconds_used = 0
+        trial_used = 0
     merged["trialMinutesLimit"] = trial_limit
     merged["trialMinutesUsed"] = trial_used
+    merged["trialSecondsUsed"] = trial_seconds_used
     return merged

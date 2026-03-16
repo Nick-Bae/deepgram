@@ -456,6 +456,13 @@ def billing_status(
         if refresh:
             raise HTTPException(status_code=400, detail=str(exc) or "billing_status_sync_failed") from exc
         # Keep returning local billing snapshot even if Stripe sync is temporarily unavailable.
+    try:
+        effective_trial_seconds_remaining = multichurch_store.get_org_effective_trial_seconds_remaining(org_id=org_id)
+    except ValueError:
+        effective_trial_seconds_remaining = None
+    if effective_trial_seconds_remaining is not None:
+        billing = dict(billing)
+        billing["trialSecondsRemaining"] = effective_trial_seconds_remaining
     return {"orgId": org_id, "billing": billing}
 
 

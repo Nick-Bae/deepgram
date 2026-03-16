@@ -1,6 +1,12 @@
 class PCMWorkletProcessor extends AudioWorkletProcessor {
-  process(inputs) {
+  process(inputs, outputs) {
     const input = inputs[0];
+    const output = outputs[0];
+    if (output) {
+      for (const channel of output) {
+        channel.fill(0);
+      }
+    }
     if (!input || !input[0]) return true;
     const samples = input[0];
     const buffer = new ArrayBuffer(samples.length * 2);

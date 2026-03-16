@@ -3,7 +3,7 @@ import os
 import json
 import pathlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 from collections import deque
@@ -16,12 +16,10 @@ from app.utils.spacing import apply_ko_spacing
 
 load_dotenv()
 
-_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # fast & good; use gpt-4o if you want
-_API_KEY = os.getenv("OPENAI_API_KEY")
-
 _client: AsyncOpenAI | None = None
 _CUSTOM_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
 _SERVICE_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
+_HANGUL_RE = re.compile(r"[가-힣]")
 
 @dataclass
 class TranslationContext:
@@ -29,6 +27,22 @@ class TranslationContext:
     pronoun: str = ENV.CONTEXT_PRONOUN
     narration_mode: str = ENV.CONTEXT_MODE
     last_english: Optional[str] = None
+    recent_pairs: list[dict[str, str]] = field(default_factory=list)
+
+    def remember(self, source_text: str, translated_text: str, *, max_items: int = 3) -> None:
+        clean_source = " ".join((source_text or "").split()).strip()
+        clean_target = " ".join((translated_text or "").split()).strip()
+        if not clean_target:
+            return
+        self.last_english = clean_target
+        if not clean_source:
+            return
+        next_pair = {"source": clean_source, "target": clean_target}
+        if self.recent_pairs and self.recent_pairs[-1] == next_pair:
+            return
+        self.recent_pairs.append(next_pair)
+        if len(self.recent_pairs) > max_items:
+            self.recent_pairs = self.recent_pairs[-max_items:]
 
 
 @dataclass
@@ -45,7 +59,6 @@ THEOLOGICAL_TERMS: list[tuple[str, str]] = [
     ("하나님 나라", "the kingdom of God"),
     ("언약", "covenant"),
     ("은혜", "grace"),
-    ("의", "righteousness"),
     ("성령", "the Holy Spirit"),
     ("회개", "repentance"),
     ("구원", "salvation"),
@@ -257,9 +270,45 @@ def _preprocess_source_text(text: str, source_lang: str) -> str:
     for pattern, repl in replacements:
         cleaned = re.sub(pattern, repl, cleaned)
 
+    cleaned = _collapse_compacted_ko_repeat_tokens(cleaned)
+
     # Normalize missing space in "이시간" when it appears at the start
     cleaned = re.sub(r"^이시간", "이 시간", cleaned)
     return cleaned
+
+
+def _collapse_compacted_ko_repeat_tokens(text: str) -> str:
+    if not text or not _HANGUL_RE.search(text):
+        return text
+
+    tokens = text.split()
+    if len(tokens) < 2:
+        return text
+
+    rebuilt: list[str] = []
+    changed = False
+
+    for token in tokens:
+        candidate = token
+        compact = re.sub(r"\s+", "", candidate)
+        if rebuilt and len(compact) >= 4 and _HANGUL_RE.search(candidate):
+            prev_compact = re.sub(r"\s+", "", "".join(rebuilt))
+            max_overlap = min(len(prev_compact), len(compact) - 1)
+            overlap = 0
+            for size in range(max_overlap, 3, -1):
+                if compact.startswith(prev_compact[-size:]):
+                    overlap = size
+                    break
+            if overlap:
+                candidate = candidate[overlap:]
+                compact = compact[overlap:]
+                changed = True
+                if not candidate:
+                    continue
+        rebuilt.append(candidate)
+
+    collapsed = " ".join(rebuilt).strip()
+    return collapsed if changed and collapsed else text
 
 
 def _log_translation_example(
@@ -395,9 +444,9 @@ def _build_fewshot_block(source: str, target: str, *, current_source_text: Optio
 def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        if not _API_KEY:
+        if not ENV.OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY not set")
-        _client = AsyncOpenAI(api_key=_API_KEY)
+        _client = AsyncOpenAI(api_key=ENV.OPENAI_API_KEY)
     return _client
 
 
@@ -453,11 +502,16 @@ def _normalize_pronoun(ctx: Optional[TranslationContext]) -> Optional[str]:
 
 
 def _contains_marker_list(text: str, markers: list[str]) -> bool:
-    compact = re.sub(r"\s+", "", text or "")
+    raw = (text or "").strip()
+    compact = re.sub(r"\s+", "", raw)
+    if not compact:
+        return False
     for marker in markers:
-        # Match only when the marker is not glued to adjacent Hangul to avoid false positives (e.g., '성전' contains '전').
-        pattern = rf"(?<![가-힣]){re.escape(marker)}(?![가-힣])"
-        if re.search(pattern, compact):
+        pattern = rf"(^|[\s\"'“”‘’(\[])({re.escape(marker)})(?=$|[\s,.:;!?\"'“”‘’)\]])"
+        if raw and re.search(pattern, raw):
+            return True
+        # STT text sometimes drops spaces; allow a marker at the start/end of the compacted clause.
+        if compact == marker or compact.startswith(marker) or compact.endswith(marker):
             return True
     return False
 
@@ -496,6 +550,164 @@ def _clause_head(en: str) -> str:
         return ""
     head = re.split(r"[.!?;:\n]", clean, 1)[0]
     return head.strip()
+
+
+def _infer_subject_from_context_history(ctx: Optional[TranslationContext]) -> tuple[str, str]:
+    if not ctx:
+        return ENV.CONTEXT_SUBJECT, ENV.CONTEXT_PRONOUN
+
+    default_subject = ctx.subject or ENV.CONTEXT_SUBJECT
+    default_pronoun = ctx.pronoun or ENV.CONTEXT_PRONOUN
+    candidates: list[str] = []
+
+    if ctx.last_english:
+        candidates.append(ctx.last_english)
+
+    for pair in reversed(ctx.recent_pairs):
+        target = (pair.get("target") or "").strip()
+        if target and target not in candidates:
+            candidates.append(target)
+        if len(candidates) >= 3:
+            break
+
+    for candidate in candidates:
+        inferred_subject, inferred_pronoun = _infer_subject_from_english(candidate, default_subject, default_pronoun)
+        if inferred_subject != default_subject or inferred_pronoun != default_pronoun:
+            return inferred_subject, inferred_pronoun
+
+    return default_subject, default_pronoun
+
+
+_CONTEXTUAL_KO_PREFIXES = (
+    "그리고",
+    "그런데",
+    "근데",
+    "그래서",
+    "그러니까",
+    "그러면",
+    "그러면서",
+    "또",
+    "또한",
+    "이",
+    "그",
+    "저",
+    "여기",
+    "거기",
+    "저기",
+)
+
+
+def _needs_recent_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    if _contains_first_person_markers(compact) or _contains_we_markers(compact) or _detect_third_person_pronoun(compact):
+        return False
+    if "스스로" in compact:
+        return True
+    if any(compact.startswith(prefix) for prefix in _CONTEXTUAL_KO_PREFIXES):
+        return True
+    if re.match(r"^(이|그|저)(것|부분|말씀|본문|사람|분|때|장면|모습|소리|내용)", compact):
+        return True
+    return len(compact) <= 24
+
+
+def _should_include_prompt_context(text: str, *, update_ctx: bool) -> bool:
+    return (not update_ctx) or _needs_recent_context(text)
+
+
+def _build_recent_context_block(
+    ctx: Optional[TranslationContext],
+    *,
+    current_source_text: Optional[str] = None,
+    max_items: int = 2,
+) -> str:
+    if not ctx or not ctx.recent_pairs or max_items <= 0:
+        return ""
+
+    current_norm = " ".join((current_source_text or "").split()).strip()
+    items: list[dict[str, str]] = []
+    for pair in reversed(ctx.recent_pairs):
+        source_text = (pair.get("source") or "").strip()
+        target_text = (pair.get("target") or "").strip()
+        if not source_text or not target_text:
+            continue
+        if current_norm and source_text == current_norm:
+            continue
+        items.append({"source": source_text[:180], "target": target_text[:180]})
+        if len(items) >= max_items:
+            break
+
+    if not items:
+        return ""
+
+    items.reverse()
+    lines = ["Recent translated context:"]
+    for idx, item in enumerate(items, start=1):
+        lines.append(f"{idx}. Korean: {item['source']}")
+        lines.append(f"   English: {item['target']}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _openai_chat_options(model_name: str) -> dict[str, Any]:
+    clean_model = (model_name or "").strip().lower()
+    if clean_model.startswith("gpt-5"):
+        return {}
+    return {
+        "temperature": 0.2,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "top_p": 1.0,
+    }
+
+
+def _subject_label_for_pronoun(pronoun: str, fallback: str) -> str:
+    normalized = (pronoun or "").strip().lower()
+    if normalized == "they":
+        return "the people being described"
+    if normalized == "he":
+        return "the man being described"
+    if normalized == "she":
+        return "the woman being described"
+    if normalized == "i":
+        return "the speaker"
+    return fallback
+
+
+def _context_for_prompt(
+    ctx: Optional[TranslationContext],
+    text: str,
+    *,
+    implicit_first_person: bool = False,
+) -> Optional[TranslationContext]:
+    if not ctx:
+        return None
+
+    if implicit_first_person:
+        return TranslationContext(
+            subject="the speaker",
+            pronoun="I",
+            narration_mode=ctx.narration_mode,
+            last_english=ctx.last_english,
+            recent_pairs=list(ctx.recent_pairs),
+        )
+
+    explicit_pronoun = _detect_third_person_pronoun(text)
+    if not explicit_pronoun:
+        return ctx
+
+    current_pronoun = _normalize_pronoun(ctx)
+    subject = ctx.subject or ENV.CONTEXT_SUBJECT
+    if current_pronoun != explicit_pronoun:
+        subject = _subject_label_for_pronoun(explicit_pronoun, subject)
+
+    return TranslationContext(
+        subject=subject,
+        pronoun=explicit_pronoun,
+        narration_mode=ctx.narration_mode,
+        last_english=ctx.last_english,
+        recent_pairs=list(ctx.recent_pairs),
+    )
 
 
 def _infer_subject_from_english(
@@ -554,9 +766,20 @@ def _format_replacement(match: re.Match, replacement: str) -> str:
     sentence_start = idx == 0 or string[idx - 1] in ".!?“”\"'‘’("
     if sentence_start:
         return replacement
+    if replacement.startswith("I"):
+        return replacement
     if replacement:
         return replacement[0].lower() + replacement[1:]
     return replacement
+
+
+def _normalize_english_pronoun_case(text: str) -> str:
+    if not text:
+        return text
+
+    updated = re.sub(r"(?<![A-Za-z])i(?![A-Za-z])", "I", text)
+    updated = re.sub(r"(?<![A-Za-z])i(['’](?:m|d|ll|ve))\b", lambda m: "I" + m.group(1), updated, flags=re.IGNORECASE)
+    return updated
 
 def _detect_third_person_pronoun(ko: str) -> str:
     compact = re.sub(r"\s+", "", ko)
@@ -721,8 +944,11 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
     # If Korean explicitly uses third-person pronouns (그는/그녀는/그들은), honor that.
     explicit_pronoun = _detect_third_person_pronoun(source_text)
     if explicit_pronoun:
+        previous_pronoun = _normalize_pronoun(ctx)
         pronoun_key = explicit_pronoun
         if ctx:
+            if previous_pronoun != explicit_pronoun:
+                ctx.subject = _subject_label_for_pronoun(explicit_pronoun, ctx.subject or ENV.CONTEXT_SUBJECT)
             ctx.pronoun = explicit_pronoun
 
     # If the current English clause clearly has a third-person subject (e.g., "the Levites")
@@ -825,6 +1051,8 @@ def _enforce_we_guardrails(en: str, source_text: str, ctx: Optional[TranslationC
     """
     if _contains_first_person_markers(source_text) or _contains_implicit_first_person_kinship(source_text):
         return en
+    if _detect_third_person_pronoun(source_text):
+        return en
     pronoun_pref = _normalize_pronoun(ctx)
     if not _contains_we_markers(source_text) and pronoun_pref != "we":
         return en
@@ -889,26 +1117,18 @@ async def translate_text(
     implicit_first_person = _contains_implicit_first_person_kinship(text)
 
     if ctx:
-        # Use the most recent English line to shape the subject/pronoun hint.
-        subj_hint, pronoun_hint = _infer_subject_from_english(
-            ctx.last_english or "",
-            ctx.subject or ENV.CONTEXT_SUBJECT,
-            ctx.pronoun or ENV.CONTEXT_PRONOUN,
-        )
+        subj_hint, pronoun_hint = _infer_subject_from_context_history(ctx)
         ctx.subject = subj_hint
         ctx.pronoun = pronoun_hint
 
     if explicit_first_person:
         ctx_for_prompt = None
-    elif implicit_first_person and ctx:
-        ctx_for_prompt = TranslationContext(
-            subject="the speaker",
-            pronoun="I",
-            narration_mode=ctx.narration_mode,
-            last_english=ctx.last_english,
-        )
     else:
-        ctx_for_prompt = ctx
+        ctx_for_prompt = _context_for_prompt(
+            ctx,
+            text,
+            implicit_first_person=implicit_first_person,
+        )
 
     client = _get_client()
     system = _build_system_prompt(
@@ -925,24 +1145,26 @@ async def translate_text(
         prev = ctx_for_prompt.last_english or "(none yet)"
         subject_hint = ctx_for_prompt.subject or ENV.CONTEXT_SUBJECT
         pronoun_hint = ctx_for_prompt.pronoun or ENV.CONTEXT_PRONOUN
-        user_content = (
-            f"Previous English sentence: {prev}\n"
-            f"Subject hint: continue referring to {subject_hint} ({pronoun_hint}).\n\n"
-            f"Current text:\n{masked_text}"
-        )
+        if _should_include_prompt_context(text, update_ctx=update_ctx):
+            recent_context_block = _build_recent_context_block(ctx_for_prompt, current_source_text=text)
+            user_content = (
+                recent_context_block +
+                f"Previous English sentence: {prev}\n"
+                f"Subject hint: continue referring to {subject_hint} ({pronoun_hint}).\n\n"
+                f"Current text:\n{masked_text}"
+            )
+        else:
+            user_content = f"Current text:\n{masked_text}"
 
     try:
-        model_name = (model_override or _MODEL or "gpt-4o-mini").strip() or "gpt-4o-mini"
+        model_name = ENV.resolve_translation_model(model_override)
         resp = await client.chat.completions.create(
             model=model_name,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content}
             ],
-            temperature=0.2,
-            presence_penalty=0,
-            frequency_penalty=0,
-            top_p=1.0,
+            **_openai_chat_options(model_name),
         )
         usage = TranslationUsage(model=str(getattr(resp, "model", None) or model_name))
         resp_usage = getattr(resp, "usage", None)
@@ -981,6 +1203,8 @@ async def translate_text(
             out = _enforce_subject_guardrails(out, text, ctx)
         if source.lower().startswith("ko"):
             out = _enforce_we_guardrails(out, text, ctx)
+        if target.lower().startswith("en"):
+            out = _normalize_english_pronoun_case(out)
 
         if ctx and update_ctx:
             # Update context for the next clause so subject continuity follows
@@ -990,7 +1214,7 @@ async def translate_text(
                 ctx.subject or ENV.CONTEXT_SUBJECT,
                 ctx.pronoun or ENV.CONTEXT_PRONOUN,
             )
-            ctx.last_english = out
+            ctx.remember(text, out)
 
         _log_translation_example(
             source_lang=source,
@@ -1009,11 +1233,11 @@ async def translate_text(
                     "promptTokens": 0,
                     "completionTokens": 0,
                     "totalTokens": 0,
-                    "model": (model_override or _MODEL or "gpt-4o-mini").strip() or "gpt-4o-mini",
+                    "model": ENV.resolve_translation_model(model_override),
                     "estimatedUsd": 0.0,
                     "failOpen": True,
                     "errorMessage": str(e)[:240],
                 }
             )
-        print(f"[TX] OpenAI error (model={model_override or _MODEL}): {e}")
+        print(f"[TX] OpenAI error (model={ENV.resolve_translation_model(model_override)}): {e}")
         return text

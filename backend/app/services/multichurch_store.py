@@ -278,26 +278,137 @@ def _billing_trial_minutes_limit(billing: Dict[str, Any]) -> int:
     return max(0, parsed)
 
 
+def _billing_trial_seconds_limit(billing: Dict[str, Any]) -> int:
+    minutes_limit = _billing_trial_minutes_limit(billing)
+    if minutes_limit <= 0:
+        return 0
+    return minutes_limit * 60
+
+
+def _billing_trial_seconds_used(billing: Dict[str, Any]) -> int:
+    seconds_limit = _billing_trial_seconds_limit(billing)
+    if seconds_limit <= 0:
+        return 0
+    raw_seconds = billing.get("trialSecondsUsed")
+    try:
+        seconds_used = int(raw_seconds)
+    except (TypeError, ValueError):
+        seconds_used = _safe_int(billing.get("trialMinutesUsed"), 0) * 60
+    seconds_used = max(0, seconds_used)
+    return min(seconds_limit, seconds_used)
+
+
+def _set_billing_trial_seconds_used(billing: Dict[str, Any], seconds_used: int) -> int:
+    seconds_limit = _billing_trial_seconds_limit(billing)
+    if seconds_limit <= 0:
+        billing["trialMinutesUsed"] = 0
+        billing["trialSecondsUsed"] = 0
+        return 0
+    clamped_seconds = max(0, min(seconds_limit, int(seconds_used)))
+    billing["trialMinutesLimit"] = _billing_trial_minutes_limit(billing)
+    billing["trialMinutesUsed"] = min(_billing_trial_minutes_limit(billing), clamped_seconds // 60)
+    billing["trialSecondsUsed"] = clamped_seconds
+    return clamped_seconds
+
+
+def _consume_billing_trial_seconds(billing: Dict[str, Any], delta_seconds: int) -> int:
+    seconds_limit = _billing_trial_seconds_limit(billing)
+    if seconds_limit <= 0:
+        return 0
+    delta = max(0, int(delta_seconds))
+    if delta <= 0:
+        return _billing_trial_seconds_used(billing)
+    return _set_billing_trial_seconds_used(billing, _billing_trial_seconds_used(billing) + delta)
+
+
 def _billing_trial_minutes_used(billing: Dict[str, Any]) -> int:
-    limit = _billing_trial_minutes_limit(billing)
-    parsed = _safe_int(billing.get("trialMinutesUsed"), 0)
-    used = max(0, parsed)
-    if limit > 0:
-        return min(limit, used)
-    return used
+    return _billing_trial_seconds_used(billing) // 60
+
+
+def _billing_trial_seconds_remaining(billing: Dict[str, Any]) -> Optional[int]:
+    seconds_limit = _billing_trial_seconds_limit(billing)
+    if seconds_limit <= 0:
+        return None
+    used = _billing_trial_seconds_used(billing)
+    return max(0, seconds_limit - used)
 
 
 def _billing_trial_minutes_remaining(billing: Dict[str, Any]) -> Optional[int]:
-    limit = _billing_trial_minutes_limit(billing)
-    if limit <= 0:
+    remaining_seconds = _billing_trial_seconds_remaining(billing)
+    if remaining_seconds is None:
         return None
-    used = _billing_trial_minutes_used(billing)
-    return max(0, limit - used)
+    if remaining_seconds <= 0:
+        return 0
+    return int(math.ceil(remaining_seconds / 60))
 
 
 def _billing_trial_minutes_exhausted(billing: Dict[str, Any]) -> bool:
-    remaining = _billing_trial_minutes_remaining(billing)
-    return remaining is not None and remaining <= 0
+    remaining_seconds = _billing_trial_seconds_remaining(billing)
+    return remaining_seconds is not None and remaining_seconds <= 0
+
+
+def _ceil_minutes_from_seconds(total_seconds: int) -> int:
+    seconds = max(0, int(total_seconds))
+    if seconds <= 0:
+        return 0
+    return int(math.ceil(seconds / 60))
+
+
+def _room_unbilled_elapsed_seconds(room: Dict[str, Any], *, now: datetime) -> int:
+    last_tick_at = room.get("lastUsageTickAt") or room.get("startedAt") or now
+    if not isinstance(last_tick_at, datetime):
+        last_tick_at = now
+    elapsed_seconds = (now - last_tick_at).total_seconds()
+    if elapsed_seconds <= 0:
+        return 0
+    return int(elapsed_seconds)
+
+
+def _billing_payload_from_org_row(org: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    raw_billing = org.get("billing")
+    billing_payload = dict(raw_billing) if isinstance(raw_billing, dict) else {}
+    changed = not isinstance(raw_billing, dict)
+    for key, value in org.items():
+        if not isinstance(key, str) or not key.startswith("billing."):
+            continue
+        changed = True
+        path = [part for part in key.split(".")[1:] if part]
+        if not path:
+            continue
+        target = billing_payload
+        for part in path[:-1]:
+            next_value = target.get(part)
+            if not isinstance(next_value, dict):
+                if next_value is None:
+                    next_value = {}
+                    target[part] = next_value
+                    changed = True
+                else:
+                    next_value = {}
+                    target[part] = next_value
+                    changed = True
+            target = next_value
+        if path[-1] not in target or target.get(path[-1]) is None:
+            target[path[-1]] = value
+            changed = True
+    return billing_payload, changed
+
+
+def _effective_trial_seconds_remaining_for_rooms(
+    billing: Dict[str, Any],
+    rooms: List[Dict[str, Any]],
+    *,
+    now: datetime,
+) -> Optional[int]:
+    remaining_seconds = _billing_trial_seconds_remaining(billing)
+    if remaining_seconds is None:
+        return None
+    live_runtime_seconds = 0
+    for room in rooms:
+        if str(room.get("status") or "").strip().lower() != "live":
+            continue
+        live_runtime_seconds += _room_unbilled_elapsed_seconds(room, now=now)
+    return max(0, remaining_seconds - live_runtime_seconds)
 
 
 def _billing_start_denial_reason(*, billing: Dict[str, Any], now: datetime) -> Optional[str]:
@@ -980,6 +1091,28 @@ class InMemoryMultiChurchStore:
             )
             org["updatedAt"] = now
             return dict(merged)
+
+    def get_org_effective_trial_seconds_remaining(self, *, org_id: str) -> Optional[int]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            billing = _normalize_billing_state(
+                org.get("billing"),
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            org["billing"] = billing
+            live_rooms = [
+                room
+                for (row_org_id, _room_id), room in self._rooms.items()
+                if row_org_id == clean_org_id and str(room.get("status") or "").strip().lower() == "live"
+            ]
+            return _effective_trial_seconds_remaining_for_rooms(billing, live_rooms, now=now)
 
     def ensure_org_can_start_service(self, *, org_id: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -1950,11 +2083,8 @@ class InMemoryMultiChurchStore:
                 service["lastRoomId"] = room_id
                 service["updatedAt"] = now
 
-            started_at: datetime = room.get("startedAt") or now
-            duration_min = max(1, int(math.ceil((now - started_at).total_seconds() / 60)))
-            usage_key = (org_id, _yyyymm(now))
             usage = self._usage.setdefault(
-                usage_key,
+                (org_id, _yyyymm(now)),
                 {
                     "minutesStreamed": 0,
                     "minutesTranslated": 0,
@@ -1963,6 +2093,30 @@ class InMemoryMultiChurchStore:
                     "updatedAt": now,
                 },
             )
+            org = self._orgs.get(org_id)
+            if org:
+                self._roll_billing_period_if_needed(org, now)
+                billing = _normalize_org_billing(org, now=now)
+                org["billing"] = billing
+                billing_limits_enabled = _org_billing_limits_enabled(org)
+                has_monthly_cap = billing_limits_enabled and int(org.get("maxMinutesPerMonth") or 0) > 0
+                has_trial_cap = _billing_trial_seconds_limit(billing) > 0
+                remainder_seconds = _room_unbilled_elapsed_seconds(room, now=now)
+                if remainder_seconds > 0 and (has_monthly_cap or has_trial_cap):
+                    delta_minutes = _ceil_minutes_from_seconds(remainder_seconds)
+                    usage["minutesTranslated"] += delta_minutes
+                    if has_monthly_cap:
+                        org["currentMonthMinutes"] = int(org.get("currentMonthMinutes") or 0) + delta_minutes
+                        if int(org.get("currentMonthMinutes") or 0) >= int(org.get("maxMinutesPerMonth") or 0):
+                            org["hardCapReached"] = True
+                    if has_trial_cap:
+                        _consume_billing_trial_seconds(billing, remainder_seconds)
+                    room["lastUsageTickAt"] = now
+                    usage["updatedAt"] = now
+                    org["updatedAt"] = now
+
+            started_at: datetime = room.get("startedAt") or now
+            duration_min = max(1, int(math.ceil((now - started_at).total_seconds() / 60)))
             usage["minutesStreamed"] += duration_min
             usage["sessionsCount"] += 1
             usage["peakListeners"] = max(int(usage.get("peakListeners", 0)), int(room.get("listenerCountPeak", 0)))
@@ -2025,7 +2179,7 @@ class InMemoryMultiChurchStore:
                 billing_limits_enabled = _org_billing_limits_enabled(org)
                 billing = _normalize_org_billing(org, now=now)
                 org["billing"] = billing
-                has_trial_cap = _billing_trial_minutes_limit(billing) > 0
+                has_trial_cap = _billing_trial_seconds_limit(billing) > 0
                 if not billing_limits_enabled and not has_trial_cap:
                     continue
                 monthly_reached = bool(org.get("hardCapReached")) if billing_limits_enabled else False
@@ -2051,8 +2205,7 @@ class InMemoryMultiChurchStore:
 
                 max_minutes = int(org.get("maxMinutesPerMonth") or 0)
                 has_monthly_cap = billing_limits_enabled and max_minutes > 0
-                trial_limit = _billing_trial_minutes_limit(billing)
-                has_trial_cap = trial_limit > 0
+                has_trial_cap = _billing_trial_seconds_limit(billing) > 0
                 if not has_monthly_cap and not has_trial_cap:
                     continue
 
@@ -2071,6 +2224,7 @@ class InMemoryMultiChurchStore:
                     continue
 
                 delta_minutes = increments * tick_min
+                delta_seconds = increments * max(1, tick_seconds)
                 room["lastUsageTickAt"] = last_tick_at + timedelta(seconds=increments * tick_seconds)
 
                 usage = self._usage.setdefault(
@@ -2089,8 +2243,7 @@ class InMemoryMultiChurchStore:
                 if has_monthly_cap:
                     org["currentMonthMinutes"] = int(org.get("currentMonthMinutes") or 0) + delta_minutes
                 if has_trial_cap:
-                    used = _billing_trial_minutes_used(billing)
-                    billing["trialMinutesUsed"] = min(trial_limit, used + delta_minutes)
+                    _consume_billing_trial_seconds(billing, delta_seconds)
 
                 monthly_reached = has_monthly_cap and int(org.get("currentMonthMinutes") or 0) >= max_minutes
                 trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(billing)
@@ -2760,12 +2913,13 @@ class FirestoreMultiChurchStore:
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
+        billing_payload, lifted_legacy_fields = _billing_payload_from_org_row(org)
         billing = _normalize_billing_state(
-            org.get("billing"),
+            billing_payload,
             plan_key=str(org.get("plan") or "trial"),
             now=now,
         )
-        if not isinstance(org.get("billing"), dict):
+        if lifted_legacy_fields or billing != billing_payload:
             org_ref.set(
                 {
                     "billing": billing,
@@ -2801,6 +2955,36 @@ class FirestoreMultiChurchStore:
             merge=True,
         )
         return dict(merged)
+
+    def get_org_effective_trial_seconds_remaining(self, *, org_id: str) -> Optional[int]:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        org = org_snap.to_dict() or {}
+        billing_payload, lifted_legacy_fields = _billing_payload_from_org_row(org)
+        billing = _normalize_billing_state(
+            billing_payload,
+            plan_key=str(org.get("plan") or "trial"),
+            now=now,
+        )
+        if lifted_legacy_fields or billing != billing_payload:
+            org_ref.set(
+                {
+                    "billing": billing,
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        live_rooms = [
+            room_snap.to_dict() or {}
+            for room_snap in self._where(self._org_ref(clean_org_id).collection("rooms"), "status", "==", "live").stream()
+        ]
+        return _effective_trial_seconds_remaining_for_rooms(billing, live_rooms, now=now)
 
     def ensure_org_can_start_service(self, *, org_id: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -3853,6 +4037,20 @@ class FirestoreMultiChurchStore:
             service_ref = self._service_ref(org_id, service_key)
             service_snap = service_ref.get(transaction=transaction)
             service = service_snap.to_dict() if service_snap.exists else {}
+            org_ref = self._org_ref(org_id)
+            org_snap = org_ref.get(transaction=transaction)
+            org = org_snap.to_dict() or {}
+            if org_snap.exists:
+                org = self._roll_billing_period_if_needed(org_id, org, now=now)
+            billing = _normalize_org_billing(org, now=now) if org_snap.exists else {}
+            billing_limits_enabled = _org_billing_limits_enabled(org) if org_snap.exists else False
+            has_monthly_cap = billing_limits_enabled and int(org.get("maxMinutesPerMonth") or 0) > 0
+            has_trial_cap = _billing_trial_seconds_limit(billing) > 0 if org_snap.exists else False
+            remainder_seconds = _room_unbilled_elapsed_seconds(room, now=now)
+            translated_delta_minutes = 0
+            if remainder_seconds > 0 and (has_monthly_cap or has_trial_cap):
+                translated_delta_minutes = _ceil_minutes_from_seconds(remainder_seconds)
+
             started_at = room.get("startedAt")
             if isinstance(started_at, datetime):
                 duration_min = max(1, int(math.ceil((now - started_at).total_seconds() / 60)))
@@ -3878,17 +4076,28 @@ class FirestoreMultiChurchStore:
                     },
                     merge=True,
                 )
+            if org_snap.exists and translated_delta_minutes > 0:
+                org_update: Dict[str, Any] = {"updatedAt": gcf_firestore.SERVER_TIMESTAMP}
+                if has_monthly_cap:
+                    next_month_minutes = int(org.get("currentMonthMinutes") or 0) + translated_delta_minutes
+                    org_update["currentMonthMinutes"] = next_month_minutes
+                    if next_month_minutes >= int(org.get("maxMinutesPerMonth") or 0):
+                        org_update["hardCapReached"] = True
+                if has_trial_cap:
+                    _consume_billing_trial_seconds(billing, remainder_seconds)
+                    billing["updatedAt"] = now
+                    org_update["billing"] = dict(billing)
+                transaction.set(org_ref, org_update, merge=True)
             usage_ref = self._usage_ref(org_id, _yyyymm(now))
-            transaction.set(
-                usage_ref,
-                {
-                    "minutesStreamed": gcf_firestore.Increment(duration_min),
-                    "sessionsCount": gcf_firestore.Increment(1),
-                    "peakListeners": gcf_firestore.Increment(0),
-                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
-                },
-                merge=True,
-            )
+            usage_update: Dict[str, Any] = {
+                "minutesStreamed": gcf_firestore.Increment(duration_min),
+                "sessionsCount": gcf_firestore.Increment(1),
+                "peakListeners": gcf_firestore.Increment(0),
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            }
+            if translated_delta_minutes > 0:
+                usage_update["minutesTranslated"] = gcf_firestore.Increment(translated_delta_minutes)
+            transaction.set(usage_ref, usage_update, merge=True)
             return {"orgId": org_id, "roomId": room_id, "status": "ended"}
 
         tx = db.transaction()
@@ -3962,14 +4171,15 @@ class FirestoreMultiChurchStore:
             max_minutes = int(org.get("maxMinutesPerMonth") or 0)
             has_monthly_cap = billing_limits_enabled and max_minutes > 0
             trial_limit = _billing_trial_minutes_limit(billing)
-            has_trial_cap = trial_limit > 0
+            trial_limit_seconds = _billing_trial_seconds_limit(billing)
+            has_trial_cap = trial_limit_seconds > 0
             if not has_monthly_cap and not has_trial_cap:
                 continue
 
             current_minutes = int(org.get("currentMonthMinutes") or 0)
             cap_reached = bool(org.get("hardCapReached")) if has_monthly_cap else False
-            trial_used = _billing_trial_minutes_used(billing)
-            trial_reached = has_trial_cap and trial_used >= trial_limit
+            trial_billing_next = dict(billing)
+            trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(trial_billing_next)
 
             room_snaps = list(self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream())
             live_room_ids = [snap.id for snap in room_snaps]
@@ -3984,7 +4194,7 @@ class FirestoreMultiChurchStore:
 
             org_delta = 0
             usage_delta = 0
-            trial_delta = 0
+            trial_delta_seconds = 0
             for room_snap in room_snaps:
                 room = room_snap.to_dict() or {}
                 if cap_reached or trial_reached:
@@ -3997,33 +4207,36 @@ class FirestoreMultiChurchStore:
                 if increments <= 0:
                     continue
                 delta_minutes = increments * tick_min
+                delta_seconds = increments * max(1, tick_seconds)
                 if has_monthly_cap:
                     org_delta += delta_minutes
                 usage_delta += delta_minutes
                 if has_trial_cap:
-                    trial_delta += delta_minutes
+                    trial_delta_seconds += delta_seconds
 
                 next_tick_at = last_tick_at + timedelta(seconds=increments * tick_seconds)
                 self._room_ref(org_id, room_snap.id).set({"lastUsageTickAt": next_tick_at}, merge=True)
 
                 if has_monthly_cap and (current_minutes + org_delta) >= max_minutes:
                     cap_reached = True
-                if has_trial_cap and (trial_used + trial_delta) >= trial_limit:
+                if has_trial_cap and (trial_delta_seconds > 0):
+                    _set_billing_trial_seconds_used(
+                        trial_billing_next,
+                        _billing_trial_seconds_used(billing) + trial_delta_seconds,
+                    )
+                if has_trial_cap and _billing_trial_minutes_exhausted(trial_billing_next):
                     trial_reached = True
 
-            trial_used_next = trial_used
-            if has_trial_cap and trial_delta > 0:
-                trial_used_next = min(trial_limit, trial_used + trial_delta)
-
-            if org_delta > 0 or cap_reached or (has_trial_cap and trial_used_next != trial_used):
+            trial_usage_changed = has_trial_cap and _billing_trial_seconds_used(trial_billing_next) != _billing_trial_seconds_used(billing)
+            if org_delta > 0 or cap_reached or trial_usage_changed:
                 org_update: Dict[str, Any] = {}
                 if org_delta > 0:
                     org_update["currentMonthMinutes"] = gcf_firestore.Increment(org_delta)
                 if cap_reached:
                     org_update["hardCapReached"] = True
                 if has_trial_cap:
-                    org_update["billing.trialMinutesLimit"] = trial_limit
-                    org_update["billing.trialMinutesUsed"] = trial_used_next
+                    trial_billing_next["updatedAt"] = now
+                    org_update["billing"] = dict(trial_billing_next)
                 if org_update:
                     self._org_ref(org_id).set(org_update, merge=True)
 

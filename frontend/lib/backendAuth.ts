@@ -145,6 +145,8 @@ export type OrgBillingStatus = {
   priceId?: string | null;
   trialMinutesLimit?: number;
   trialMinutesUsed?: number;
+  trialSecondsUsed?: number;
+  trialSecondsRemaining?: number;
   limits?: { maxServiceKeys?: number };
   entitlements?: { canStartService?: boolean };
   updatedAt?: string | null;

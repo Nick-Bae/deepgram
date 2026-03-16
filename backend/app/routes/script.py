@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.auth.guards import require_org_role, resolve_default_org_id_for_roles
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
+from app.env import ENV
 from app.services.multichurch_store import multichurch_store
 from app.services.script_store import script_store
 from app.utils.translate import translate_text
@@ -15,7 +16,7 @@ from app.utils.translate import translate_text
 router = APIRouter(tags=["script"])
 SCRIPT_EDITOR_ROLES = {"owner", "admin", "host"}
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。？！…])\s+|\n+")
-SERMON_TRANSLATION_MODEL = (os.getenv("OPENAI_SERMON_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+SERMON_TRANSLATION_MODEL = ENV.SERMON_TRANSLATION_MODEL
 
 
 def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:

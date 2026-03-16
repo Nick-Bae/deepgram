@@ -154,9 +154,8 @@ function formatBillingStatus(status: string): string {
   return token.replace(/_/g, " ");
 }
 
-function formatCountdownMinutes(rawMinutes: number): string {
-  const minutes = Math.max(0, Math.floor(Number.isFinite(rawMinutes) ? rawMinutes : 0));
-  const totalSeconds = minutes * 60;
+function formatCountdownSeconds(rawSeconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(Number.isFinite(rawSeconds) ? rawSeconds : 0));
   const mm = Math.floor(totalSeconds / 60);
   const ss = totalSeconds % 60;
   return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
@@ -242,6 +241,7 @@ export default function HostChurchPage() {
   const [billingError, setBillingError] = useState<string | null>(null);
   const [billingNotice, setBillingNotice] = useState<string | null>(null);
   const [trialBroadcastNotice, setTrialBroadcastNotice] = useState<string | null>(null);
+  const [trialCountdownSeconds, setTrialCountdownSeconds] = useState<number | null>(null);
   const [sermonUsageState, setSermonUsageState] = useState<OrgSermonUsageResponse | null>(null);
   const [sermonBudgetInput, setSermonBudgetInput] = useState("0");
   const [sermonBudgetBusy, setSermonBudgetBusy] = useState(false);
@@ -278,8 +278,26 @@ export default function HostChurchPage() {
   const billingMaxServiceKeys = Number(billingProfile?.limits?.maxServiceKeys || 0);
   const trialMinutesLimit = Number(billingProfile?.trialMinutesLimit || 0);
   const trialMinutesUsed = Number(billingProfile?.trialMinutesUsed || 0);
-  const trialMinutesRemaining = trialMinutesLimit > 0 ? Math.max(0, trialMinutesLimit - trialMinutesUsed) : null;
-  const isTrialExpired = isTrialPlan && trialMinutesRemaining !== null && trialMinutesRemaining <= 0;
+  const trialSecondsLimit = trialMinutesLimit > 0 ? trialMinutesLimit * 60 : 0;
+  const trialSecondsUsed = Math.max(
+    0,
+    Number.isFinite(Number(billingProfile?.trialSecondsUsed))
+      ? Number(billingProfile?.trialSecondsUsed || 0)
+      : trialMinutesUsed * 60,
+  );
+  const trialSecondsRemaining = Number.isFinite(Number(billingProfile?.trialSecondsRemaining))
+    ? Math.max(0, Number(billingProfile?.trialSecondsRemaining || 0))
+    : trialSecondsLimit > 0
+      ? Math.max(0, trialSecondsLimit - trialSecondsUsed)
+      : null;
+  const trialCountdownKeyRef = useRef("");
+  const effectiveTrialCountdownSeconds = useMemo(() => {
+    if (!isTrialPlan || trialSecondsRemaining === null) return null;
+    if (trialCountdownSeconds !== null) return trialCountdownSeconds;
+    return trialSecondsRemaining;
+  }, [isTrialPlan, trialCountdownSeconds, trialSecondsRemaining]);
+  const isTrialExpired = isTrialPlan && effectiveTrialCountdownSeconds !== null && effectiveTrialCountdownSeconds <= 0;
+  const startServiceDisabled = busy || isTrialExpired;
   const trialNoticeCheckpointRef = useRef<"" | "warn5" | "warn1" | "expired">("");
   const hasPaidPlan = PAID_PLAN_KEYS.includes(billingPlanToken as PaidPlanKey);
   const hasActiveLikeSubscription = billingStatusToken === "active" || billingStatusToken === "trialing" || billingStatusToken === "past_due";
@@ -328,6 +346,8 @@ export default function HostChurchPage() {
     setBillingError(null);
     setBillingNotice(null);
     setTrialBroadcastNotice(null);
+    setTrialCountdownSeconds(null);
+    trialCountdownKeyRef.current = "";
     trialNoticeCheckpointRef.current = "";
     setSermonUsageState(null);
     setSermonBudgetInput("0");
@@ -335,6 +355,41 @@ export default function HostChurchPage() {
     setSermonBudgetError(null);
     setSermonBudgetNotice(null);
   }, [resolvedOrgId]);
+
+  useEffect(() => {
+    if (!isTrialPlan || trialSecondsRemaining === null) {
+      setTrialCountdownSeconds(null);
+      trialCountdownKeyRef.current = "";
+      return;
+    }
+
+    const nextSeconds = trialSecondsRemaining;
+    const countdownKey = `${resolvedOrgId}:${billingPlanToken}:${trialSecondsLimit}`;
+    const keyChanged = trialCountdownKeyRef.current !== countdownKey;
+    trialCountdownKeyRef.current = countdownKey;
+
+    setTrialCountdownSeconds((prev) => {
+      if (keyChanged || prev === null) return nextSeconds;
+      if (activeRoomId) {
+        const liveDelta = prev - nextSeconds;
+        // While the room stays open, trust the local second timer unless the backend
+        // is materially lower. This avoids immediate one-minute jumps on room start.
+        if (liveDelta >= 0 && liveDelta <= 60) return prev;
+      }
+      return Math.min(prev, nextSeconds);
+    });
+  }, [activeRoomId, billingPlanToken, isTrialPlan, resolvedOrgId, trialSecondsLimit, trialSecondsRemaining]);
+
+  useEffect(() => {
+    if (!isTrialPlan || !activeRoomId) return;
+    const timer = window.setInterval(() => {
+      setTrialCountdownSeconds((prev) => {
+        if (prev === null) return prev;
+        return Math.max(0, prev - 1);
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [activeRoomId, isTrialPlan]);
 
   useEffect(() => {
     if (authLoading) return;
@@ -792,26 +847,26 @@ export default function HostChurchPage() {
   }, [authLoading, canManageInvites, getIdToken, resolvedOrgId, user]);
 
   useEffect(() => {
-    if (billingPlanToken !== "trial" || trialMinutesRemaining === null) {
+    if (billingPlanToken !== "trial" || effectiveTrialCountdownSeconds === null) {
       trialNoticeCheckpointRef.current = "";
       setTrialBroadcastNotice(null);
       return;
     }
-    if (trialMinutesRemaining <= 0) {
+    if (effectiveTrialCountdownSeconds <= 0) {
       if (trialNoticeCheckpointRef.current !== "expired") {
         trialNoticeCheckpointRef.current = "expired";
         setTrialBroadcastNotice("Your 30-minute trial has ended. Upgrade to continue broadcasting.");
       }
       return;
     }
-    if (trialMinutesRemaining <= 1) {
+    if (effectiveTrialCountdownSeconds <= 60) {
       if (trialNoticeCheckpointRef.current !== "warn1" && trialNoticeCheckpointRef.current !== "expired") {
         trialNoticeCheckpointRef.current = "warn1";
         setTrialBroadcastNotice("Trial: 1 minute remaining. Broadcast will stop automatically when time runs out.");
       }
       return;
     }
-    if (trialMinutesRemaining <= 5) {
+    if (effectiveTrialCountdownSeconds <= 5 * 60) {
       if (trialNoticeCheckpointRef.current === "") {
         trialNoticeCheckpointRef.current = "warn5";
         setTrialBroadcastNotice("Trial: 5 minutes remaining. Upgrade anytime to avoid interruption.");
@@ -822,7 +877,7 @@ export default function HostChurchPage() {
       trialNoticeCheckpointRef.current = "";
       setTrialBroadcastNotice(null);
     }
-  }, [billingPlanToken, trialMinutesRemaining]);
+  }, [billingPlanToken, effectiveTrialCountdownSeconds]);
 
   const generateInviteLink = async () => {
     if (!resolvedOrgId) {
@@ -1128,6 +1183,10 @@ export default function HostChurchPage() {
       setErrorMsg("Church slug is missing. Refresh the page.");
       return;
     }
+    if (isTrialExpired && !activeRoomId) {
+      setErrorMsg(ERROR_DETAIL_MESSAGES.trial_expired);
+      return;
+    }
     if (!normalizedServiceKey) {
       setErrorMsg("Enter a service key before starting.");
       return;
@@ -1154,6 +1213,9 @@ export default function HostChurchPage() {
       });
       if (!res.ok) {
         const msg = await readErrorMessage(res, "start_service");
+        if (res.status === 402 && resolvedOrgId) {
+          void loadBillingProfile({ refresh: true });
+        }
         throw new Error(msg);
       }
       const data: StartResponse = await res.json();
@@ -1179,6 +1241,9 @@ export default function HostChurchPage() {
         syncHostUrl(data.roomId, data.serviceKey || normalizedServiceKey);
       }
       setErrorMsg(null);
+      if (resolvedOrgId) {
+        void loadBillingProfile({ refresh: true });
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setErrorMsg(message || "start_failed");
@@ -1218,6 +1283,7 @@ export default function HostChurchPage() {
       });
       syncHostUrl(undefined, normalizedServiceKey);
       setErrorMsg(null);
+      void loadBillingProfile({ refresh: true });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       setErrorMsg(message || "end_failed");
@@ -1661,7 +1727,7 @@ export default function HostChurchPage() {
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, alignItems: "center" }}>
                 <button
                   onClick={startService}
-                  disabled={busy}
+                  disabled={startServiceDisabled}
                   style={{
                     borderRadius: 10,
                     border: "1px solid rgba(79,115,170,0.3)",
@@ -1669,8 +1735,8 @@ export default function HostChurchPage() {
                     color: "#f8fafc",
                     fontWeight: 700,
                     padding: "9px 14px",
-                    cursor: busy ? "not-allowed" : "pointer",
-                    opacity: busy ? 0.6 : 1,
+                    cursor: startServiceDisabled ? "not-allowed" : "pointer",
+                    opacity: startServiceDisabled ? 0.6 : 1,
                     boxShadow: accentPrimaryShadow,
                   }}
                 >
@@ -1696,7 +1762,7 @@ export default function HostChurchPage() {
                 <span style={{ opacity: 0.84, fontSize: 14 }}>
                   {activeRoomId ? `Live room: ${activeRoomId}` : "No live room"}
                 </span>
-                {billingPlanToken === "trial" && trialMinutesRemaining !== null ? (
+                {billingPlanToken === "trial" && effectiveTrialCountdownSeconds !== null ? (
                   <span
                     style={{
                       borderRadius: 999,
@@ -1708,7 +1774,7 @@ export default function HostChurchPage() {
                       padding: "6px 10px",
                     }}
                   >
-                    Trial remaining: {formatCountdownMinutes(trialMinutesRemaining)}
+                    Trial remaining: {formatCountdownSeconds(effectiveTrialCountdownSeconds)}
                   </span>
                 ) : null}
               </div>
@@ -1898,14 +1964,14 @@ export default function HostChurchPage() {
                             </p>
                           </div>
                         ) : null}
-                        {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining !== null ? (
+                        {isTrialPlan && !hasSubscriptionPeriod && effectiveTrialCountdownSeconds !== null ? (
                           <p style={settingsBodyTextStyle}>
                             Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
                             {" · "}
-                            Remaining: <strong>{trialMinutesRemaining}</strong> minutes
+                            Remaining: <strong>{formatCountdownSeconds(effectiveTrialCountdownSeconds)}</strong>
                           </p>
                         ) : null}
-                        {isTrialPlan && !hasSubscriptionPeriod && trialMinutesRemaining === null ? (
+                        {isTrialPlan && !hasSubscriptionPeriod && effectiveTrialCountdownSeconds === null ? (
                           <p style={settingsBodyTextStyle}>Trial usage details will appear after the next usage tick.</p>
                         ) : null}
                         {!isTrialPlan && !hasSubscriptionPeriod ? (
@@ -2348,9 +2414,15 @@ export default function HostChurchPage() {
 
         {activeTab === "broadcast" ? (
           activeRoomId ? (
+            isTrialExpired ? (
+              <section style={{ border: "1px solid rgba(252,165,165,0.55)", borderRadius: 14, padding: 16, background: "rgba(127,29,29,0.18)", color: "#fecaca" }}>
+                Your trial has ended. Broadcasting is blocked until billing is added.
+              </section>
+            ) : (
             <section>
               <TranslationBox />
             </section>
+            )
           ) : (
             <section style={{ border: "1px dashed rgba(255,255,255,0.2)", borderRadius: 14, padding: 16, opacity: 0.82 }}>
               Start a service to enable producer controls.
