@@ -327,7 +327,7 @@ export default function TranslationBox() {
     if (code === 'insufficient_quota' || reason === 'openai_quota') return 'OpenAI quota exceeded'
     if (reason === 'timeout') return 'Translation timed out'
     if (reason === 'auth_error') return 'Translator auth error'
-    return msg || 'Translation failed; showing source text'
+    return msg || 'Translation failed; output was held'
   }, [failOpenMeta])
 
   const endsWithSentenceBoundary = useCallback((raw: string) => {
@@ -719,10 +719,15 @@ export default function TranslationBox() {
     const isFinal = !!lastMeta?.is_final;
     const committedSrc = typeof last.srcText === 'string' ? last.srcText.trim() : '';
 
-    if (!incoming) return;
+    if (!incoming && !committedSrc) return;
 
-    console.log('[FE][WS][in]', { seq, isFinal, out: clip(incoming) });
-    setTranslated(incoming);
+    if (incoming) {
+      console.log('[FE][WS][in]', { seq, isFinal, out: clip(incoming) });
+      setTranslated(incoming);
+    } else if (isFinal) {
+      console.log('[FE][WS][in][suppressed-target]', { seq, src: clip(committedSrc || '(none)') });
+      setTranslated('');
+    }
 
     if (isFinal) {
       if (seq && seq <= lastHandledSeqRef.current) {
@@ -743,16 +748,18 @@ export default function TranslationBox() {
         if (committedSrc) {
           lastKRFromServerRef.current = committedSrc;
         }
-        if (!isMuted && incoming !== currentSpokenRef.current) {
+        if (incoming && !isMuted && incoming !== currentSpokenRef.current) {
           enqueueFinalTTS(incoming);
-        } else {
+        } else if (incoming) {
           console.log('[FE][TTS][skip]', { isMuted, sameAsCurrent: incoming === currentSpokenRef.current });
         }
       }
 
       const bestSourceForLog = committedSrc || clauseRef.current.trim() || lastInterimRef.current.trim()
       console.log('[FE][WS][final][ko]', { seq, src: clip(bestSourceForLog || '(none)') })
-      console.log('[FE][WS][final][en]', { seq, out: clip(incoming) })
+      if (incoming) {
+        console.log('[FE][WS][final][en]', { seq, out: clip(incoming) })
+      }
       softMapRef.current.delete(seq);
 
       const clauseSnapshot = clauseRef.current.trim();
@@ -773,7 +780,7 @@ export default function TranslationBox() {
       return;
     }
 
-    if (!seq) return;
+    if (!seq || !incoming) return;
     const now = Date.now();
     const prev = softMapRef.current.get(seq);
     if (!prev) {

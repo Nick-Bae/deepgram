@@ -1011,6 +1011,8 @@ async def translate_text(
                     "totalTokens": 0,
                     "model": (model_override or _MODEL or "gpt-4o-mini").strip() or "gpt-4o-mini",
                     "estimatedUsd": 0.0,
+                    "failOpen": True,
+                    "errorMessage": str(e)[:240],
                 }
             )
         print(f"[TX] OpenAI error (model={model_override or _MODEL}): {e}")

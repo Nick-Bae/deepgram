@@ -358,7 +358,7 @@ async def _translate_text_guarded(
             f"used={blocked.get('used')}",
             f"limit={blocked.get('limit')}",
         )
-        return source_text, _rate_limit_meta(blocked)
+        return "", _rate_limit_meta(blocked)
     usage: dict[str, Any] = {}
     try:
         translated = await translate_text(
@@ -373,6 +373,11 @@ async def _translate_text_guarded(
         )
     finally:
         _settle_translation_budget(reservations, actual_tokens=int(usage.get("totalTokens") or 0))
+    source_primary = _normalize_lang(source_lang, "ko")
+    target_primary = _normalize_lang(target_lang, "en")
+    if source_primary != target_primary and bool(usage.get("failOpen")):
+        error_message = str(usage.get("errorMessage") or "translation_failed")
+        return "", _fail_open_meta(RuntimeError(error_message))
     return translated, None
 
 
