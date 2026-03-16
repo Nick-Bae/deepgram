@@ -15,6 +15,7 @@ import {
   fetchOrgSermonUsage,
   listOrgInvites,
   revokeOrgInvite,
+  saveOrgProfile,
   saveOrgBillingLimits,
   saveOrgSermonBudget,
   setCurrentOrg,
@@ -186,7 +187,7 @@ async function copyTextToClipboard(value: string): Promise<void> {
 
 export default function HostChurchPage() {
   const router = useRouter();
-  const { user, loading: authLoading, getIdToken, logout } = useAuth();
+  const { user, loading: authLoading, getIdToken, logout, updateDisplayName } = useAuth();
   const slug = typeof router.query.churchSlug === "string" ? router.query.churchSlug : "";
   const querySection = typeof router.query.section === "string" ? router.query.section : "";
   const queryServiceKey = typeof router.query.serviceKey === "string" ? router.query.serviceKey : "";
@@ -225,6 +226,14 @@ export default function HostChurchPage() {
   const [deletingServiceKey, setDeletingServiceKey] = useState("");
   const [billingState, setBillingState] = useState<OrgBillingLimitsResponse | null>(null);
   const [billingProfile, setBillingProfile] = useState<OrgBillingStatus | null>(null);
+  const [accountDisplayNameInput, setAccountDisplayNameInput] = useState("");
+  const [accountProfileBusy, setAccountProfileBusy] = useState(false);
+  const [accountProfileError, setAccountProfileError] = useState<string | null>(null);
+  const [accountProfileNotice, setAccountProfileNotice] = useState<string | null>(null);
+  const [churchNameInput, setChurchNameInput] = useState("");
+  const [churchProfileBusy, setChurchProfileBusy] = useState(false);
+  const [churchProfileError, setChurchProfileError] = useState<string | null>(null);
+  const [churchProfileNotice, setChurchProfileNotice] = useState<string | null>(null);
   const [selectedPlan, setSelectedPlan] = useState<PaidPlanKey>("starter");
   const [billingBusy, setBillingBusy] = useState(false);
   const [billingCheckoutBusy, setBillingCheckoutBusy] = useState(false);
@@ -302,6 +311,9 @@ export default function HostChurchPage() {
     setRevokingInviteId("");
     setCopyBusy(false);
     setShareBusy(false);
+    setChurchProfileBusy(false);
+    setChurchProfileError(null);
+    setChurchProfileNotice(null);
     setNewServiceKey("");
     setNewServiceTitle("");
     setServiceManageError(null);
@@ -472,6 +484,63 @@ export default function HostChurchPage() {
     if (!origin || !slug || !normalizedServiceKey) return "";
     return `${origin}/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(normalizedServiceKey)}`;
   }, [normalizedServiceKey, origin, slug]);
+
+  const saveAccountProfile = useCallback(async () => {
+    const nextName = accountDisplayNameInput.trim();
+    if (nextName.length < 2) {
+      setAccountProfileError("Display name must be at least 2 characters.");
+      setAccountProfileNotice(null);
+      return;
+    }
+    setAccountProfileBusy(true);
+    setAccountProfileError(null);
+    setAccountProfileNotice(null);
+    try {
+      await updateDisplayName(nextName);
+      const freshToken = await getIdToken(true);
+      if (freshToken) {
+        persistAuthToken(freshToken);
+        const me = await fetchAuthMe(freshToken);
+        setIsMasterUser(Boolean(me.user?.isMaster));
+        setMemberships(me.memberships || []);
+      }
+      setAccountProfileNotice("Display name updated.");
+    } catch (err) {
+      setAccountProfileError(err instanceof Error ? err.message : "Failed to update display name.");
+    } finally {
+      setAccountProfileBusy(false);
+    }
+  }, [accountDisplayNameInput, getIdToken, updateDisplayName]);
+
+  const saveChurchProfile = useCallback(async () => {
+    const nextName = churchNameInput.trim();
+    if (nextName.length < 2) {
+      setChurchProfileError("Church name must be at least 2 characters.");
+      setChurchProfileNotice(null);
+      return;
+    }
+    if (!resolvedOrgId) {
+      setChurchProfileError("Church organization is missing.");
+      setChurchProfileNotice(null);
+      return;
+    }
+    setChurchProfileBusy(true);
+    setChurchProfileError(null);
+    setChurchProfileNotice(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const updated = await saveOrgProfile(idToken, resolvedOrgId, { name: nextName });
+      setOrgData((current) => (current ? { ...current, name: updated.name } : current));
+      setMemberships((rows) => rows.map((row) => (row.orgId === updated.orgId ? { ...row, name: updated.name } : row)));
+      setChurchProfileNotice("Church name updated.");
+    } catch (err) {
+      setChurchProfileError(err instanceof Error ? err.message : "Failed to update church name.");
+    } finally {
+      setChurchProfileBusy(false);
+    }
+  }, [churchNameInput, getIdToken, resolvedOrgId]);
 
   const buildTabHref = useCallback(
     (
@@ -1249,7 +1318,7 @@ export default function HostChurchPage() {
   const settingsGridStyle = {
     display: "grid",
     gap: 16,
-    gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
   } as const;
   const settingsCardStyle = {
     border: "1px solid rgba(255,255,255,0.88)",
@@ -1328,11 +1397,12 @@ export default function HostChurchPage() {
   } as const;
   const settingsInlineFieldStyle = {
     ...hostFieldStyle,
-    minWidth: 160,
+    minWidth: "min(100%, 160px)",
   } as const;
   const settingsServiceRowStyle = {
-    display: "grid",
-    gridTemplateColumns: "minmax(0,1fr) auto",
+    display: "flex",
+    flexWrap: "wrap" as const,
+    justifyContent: "space-between",
     gap: 12,
     alignItems: "center",
     border: "1px solid rgba(215,223,235,0.9)",
@@ -1347,6 +1417,15 @@ export default function HostChurchPage() {
   ).trim();
   const currentUserInitial = currentUserName.charAt(0).toUpperCase() || "H";
   const currentChurchLabel = (orgData?.name || slug || "Current Church").trim();
+  const churchPublicPath = slug ? `${origin || ""}/c/${slug}` : "";
+
+  useEffect(() => {
+    setAccountDisplayNameInput(currentUserName);
+  }, [currentUserName]);
+
+  useEffect(() => {
+    setChurchNameInput((orgData?.name || "").trim());
+  }, [orgData?.name, orgData?.orgId]);
 
   if (!user && !authLoading) {
     return (
@@ -1663,6 +1742,111 @@ export default function HostChurchPage() {
             canManageServices ? (
               <div style={settingsShellStyle}>
                 <div style={settingsGridStyle}>
+                  <section style={settingsCardStyle}>
+                    <p style={settingsSectionLabelStyle}>Account</p>
+                    <h3 style={settingsTitleStyle}>Your Profile</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Update the name shown in the host console and team-facing flows.
+                    </p>
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Display name</span>
+                      <input
+                        value={accountDisplayNameInput}
+                        onChange={(e) => {
+                          setAccountDisplayNameInput(e.target.value);
+                          setAccountProfileError(null);
+                          setAccountProfileNotice(null);
+                        }}
+                        style={{ ...settingsInlineFieldStyle, width: "100%" }}
+                      />
+                    </label>
+                    <p style={{ margin: 0, fontSize: 12, color: "#6b7b92" }}>
+                      This can be changed later.
+                    </p>
+                    {accountProfileError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {accountProfileError}</p> : null}
+                    {accountProfileNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{accountProfileNotice}</p> : null}
+                    <div>
+                      <button
+                        onClick={() => {
+                          void saveAccountProfile();
+                        }}
+                        disabled={accountProfileBusy}
+                        style={{
+                          ...settingsButtonPrimaryStyle,
+                          opacity: accountProfileBusy ? 0.6 : 1,
+                          cursor: accountProfileBusy ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {accountProfileBusy ? "Saving..." : "Save Display Name"}
+                      </button>
+                    </div>
+                  </section>
+
+                  <section style={settingsCardStyle}>
+                    <p style={settingsSectionLabelStyle}>Church Identity</p>
+                    <h3 style={settingsTitleStyle}>Church Name & URL</h3>
+                    <p style={settingsBodyTextStyle}>
+                      The church name can be updated later. The church slug is public-facing and stays fixed after creation.
+                    </p>
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Church name</span>
+                      <input
+                        value={churchNameInput}
+                        onChange={(e) => {
+                          setChurchNameInput(e.target.value);
+                          setChurchProfileError(null);
+                          setChurchProfileNotice(null);
+                        }}
+                        disabled={!canManagePaidBilling}
+                        style={{
+                          ...settingsInlineFieldStyle,
+                          width: "100%",
+                          opacity: canManagePaidBilling ? 1 : 0.7,
+                        }}
+                      />
+                    </label>
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Church URL slug</span>
+                      <input
+                        readOnly
+                        value={slug}
+                        style={{
+                          ...settingsInlineFieldStyle,
+                          width: "100%",
+                          background: "rgba(239,244,250,0.92)",
+                          color: "#5f6f86",
+                        }}
+                      />
+                    </label>
+                    {churchPublicPath ? (
+                      <p style={{ margin: 0, fontSize: 12, color: "#4d607a", wordBreak: "break-all" }}>
+                        Public path: <strong>{churchPublicPath}</strong>
+                      </p>
+                    ) : null}
+                    {!canManagePaidBilling ? (
+                      <p style={{ margin: 0, fontSize: 13, color: "#5f6f86" }}>
+                        Owner or admin role is required to rename the church. The slug remains locked for all roles.
+                      </p>
+                    ) : null}
+                    {churchProfileError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {churchProfileError}</p> : null}
+                    {churchProfileNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{churchProfileNotice}</p> : null}
+                    <div>
+                      <button
+                        onClick={() => {
+                          void saveChurchProfile();
+                        }}
+                        disabled={churchProfileBusy || !canManagePaidBilling || !resolvedOrgId}
+                        style={{
+                          ...settingsButtonPrimaryStyle,
+                          opacity: churchProfileBusy || !canManagePaidBilling || !resolvedOrgId ? 0.6 : 1,
+                          cursor: churchProfileBusy || !canManagePaidBilling || !resolvedOrgId ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {churchProfileBusy ? "Saving..." : "Save Church Name"}
+                      </button>
+                    </div>
+                  </section>
+
                   <section style={settingsSubscriptionCardStyle}>
                     <p style={settingsSectionLabelStyle}>Billing Overview</p>
                     <h3 style={settingsTitleStyle}>Subscription</h3>

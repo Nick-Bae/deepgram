@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 import os
 from threading import Lock
 import time
@@ -44,6 +45,7 @@ _ID_TOKEN_CLOCK_SKEW_SECONDS = max(
 )
 _super_uid_cache: dict[str, tuple[float, bool]] = {}
 _super_uid_lock = Lock()
+logger = logging.getLogger(__name__)
 
 
 def _claim_bool(value: object) -> bool:
@@ -107,6 +109,14 @@ def _project_id() -> Optional[str]:
     return project or None
 
 
+def _firebase_admin_credentials_path() -> Optional[str]:
+    explicit = (os.getenv("FIREBASE_ADMIN_CREDENTIALS") or "").strip()
+    if explicit:
+        return explicit
+    fallback = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    return fallback or None
+
+
 @lru_cache(maxsize=1)
 def _ensure_firebase_app() -> bool:
     if firebase_admin is None or firebase_auth is None or firebase_credentials is None:
@@ -114,7 +124,7 @@ def _ensure_firebase_app() -> bool:
     if firebase_admin._apps:  # type: ignore[attr-defined]
         return True
 
-    cred_path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    cred_path = _firebase_admin_credentials_path() or ""
     if cred_path and os.path.exists(cred_path):
         cred = firebase_credentials.Certificate(cred_path)
     else:
@@ -186,6 +196,100 @@ def verify_id_token_value(id_token: Optional[str]) -> Optional[AuthenticatedUser
 def verify_bearer_token(authorization: Optional[str]) -> Optional[AuthenticatedUser]:
     token = _extract_bearer_token(authorization)
     return verify_id_token_value(token)
+
+
+def _is_user_not_found_error(exc: Exception) -> bool:
+    err_name = type(exc).__name__.lower()
+    err_msg = str(exc).lower()
+    return (
+        "usernotfound" in err_name
+        or "emailnotfound" in err_name
+        or "no user record" in err_msg
+        or "user not found" in err_msg
+    )
+
+
+def _is_provider_unavailable_error(exc: Exception) -> bool:
+    err_name = type(exc).__name__.lower()
+    err_msg = str(exc).lower()
+    return "certificate" in err_name or "transport" in err_name or "connection" in err_msg
+
+
+def _is_invalid_continue_url_error(exc: Exception) -> bool:
+    err_msg = str(exc).lower()
+    return any(
+        token in err_msg
+        for token in (
+            "continue uri",
+            "continue url",
+            "invalid continue",
+            "unauthorized domain",
+            "unauthorized_domain",
+            "domain is not whitelisted",
+            "domain not allowlisted",
+            "allowlisted",
+            "not whitelisted",
+            "invalid dynamic link domain",
+            "dynamic link",
+        )
+    )
+
+
+def generate_password_reset_link_value(
+    email: Optional[str],
+    *,
+    continue_url: Optional[str] = None,
+) -> Optional[str]:
+    clean_email = str(email or "").strip()
+    if not clean_email:
+        raise HTTPException(status_code=400, detail="invalid_email")
+    try:
+        initialized = _ensure_firebase_app()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="firebase_init_failed") from exc
+    if not initialized:
+        raise HTTPException(status_code=503, detail="firebase_admin_not_configured")
+
+    settings = None
+    clean_continue_url = str(continue_url or "").strip()
+    if clean_continue_url:
+        try:
+            settings = firebase_auth.ActionCodeSettings(url=clean_continue_url)  # type: ignore[union-attr]
+        except TypeError:
+            settings = firebase_auth.ActionCodeSettings(clean_continue_url)  # type: ignore[union-attr]
+
+    try:
+        if settings is None:
+            return firebase_auth.generate_password_reset_link(clean_email)  # type: ignore[union-attr]
+        try:
+            return firebase_auth.generate_password_reset_link(clean_email, action_code_settings=settings)  # type: ignore[union-attr]
+        except TypeError:
+            return firebase_auth.generate_password_reset_link(clean_email, settings)  # type: ignore[union-attr]
+    except Exception as exc:
+        if _is_user_not_found_error(exc):
+            return None
+        if settings is not None and _is_invalid_continue_url_error(exc):
+            logger.warning(
+                "Password reset continue URL rejected by Firebase Auth for %s; retrying without continue URL. url=%s error=%s",
+                clean_email,
+                clean_continue_url,
+                str(exc),
+            )
+            try:
+                return firebase_auth.generate_password_reset_link(clean_email)  # type: ignore[union-attr]
+            except Exception as retry_exc:
+                if _is_user_not_found_error(retry_exc):
+                    return None
+                if _is_provider_unavailable_error(retry_exc):
+                    logger.exception("Firebase Auth unavailable while retrying password reset link for %s", clean_email)
+                    raise HTTPException(status_code=503, detail="auth_provider_unavailable") from retry_exc
+                logger.exception("Password reset link generation failed for %s after continue URL fallback", clean_email)
+                raise HTTPException(status_code=503, detail="password_reset_unavailable") from retry_exc
+        if _is_provider_unavailable_error(exc):
+            logger.exception("Firebase Auth unavailable while generating password reset link for %s", clean_email)
+            raise HTTPException(status_code=503, detail="auth_provider_unavailable") from exc
+        logger.exception("Password reset link generation failed for %s", clean_email)
+        raise HTTPException(status_code=503, detail="password_reset_unavailable") from exc
 
 
 def get_current_user_optional(

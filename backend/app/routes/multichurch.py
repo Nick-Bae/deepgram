@@ -35,6 +35,10 @@ class CreateServiceRequest(BaseModel):
     target: str = Field(default="en", min_length=2, max_length=20)
 
 
+class UpdateOrgProfileRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+
+
 def _start_service_for_org(
     *,
     org_id: str,
@@ -146,6 +150,29 @@ def delete_service(
         if detail == "service_active":
             raise HTTPException(status_code=409, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "service_delete_failed") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
+
+
+@router.post("/org/{org_id}/profile")
+def update_org_profile(
+    org_id: str,
+    payload: UpdateOrgProfileRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        return multichurch_store.update_org_profile(
+            org_id=org_id,
+            requested_by_uid=current_user.uid,
+            name=payload.name,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"invalid_uid", "invalid_name"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "org_profile_update_failed") from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
 

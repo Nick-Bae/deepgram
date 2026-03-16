@@ -19,7 +19,7 @@ import { clearHostToken, persistAuthToken } from "../utils/streamContext";
 function mapFirebaseError(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
   if (code === "auth/invalid-credential") return "Invalid email or password.";
-  if (code === "auth/user-not-found") return "No user found for this email.";
+  if (code === "auth/user-not-found") return "Invalid email or password.";
   if (code === "auth/wrong-password") return "Invalid email or password.";
   if (code === "auth/too-many-requests") return "Too many attempts. Try again later.";
   if (err instanceof Error) return err.message;
@@ -193,7 +193,7 @@ export default function LoginPage() {
         },
         {
           title: "Support path",
-          description: "If access or billing is blocked, the contact flow is available from here without leaving the auth flow.",
+          description: "Password reset and account recovery are available from here without exposing public account lookup.",
         },
       ]}
       headerActions={[
@@ -261,6 +261,14 @@ export default function LoginPage() {
               style={studioFieldStyle}
             />
           </label>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+            <Link href="/recover-account" style={{ color: "#3f6093", fontWeight: 700, fontSize: 13 }}>
+              Forgot password?
+            </Link>
+            <Link href="/recover-account" style={{ color: "#3f6093", fontWeight: 700, fontSize: 13 }}>
+              Forgot login email?
+            </Link>
+          </div>
 
           <button type="submit" disabled={!configured || busy} style={buildStudioButtonStyle({ disabled: !configured || busy })}>
             {busy ? "Signing In..." : "Sign In"}

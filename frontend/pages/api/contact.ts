@@ -43,6 +43,12 @@ const TOPIC_LABELS: Record<ContactTopic, string> = {
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
 
+function isResendDomainNotVerified(status: number, body: string): boolean {
+  if (status !== 403) return false;
+  const payload = (body || "").toLowerCase();
+  return payload.includes("domain is not verified") || payload.includes("verify your domain");
+}
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -175,8 +181,11 @@ async function sendContactEmail(payload: {
   sender?: AuthenticatedSender;
 }) {
   const resendApiKey = (process.env.RESEND_API_KEY || "").trim();
-  const toEmail = (process.env.CONTACT_TO_EMAIL || process.env.SUPPORT_TO_EMAIL || "").trim();
+  const primaryInbox = (process.env.CONTACT_TO_EMAIL || process.env.SUPPORT_TO_EMAIL || "support@worshiptranslation.com").trim();
+  const billingInbox = (process.env.BILLING_TO_EMAIL || "billing@worshiptranslation.com").trim();
+  const toEmail = payload.topic === "billing" && billingInbox ? billingInbox : primaryInbox;
   const fromEmail = (process.env.CONTACT_FROM_EMAIL || "").trim();
+  const fallbackFromEmail = (process.env.RESEND_FALLBACK_FROM_EMAIL || "Worship <onboarding@resend.dev>").trim();
 
   if (!resendApiKey || !toEmail || !fromEmail) {
     throw new Error("contact_not_configured");
@@ -214,27 +223,37 @@ async function sendContactEmail(payload: {
     </div>
   `.trim();
 
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${resendApiKey}`,
-    },
-    body: JSON.stringify({
-      from: fromEmail,
-      to: [toEmail],
-      reply_to: payload.email,
-      subject: title,
-      text,
-      html,
-      tags: [
-        { name: "source", value: "worship-contact-form" },
-        { name: "topic", value: payload.topic },
-      ],
-    }),
-  });
+  const sendViaResend = async (activeFromEmail: string) =>
+    fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${resendApiKey}`,
+      },
+      body: JSON.stringify({
+        from: activeFromEmail,
+        to: [toEmail],
+        reply_to: payload.email,
+        subject: title,
+        text,
+        html,
+        tags: [
+          { name: "source", value: "worship-contact-form" },
+          { name: "topic", value: payload.topic },
+        ],
+      }),
+    });
 
+  let res = await sendViaResend(fromEmail);
   if (!res.ok) {
+    const bodyText = await res.text();
+    if (isResendDomainNotVerified(res.status, bodyText) && fallbackFromEmail && fallbackFromEmail !== fromEmail) {
+      res = await sendViaResend(fallbackFromEmail);
+      if (!res.ok) {
+        throw new Error(`resend_failed_${res.status}`);
+      }
+      return;
+    }
     throw new Error(`resend_failed_${res.status}`);
   }
 }

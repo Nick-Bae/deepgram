@@ -202,11 +202,25 @@ export const studioReadOnlyCardStyle: CSSProperties = {
 };
 
 function renderHeaderAction(action: StudioAccessAction) {
+  const baseStyle = action.accent
+    ? buildStudioButtonStyle()
+    : {
+        borderRadius: 999,
+        border: "1px solid rgba(197,210,228,0.9)",
+        background: "rgba(248,250,253,0.96)",
+        color: "#465a76",
+        fontWeight: 800,
+        padding: "12px 18px",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        boxShadow: "none",
+      };
   return (
     <Link
       key={`${action.href}:${action.label}`}
       href={action.href}
-      style={action.accent ? buildStudioButtonStyle() : buildStudioButtonStyle({ tone: "secondary" })}
+      style={baseStyle}
     >
       {action.label}
     </Link>
@@ -284,8 +298,8 @@ export default function StudioAccessLayout({
             style={{
               display: "grid",
               gap: 18,
-              gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
-              alignItems: "start",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
+              alignItems: "stretch",
             }}
           >
             <aside
@@ -295,6 +309,8 @@ export default function StudioAccessLayout({
                 padding: 22,
                 display: "grid",
                 gap: 16,
+                height: "100%",
+                alignContent: "start",
               }}
             >
               <div
@@ -336,6 +352,8 @@ export default function StudioAccessLayout({
                 padding: 22,
                 display: "grid",
                 gap: 16,
+                height: "100%",
+                alignContent: "start",
               }}
             >
               <div

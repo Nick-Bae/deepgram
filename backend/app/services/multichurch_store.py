@@ -704,6 +704,38 @@ class InMemoryMultiChurchStore:
                 "services": rows,
             }
 
+    def update_org_profile(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        name: str,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        clean_name = _clean_token(name)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if len(clean_name) < 2:
+            raise ValueError("invalid_name")
+
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in {"owner", "admin"}:
+                raise PermissionError("forbidden")
+            org["name"] = clean_name
+            org["updatedAt"] = _utcnow()
+            return {
+                "orgId": clean_org_id,
+                "slug": str(org.get("slug") or clean_org_id),
+                "name": clean_name,
+            }
+
     def check_org_slug_availability(self, *, slug: str, max_suggestions: int = 3) -> Dict[str, Any]:
         normalized = _normalize_slug(slug)
         safe_limit = max(0, min(10, int(max_suggestions)))
@@ -2379,6 +2411,46 @@ class FirestoreMultiChurchStore:
             )
         rows.sort(key=lambda r: r["serviceKey"])
         return {"orgId": org_id, "slug": slug, "name": (org or {}).get("name", slug), "services": rows}
+
+    def update_org_profile(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        name: str,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        clean_name = _clean_token(name)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        if len(clean_name) < 2:
+            raise ValueError("invalid_name")
+
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin"}:
+            raise PermissionError("forbidden")
+
+        org_ref.set(
+            {
+                "name": clean_name,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        self._invalidate_membership_cache(clean_uid)
+        org = org_snap.to_dict() or {}
+        return {
+            "orgId": clean_org_id,
+            "slug": str(org.get("slug") or clean_org_id),
+            "name": clean_name,
+        }
 
     def check_org_slug_availability(self, *, slug: str, max_suggestions: int = 3) -> Dict[str, Any]:
         normalized = _normalize_slug(slug)

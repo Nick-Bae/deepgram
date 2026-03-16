@@ -22,6 +22,8 @@ class AuthRouteTests(unittest.TestCase):
         self.addCleanup(self.patch_auth_store.stop)
         self.addCleanup(self.patch_multichurch_store.stop)
         auth_routes._invite_rate_hits.clear()
+        auth_routes._password_reset_ip_hits.clear()
+        auth_routes._password_reset_email_hits.clear()
 
     @staticmethod
     def _user(uid: str, *, email: str | None = None, display_name: str | None = None) -> AuthenticatedUser:
@@ -45,6 +47,17 @@ class AuthRouteTests(unittest.TestCase):
         org_id = str((result.get("org") or {}).get("orgId") or "").strip()
         self.assertTrue(org_id, result)
         return org_id
+
+    @staticmethod
+    def _request(ip: str = "127.0.0.1"):
+        class _Client:
+            host = ip
+
+        class _Request:
+            headers = {}
+            client = _Client()
+
+        return _Request()
 
     def test_invite_lifecycle_routes_and_second_redeem_conflict(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-route-1", slug="route-life-a", name="Route Life A")
@@ -222,6 +235,61 @@ class AuthRouteTests(unittest.TestCase):
             auth_routes.auth_slug_availability(slug="!!!")
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(ctx.exception.detail, "invalid_slug")
+
+    def test_password_reset_route_sends_email_when_link_generated(self) -> None:
+        with patch.object(auth_routes, "generate_password_reset_link_value", return_value="https://reset-link") as link_mock:
+            with patch.object(auth_routes, "_send_password_reset_email_via_resend") as send_mock:
+                payload = auth_routes.auth_password_reset(
+                    payload=auth_routes.PasswordResetRequest(email="member@example.com"),
+                    request=self._request(),
+                )
+        self.assertEqual(payload.get("ok"), True)
+        link_mock.assert_called_once()
+        send_mock.assert_called_once_with(email="member@example.com", reset_link="https://reset-link")
+
+    def test_password_reset_route_is_still_ok_when_email_not_found(self) -> None:
+        with patch.object(auth_routes, "generate_password_reset_link_value", return_value=None) as link_mock:
+            with patch.object(auth_routes, "_send_password_reset_email_via_resend") as send_mock:
+                payload = auth_routes.auth_password_reset(
+                    payload=auth_routes.PasswordResetRequest(email="missing@example.com"),
+                    request=self._request(),
+                )
+        self.assertEqual(payload.get("ok"), True)
+        link_mock.assert_called_once()
+        send_mock.assert_not_called()
+
+    def test_update_org_profile_route_updates_name_and_keeps_slug(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-route-profile", slug="route-profile", name="Route Profile")
+
+        updated = multichurch_routes.update_org_profile(
+            org_id=org_id,
+            payload=multichurch_routes.UpdateOrgProfileRequest(name="Updated Route Profile"),
+            current_user=self._user("owner-route-profile"),
+        )
+        self.assertEqual(updated.get("orgId"), org_id)
+        self.assertEqual(updated.get("slug"), "route-profile")
+        self.assertEqual(updated.get("name"), "Updated Route Profile")
+
+        services = multichurch_routes.list_services("route-profile")
+        self.assertEqual(services.get("name"), "Updated Route Profile")
+
+    def test_update_org_profile_route_requires_owner_or_admin(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-route-profile-viewer", slug="route-profile-viewer", name="Route Profile Viewer")
+        invite = auth_routes.auth_create_invite(
+            org_id=org_id,
+            payload=auth_routes.CreateInviteRequest(role="viewer"),
+            user=self._user("owner-route-profile-viewer"),
+        )
+        auth_routes.auth_redeem_invite(code=str(invite.get("code") or ""), user=self._user("viewer-route-profile"))
+
+        with self.assertRaises(HTTPException) as ctx:
+            multichurch_routes.update_org_profile(
+                org_id=org_id,
+                payload=multichurch_routes.UpdateOrgProfileRequest(name="Blocked Rename"),
+                current_user=self._user("viewer-route-profile"),
+            )
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.detail, "forbidden")
 
 
 if __name__ == "__main__":

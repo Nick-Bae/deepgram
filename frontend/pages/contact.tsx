@@ -1,5 +1,6 @@
 import Head from "next/head";
 import Link from "next/link";
+import { useRouter } from "next/router";
 import Script from "next/script";
 import { useEffect, useRef, useState } from "react";
 
@@ -19,8 +20,15 @@ const TOPIC_OPTIONS: Array<{ value: ContactTopic; label: string }> = [
   { value: "other", label: "Other" },
 ];
 
-const supportEmail = (process.env.NEXT_PUBLIC_SUPPORT_EMAIL || "").trim();
 const turnstileSiteKey = (process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "").trim();
+
+function decodeEmail(codes: number[]): string {
+  return codes.map((code) => String.fromCharCode(code)).join("");
+}
+
+function buildSupportEmail(): string {
+  return decodeEmail([115, 117, 112, 112, 111, 114, 116, 64, 119, 111, 114, 115, 104, 105, 112, 116, 114, 97, 110, 115, 108, 97, 116, 105, 111, 110, 46, 99, 111, 109]);
+}
 
 type TurnstileApi = {
   render: (container: HTMLElement, options: Record<string, unknown>) => string;
@@ -35,6 +43,7 @@ declare global {
 }
 
 export default function ContactPage() {
+  const router = useRouter();
   const { user, loading, configured, getIdToken } = useAuth();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -46,9 +55,13 @@ export default function ContactPage() {
   const [turnstileToken, setTurnstileToken] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [directEmail, setDirectEmail] = useState("");
+  const [directEmailMsg, setDirectEmailMsg] = useState<string | null>(null);
+  const [copiedDirectEmail, setCopiedDirectEmail] = useState(false);
   const [busy, setBusy] = useState(false);
   const widgetHostRef = useRef<HTMLDivElement | null>(null);
   const widgetIdRef = useRef<string | null>(null);
+  const queryPrefillRef = useRef(false);
 
   const needsTurnstile = Boolean(turnstileSiteKey) && !user;
 
@@ -80,6 +93,24 @@ export default function ContactPage() {
   }, [configured, getIdToken, loading, organization, user]);
 
   useEffect(() => {
+    if (!router.isReady || queryPrefillRef.current) return;
+    const topicQuery = typeof router.query.topic === "string" ? router.query.topic.trim().toLowerCase() : "";
+    const organizationQuery = typeof router.query.organization === "string" ? router.query.organization.trim().slice(0, 160) : "";
+    const messageQuery = typeof router.query.message === "string" ? router.query.message.replace(/\r\n/g, "\n").trim().slice(0, 4000) : "";
+
+    if (topicQuery && TOPIC_OPTIONS.some((entry) => entry.value === topicQuery)) {
+      setTopic(topicQuery as ContactTopic);
+    }
+    if (organizationQuery && !organization) {
+      setOrganization(organizationQuery);
+    }
+    if (messageQuery && !message) {
+      setMessage(messageQuery);
+    }
+    queryPrefillRef.current = true;
+  }, [message, organization, router.isReady, router.query.message, router.query.organization, router.query.topic]);
+
+  useEffect(() => {
     if (!needsTurnstile || !turnstileReady || !widgetHostRef.current || widgetIdRef.current || !window.turnstile) return;
     widgetIdRef.current = window.turnstile.render(widgetHostRef.current, {
       sitekey: turnstileSiteKey,
@@ -103,6 +134,30 @@ export default function ContactPage() {
       }
     };
   }, []);
+
+  const revealSupportEmail = () => {
+    setDirectEmailMsg(null);
+    setCopiedDirectEmail(false);
+    if (needsTurnstile && !turnstileToken) {
+      setDirectEmailMsg("Complete the spam protection check to reveal the support email.");
+      return;
+    }
+    setDirectEmail(buildSupportEmail());
+  };
+
+  const copySupportEmail = async () => {
+    if (!directEmail || typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      setDirectEmailMsg("Copy is not available in this browser. Use the email link instead.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(directEmail);
+      setCopiedDirectEmail(true);
+      setDirectEmailMsg("Support email copied.");
+    } catch {
+      setDirectEmailMsg("Copy failed. Use the email link instead.");
+    }
+  };
 
   const onSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -263,7 +318,7 @@ export default function ContactPage() {
             style={{
               display: "grid",
               gap: 18,
-              gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
               alignItems: "start",
             }}
           >
@@ -328,11 +383,76 @@ export default function ContactPage() {
                 <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>
                   Anonymous requests are throttled and screened before delivery. Logged-in users can submit with less friction.
                 </p>
-                {supportEmail ? (
-                  <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>
-                    Fallback email: <a href={`mailto:${supportEmail}`} style={{ color: "#3f6093", fontWeight: 700 }}>{supportEmail}</a>
+                <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>
+                  Messages are routed internally by topic. Billing requests go to the billing inbox, and other requests go to support.
+                </p>
+                <div
+                  style={{
+                    borderRadius: 18,
+                    background: "rgba(244,247,252,0.72)",
+                    border: "1px solid rgba(219,227,238,0.9)",
+                    padding: "14px 16px",
+                    display: "grid",
+                    gap: 10,
+                  }}
+                >
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 800, color: "#22344c" }}>Prefer direct email?</p>
+                  <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7, color: "#5d6d84" }}>
+                    Keep using the form if possible. If you need a direct address, reveal the support inbox below.
                   </p>
-                ) : null}
+                  {directEmail ? (
+                    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
+                      <a
+                        href={`mailto:${directEmail}`}
+                        style={{
+                          color: "#3f6093",
+                          fontWeight: 700,
+                          textDecoration: "none",
+                          wordBreak: "break-all",
+                        }}
+                      >
+                        {directEmail}
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void copySupportEmail();
+                        }}
+                        style={{
+                          borderRadius: 999,
+                          border: "1px solid rgba(79,115,170,0.2)",
+                          background: "rgba(255,255,255,0.74)",
+                          color: "#314965",
+                          fontWeight: 700,
+                          padding: "8px 12px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {copiedDirectEmail ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={revealSupportEmail}
+                      style={{
+                        justifySelf: "start",
+                        borderRadius: 999,
+                        border: "1px solid rgba(79,115,170,0.2)",
+                        background: "rgba(255,255,255,0.74)",
+                        color: "#314965",
+                        fontWeight: 700,
+                        padding: "10px 14px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Reveal support email
+                    </button>
+                  )}
+                  {directEmailMsg ? (
+                    <p style={{ margin: 0, fontSize: 12, lineHeight: 1.6, color: "#6b7b92" }}>{directEmailMsg}</p>
+                  ) : null}
+                </div>
               </div>
             </aside>
 
@@ -375,7 +495,7 @@ export default function ContactPage() {
               ) : null}
 
               <form onSubmit={onSubmit} style={{ display: "grid", gap: 14 }}>
-                <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
+                <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))" }}>
                   <label style={{ display: "grid", gap: 6 }}>
                     <span style={{ fontSize: 13, color: "#5f6f86" }}>Name</span>
                     <input
@@ -400,7 +520,7 @@ export default function ContactPage() {
                   </label>
                 </div>
 
-                <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
+                <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))" }}>
                   <label style={{ display: "grid", gap: 6 }}>
                     <span style={{ fontSize: 13, color: "#5f6f86" }}>Organization</span>
                     <input
@@ -469,7 +589,7 @@ export default function ContactPage() {
 
                 <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                   <p style={{ margin: 0, fontSize: 13, color: "#6b7b92" }}>
-                    {supportEmail ? `Need a fallback? Email ${supportEmail}.` : "Support replies are handled through the configured support inbox."}
+                    Choose the closest topic and the message will be routed to the right internal inbox.
                   </p>
                   <button
                     type="submit"

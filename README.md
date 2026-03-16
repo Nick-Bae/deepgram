@@ -136,6 +136,23 @@ NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=...    # optional
 NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=...          # optional
 ```
 
+### Backend env for branded password reset emails
+
+Add to the backend deployment environment:
+
+```bash
+RESEND_API_KEY=...
+PASSWORD_RESET_FROM_EMAIL="Worship <support@worshiptranslation.com>"
+RESEND_FALLBACK_FROM_EMAIL="Worship <onboarding@resend.dev>"
+PASSWORD_RESET_CONTINUE_URL=https://www.worshiptranslation.com/login
+PASSWORD_RESET_BRAND_NAME="Worship Translation"
+FIREBASE_ADMIN_CREDENTIALS=/abs/path/to/firebase-adminsdk.json
+```
+
+If `PASSWORD_RESET_FROM_EMAIL` is not set, the backend falls back to `CONTACT_FROM_EMAIL`.
+`FIREBASE_ADMIN_CREDENTIALS` should point to a Firebase Admin SDK service account with Firebase Auth permissions. If it is not set, the backend falls back to `GOOGLE_APPLICATION_CREDENTIALS`.
+If your custom sender domain is not verified in Resend yet, `RESEND_FALLBACK_FROM_EMAIL` can temporarily use `onboarding@resend.dev`.
+
 ## Firestore bootstrap
 
 Seed one org + default services:

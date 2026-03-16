@@ -408,7 +408,7 @@ export default function HomePage() {
             style={{
               display: "grid",
               gap: 22,
-              gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
               alignItems: "stretch",
             }}
           >
@@ -512,7 +512,7 @@ export default function HomePage() {
                 style={{
                   display: "grid",
                   gap: 12,
-                  gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))",
                 }}
               >
                 {landingStats.map((stat) => (
@@ -562,7 +562,7 @@ export default function HomePage() {
                 style={{
                   display: "grid",
                   gap: 14,
-                  gridTemplateColumns: "minmax(0, 1.3fr) minmax(250px, 1fr)",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 250px), 1fr))",
                   alignItems: "stretch",
                   flex: 1,
                 }}
@@ -690,7 +690,7 @@ export default function HomePage() {
             </article>
           </section>
 
-          <section style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
+          <section style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))" }}>
             {quickLinks.map((card) => (
               <article
                 key={card.title}
@@ -738,7 +738,7 @@ export default function HomePage() {
             style={{
               display: "grid",
               gap: 18,
-              gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
             }}
           >
             <article

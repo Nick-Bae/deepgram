@@ -103,6 +103,12 @@ export type DeleteOrgServiceResponse = {
   serviceKey: string;
 };
 
+export type OrgProfileResponse = {
+  orgId: string;
+  slug: string;
+  name: string;
+};
+
 export type OrgPromptResponse = {
   orgId: string;
   prompt: string;
@@ -572,6 +578,21 @@ export function deleteOrgService(idToken: string, orgId: string, serviceKey: str
     idToken,
     { method: "DELETE" },
   );
+}
+
+export function saveOrgProfile(
+  idToken: string,
+  orgId: string,
+  payload: { name: string },
+): Promise<OrgProfileResponse> {
+  return authFetch<OrgProfileResponse>(`/api/org/${encodeURIComponent(orgId)}/profile`, idToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: payload.name }),
+  }).then((result) => {
+    invalidateAuthMeCache(idToken);
+    return result;
+  });
 }
 
 export function fetchOrgPrompt(idToken: string, orgId: string): Promise<OrgPromptResponse> {

@@ -50,6 +50,7 @@ export default function SignupPage() {
   const inviteJoinFlow = nextPath.startsWith("/join?");
   const passwordMismatch = Boolean(confirmPassword) && password !== confirmPassword;
   const normalizedSlug = normalizeChurchSlug(churchSlug);
+  const slugExample = "chicago-ark";
 
   useEffect(() => {
     if (inviteJoinFlow) return;
@@ -293,8 +294,56 @@ export default function SignupPage() {
                 required
                 pattern="[a-z0-9-]+"
                 title="Use lowercase letters, numbers, and hyphens."
+                placeholder={slugExample}
                 style={studioFieldStyle}
               />
+              <div
+                style={{
+                  borderRadius: 16,
+                  border: "1px solid rgba(224,163,86,0.34)",
+                  background: "linear-gradient(145deg, rgba(252,247,236,0.94), rgba(244,233,208,0.86))",
+                  color: "#7a5525",
+                  padding: "12px 14px",
+                  display: "grid",
+                  gap: 6,
+                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.5)",
+                }}
+              >
+                <p style={{ margin: 0, fontSize: 12, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" }}>
+                  Important
+                </p>
+                <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7 }}>
+                  Keep the slug simple. Use English lowercase letters, numbers, and hyphens only.
+                </p>
+                <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7 }}>
+                  This becomes part of your public church URL and <strong>cannot be changed later</strong>.
+                </p>
+                <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7 }}>
+                  Example slug: <strong>{slugExample}</strong>
+                </p>
+                <div
+                  style={{
+                    borderRadius: 12,
+                    border: "1px solid rgba(196,140,70,0.34)",
+                    background: "rgba(255,255,255,0.56)",
+                    padding: "10px 12px",
+                    display: "grid",
+                    gap: 6,
+                  }}
+                >
+                  <p style={{ margin: 0, fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase", color: "#8b6533" }}>
+                    Preview URL
+                  </p>
+                  <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7, wordBreak: "break-all" }}>
+                    Example: <strong>/c/{slugExample}/s/sun-11am</strong>
+                  </p>
+                  {normalizedSlug ? (
+                    <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7, wordBreak: "break-all", color: "#5d4017" }}>
+                      Yours: <strong>/c/{normalizedSlug}/s/sun-11am</strong>
+                    </p>
+                  ) : null}
+                </div>
+              </div>
               {slugAvailabilityBusy ? <span style={studioHelperTextStyle}>Checking slug availability...</span> : null}
               {!slugAvailabilityBusy && slugAvailable === true ? <span style={{ ...studioHelperTextStyle, color: "#2f6d4f" }}>Slug is available.</span> : null}
               {!slugAvailabilityBusy && slugAvailable === false ? <span style={{ ...studioHelperTextStyle, color: "#a33d51" }}>That slug is already taken.</span> : null}

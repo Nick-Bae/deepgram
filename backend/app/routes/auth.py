@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 from collections import deque
+import logging
 import os
+import re
 import time
 from threading import Lock
 from typing import Deque, Dict, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
+from app.auth.firebase_auth import (
+    AuthenticatedUser,
+    generate_password_reset_link_value,
+    get_current_user_required,
+)
 from app.services.multichurch_store import DEFAULT_INVITE_EXPIRY_HOURS, multichurch_store
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -32,6 +40,13 @@ _INVITE_RATE_PREVIEW_MAX = _env_int("INVITE_RATE_PREVIEW_MAX_PER_WINDOW", 120, m
 _INVITE_RATE_REDEEM_MAX = _env_int("INVITE_RATE_REDEEM_MAX_PER_WINDOW", 40, min_value=1, max_value=5000)
 _invite_rate_hits: Dict[Tuple[str, str], Deque[float]] = {}
 _invite_rate_lock = Lock()
+_PASSWORD_RESET_RATE_WINDOW_SECONDS = _env_int("PASSWORD_RESET_RATE_WINDOW_SECONDS", 3600, min_value=60, max_value=86400)
+_PASSWORD_RESET_RATE_MAX_PER_IP = _env_int("PASSWORD_RESET_RATE_MAX_PER_IP", 5, min_value=1, max_value=500)
+_PASSWORD_RESET_RATE_MAX_PER_EMAIL = _env_int("PASSWORD_RESET_RATE_MAX_PER_EMAIL", 3, min_value=1, max_value=100)
+_password_reset_ip_hits: Dict[str, Deque[float]] = {}
+_password_reset_email_hits: Dict[str, Deque[float]] = {}
+_password_reset_rate_lock = Lock()
+_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", re.I)
 
 
 def _enforce_invite_rate_limit(uid: str, *, action: str, max_hits: int) -> None:
@@ -78,6 +93,10 @@ class SetOrgBillingLimitsRequest(BaseModel):
     enabled: bool = Field(...)
 
 
+class PasswordResetRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+
+
 def _sanitize_membership_payload(rows: list[dict]) -> list[dict]:
     sanitized: list[dict] = []
     for row in rows:
@@ -95,6 +114,167 @@ def _sanitize_auth_payload(payload: dict) -> dict:
     return item
 
 
+def _client_ip(request: Request) -> str:
+    forwarded = (request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip() or "unknown"
+    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    return str(host or "unknown")
+
+
+def _enforce_password_reset_rate_limit(ip: str, email: str) -> None:
+    now = time.monotonic()
+    cutoff = now - _PASSWORD_RESET_RATE_WINDOW_SECONDS
+    clean_ip = (ip or "").strip() or "unknown"
+    clean_email = (email or "").strip().lower()
+    with _password_reset_rate_lock:
+        ip_bucket = _password_reset_ip_hits.get(clean_ip)
+        if ip_bucket is None:
+            ip_bucket = deque()
+            _password_reset_ip_hits[clean_ip] = ip_bucket
+        while ip_bucket and ip_bucket[0] <= cutoff:
+            ip_bucket.popleft()
+        if len(ip_bucket) >= _PASSWORD_RESET_RATE_MAX_PER_IP:
+            raise HTTPException(status_code=429, detail="password_reset_rate_limited")
+        ip_bucket.append(now)
+
+        email_bucket = _password_reset_email_hits.get(clean_email)
+        if email_bucket is None:
+            email_bucket = deque()
+            _password_reset_email_hits[clean_email] = email_bucket
+        while email_bucket and email_bucket[0] <= cutoff:
+            email_bucket.popleft()
+        if len(email_bucket) >= _PASSWORD_RESET_RATE_MAX_PER_EMAIL:
+            raise HTTPException(status_code=429, detail="password_reset_rate_limited")
+        email_bucket.append(now)
+
+
+def _password_reset_continue_url() -> str | None:
+    value = (
+        (os.getenv("PASSWORD_RESET_CONTINUE_URL") or "").strip()
+        or (os.getenv("AUTH_PASSWORD_RESET_CONTINUE_URL") or "").strip()
+    )
+    return value or None
+
+
+def _password_reset_from_email() -> str:
+    value = (
+        (os.getenv("PASSWORD_RESET_FROM_EMAIL") or "").strip()
+        or (os.getenv("AUTH_FROM_EMAIL") or "").strip()
+        or (os.getenv("CONTACT_FROM_EMAIL") or "").strip()
+    )
+    if not value:
+        raise HTTPException(status_code=503, detail="password_reset_email_not_configured")
+    return value
+
+
+def _password_reset_fallback_from_email() -> str:
+    value = (os.getenv("RESEND_FALLBACK_FROM_EMAIL") or "").strip()
+    return value or "Worship <onboarding@resend.dev>"
+
+
+def _password_reset_brand_name() -> str:
+    value = (
+        (os.getenv("PASSWORD_RESET_BRAND_NAME") or "").strip()
+        or (os.getenv("APP_BRAND_NAME") or "").strip()
+    )
+    return value or "Worship Translation"
+
+
+def _is_resend_domain_not_verified(status_code: int, body: str) -> bool:
+    if int(status_code) != 403:
+        return False
+    payload = str(body or "").lower()
+    return "domain is not verified" in payload or "verify your domain" in payload
+
+
+def _send_password_reset_email_via_resend(*, email: str, reset_link: str) -> None:
+    resend_api_key = (os.getenv("RESEND_API_KEY") or "").strip()
+    if not resend_api_key:
+        raise HTTPException(status_code=503, detail="password_reset_email_not_configured")
+    from_email = _password_reset_from_email()
+    fallback_from_email = _password_reset_fallback_from_email()
+    brand_name = _password_reset_brand_name()
+    subject = f"Reset your {brand_name} password"
+    html = f"""
+    <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #0f172a;">
+      <h2 style="margin-bottom: 12px;">Reset your password</h2>
+      <p>A password reset was requested for your {brand_name} account.</p>
+      <p style="margin: 22px 0;">
+        <a href="{reset_link}" style="display: inline-block; padding: 12px 18px; border-radius: 999px; background: #4f73aa; color: #ffffff; text-decoration: none; font-weight: 700;">
+          Reset Password
+        </a>
+      </p>
+      <p>If the button does not work, request another password reset from the login page.</p>
+      <p>If you did not request this, you can ignore this email.</p>
+      <p>Thanks,<br />{brand_name}</p>
+    </div>
+    """.strip()
+    text = "\n".join(
+        [
+            f"Reset your {brand_name} password",
+            "",
+            f"A password reset was requested for your {brand_name} account.",
+            "",
+            "Use the reset button in the email to continue.",
+            "If you did not request this, you can ignore this email.",
+            "",
+            f"Thanks,",
+            brand_name,
+        ]
+    )
+
+    def _post_email(active_from_email: str) -> httpx.Response:
+        return client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": active_from_email,
+                "to": [email],
+                "subject": subject,
+                "html": html,
+                "text": text,
+                "tags": [
+                    {"name": "source", "value": "worship-password-reset"},
+                ],
+            },
+        )
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = _post_email(from_email)
+            if (
+                _is_resend_domain_not_verified(response.status_code, response.text)
+                and fallback_from_email
+                and fallback_from_email != from_email
+            ):
+                logger.warning(
+                    "Primary password reset sender rejected by Resend; retrying with fallback sender %s for %s",
+                    fallback_from_email,
+                    email,
+                )
+                response = _post_email(fallback_from_email)
+    except Exception as exc:
+        logger.exception("Password reset email delivery failed for %s", email)
+        raise HTTPException(status_code=503, detail="password_reset_email_delivery_failed") from exc
+
+    if response.status_code >= 400:
+        logger.error(
+            "Password reset email delivery failed for %s: status=%s body=%s",
+            email,
+            response.status_code,
+            response.text[:1000],
+        )
+        raise HTTPException(status_code=503, detail="password_reset_email_delivery_failed")
+
+
 @router.get("/auth/me")
 def auth_me(user: AuthenticatedUser = Depends(get_current_user_required)):
     memberships = multichurch_store.list_memberships(user.uid)
@@ -110,6 +290,22 @@ def auth_me(user: AuthenticatedUser = Depends(get_current_user_required)):
         "currentOrgId": current_org_id,
         "memberships": _sanitize_membership_payload(memberships),
     }
+
+
+@router.post("/auth/password-reset")
+def auth_password_reset(payload: PasswordResetRequest, request: Request):
+    clean_email = (payload.email or "").strip().lower()
+    if not _EMAIL_PATTERN.match(clean_email):
+        raise HTTPException(status_code=400, detail="invalid_email")
+
+    _enforce_password_reset_rate_limit(_client_ip(request), clean_email)
+    reset_link = generate_password_reset_link_value(
+        clean_email,
+        continue_url=_password_reset_continue_url(),
+    )
+    if reset_link:
+        _send_password_reset_email_via_resend(email=clean_email, reset_link=reset_link)
+    return {"ok": True}
 
 
 @router.post("/auth/bootstrap-owner")
