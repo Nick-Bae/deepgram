@@ -30,6 +30,11 @@ export default function JoinByInvitePage() {
     const raw = typeof router.query.code === "string" ? router.query.code : "";
     return raw.trim();
   }, [router.query.code]);
+  const inviteChurchName = useMemo(() => {
+    const raw = typeof router.query.church === "string" ? router.query.church : "";
+    return raw.trim().slice(0, 120);
+  }, [router.query.church]);
+  const inviteChurchLabel = (preview?.name || inviteChurchName || "").trim();
 
   useEffect(() => {
     if (!router.isReady || loading || !configured || !user || !inviteCode) return;
@@ -83,17 +88,26 @@ export default function JoinByInvitePage() {
   };
 
   const showJoinButton = Boolean(preview && user && configured);
-  const nextJoinPath = `/join?code=${encodeURIComponent(inviteCode || "")}`;
+  const nextJoinPath = useMemo(() => {
+    const params = new URLSearchParams();
+    if (inviteCode) params.set("code", inviteCode);
+    if (inviteChurchName) params.set("church", inviteChurchName);
+    return `/join?${params.toString()}`;
+  }, [inviteChurchName, inviteCode]);
 
   return (
     <StudioAccessLayout
       pageTitle="Join Church Workspace | Worship"
       pageDescription="Use an invite link to join a church workspace."
       panelEyebrow="Invite Access"
-      panelTitle="Join Church Workspace"
-      panelDescription="Use your invite link to join a church organization."
+      panelTitle={inviteChurchLabel ? `Join ${inviteChurchLabel}` : "Join Church Workspace"}
+      panelDescription={
+        inviteChurchLabel
+          ? `Use your invite link to join ${inviteChurchLabel}.`
+          : "Use your invite link to join a church organization."
+      }
       infoEyebrow="Invite Flow"
-      infoTitle="Accept the invite and land in the right workspace."
+      infoTitle={inviteChurchLabel ? `Accept the invite for ${inviteChurchLabel}.` : "Accept the invite and land in the right workspace."}
       infoDescription="Invite links preserve church context so the account can be attached to the correct organization before routing into the dashboard."
       infoItems={[
         {
@@ -124,6 +138,14 @@ export default function JoinByInvitePage() {
 
       {previewBusy ? <p style={buildStudioNoticeStyle("info")}>Checking invite...</p> : null}
 
+      {!preview && inviteChurchLabel ? (
+        <div style={studioReadOnlyCardStyle}>
+          <p style={{ marginTop: 0, marginBottom: 0, ...studioSubtleTextStyle }}>
+            <strong style={{ color: "#22344c" }}>Invited church:</strong> {inviteChurchLabel}
+          </p>
+        </div>
+      ) : null}
+
       {preview ? (
         <div style={studioReadOnlyCardStyle}>
           <p style={{ marginTop: 0, marginBottom: 6, ...studioSubtleTextStyle }}>
@@ -151,15 +173,20 @@ export default function JoinByInvitePage() {
 
       {!user && configured && inviteCode ? (
         <div style={{ display: "grid", gap: 10 }}>
-          <p style={studioSubtleTextStyle}>This invite requires an account.</p>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-            <Link href={`/login?next=${encodeURIComponent(nextJoinPath)}`} style={buildStudioButtonStyle()}>
-              Sign In to Join
-            </Link>
-            <Link href={`/signup?next=${encodeURIComponent(nextJoinPath)}`} style={buildStudioButtonStyle({ tone: "secondary" })}>
-              Create Account to Join
+          <p style={studioSubtleTextStyle}>
+            {inviteChurchLabel ? `Create an account to continue joining ${inviteChurchLabel}.` : "Create an account to continue joining this church."}
+          </p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+            <Link href={`/signup?next=${encodeURIComponent(nextJoinPath)}`} style={buildStudioButtonStyle()}>
+              Continue to Join
             </Link>
           </div>
+          <p style={{ ...studioSubtleTextStyle, margin: 0, fontSize: 12 }}>
+            Already have an account?{" "}
+            <Link href={`/login?next=${encodeURIComponent(nextJoinPath)}`} style={{ color: "#3f6093", fontWeight: 700, textDecoration: "none" }}>
+              Sign in
+            </Link>
+          </p>
         </div>
       ) : null}
     </StudioAccessLayout>

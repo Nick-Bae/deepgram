@@ -348,6 +348,8 @@ async def _translate_text_guarded(
     update_ctx: bool = True,
     custom_prompt: Optional[str] = None,
     service_prompt: Optional[str] = None,
+    compact_prompt: bool = False,
+    max_tokens: Optional[int] = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
     reservations, blocked = _reserve_translation_budget(org_id=org_id, host_uid=host_uid, source_text=source_text)
     if blocked is not None:
@@ -369,6 +371,8 @@ async def _translate_text_guarded(
             update_ctx=update_ctx,
             custom_prompt=custom_prompt,
             service_prompt=service_prompt,
+            compact_prompt=compact_prompt,
+            max_tokens=max_tokens,
             usage_out=usage,
         )
     finally:
@@ -1021,7 +1025,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     await websocket.accept()
     translation_ctx = TranslationContext()
-    chunker = KoChunker() if early_commit and src_lang.startswith("ko") else None
+    chunker = KoChunker(
+        waitk_lo=ENV.WAITK_LO,
+        waitk_hi=ENV.WAITK_HI,
+        silence_commit_ms=ENV.SILENCE_COMMIT_MS,
+        max_precommit_tokens=ENV.MAX_PRECOMMIT_TOKENS,
+    ) if early_commit and src_lang.startswith("ko") else None
     try:
         dg = await connect_to_deepgram(language=dg_language, keywords=dg_keywords)  # <-- dg is created here
     except Exception as e:
@@ -1269,7 +1278,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     translated = clean_src
                 else:
                     try:
-                        custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
+                        custom_prompt, _service_prompt = _cached_prompt_overrides(org_id)
+                        # Partial previews use a compact prompt (no Bible names block,
+                        # no full service scripture) to cut ~1000-1500 prompt tokens and
+                        # reduce time-to-first-token by ~300-600 ms.
                         translated, limit_meta = await _translate_text_guarded(
                             clean_src,
                             src_lang_full,
@@ -1279,7 +1291,9 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             ctx=translation_ctx,
                             update_ctx=update_ctx,
                             custom_prompt=custom_prompt,
-                            service_prompt=service_prompt,
+                            service_prompt="",
+                            compact_prompt=True,
+                            max_tokens=120,
                         )
                         if limit_meta:
                             meta_payload.update(limit_meta)

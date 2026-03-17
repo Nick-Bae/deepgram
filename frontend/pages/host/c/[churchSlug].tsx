@@ -271,6 +271,7 @@ export default function HostChurchPage() {
   const [sermonBudgetError, setSermonBudgetError] = useState<string | null>(null);
   const [sermonBudgetNotice, setSermonBudgetNotice] = useState<string | null>(null);
   const normalizedServiceKey = serviceKey.trim();
+  const normalizedQueryServiceKey = queryServiceKey.trim();
   const activeTab = resolveHostTab(querySection);
   const isBillingTab = activeTab === "billing";
   const resolvedOrgId = (orgData?.orgId || queryOrgId || "").trim();
@@ -339,6 +340,13 @@ export default function HostChurchPage() {
     if (!hasPaidPlan || !hasActiveLikeSubscription) return PAID_PLAN_KEYS;
     return PAID_PLAN_KEYS.filter((plan) => plan !== (billingPlanToken as PaidPlanKey));
   }, [billingPlanToken, hasActiveLikeSubscription, hasPaidPlan]);
+  const serviceKeyForStart = useMemo(() => {
+    const serviceRows = orgData?.services || [];
+    if (!serviceRows.length) return (normalizedServiceKey || normalizedQueryServiceKey).trim();
+    if (normalizedServiceKey && serviceRows.some((row) => row.serviceKey === normalizedServiceKey)) return normalizedServiceKey;
+    if (normalizedQueryServiceKey && serviceRows.some((row) => row.serviceKey === normalizedQueryServiceKey)) return normalizedQueryServiceKey;
+    return (serviceRows[0]?.serviceKey || "").trim();
+  }, [normalizedQueryServiceKey, normalizedServiceKey, orgData?.services]);
 
   useEffect(() => {
     if (!resolvedOrgId) return;
@@ -564,15 +572,23 @@ export default function HostChurchPage() {
   }, [orgData, serviceKey]);
 
   useEffect(() => {
+    if (!orgData?.services?.length) return;
+    if (normalizedServiceKey) return;
+    if (!serviceKeyForStart || serviceKey === serviceKeyForStart) return;
+    setServiceKey(serviceKeyForStart);
+  }, [normalizedServiceKey, orgData?.services?.length, serviceKey, serviceKeyForStart]);
+
+  useEffect(() => {
     if (!selectedService) return;
     if (selectedService.defaultLanguagePair?.source) setSourceLang(selectedService.defaultLanguagePair.source);
     if (selectedService.defaultLanguagePair?.target) setTargetLang(selectedService.defaultLanguagePair.target);
   }, [selectedService?.serviceKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const listenerUrl = useMemo(() => {
-    if (!origin || !slug || !normalizedServiceKey) return "";
-    return `${origin}/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(normalizedServiceKey)}`;
-  }, [normalizedServiceKey, origin, slug]);
+    const listenerServiceKey = (normalizedServiceKey || serviceKeyForStart).trim();
+    if (!origin || !slug || !listenerServiceKey) return "";
+    return `${origin}/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(listenerServiceKey)}`;
+  }, [normalizedServiceKey, origin, serviceKeyForStart, slug]);
 
   const saveAccountProfile = useCallback(async () => {
     const nextName = accountDisplayNameInput.trim();
@@ -927,7 +943,11 @@ export default function HostChurchPage() {
       persistAuthToken(idToken);
       const created = await createOrgInvite(idToken, resolvedOrgId, { role: inviteRole, expiresHours: 24 * 3 });
       const originBase = typeof window !== "undefined" ? window.location.origin : "";
-      const link = originBase ? `${originBase}/join?code=${encodeURIComponent(created.code)}` : `/join?code=${encodeURIComponent(created.code)}`;
+      const params = new URLSearchParams();
+      params.set("code", created.code);
+      params.set("church", (orgData?.name || slug || "church").trim());
+      const joinPath = `/join?${params.toString()}`;
+      const link = originBase ? `${originBase}${joinPath}` : joinPath;
       setInviteLink(link);
       setInviteNotice("Invite link created. Use Copy Link or Share via...");
       await loadInvites();
@@ -1213,6 +1233,7 @@ export default function HostChurchPage() {
   };
 
   const startService = async () => {
+    const startKey = serviceKeyForStart.trim();
     if (!resolvedOrgId && !slug) {
       setErrorMsg("Church slug is missing. Refresh the page.");
       return;
@@ -1221,19 +1242,19 @@ export default function HostChurchPage() {
       setErrorMsg(ERROR_DETAIL_MESSAGES.trial_expired);
       return;
     }
-    if (!normalizedServiceKey) {
+    if (!startKey) {
       setErrorMsg("Enter a service key before starting.");
       return;
     }
-    if (normalizedServiceKey !== serviceKey) setServiceKey(normalizedServiceKey);
+    if (startKey !== serviceKey) setServiceKey(startKey);
     setBusy(true);
     try {
       const idToken = await getIdToken();
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
       const path = resolvedOrgId
-        ? `/api/org/${encodeURIComponent(resolvedOrgId)}/service/${encodeURIComponent(normalizedServiceKey)}/start`
-        : `/api/c/${encodeURIComponent(slug)}/service/${encodeURIComponent(normalizedServiceKey)}/start`;
+        ? `/api/org/${encodeURIComponent(resolvedOrgId)}/service/${encodeURIComponent(startKey)}/start`
+        : `/api/c/${encodeURIComponent(slug)}/service/${encodeURIComponent(startKey)}/start`;
       const res = await fetch(`${API_URL}${path}`, {
         method: "POST",
         headers: {
@@ -1259,12 +1280,12 @@ export default function HostChurchPage() {
       persistStreamContext({
         orgId: nextOrgId || undefined,
         roomId: data.roomId,
-        serviceKey: data.serviceKey || normalizedServiceKey,
+        serviceKey: data.serviceKey || startKey,
         churchSlug: slug,
       });
       if (nextOrgId && nextOrgId !== queryOrgId) {
         const href = buildTabHref("broadcast", {
-          serviceKey: data.serviceKey || normalizedServiceKey,
+          serviceKey: data.serviceKey || startKey,
           orgId: nextOrgId,
           roomId: data.roomId,
         });
@@ -1272,7 +1293,7 @@ export default function HostChurchPage() {
           void router.replace(href, undefined, { shallow: true });
         }
       } else {
-        syncHostUrl(data.roomId, data.serviceKey || normalizedServiceKey);
+        syncHostUrl(data.roomId, data.serviceKey || startKey);
       }
       setErrorMsg(null);
       if (resolvedOrgId) {
@@ -1478,7 +1499,7 @@ export default function HostChurchPage() {
     display: "grid",
     placeItems: "center",
     color: "#ffb703",
-    fontSize: 22,
+    fontSize: 40,
     fontWeight: 900,
     fontStyle: "italic",
   } as const;

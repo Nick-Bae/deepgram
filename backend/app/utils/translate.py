@@ -20,6 +20,10 @@ _client: AsyncOpenAI | None = None
 _CUSTOM_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
 _SERVICE_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
 _HANGUL_RE = re.compile(r"[가-힣]")
+# Cache for the static portion of the system prompt (everything except context block).
+# Keyed by (source, target, custom_text_hash, service_text_hash, compact_prompt).
+# This avoids iterating 224 Bible names and rebuilding the same string on every call.
+_SYSTEM_PROMPT_BASE_CACHE: dict[tuple, str] = {}
 
 @dataclass
 class TranslationContext:
@@ -837,25 +841,20 @@ def _unmask_hard_glossary(text: str, mapping: dict[str, str]) -> str:
     return out
 
 
-def _build_system_prompt(
+def _build_system_prompt_base(
     source: str,
     target: str,
-    ctx: Optional[TranslationContext],
-    *,
-    current_source_text: Optional[str] = None,
-    custom_prompt: Optional[str] = None,
-    service_prompt: Optional[str] = None,
-    compact_prompt: bool = False,
+    service_text: str,
+    custom_text: str,
+    compact_prompt: bool,
 ) -> str:
     """
-    Core system prompt: neutral/cautious worship captioning with domain aids.
+    Build the static/cacheable portion of the system prompt (no context block, no few-shot).
+    The result is cached by (source, target, service_text_hash, custom_text_hash, compact_prompt).
     """
     source_name = _language_name(source)
     target_name = _language_name(target)
-    service_text = ((service_prompt or "") if service_prompt is not None else (_get_service_prompt() or "")).strip()
     service_block = ("\nService background:\n" + service_text + "\n") if service_text else ""
-
-    custom_text = ((custom_prompt or "") if custom_prompt is not None else (_get_custom_prompt() or "")).strip()
     custom_block = ("\nGlobal guidance:\n" + custom_text + "\n") if custom_text else ""
 
     if compact_prompt:
@@ -869,7 +868,6 @@ def _build_system_prompt(
             "- Output only the translation text.\n"
             + service_block
             + custom_block
-            + _build_context_block(ctx)
         )
 
     # Theological glossary (only if from Korean)
@@ -894,9 +892,7 @@ def _build_system_prompt(
             "\nBiblical names/places (standard forms):\n" + "\n".join(bible_name_lines) + "\n"
         )
 
-    fewshot_block = _build_fewshot_block(source, target, current_source_text=current_source_text)
-
-    system = (
+    return (
         "You are a professional translator for live church worship captions.\n"
         f"Translate {source_name} → {target_name} faithfully and naturally.\n"
         "\n"
@@ -925,13 +921,36 @@ def _build_system_prompt(
         "\n"
         + bible_names_block
         + glossary_block
-        + fewshot_block
         + service_block
         + custom_block
-        + _build_context_block(ctx)
     )
 
-    return system
+
+def _build_system_prompt(
+    source: str,
+    target: str,
+    ctx: Optional[TranslationContext],
+    *,
+    current_source_text: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    service_prompt: Optional[str] = None,
+    compact_prompt: bool = False,
+) -> str:
+    """
+    Core system prompt: neutral/cautious worship captioning with domain aids.
+    The static base is cached; only the per-call context block and few-shot block are appended fresh.
+    """
+    service_text = ((service_prompt or "") if service_prompt is not None else (_get_service_prompt() or "")).strip()
+    custom_text = ((custom_prompt or "") if custom_prompt is not None else (_get_custom_prompt() or "")).strip()
+
+    cache_key = (source, target, hash(service_text), hash(custom_text), compact_prompt)
+    base = _SYSTEM_PROMPT_BASE_CACHE.get(cache_key)
+    if base is None:
+        base = _build_system_prompt_base(source, target, service_text, custom_text, compact_prompt)
+        _SYSTEM_PROMPT_BASE_CACHE[cache_key] = base
+
+    fewshot_block = "" if compact_prompt else _build_fewshot_block(source, target, current_source_text=current_source_text)
+    return base + fewshot_block + _build_context_block(ctx)
 
 
 def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
@@ -1098,6 +1117,7 @@ async def translate_text(
     custom_prompt: Optional[str] = None,
     service_prompt: Optional[str] = None,
     compact_prompt: bool = False,
+    max_tokens: Optional[int] = None,
     model_override: Optional[str] = None,
     usage_out: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -1158,6 +1178,9 @@ async def translate_text(
 
     try:
         model_name = ENV.resolve_translation_model(model_override)
+        extra_opts: dict[str, Any] = {}
+        if max_tokens is not None:
+            extra_opts["max_tokens"] = max_tokens
         resp = await client.chat.completions.create(
             model=model_name,
             messages=[
@@ -1165,6 +1188,7 @@ async def translate_text(
                 {"role": "user", "content": user_content}
             ],
             **_openai_chat_options(model_name),
+            **extra_opts,
         )
         usage = TranslationUsage(model=str(getattr(resp, "model", None) or model_name))
         resp_usage = getattr(resp, "usage", None)
