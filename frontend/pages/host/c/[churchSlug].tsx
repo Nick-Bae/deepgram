@@ -66,7 +66,7 @@ const BILLING_ADMIN_EMAILS = new Set(
 type HostAction = "load_services" | "start_service" | "end_service";
 type InviteRoleChoice = Extract<InviteRole, "admin" | "host">;
 type PaidPlanKey = Exclude<BillingPlanKey, "trial">;
-type HostTab = "broadcast" | "settings" | "team";
+type HostTab = "broadcast" | "settings" | "billing" | "team";
 const PAID_PLAN_KEYS: PaidPlanKey[] = ["starter", "growth", "premium"];
 
 const PLAN_LABELS: Record<PaidPlanKey, string> = {
@@ -75,9 +75,27 @@ const PLAN_LABELS: Record<PaidPlanKey, string> = {
   premium: "Premium (Unlimited / $60)",
 };
 
+const PLAN_SUMMARIES: Record<PaidPlanKey, { title: string; monthlyPrice: string; serviceLimit: string }> = {
+  starter: {
+    title: "Starter",
+    monthlyPrice: "$20 / month",
+    serviceLimit: "Up to 5 service keys",
+  },
+  growth: {
+    title: "Growth",
+    monthlyPrice: "$40 / month",
+    serviceLimit: "Up to 12 service keys",
+  },
+  premium: {
+    title: "Premium",
+    monthlyPrice: "$60 / month",
+    serviceLimit: "Unlimited service keys",
+  },
+};
+
 function resolveHostTab(raw: string): HostTab {
   const token = (raw || "").trim().toLowerCase();
-  if (token === "settings" || token === "team") return token;
+  if (token === "settings" || token === "billing" || token === "team") return token;
   return "broadcast";
 }
 
@@ -131,12 +149,12 @@ async function readErrorMessage(res: Response, action: HostAction): Promise<stri
   return mapStatusMessage(res.status, action) || `${fallbackMessage(action)} (HTTP ${res.status})`;
 }
 
-function formatDateTime(raw?: string | null): string {
+function formatDateTime(raw?: string | null, options?: Intl.DateTimeFormatOptions): string {
   const txt = (raw || "").trim();
   if (!txt) return "-";
   const parsed = new Date(txt);
   if (Number.isNaN(parsed.getTime())) return txt;
-  return parsed.toLocaleString();
+  return parsed.toLocaleString(undefined, options);
 }
 
 function formatPlanLabel(planKey: string): string {
@@ -147,6 +165,11 @@ function formatPlanLabel(planKey: string): string {
   if (token === "premium") return "Premium";
   return token || "Unknown";
 }
+
+const subscriptionPeriodDateTimeOptions: Intl.DateTimeFormatOptions = {
+  dateStyle: "medium",
+  timeStyle: "short",
+};
 
 function formatBillingStatus(status: string): string {
   const token = (status || "").trim().toLowerCase();
@@ -249,6 +272,7 @@ export default function HostChurchPage() {
   const [sermonBudgetNotice, setSermonBudgetNotice] = useState<string | null>(null);
   const normalizedServiceKey = serviceKey.trim();
   const activeTab = resolveHostTab(querySection);
+  const isBillingTab = activeTab === "billing";
   const resolvedOrgId = (orgData?.orgId || queryOrgId || "").trim();
   const canManageInvites = useMemo(() => {
     const lowered = membershipRole.trim().toLowerCase();
@@ -301,6 +325,16 @@ export default function HostChurchPage() {
   const trialNoticeCheckpointRef = useRef<"" | "warn5" | "warn1" | "expired">("");
   const hasPaidPlan = PAID_PLAN_KEYS.includes(billingPlanToken as PaidPlanKey);
   const hasActiveLikeSubscription = billingStatusToken === "active" || billingStatusToken === "trialing" || billingStatusToken === "past_due";
+  const billingNeedsAttention = isTrialExpired || ["past_due", "canceled", "unpaid", "incomplete"].includes(billingStatusToken);
+  const billingAlertMessage = isTrialExpired
+    ? "Trial access has ended. Review billing before the next broadcast."
+    : billingStatusToken === "past_due"
+      ? "Billing is past due. Update payment details to avoid losing access."
+      : billingStatusToken === "canceled"
+        ? "This subscription is canceled. Confirm the period end and next steps."
+        : billingStatusToken === "unpaid" || billingStatusToken === "incomplete"
+          ? "Subscription setup is incomplete. Open billing to finish activation."
+          : "";
   const selectablePaidPlans = useMemo(() => {
     if (!hasPaidPlan || !hasActiveLikeSubscription) return PAID_PLAN_KEYS;
     return PAID_PLAN_KEYS.filter((plan) => plan !== (billingPlanToken as PaidPlanKey));
@@ -737,13 +771,13 @@ export default function HostChurchPage() {
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      if (forceRefresh || activeTab === "settings") {
+      if (forceRefresh || isBillingTab) {
         setBillingError(message || "Failed to load billing profile.");
       }
     } finally {
       if (forceRefresh) setBillingRefreshBusy(false);
     }
-  }, [activeTab, canManageServices, getIdToken, resolvedOrgId]);
+  }, [canManageServices, getIdToken, isBillingTab, resolvedOrgId]);
 
   const loadSermonUsage = useCallback(async () => {
     if (!resolvedOrgId || !canManageBilling) {
@@ -759,7 +793,7 @@ export default function HostChurchPage() {
   }, [canManageBilling, getIdToken, resolvedOrgId]);
 
   useEffect(() => {
-    if (activeTab !== "settings" || !canManageBilling || !resolvedOrgId || authLoading || !user) return;
+    if (!isBillingTab || !canManageBilling || !resolvedOrgId || authLoading || !user) return;
     let cancelled = false;
     const run = async () => {
       setBillingError(null);
@@ -788,7 +822,7 @@ export default function HostChurchPage() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, authLoading, canManageBilling, getIdToken, resolvedOrgId, user]);
+  }, [authLoading, canManageBilling, getIdToken, isBillingTab, resolvedOrgId, user]);
 
   useEffect(() => {
     if (!canManageServices || !resolvedOrgId || authLoading || !user) return;
@@ -802,7 +836,7 @@ export default function HostChurchPage() {
         if (cancelled) return;
         setBillingProfile(payload.billing || null);
       } catch (err: unknown) {
-        if (!cancelled && activeTab === "settings") {
+        if (!cancelled && isBillingTab) {
           const message = err instanceof Error ? err.message : String(err);
           setBillingError(message || "Failed to load billing profile.");
         }
@@ -816,7 +850,7 @@ export default function HostChurchPage() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [activeTab, authLoading, canManageServices, getIdToken, resolvedOrgId, user]);
+  }, [authLoading, canManageServices, getIdToken, isBillingTab, resolvedOrgId, user]);
 
   useEffect(() => {
     if (!canManageInvites || !resolvedOrgId || authLoading || !user) return;
@@ -1023,11 +1057,11 @@ export default function HostChurchPage() {
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
       const settingsPath =
-        buildTabHref("settings", {
+        buildTabHref("billing", {
           orgId: resolvedOrgId,
           serviceKey: normalizedServiceKey || undefined,
           roomId: activeRoomId || undefined,
-        }) || `/host/c/${encodeURIComponent(slug || "demo")}/settings`;
+        }) || `/host/c/${encodeURIComponent(slug || "demo")}/billing`;
       const browserOrigin = (typeof window !== "undefined" && window.location.origin) || origin;
       const returnUrl = browserOrigin ? `${browserOrigin}${settingsPath}` : settingsPath;
       const checkout = await createBillingCheckoutSession(idToken, {
@@ -1060,11 +1094,11 @@ export default function HostChurchPage() {
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
       const settingsPath =
-        buildTabHref("settings", {
+        buildTabHref("billing", {
           orgId: resolvedOrgId,
           serviceKey: normalizedServiceKey || undefined,
           roomId: activeRoomId || undefined,
-        }) || `/host/c/${encodeURIComponent(slug || "demo")}/settings`;
+        }) || `/host/c/${encodeURIComponent(slug || "demo")}/billing`;
       const browserOrigin = (typeof window !== "undefined" && window.location.origin) || origin;
       const returnUrl = browserOrigin ? `${browserOrigin}${settingsPath}` : settingsPath;
       const portal = await createBillingPortalSession(idToken, {
@@ -1298,12 +1332,91 @@ export default function HostChurchPage() {
     color: "#0f172a",
     padding: "20px 14px 34px",
   } as const;
+  const dashboardPanelShadow = "0 18px 38px rgba(122,138,163,0.12)";
+  const dashboardCardShadow = "0 14px 30px rgba(122,138,163,0.1)";
+  const dashboardCompactShadow = "0 10px 22px rgba(122,138,163,0.08)";
   const hostTopPanelStyle = {
     border: "1px solid rgba(255,255,255,0.88)",
     borderRadius: 24,
     background: "linear-gradient(145deg, rgba(242,246,251,0.98), rgba(220,228,240,0.94))",
-    boxShadow: "24px 24px 56px rgba(122,138,163,0.18), -18px -18px 38px rgba(255,255,255,0.78)",
+    boxShadow: dashboardPanelShadow,
     padding: 16,
+  } as const;
+  const hostTopIntroStyle = {
+    margin: "0 0 18px",
+    width: "100%",
+    padding: "22px 24px",
+    borderRadius: 22,
+    position: "relative" as const,
+    overflow: "hidden" as const,
+    background: "linear-gradient(135deg, rgba(237,252,247,0.98), rgba(224,242,254,0.96) 52%, rgba(255,255,255,0.84))",
+    boxShadow: "0 20px 38px rgba(44,95,123,0.14), inset 0 1px 0 rgba(255,255,255,0.72)",
+  } as const;
+  const hostTopIntroGlowStyle = {
+    position: "absolute" as const,
+    inset: "auto -70px -110px auto",
+    width: 260,
+    height: 210,
+    borderRadius: 999,
+    background: "radial-gradient(circle, rgba(45,212,191,0.24) 0%, rgba(45,212,191,0) 72%)",
+    filter: "blur(10px)",
+  } as const;
+  const hostTopIntroRailStyle = {
+    position: "absolute" as const,
+    left: 0,
+    top: 18,
+    bottom: 18,
+    width: 6,
+    borderRadius: 999,
+    background: "linear-gradient(180deg, #14b8a6, #0f766e)",
+    boxShadow: "0 0 22px rgba(20,184,166,0.28)",
+  } as const;
+  const hostTopIntroContentStyle = {
+    position: "relative" as const,
+    display: "grid",
+    gap: 8,
+    paddingLeft: 18,
+  } as const;
+  const hostTopIntroBadgeStyle = {
+    display: "inline-flex",
+    alignItems: "center",
+    width: "fit-content",
+    padding: "6px 10px",
+    borderRadius: 999,
+    background: "rgba(15,118,110,0.1)",
+    color: "#0f766e",
+    fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
+    fontSize: 11,
+    lineHeight: 1,
+    fontWeight: 800,
+    letterSpacing: "0.14em",
+    textTransform: "uppercase" as const,
+  } as const;
+  const hostTopIntroHeadlineStyle = {
+    margin: 0,
+    color: "#16324f",
+    fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
+    fontSize: "clamp(26px, 3.4vw, 36px)",
+    lineHeight: 1.02,
+    fontWeight: 900,
+    letterSpacing: "-0.06em",
+  } as const;
+  const hostTopIntroAccentStyle = {
+    color: "#0f766e",
+    background: "linear-gradient(135deg, #14b8a6, #0f766e)",
+    backgroundClip: "text" as const,
+    WebkitBackgroundClip: "text" as const,
+    WebkitTextFillColor: "transparent",
+  } as const;
+  const hostTopIntroSubtextStyle = {
+    margin: 0,
+    maxWidth: 760,
+    color: "#45607d",
+    fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
+    fontSize: "clamp(14px, 1.7vw, 16px)",
+    lineHeight: 1.55,
+    fontWeight: 500,
+    letterSpacing: "-0.01em",
   } as const;
   const hostFieldStyle = {
     borderRadius: 10,
@@ -1326,7 +1439,7 @@ export default function HostChurchPage() {
     border: "1px solid rgba(255,255,255,0.88)",
     background: "rgba(230,236,244,0.94)",
     backdropFilter: "blur(8px)",
-    boxShadow: "inset 5px 5px 12px rgba(122,138,163,0.12), inset -5px -5px 12px rgba(255,255,255,0.82)",
+    boxShadow: dashboardCompactShadow,
   } as const;
   const studioHeaderStyle = {
     borderRadius: 34,
@@ -1342,10 +1455,7 @@ export default function HostChurchPage() {
     display: "flex",
     alignItems: "center",
     gap: 16,
-    borderRadius: 26,
-    background: "linear-gradient(145deg, rgba(255,255,255,0.1), rgba(255,255,255,0.04))",
-    padding: "10px 14px 10px 18px",
-    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.08), 0 12px 24px rgba(15,23,42,0.14)",
+    padding: 0,
   } as const;
   const studioLogoutButtonStyle = {
     borderRadius: 18,
@@ -1391,7 +1501,7 @@ export default function HostChurchPage() {
     borderRadius: 22,
     padding: 18,
     background: "linear-gradient(145deg, rgba(248,250,253,0.96), rgba(230,236,244,0.92))",
-    boxShadow: "20px 20px 40px rgba(122,138,163,0.12), -14px -14px 28px rgba(255,255,255,0.72)",
+    boxShadow: dashboardCardShadow,
     display: "grid",
     gap: 12,
   } as const;
@@ -1402,6 +1512,36 @@ export default function HostChurchPage() {
   const settingsBudgetCardStyle = {
     ...settingsCardStyle,
     background: "linear-gradient(145deg, rgba(240,246,243,0.98), rgba(219,231,226,0.94))",
+  } as const;
+  const billingHeroCardStyle = {
+    ...settingsCardStyle,
+    padding: 22,
+    background: "linear-gradient(145deg, rgba(247,241,232,0.99), rgba(232,220,203,0.95))",
+    boxShadow: "0 18px 36px rgba(131,109,82,0.12)",
+  } as const;
+  const billingDeckStyle = {
+    display: "grid",
+    gap: 16,
+    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
+  } as const;
+  const billingPlanCardBaseStyle = {
+    borderRadius: 22,
+    padding: 18,
+    display: "grid",
+    gap: 10,
+    minHeight: 220,
+    background: "linear-gradient(145deg, rgba(255,255,255,0.9), rgba(242,236,229,0.9))",
+    boxShadow: dashboardCompactShadow,
+  } as const;
+  const billingAlertStyle = {
+    borderRadius: 18,
+    border: "1px solid rgba(188,95,111,0.28)",
+    background: "linear-gradient(145deg, rgba(255,244,245,0.94), rgba(252,231,236,0.92))",
+    color: "#9f3650",
+    padding: "12px 14px",
+    fontSize: 13,
+    fontWeight: 700,
+    lineHeight: 1.5,
   } as const;
   const settingsSectionLabelStyle = {
     margin: 0,
@@ -1422,6 +1562,26 @@ export default function HostChurchPage() {
     fontSize: 13,
     color: "#5f6f86",
     lineHeight: 1.6,
+  } as const;
+  const supportFooterStyle = {
+    padding: "4px 2px 0",
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  } as const;
+  const supportFooterLinkStyle = {
+    border: "none",
+    background: "transparent",
+    padding: 0,
+    color: "#4f73aa",
+    fontSize: 13,
+    fontWeight: 800,
+    cursor: "pointer",
+    textDecoration: "underline",
+    textUnderlineOffset: "3px",
+    whiteSpace: "nowrap" as const,
   } as const;
   const settingsPillBaseStyle = {
     display: "inline-flex",
@@ -1449,7 +1609,7 @@ export default function HostChurchPage() {
     fontWeight: 700,
     padding: "10px 14px",
     cursor: "pointer",
-    boxShadow: "8px 8px 18px rgba(122,138,163,0.1), -8px -8px 18px rgba(255,255,255,0.76)",
+    boxShadow: "0 8px 16px rgba(122,138,163,0.08)",
   } as const;
   const settingsButtonDangerStyle = {
     borderRadius: 12,
@@ -1481,9 +1641,36 @@ export default function HostChurchPage() {
     (user?.email ? user.email.split("@")[0].replace(/[._-]+/g, " ") : "") ||
     "Host"
   ).trim();
-  const currentUserInitial = currentUserName.charAt(0).toUpperCase() || "H";
   const currentChurchLabel = (orgData?.name || slug || "Current Church").trim();
+  const currentChurchInitial = currentChurchLabel.charAt(0).toUpperCase() || "C";
   const churchPublicPath = slug ? `${origin || ""}/c/${slug}` : "";
+  const dashboardContactHref = useMemo(() => {
+    const topic = activeTab === "billing" ? "billing" : activeTab === "broadcast" ? "translation" : "setup";
+    const sectionLabel = activeTab === "billing"
+      ? "Billing & Subscription"
+      : activeTab === "team"
+        ? "Team"
+        : activeTab === "settings"
+          ? "Church Settings"
+          : "Live Broadcast";
+    const params = new URLSearchParams();
+    params.set("topic", topic);
+    params.set("organization", currentChurchLabel);
+    params.set(
+      "message",
+      [
+        `Church: ${currentChurchLabel}`,
+        `User: ${currentUserName}`,
+        `Current section: ${sectionLabel}`,
+        churchPublicPath ? `Public page: ${churchPublicPath}` : "",
+        "",
+        "How can we help?",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+    return `/contact?${params.toString()}`;
+  }, [activeTab, churchPublicPath, currentChurchLabel, currentUserName]);
 
   useEffect(() => {
     setAccountDisplayNameInput(currentUserName);
@@ -1531,7 +1718,7 @@ export default function HostChurchPage() {
           />
           <div style={{ position: "relative", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 18 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
-              <div style={studioBrandTileStyle}>{currentUserInitial}</div>
+              <div style={studioBrandTileStyle}>{currentChurchInitial}</div>
               <div style={{ fontFamily: "Inter, 'Segoe UI', system-ui, sans-serif" }}>
                 <h1
                   style={{
@@ -1543,7 +1730,7 @@ export default function HostChurchPage() {
                     letterSpacing: "-0.05em",
                   }}
                 >
-                  {currentUserName}
+                  {currentChurchLabel}
                 </h1>
                 <p
                   style={{
@@ -1559,23 +1746,22 @@ export default function HostChurchPage() {
               </div>
             </div>
 
-            <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
+            <div style={studioUserPanelStyle}>
               <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
                 <span
                   style={{
                     color: "#e1e8f4",
-                    fontSize: 16,
-                    fontWeight: 700,
+                    fontSize: 20,
+                    fontWeight: 500,
                     whiteSpace: "nowrap",
                     overflow: "hidden",
                     textOverflow: "ellipsis",
                     maxWidth: 280,
                   }}
                 >
-                  {currentChurchLabel}
+                  {currentUserName}
                 </span>
               </div>
-
               <button
                 onClick={async () => {
                   clearHostToken();
@@ -1591,13 +1777,19 @@ export default function HostChurchPage() {
         </section>
 
         <section style={hostTopPanelStyle}>
-          <h1 style={{ marginTop: 0, marginBottom: 8, fontSize: 26, color: "#0f172a" }}>{orgData?.name || slug || "Host"}</h1>
-          <p style={{ marginTop: 0, opacity: 0.75, marginBottom: 14, color: "#475569" }}>
-            Start a room for a recurring service, then begin microphone streaming.
-          </p>
-          <p style={{ marginTop: 0, marginBottom: 10, opacity: 0.76, fontSize: 13, color: "#475569" }}>
-            {resolvedOrgId ? `Org: ${resolvedOrgId}` : loading ? "Loading church organization..." : "Organization not loaded yet."}
-          </p>
+          <div style={hostTopIntroStyle}>
+            <div aria-hidden="true" style={hostTopIntroGlowStyle} />
+            <div aria-hidden="true" style={hostTopIntroRailStyle} />
+            <div style={hostTopIntroContentStyle}>
+              <span style={hostTopIntroBadgeStyle}>Step-by-Step</span>
+              <h2 style={hostTopIntroHeadlineStyle}>
+                Launch Your <span style={hostTopIntroAccentStyle}>Broadcast</span>
+              </h2>
+              <p style={hostTopIntroSubtextStyle}>
+                Select a service to open the Control Panel, then click Start Translation to go live.
+              </p>
+            </div>
+          </div>
           {errorMsg ? <p style={{ color: "#b91c1c", marginTop: 0 }}>Error: {errorMsg}</p> : null}
           {memberships.length > 1 ? (
             <div style={{ marginBottom: 12, display: "grid", gap: 4, maxWidth: 380 }}>
@@ -1655,6 +1847,34 @@ export default function HostChurchPage() {
               }}
             >
               Church Settings
+            </button>
+            <button
+              onClick={() => navigateToTab("billing")}
+              style={{
+                borderRadius: 10,
+                border: activeTab === "billing"
+                  ? "1px solid rgba(79,115,170,0.38)"
+                  : billingNeedsAttention
+                    ? "1px solid rgba(188,95,111,0.34)"
+                    : "1px solid rgba(189,200,217,0.92)",
+                background: activeTab === "billing"
+                  ? accentPrimaryGradient
+                  : billingNeedsAttention
+                    ? "linear-gradient(145deg, rgba(255,245,245,0.92), rgba(252,229,229,0.9))"
+                    : "rgba(247,250,253,0.78)",
+                color: activeTab === "billing" ? "#f8fafc" : billingNeedsAttention ? "#a94457" : "#42556f",
+                fontSize: 13,
+                fontWeight: 800,
+                padding: "8px 12px",
+                cursor: "pointer",
+                boxShadow: activeTab === "billing"
+                  ? accentPrimaryShadow
+                  : billingNeedsAttention
+                    ? "0 12px 24px rgba(188,95,111,0.14)"
+                    : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
+              }}
+            >
+              Billing & Subscription
             </button>
             <button
               onClick={() => navigateToTab("team")}
@@ -1715,14 +1935,7 @@ export default function HostChurchPage() {
                     <span style={{ fontSize: 12, opacity: 0.75, color: "#64748b" }}>No services found. Create a service in Church Settings first, then start it here.</span>
                   ) : null}
                 </label>
-                <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Source</span>
-                  <input value={sourceLang} onChange={(e) => setSourceLang(e.target.value)} style={hostFieldStyle} />
-                </label>
-                <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Target</span>
-                  <input value={targetLang} onChange={(e) => setTargetLang(e.target.value)} style={hostFieldStyle} />
-                </label>
+                
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, alignItems: "center" }}>
                 <button
@@ -1914,10 +2127,10 @@ export default function HostChurchPage() {
                   </section>
 
                   <section style={settingsSubscriptionCardStyle}>
-                    <p style={settingsSectionLabelStyle}>Billing Overview</p>
-                    <h3 style={settingsTitleStyle}>Subscription</h3>
+                    <p style={settingsSectionLabelStyle}>Billing Snapshot</p>
+                    <h3 style={settingsTitleStyle}>Billing & Subscription</h3>
                     <p style={settingsBodyTextStyle}>
-                      Review the current plan, Stripe sync status, and billing actions for this church.
+                      View the current plan and renewal timing here. Open Billing for plan changes, payment details, and billing controls.
                     </p>
 
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -1931,17 +2144,23 @@ export default function HostChurchPage() {
                             ? "1px solid rgba(91,179,130,0.22)"
                             : billingStatusToken === "past_due"
                               ? "1px solid rgba(224,163,86,0.26)"
-                              : "1px solid rgba(189,200,217,0.9)",
+                              : billingNeedsAttention
+                                ? "1px solid rgba(188,95,111,0.26)"
+                                : "1px solid rgba(189,200,217,0.9)",
                           background: billingStatusToken === "active"
                             ? "rgba(91,179,130,0.14)"
                             : billingStatusToken === "past_due"
                               ? "rgba(224,163,86,0.16)"
-                              : "rgba(247,250,253,0.8)",
+                              : billingNeedsAttention
+                                ? "rgba(188,95,111,0.12)"
+                                : "rgba(247,250,253,0.8)",
                           color: billingStatusToken === "active"
                             ? "#3b7d5c"
                             : billingStatusToken === "past_due"
                               ? "#9a6433"
-                              : "#55657d",
+                              : billingNeedsAttention
+                                ? "#a94457"
+                                : "#55657d",
                         }}
                       >
                         Status · {formatBillingStatus(billingStatusToken)}
@@ -1951,15 +2170,17 @@ export default function HostChurchPage() {
                       </span>
                     </div>
 
+                    {billingAlertMessage ? <div style={billingAlertStyle}>{billingAlertMessage}</div> : null}
+
                     {billingProfile ? (
                       <div style={{ display: "grid", gap: 8 }}>
                         {hasSubscriptionPeriod ? (
                           <div style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.8)", background: "rgba(255,255,255,0.7)", padding: "12px 14px" }}>
                             <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Subscription Period</p>
                             <p style={{ margin: "6px 0 0", fontSize: 13, color: "#334155" }}>
-                              <strong>{formatDateTime(billingProfile.currentPeriodStart)}</strong>
+                              <strong>{formatDateTime(billingProfile.currentPeriodStart, subscriptionPeriodDateTimeOptions)}</strong>
                               {" → "}
-                              <strong>{formatDateTime(billingProfile.currentPeriodEnd)}</strong>
+                              <strong>{formatDateTime(billingProfile.currentPeriodEnd, subscriptionPeriodDateTimeOptions)}</strong>
                               {billingProfile.cancelAtPeriodEnd ? " · Cancels at period end" : ""}
                             </p>
                           </div>
@@ -1975,192 +2196,21 @@ export default function HostChurchPage() {
                           <p style={settingsBodyTextStyle}>Trial usage details will appear after the next usage tick.</p>
                         ) : null}
                         {!isTrialPlan && !hasSubscriptionPeriod ? (
-                          <p style={settingsBodyTextStyle}>Subscription period is syncing from Stripe. Click refresh in a few seconds.</p>
+                          <p style={settingsBodyTextStyle}>Subscription period is syncing from Stripe. Open billing to review the latest details.</p>
                         ) : null}
                       </div>
                     ) : (
-                      <p style={settingsBodyTextStyle}>Loading billing profile…</p>
+                      <p style={settingsBodyTextStyle}>Loading billing summary…</p>
                     )}
 
-                    {canManagePaidBilling ? (
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-                        <select
-                          value={selectedPlan}
-                          onChange={(e) => setSelectedPlan(e.target.value as PaidPlanKey)}
-                          style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
-                        >
-                          {selectablePaidPlans.map((plan) => (
-                            <option key={plan} value={plan}>
-                              {PLAN_LABELS[plan]}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          onClick={openUpgradeCheckout}
-                          disabled={billingCheckoutBusy || !resolvedOrgId}
-                          style={{
-                            ...settingsButtonPrimaryStyle,
-                            opacity: billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
-                            cursor: billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          }}
-                        >
-                          {billingCheckoutBusy ? "Opening Checkout..." : "Upgrade Plan"}
-                        </button>
-                        <button
-                          onClick={openBillingPortal}
-                          disabled={billingPortalBusy || !resolvedOrgId}
-                          style={{
-                            ...settingsButtonNeutralStyle,
-                            opacity: billingPortalBusy || !resolvedOrgId ? 0.6 : 1,
-                            cursor: billingPortalBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          }}
-                        >
-                          {billingPortalBusy ? "Opening Portal..." : "Manage Billing"}
-                        </button>
-                        <button
-                          onClick={() => {
-                            void loadBillingProfile({ refresh: true });
-                          }}
-                          disabled={billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId}
-                          style={{
-                            ...settingsButtonNeutralStyle,
-                            opacity: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? 0.6 : 1,
-                            cursor: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                          }}
-                        >
-                          {billingRefreshBusy ? "Refreshing..." : "Refresh Billing"}
-                        </button>
-                      </div>
-                    ) : (
-                      <p style={settingsBodyTextStyle}>
-                        Owner or admin role is required to manage subscription checkout and billing portal.
-                      </p>
-                    )}
-                  </section>
-
-                  <section style={settingsCardStyle}>
-                    <p style={settingsSectionLabelStyle}>Policy Controls</p>
-                    <h3 style={settingsTitleStyle}>Billing Limits</h3>
-                    <p style={settingsBodyTextStyle}>
-                      Toggle monthly hard-cap enforcement for this church only.
-                    </p>
-                    {canManageBilling ? (
-                      <>
-                        <div style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.84)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
-                          <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
-                            Status:{" "}
-                            <strong>{billingState ? (billingState.billingLimitsEnabled ? "Enabled" : "Disabled") : "Loading..."}</strong>
-                            {billingState && !billingState.globalBillingLimitsEnabled ? " · Global override currently disables all billing checks" : ""}
-                          </p>
-                          {billingState ? (
-                            <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
-                              Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
-                              {" · "}
-                              Hard cap: {billingState.hardCapReached ? "reached" : "not reached"}
-                            </p>
-                          ) : null}
-                        </div>
-                        {billingError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {billingError}</p> : null}
-                        {billingNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{billingNotice}</p> : null}
-                        <div>
-                          <button
-                            onClick={toggleBillingLimits}
-                            disabled={billingBusy || !resolvedOrgId}
-                            style={{
-                              ...(billingState?.billingLimitsEnabled ? settingsButtonDangerStyle : settingsButtonPrimaryStyle),
-                              opacity: billingBusy || !resolvedOrgId ? 0.6 : 1,
-                              cursor: billingBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                            }}
-                          >
-                            {billingBusy
-                              ? "Saving..."
-                              : billingState?.billingLimitsEnabled
-                                ? "Disable Billing Limits"
-                                : "Enable Billing Limits"}
-                          </button>
-                        </div>
-                      </>
-                    ) : (
-                      <p style={settingsBodyTextStyle}>Billing admin account is required to change billing limits.</p>
-                    )}
-                  </section>
-
-                  <section style={settingsBudgetCardStyle}>
-                    <p style={settingsSectionLabelStyle}>AI Budget</p>
-                    <h3 style={settingsTitleStyle}>Sermon Prep Budget</h3>
-                    <p style={settingsBodyTextStyle}>
-                      Track OpenAI token usage by sermon and cap monthly Sermon Prep spend for this church.
-                    </p>
-                    {sermonUsageState ? (
-                      <>
-                        <div style={{ borderRadius: 16, border: "1px solid rgba(184,204,194,0.88)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
-                          <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
-                            Month {sermonUsageState.currentMonthKey}: <strong>${sermonUsageState.currentMonthEstimatedUsd.toFixed(4)}</strong>
-                            {sermonUsageState.effectiveBudgetEnabled ? ` / $${sermonUsageState.budgetUsd.toFixed(2)}` : " (budget disabled)"}
-                            {" · "}
-                            Tokens: {sermonUsageState.currentMonthTotalTokens.toLocaleString()}
-                            {" · "}
-                            Cap: {sermonUsageState.capReached ? "reached" : "not reached"}
-                          </p>
-                          {sermonUsageState.sermons.length ? (
-                            <div style={{ display: "grid", gap: 4 }}>
-                              {sermonUsageState.sermons.slice(0, 4).map((row) => (
-                                <p key={row.sermonId} style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
-                                  {row.sermonId}: ${row.estimatedUsd.toFixed(4)} · {row.totalTokens.toLocaleString()} tokens
-                                </p>
-                              ))}
-                            </div>
-                          ) : (
-                            <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>No Sermon Prep usage recorded this month yet.</p>
-                          )}
-                        </div>
-                      </>
-                    ) : (
-                      <p style={settingsBodyTextStyle}>Loading usage…</p>
-                    )}
-                    {canManageBilling ? (
-                      <>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "end" }}>
-                          <label style={{ display: "grid", gap: 6 }}>
-                            <span style={{ fontSize: 12, color: "#5f6f86" }}>Monthly budget (USD)</span>
-                            <input
-                              type="number"
-                              min={0}
-                              step={0.01}
-                              value={sermonBudgetInput}
-                              onChange={(e) => setSermonBudgetInput(e.target.value)}
-                              style={{ ...settingsInlineFieldStyle, minWidth: 150 }}
-                            />
-                          </label>
-                          <button
-                            onClick={saveSermonBudget}
-                            disabled={sermonBudgetBusy || !resolvedOrgId}
-                            style={{
-                              ...settingsButtonPrimaryStyle,
-                              opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
-                              cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                            }}
-                          >
-                            {sermonBudgetBusy ? "Saving..." : "Save Sermon Budget"}
-                          </button>
-                          <button
-                            onClick={() => {
-                              void loadSermonUsage();
-                            }}
-                            disabled={sermonBudgetBusy || !resolvedOrgId}
-                            style={{
-                              ...settingsButtonNeutralStyle,
-                              opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
-                              cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                            }}
-                          >
-                            Refresh Usage
-                          </button>
-                        </div>
-                        {sermonBudgetError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {sermonBudgetError}</p> : null}
-                        {sermonBudgetNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{sermonBudgetNotice}</p> : null}
-                      </>
-                    ) : null}
+                    <div>
+                      <button
+                        onClick={() => navigateToTab("billing")}
+                        style={settingsButtonPrimaryStyle}
+                      >
+                        Open Billing & Subscription
+                      </button>
+                    </div>
                   </section>
                 </div>
 
@@ -2274,6 +2324,337 @@ export default function HostChurchPage() {
             ) : (
               <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: "#5f6f86" }}>
                 You do not have permission to manage service schedules for this church.
+              </div>
+            )
+          ) : null}
+          {activeTab === "billing" ? (
+            canManageServices ? (
+              <div style={settingsShellStyle}>
+                <section style={billingHeroCardStyle}>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <p style={{ ...settingsSectionLabelStyle, color: "#8a6441" }}>Billing & Subscription</p>
+                    <h3 style={{ ...settingsTitleStyle, fontSize: 28, lineHeight: 1.05 }}>Review plan, renewal, and subscriptions</h3>
+                    <p style={{ ...settingsBodyTextStyle, maxWidth: 760, color: "#6f5a43" }}>
+                      Review subscription status, renewal timing, plan options, billing limits, and Sermon Prep budget in one place.
+                    </p>
+                  </div>
+
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(138,100,65,0.18)", background: "rgba(170,128,91,0.12)", color: "#845f3d" }}>
+                      Plan · {formatPlanLabel(billingPlanToken)}
+                    </span>
+                    <span
+                      style={{
+                        ...settingsPillBaseStyle,
+                        border: billingStatusToken === "active"
+                          ? "1px solid rgba(91,179,130,0.22)"
+                          : billingStatusToken === "past_due"
+                            ? "1px solid rgba(224,163,86,0.26)"
+                            : billingNeedsAttention
+                              ? "1px solid rgba(188,95,111,0.26)"
+                              : "1px solid rgba(189,200,217,0.9)",
+                        background: billingStatusToken === "active"
+                          ? "rgba(91,179,130,0.14)"
+                          : billingStatusToken === "past_due"
+                            ? "rgba(224,163,86,0.16)"
+                            : billingNeedsAttention
+                              ? "rgba(188,95,111,0.12)"
+                              : "rgba(247,250,253,0.8)",
+                        color: billingStatusToken === "active"
+                          ? "#3b7d5c"
+                          : billingStatusToken === "past_due"
+                            ? "#9a6433"
+                            : billingNeedsAttention
+                              ? "#a94457"
+                              : "#55657d",
+                      }}
+                    >
+                      Status · {formatBillingStatus(billingStatusToken)}
+                    </span>
+                    <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(189,200,217,0.95)", background: "rgba(247,250,253,0.8)", color: "#55657d" }}>
+                      Service keys · {billingMaxServiceKeys > 0 ? `up to ${billingMaxServiceKeys}` : "unlimited"}
+                    </span>
+                  </div>
+
+                  {billingAlertMessage ? <div style={billingAlertStyle}>{billingAlertMessage}</div> : null}
+                  {billingError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {billingError}</p> : null}
+                  {billingNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{billingNotice}</p> : null}
+
+                  {billingProfile ? (
+                    <div style={settingsGridStyle}>
+                      <div style={{ borderRadius: 18, border: "1px solid rgba(189,200,217,0.8)", background: "rgba(255,255,255,0.68)", padding: "14px 16px" }}>
+                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Current Term</p>
+                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "#334155", lineHeight: 1.6 }}>
+                          {hasSubscriptionPeriod ? (
+                            <>
+                              <strong>{formatDateTime(billingProfile.currentPeriodStart, subscriptionPeriodDateTimeOptions)}</strong>
+                              {" → "}
+                              <strong>{formatDateTime(billingProfile.currentPeriodEnd, subscriptionPeriodDateTimeOptions)}</strong>
+                              {billingProfile.cancelAtPeriodEnd ? " · Cancels at period end" : ""}
+                            </>
+                          ) : isTrialPlan && effectiveTrialCountdownSeconds !== null ? (
+                            <>
+                              Trial time remaining: <strong>{formatCountdownSeconds(effectiveTrialCountdownSeconds)}</strong>
+                            </>
+                          ) : isTrialPlan ? (
+                            "Trial usage details will appear after the next usage tick."
+                          ) : (
+                            "Subscription period is syncing from Stripe."
+                          )}
+                        </p>
+                      </div>
+                      <div style={{ borderRadius: 18, border: "1px solid rgba(189,200,217,0.8)", background: "rgba(255,255,255,0.68)", padding: "14px 16px" }}>
+                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Usage Snapshot</p>
+                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "#334155", lineHeight: 1.6 }}>
+                          {isTrialPlan ? (
+                            <>
+                              Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
+                            </>
+                          ) : (
+                            <>
+                              Billing state is tracked per church and applies to all recurring services in this workspace.
+                            </>
+                          )}
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <p style={settingsBodyTextStyle}>Loading billing profile…</p>
+                  )}
+                </section>
+
+                <section style={settingsCardStyle}>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <p style={settingsSectionLabelStyle}>Plans</p>
+                    <h3 style={settingsTitleStyle}>Choose the next plan</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Review plan size and pricing here before opening Stripe checkout.
+                    </p>
+                  </div>
+
+                  <div style={billingDeckStyle}>
+                    {PAID_PLAN_KEYS.map((plan) => {
+                      const isSelectedPlan = selectedPlan === plan;
+                      const isCurrentPlan = hasPaidPlan && billingPlanToken === plan && hasActiveLikeSubscription;
+                      return (
+                        <button
+                          key={plan}
+                          type="button"
+                          onClick={() => {
+                            if (!canManagePaidBilling) return;
+                            setSelectedPlan(plan);
+                          }}
+                          disabled={!canManagePaidBilling}
+                          style={{
+                            ...billingPlanCardBaseStyle,
+                            textAlign: "left",
+                            border: isSelectedPlan
+                              ? "1px solid rgba(79,115,170,0.3)"
+                              : isCurrentPlan
+                                ? "1px solid rgba(91,179,130,0.28)"
+                                : "1px solid rgba(214,220,229,0.92)",
+                            cursor: canManagePaidBilling ? "pointer" : "default",
+                            opacity: canManagePaidBilling ? 1 : 0.82,
+                            boxShadow: isSelectedPlan
+                              ? accentPrimaryShadow
+                              : isCurrentPlan
+                                ? "0 14px 28px rgba(91,179,130,0.18)"
+                                : billingPlanCardBaseStyle.boxShadow,
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "start" }}>
+                            <div style={{ display: "grid", gap: 4 }}>
+                              <strong style={{ fontSize: 22, color: "#20324a" }}>{PLAN_SUMMARIES[plan].title}</strong>
+                              <span style={{ fontSize: 13, color: "#5f6f86" }}>{PLAN_SUMMARIES[plan].serviceLimit}</span>
+                            </div>
+                            {isCurrentPlan ? (
+                              <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(91,179,130,0.24)", background: "rgba(91,179,130,0.14)", color: "#3b7d5c" }}>
+                                Current
+                              </span>
+                            ) : null}
+                          </div>
+                          <div style={{ display: "grid", gap: 2 }}>
+                            <span style={{ fontSize: 30, fontWeight: 900, letterSpacing: "-0.05em", color: "#20324a" }}>{PLAN_SUMMARIES[plan].monthlyPrice}</span>
+                            <span style={{ fontSize: 12, color: "#6a7a91" }}>
+                              {isSelectedPlan ? "Selected for checkout" : "Click to select this plan"}
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {canManagePaidBilling ? (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                      <button
+                        onClick={openUpgradeCheckout}
+                        disabled={billingCheckoutBusy || !resolvedOrgId}
+                        style={{
+                          ...settingsButtonPrimaryStyle,
+                          opacity: billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
+                          cursor: billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {billingCheckoutBusy ? "Opening Checkout..." : `Open Checkout for ${PLAN_SUMMARIES[selectedPlan].title}`}
+                      </button>
+                      <button
+                        onClick={openBillingPortal}
+                        disabled={billingPortalBusy || !resolvedOrgId}
+                        style={{
+                          ...settingsButtonNeutralStyle,
+                          opacity: billingPortalBusy || !resolvedOrgId ? 0.6 : 1,
+                          cursor: billingPortalBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {billingPortalBusy ? "Opening Portal..." : "Open Stripe Billing Portal"}
+                      </button>
+                      <button
+                        onClick={() => {
+                          void loadBillingProfile({ refresh: true });
+                        }}
+                        disabled={billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId}
+                        style={{
+                          ...settingsButtonNeutralStyle,
+                          opacity: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? 0.6 : 1,
+                          cursor: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {billingRefreshBusy ? "Refreshing..." : "Refresh Billing"}
+                      </button>
+                    </div>
+                  ) : (
+                    <p style={settingsBodyTextStyle}>
+                      Owner or admin role is required to change plans or open Stripe billing actions.
+                    </p>
+                  )}
+                </section>
+
+                <div style={settingsGridStyle}>
+                  <section style={settingsCardStyle}>
+                    <p style={settingsSectionLabelStyle}>Policy Controls</p>
+                    <h3 style={settingsTitleStyle}>Billing Limits</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Toggle monthly hard-cap enforcement for this church only.
+                    </p>
+                    {canManageBilling ? (
+                      <>
+                        <div style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.84)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
+                          <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
+                            Status:{" "}
+                            <strong>{billingState ? (billingState.billingLimitsEnabled ? "Enabled" : "Disabled") : "Loading..."}</strong>
+                            {billingState && !billingState.globalBillingLimitsEnabled ? " · Global override currently disables all billing checks" : ""}
+                          </p>
+                          {billingState ? (
+                            <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
+                              Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
+                              {" · "}
+                              Hard cap: {billingState.hardCapReached ? "reached" : "not reached"}
+                            </p>
+                          ) : null}
+                        </div>
+                        <div>
+                          <button
+                            onClick={toggleBillingLimits}
+                            disabled={billingBusy || !resolvedOrgId}
+                            style={{
+                              ...(billingState?.billingLimitsEnabled ? settingsButtonDangerStyle : settingsButtonPrimaryStyle),
+                              opacity: billingBusy || !resolvedOrgId ? 0.6 : 1,
+                              cursor: billingBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {billingBusy
+                              ? "Saving..."
+                              : billingState?.billingLimitsEnabled
+                                ? "Disable Billing Limits"
+                                : "Enable Billing Limits"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <p style={settingsBodyTextStyle}>Billing admin account is required to change billing limits.</p>
+                    )}
+                  </section>
+
+                  <section style={settingsBudgetCardStyle}>
+                    <p style={settingsSectionLabelStyle}>AI Budget</p>
+                    <h3 style={settingsTitleStyle}>Sermon Prep Budget</h3>
+                    <p style={settingsBodyTextStyle}>
+                      Track OpenAI token usage by sermon and cap monthly Sermon Prep spend for this church.
+                    </p>
+                    {sermonUsageState ? (
+                      <div style={{ borderRadius: 16, border: "1px solid rgba(184,204,194,0.88)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
+                        <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
+                          Month {sermonUsageState.currentMonthKey}: <strong>${sermonUsageState.currentMonthEstimatedUsd.toFixed(4)}</strong>
+                          {sermonUsageState.effectiveBudgetEnabled ? ` / $${sermonUsageState.budgetUsd.toFixed(2)}` : " (budget disabled)"}
+                          {" · "}
+                          Tokens: {sermonUsageState.currentMonthTotalTokens.toLocaleString()}
+                          {" · "}
+                          Cap: {sermonUsageState.capReached ? "reached" : "not reached"}
+                        </p>
+                        {sermonUsageState.sermons.length ? (
+                          <div style={{ display: "grid", gap: 4 }}>
+                            {sermonUsageState.sermons.slice(0, 4).map((row) => (
+                              <p key={row.sermonId} style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
+                                {row.sermonId}: ${row.estimatedUsd.toFixed(4)} · {row.totalTokens.toLocaleString()} tokens
+                              </p>
+                            ))}
+                          </div>
+                        ) : (
+                          <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>No Sermon Prep usage recorded this month yet.</p>
+                        )}
+                      </div>
+                    ) : (
+                      <p style={settingsBodyTextStyle}>Loading usage…</p>
+                    )}
+                    {canManageBilling ? (
+                      <>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "end" }}>
+                          <label style={{ display: "grid", gap: 6 }}>
+                            <span style={{ fontSize: 12, color: "#5f6f86" }}>Monthly budget (USD)</span>
+                            <input
+                              type="number"
+                              min={0}
+                              step={0.01}
+                              value={sermonBudgetInput}
+                              onChange={(e) => setSermonBudgetInput(e.target.value)}
+                              style={{ ...settingsInlineFieldStyle, minWidth: 150 }}
+                            />
+                          </label>
+                          <button
+                            onClick={saveSermonBudget}
+                            disabled={sermonBudgetBusy || !resolvedOrgId}
+                            style={{
+                              ...settingsButtonPrimaryStyle,
+                              opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                              cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {sermonBudgetBusy ? "Saving..." : "Save Sermon Budget"}
+                          </button>
+                          <button
+                            onClick={() => {
+                              void loadSermonUsage();
+                            }}
+                            disabled={sermonBudgetBusy || !resolvedOrgId}
+                            style={{
+                              ...settingsButtonNeutralStyle,
+                              opacity: sermonBudgetBusy || !resolvedOrgId ? 0.6 : 1,
+                              cursor: sermonBudgetBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            Refresh Usage
+                          </button>
+                        </div>
+                        {sermonBudgetError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {sermonBudgetError}</p> : null}
+                        {sermonBudgetNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{sermonBudgetNotice}</p> : null}
+                      </>
+                    ) : null}
+                  </section>
+                </div>
+              </div>
+            ) : (
+              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: "#5f6f86" }}>
+                You do not have permission to view billing for this church.
               </div>
             )
           ) : null}
@@ -2429,6 +2810,25 @@ export default function HostChurchPage() {
             </section>
           )
         ) : null}
+
+        <section style={supportFooterStyle}>
+          <div style={{ display: "grid", gap: 4 }}>
+            <p style={{ margin: 0, fontSize: 16, fontWeight: 800, letterSpacing: "0.16em", textTransform: "uppercase", color: "#7c8ba3" }}>
+              Support
+            </p>
+            <p style={{ margin: 0, fontSize: 13, color: "#5f6f86", lineHeight: 1.6 }}>
+              Need help with billing, setup, team access, or translation quality? Contact support from here.
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              void router.push(dashboardContactHref);
+            }}
+            style={supportFooterLinkStyle}
+          >
+            Contact Us
+          </button>
+        </section>
       </div>
     </main>
   );

@@ -4,9 +4,9 @@ import { useRouter } from "next/router";
 import Script from "next/script";
 import { useEffect, useRef, useState } from "react";
 
-import { fetchAuthMe } from "../lib/backendAuth";
+import { fetchAuthMe, type OrgMembership } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
-import { pickPreferredMembership } from "../lib/dashboardRoute";
+import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../lib/dashboardRoute";
 
 type ContactTopic = "billing" | "setup" | "translation" | "bug" | "sales" | "account" | "other";
 
@@ -53,6 +53,7 @@ export default function ContactPage() {
   const [website, setWebsite] = useState("");
   const [turnstileReady, setTurnstileReady] = useState(false);
   const [turnstileToken, setTurnstileToken] = useState("");
+  const [preferredMembership, setPreferredMembership] = useState<OrgMembership | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [directEmail, setDirectEmail] = useState("");
@@ -80,6 +81,9 @@ export default function ContactPage() {
         if (!idToken || cancelled) return;
         const me = await fetchAuthMe(idToken);
         const membership = pickPreferredMembership(me) || me.memberships?.[0];
+        if (!cancelled) {
+          setPreferredMembership(membership || null);
+        }
         if (!cancelled && membership?.name && !organization) {
           setOrganization(membership.name);
         }
@@ -233,8 +237,7 @@ export default function ContactPage() {
       <main
         style={{
           minHeight: "100vh",
-          background:
-            "radial-gradient(circle at 8% 10%, rgba(154,179,219,0.28), transparent 28%), radial-gradient(circle at 90% 12%, rgba(223,190,131,0.18), transparent 24%), linear-gradient(180deg, #edf1f6 0%, #dfe6ef 54%, #d3dce7 100%)",
+          background: "linear-gradient(180deg, #edf1f6 0%, #dfe6ef 54%, #d3dce7 100%)",
           color: "#10213a",
           padding: "28px 16px 40px",
           fontFamily: "'Avenir Next', 'Segoe UI', sans-serif",
@@ -298,19 +301,45 @@ export default function ContactPage() {
               >
                 Back Home
               </Link>
-              <Link
-                href="/login"
-                style={{
-                  borderRadius: 999,
-                  padding: "12px 18px",
-                  background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                  color: "#f8fafc",
-                  fontWeight: 800,
-                  boxShadow: "0 14px 30px rgba(79,115,170,0.28)",
-                }}
-              >
-                Host Login
-              </Link>
+              {user ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (preferredMembership) {
+                      persistDashboardContext(preferredMembership);
+                      void router.push(buildDashboardHref(preferredMembership));
+                      return;
+                    }
+                    void router.push("/host");
+                  }}
+                  style={{
+                    borderRadius: 999,
+                    border: "none",
+                    padding: "12px 18px",
+                    background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
+                    color: "#f8fafc",
+                    fontWeight: 800,
+                    boxShadow: "0 14px 30px rgba(79,115,170,0.28)",
+                    cursor: "pointer",
+                  }}
+                >
+                  Open Dashboard
+                </button>
+              ) : (
+                <Link
+                  href="/login"
+                  style={{
+                    borderRadius: 999,
+                    padding: "12px 18px",
+                    background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
+                    color: "#f8fafc",
+                    fontWeight: 800,
+                    boxShadow: "0 14px 30px rgba(79,115,170,0.28)",
+                  }}
+                >
+                  Host Login
+                </Link>
+              )}
             </div>
           </header>
 
@@ -319,7 +348,7 @@ export default function ContactPage() {
               display: "grid",
               gap: 18,
               gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
-              alignItems: "start",
+              alignItems: "stretch",
             }}
           >
             <aside
@@ -327,10 +356,12 @@ export default function ContactPage() {
                 borderRadius: 30,
                 border: "1px solid rgba(255,255,255,0.82)",
                 background: "linear-gradient(145deg, rgba(248,251,254,0.96), rgba(228,235,244,0.9))",
-                boxShadow: "24px 24px 48px rgba(122,138,163,0.14), -16px -16px 30px rgba(255,255,255,0.76)",
+                boxShadow: "0 18px 36px rgba(122,138,163,0.12)",
                 padding: 22,
                 display: "grid",
                 gap: 16,
+                height: "100%",
+                alignContent: "start",
               }}
             >
               <div
@@ -345,12 +376,12 @@ export default function ContactPage() {
                   Support Topics
                 </p>
                 <h2 style={{ margin: "10px 0 0", fontSize: 30, lineHeight: 1.05, letterSpacing: "-0.05em" }}>
-                  Billing, onboarding, bugs, and church setup.
+                  Billing, setup, and bugs.
                 </h2>
               </div>
 
               <p style={{ margin: 0, fontSize: 15, lineHeight: 1.8, color: "#50627c" }}>
-                Use this form if you need help with billing, access, live translation quality, or getting a church workspace set up correctly.
+                Use this form for billing, access, setup, or translation issues.
               </p>
 
               <div style={{ display: "grid", gap: 12 }}>
@@ -381,10 +412,7 @@ export default function ContactPage() {
               >
                 <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#22344c" }}>Spam protection</p>
                 <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>
-                  Anonymous requests are throttled and screened before delivery. Logged-in users can submit with less friction.
-                </p>
-                <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>
-                  Messages are routed internally by topic. Billing requests go to the billing inbox, and other requests go to support.
+                  Anonymous requests are screened before delivery. Signed-in users can submit with less friction.
                 </p>
                 <div
                   style={{
@@ -398,7 +426,7 @@ export default function ContactPage() {
                 >
                   <p style={{ margin: 0, fontSize: 14, fontWeight: 800, color: "#22344c" }}>Prefer direct email?</p>
                   <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7, color: "#5d6d84" }}>
-                    Keep using the form if possible. If you need a direct address, reveal the support inbox below.
+                    Use the form when possible. If needed, reveal the support inbox below.
                   </p>
                   {directEmail ? (
                     <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
@@ -461,10 +489,12 @@ export default function ContactPage() {
                 borderRadius: 30,
                 border: "1px solid rgba(255,255,255,0.82)",
                 background: "linear-gradient(145deg, rgba(248,251,254,0.96), rgba(228,235,244,0.9))",
-                boxShadow: "24px 24px 48px rgba(122,138,163,0.14), -16px -16px 30px rgba(255,255,255,0.76)",
+                boxShadow: "0 18px 36px rgba(122,138,163,0.12)",
                 padding: 22,
                 display: "grid",
                 gap: 16,
+                height: "100%",
+                alignContent: "start",
               }}
             >
               <div
@@ -479,7 +509,7 @@ export default function ContactPage() {
                   Submit Request
                 </p>
                 <h2 style={{ margin: "10px 0 0", fontSize: 30, lineHeight: 1.05, letterSpacing: "-0.05em" }}>
-                  Tell us what is blocked.
+                  Describe the issue.
                 </h2>
               </div>
 
@@ -556,7 +586,7 @@ export default function ContactPage() {
                     required
                     minLength={20}
                     rows={8}
-                    placeholder="Describe the issue, what you expected, and which church or page is affected."
+                    placeholder="Describe the issue and which church or page is affected."
                     style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.92)", background: "rgba(247,250,253,0.86)", color: "#20324a", padding: "12px 14px", resize: "vertical" }}
                   />
                 </label>
@@ -589,7 +619,7 @@ export default function ContactPage() {
 
                 <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                   <p style={{ margin: 0, fontSize: 13, color: "#6b7b92" }}>
-                    Choose the closest topic and the message will be routed to the right internal inbox.
+                    Choose the closest topic so support can route it faster.
                   </p>
                   <button
                     type="submit"

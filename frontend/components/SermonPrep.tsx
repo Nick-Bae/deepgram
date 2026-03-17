@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/router";
 
 import { useAuth } from "../lib/authContext";
@@ -9,6 +9,9 @@ import { draftOrgSermon, finalizeOrgSermon, type SermonDraftSegment } from "../l
 type Props = {
   orgId: string;
 };
+
+const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
+const DEFAULT_PAGE_SIZE = 50;
 
 function buildDefaultSermonId(): string {
   const now = new Date();
@@ -31,9 +34,27 @@ export default function SermonPrep({ orgId }: Props) {
   const [busyDraft, setBusyDraft] = useState(false);
   const [busySave, setBusySave] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
+  const [page, setPage] = useState(1);
+  const [jumpRow, setJumpRow] = useState("");
 
   const readyCount = useMemo(() => segments.filter((row) => row.en.trim().length > 0).length, [segments]);
   const allRowsReady = segments.length > 0 && readyCount === segments.length;
+  const firstIncompleteRowId = useMemo(
+    () => segments.find((row) => !row.en.trim())?.id ?? null,
+    [segments],
+  );
+  const totalPages = useMemo(
+    () => Math.max(1, Math.ceil(Math.max(segments.length, 1) / pageSize)),
+    [pageSize, segments.length],
+  );
+  const currentPage = Math.min(page, totalPages);
+  const currentPageStart = (currentPage - 1) * pageSize;
+  const currentPageEnd = Math.min(currentPageStart + pageSize, segments.length);
+  const visibleSegments = useMemo(
+    () => segments.slice(currentPageStart, currentPageEnd),
+    [currentPageEnd, currentPageStart, segments],
+  );
 
   const statusTone = message?.startsWith("✅")
     ? "text-emerald-700"
@@ -57,6 +78,14 @@ export default function SermonPrep({ orgId }: Props) {
     }),
     [langSrc, langTgt, segments, sermonId, threshold],
   );
+
+  useEffect(() => {
+    setPage(1);
+  }, [segments.length]);
+
+  useEffect(() => {
+    setPage((prev) => Math.min(prev, totalPages));
+  }, [totalPages]);
 
   const isSessionExpiredError = useCallback((raw: string): boolean => {
     const msg = (raw || "").toLowerCase();
@@ -107,7 +136,7 @@ export default function SermonPrep({ orgId }: Props) {
     }
 
     setBusyDraft(true);
-    setMessage("⏳ Generating draft...");
+    setMessage("⏳ Generating draft... Larger sermons can take a few minutes.");
     try {
       const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
@@ -143,6 +172,26 @@ export default function SermonPrep({ orgId }: Props) {
   const updateEnglish = (id: number, next: string) => {
     setSegments((prev) => prev.map((row) => (row.id === id ? { ...row, en: next } : row)));
   };
+
+  const goToPage = (nextPage: number) => {
+    setPage(Math.min(Math.max(nextPage, 1), totalPages));
+  };
+
+  const goToRow = () => {
+    const parsed = Number(jumpRow);
+    if (!Number.isFinite(parsed)) return;
+    const normalized = Math.floor(parsed);
+    if (normalized < 1 || normalized > segments.length) return;
+    goToPage(Math.ceil(normalized / pageSize));
+  };
+
+  const goToFirstIncomplete = () => {
+    if (!firstIncompleteRowId) return;
+    goToPage(Math.ceil(firstIncompleteRowId / pageSize));
+  };
+
+  const rangeLabel =
+    segments.length > 0 ? `Rows ${currentPageStart + 1}-${currentPageEnd} of ${segments.length}` : "No rows yet";
 
   const onSaveFinal = async () => {
     if (!orgId) {
@@ -310,36 +359,109 @@ export default function SermonPrep({ orgId }: Props) {
       ) : null}
 
       {segments.length ? (
-        <div className="mt-4 overflow-x-auto rounded-2xl border border-white/10">
-          <table className="min-w-full border-collapse text-left text-sm text-slate-800">
-            <thead className="bg-slate-100 text-slate-700">
-              <tr>
-                <th className="w-16 border-b border-white/10 px-3 py-2">#</th>
-                <th className="w-1/2 border-b border-white/10 px-3 py-2">Korean (read-only)</th>
-                <th className="w-1/2 border-b border-white/10 px-3 py-2">English (editable)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {segments.map((row) => (
-                <tr key={row.id} className="align-top">
-                  <td className="border-b border-white/10 px-3 py-3 text-slate-500">{row.id}</td>
-                  <td className="border-b border-white/10 px-3 py-3">
-                    <div className="min-h-[82px] rounded-xl border border-white/10 bg-black/35 px-3 py-2 leading-relaxed text-white/90">
-                      {row.ko}
+        <div className="mt-4 space-y-3">
+          <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-slate-100 px-4 py-3 text-sm text-slate-700">
+            <span className="font-medium text-slate-900">{rangeLabel}</span>
+            <span className="text-slate-500">Page {currentPage} of {totalPages}</span>
+            <label className="inline-flex items-center gap-2">
+              <span>Rows/page</span>
+              <select
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(Number(e.target.value) || DEFAULT_PAGE_SIZE);
+                  setPage(1);
+                }}
+                className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900 focus:border-sky-500 focus:outline-none"
+              >
+                {PAGE_SIZE_OPTIONS.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => goToPage(currentPage - 1)}
+              disabled={currentPage <= 1}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => goToPage(currentPage + 1)}
+              disabled={currentPage >= totalPages}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Next
+            </button>
+            <label className="inline-flex items-center gap-2">
+              <span>Jump to row</span>
+              <input
+                value={jumpRow}
+                onChange={(e) => setJumpRow(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    goToRow();
+                  }
+                }}
+                inputMode="numeric"
+                placeholder="e.g. 320"
+                className="w-24 rounded-lg border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900 focus:border-sky-500 focus:outline-none"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={goToRow}
+              disabled={!segments.length}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Go
+            </button>
+            <button
+              type="button"
+              onClick={goToFirstIncomplete}
+              disabled={!firstIncompleteRowId}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              First incomplete
+            </button>
+          </div>
+
+          <div className="overflow-x-auto rounded-2xl border border-white/10">
+            <div className="min-w-[900px]">
+              <div className="grid grid-cols-[56px_minmax(0,1fr)_minmax(0,1fr)] bg-slate-100 text-left text-sm text-slate-700">
+                <div className="border-b border-white/10 px-3 py-2 font-semibold">#</div>
+                <div className="border-b border-white/10 px-3 py-2 font-semibold">Korean (read-only)</div>
+                <div className="border-b border-white/10 px-3 py-2 font-semibold">English (editable)</div>
+              </div>
+              <div className="divide-y divide-white/10">
+                {visibleSegments.map((row) => (
+                  <div
+                    key={row.id}
+                    className="grid grid-cols-[56px_minmax(0,1fr)_minmax(0,1fr)] items-start text-left text-sm text-slate-800"
+                  >
+                    <div className="px-3 py-3 text-slate-500">{row.id}</div>
+                    <div className="min-w-0 px-3 py-3">
+                      <div className="min-h-[82px] whitespace-pre-wrap break-words rounded-xl border border-white/10 bg-black/35 px-3 py-2 leading-relaxed text-white/90">
+                        {row.ko}
+                      </div>
                     </div>
-                  </td>
-                  <td className="border-b border-white/10 px-3 py-3">
-                    <textarea
-                      value={row.en}
-                      onChange={(e) => updateEnglish(row.id, e.target.value)}
-                      rows={3}
-                      className="w-full resize-y rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white focus:border-[#22d3ee] focus:outline-none"
-                    />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                    <div className="min-w-0 px-3 py-3">
+                      <textarea
+                        value={row.en}
+                        onChange={(e) => updateEnglish(row.id, e.target.value)}
+                        rows={3}
+                        className="min-h-[82px] w-full resize-y rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white focus:border-[#22d3ee] focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
       ) : null}
 

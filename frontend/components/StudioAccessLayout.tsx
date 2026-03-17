@@ -29,8 +29,7 @@ type StudioAccessLayoutProps = {
 
 export const studioPageStyle: CSSProperties = {
   minHeight: "100vh",
-  background:
-    "radial-gradient(circle at 8% 10%, rgba(154,179,219,0.28), transparent 28%), radial-gradient(circle at 90% 12%, rgba(223,190,131,0.18), transparent 24%), linear-gradient(180deg, #edf1f6 0%, #dfe6ef 54%, #d3dce7 100%)",
+  background: "linear-gradient(180deg, #edf1f6 0%, #dfe6ef 54%, #d3dce7 100%)",
   color: "#10213a",
   padding: "28px 16px 40px",
   fontFamily: "'Avenir Next', 'Segoe UI', sans-serif",
@@ -40,22 +39,16 @@ export const studioCardStyle: CSSProperties = {
   position: "relative",
   overflow: "hidden",
   border: "1px solid rgba(255,255,255,0.66)",
-  background:
-    "radial-gradient(circle at 14% 12%, rgba(255,255,255,0.34) 0%, rgba(255,255,255,0) 32%), linear-gradient(180deg, rgba(248,251,255,0.68) 0%, rgba(230,237,246,0.42) 54%, rgba(213,223,236,0.26) 100%)",
-  boxShadow:
-    "inset 0 1px 0 rgba(255,255,255,0.54), inset 0 -20px 28px rgba(108,126,156,0.08), 0 0 0 1px rgba(255,255,255,0.2), 0 28px 54px rgba(88,106,137,0.16)",
-  backdropFilter: "blur(24px)",
+  background: "linear-gradient(180deg, rgba(248,251,255,0.84) 0%, rgba(230,237,246,0.68) 54%, rgba(213,223,236,0.54) 100%)",
+  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.54), 0 24px 48px rgba(88,106,137,0.14)",
 };
 
 export const studioInnerCardStyle: CSSProperties = {
   position: "relative",
   overflow: "hidden",
   border: "1px solid rgba(255,255,255,0.58)",
-  background:
-    "radial-gradient(circle at 16% 10%, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0) 30%), linear-gradient(180deg, rgba(255,255,255,0.52) 0%, rgba(235,241,249,0.34) 58%, rgba(217,227,239,0.2) 100%)",
-  boxShadow:
-    "inset 0 1px 0 rgba(255,255,255,0.54), inset 0 -14px 22px rgba(110,128,158,0.06), 0 18px 30px rgba(102,120,151,0.1)",
-  backdropFilter: "blur(16px)",
+  background: "linear-gradient(180deg, rgba(255,255,255,0.62) 0%, rgba(235,241,249,0.5) 58%, rgba(217,227,239,0.34) 100%)",
+  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.54), 0 16px 28px rgba(102,120,151,0.08)",
 };
 
 export const studioLabelStyle: CSSProperties = {
@@ -114,7 +107,7 @@ export function buildStudioButtonStyle(options?: {
       padding,
       cursor: disabled ? "not-allowed" : "pointer",
       opacity: disabled ? 0.6 : 1,
-      boxShadow: "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.76)",
+      boxShadow: "0 8px 16px rgba(122,138,163,0.08)",
       display: "inline-flex",
       alignItems: "center",
       justifyContent: "center",

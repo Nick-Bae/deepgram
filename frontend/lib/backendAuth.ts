@@ -233,7 +233,8 @@ export type OrgSermonUsageResponse = {
 const AUTH_FETCH_TIMEOUT_MS = 15000;
 const SLUG_FETCH_TIMEOUT_MS = 8000;
 const PROMPT_FETCH_TIMEOUT_MS = 30000;
-const SERMON_FETCH_TIMEOUT_MS = 120000;
+const SERMON_DRAFT_FETCH_TIMEOUT_MS = 300000;
+const SERMON_FINALIZE_FETCH_TIMEOUT_MS = 120000;
 const AUTH_ME_CACHE_TTL_MS = 10000;
 
 type AuthRequestInit = RequestInit & {
@@ -661,7 +662,7 @@ export function draftOrgSermon(
 ): Promise<OrgSermonDraftResponse> {
   return authFetch<OrgSermonDraftResponse>(`/api/org/${encodeURIComponent(orgId)}/sermon/draft`, idToken, {
     method: "POST",
-    timeoutMs: SERMON_FETCH_TIMEOUT_MS,
+    timeoutMs: SERMON_DRAFT_FETCH_TIMEOUT_MS,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       sermon_id: payload.sermon_id,
@@ -687,7 +688,7 @@ export function finalizeOrgSermon(
 ): Promise<OrgSermonFinalizeResponse> {
   return authFetch<OrgSermonFinalizeResponse>(`/api/org/${encodeURIComponent(orgId)}/sermon/finalize`, idToken, {
     method: "POST",
-    timeoutMs: SERMON_FETCH_TIMEOUT_MS,
+    timeoutMs: SERMON_FINALIZE_FETCH_TIMEOUT_MS,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       sermon_id: payload.sermon_id,

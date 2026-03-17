@@ -165,6 +165,16 @@ class ScriptRouteTests(unittest.TestCase):
         self.assertEqual(segments[0]["ko"], "오늘 본문은 역대하 마지막 장입니다.")
         self.assertEqual(segments[0]["en"], "EN::오늘 본문은 역대하 마지막 장입니다.")
 
+    def test_sermon_translation_concurrency_scales_for_long_drafts(self) -> None:
+        with patch.object(script_routes, "SERMON_TRANSLATION_CONCURRENCY", 2):
+            self.assertEqual(script_routes._resolve_sermon_translation_concurrency(0), 2)
+            self.assertEqual(script_routes._resolve_sermon_translation_concurrency(20), 2)
+            self.assertEqual(script_routes._resolve_sermon_translation_concurrency(21), 3)
+            self.assertEqual(script_routes._resolve_sermon_translation_concurrency(41), 4)
+            self.assertEqual(script_routes._resolve_sermon_translation_concurrency(61), 5)
+            self.assertEqual(script_routes._resolve_sermon_translation_concurrency(81), 6)
+            self.assertEqual(script_routes._resolve_sermon_translation_concurrency(500), 6)
+
     def test_sermon_finalize_saves_sermon_and_pairs(self) -> None:
         org_id = _bootstrap_owner(self.members, owner_uid="owner-sermon-b", slug="sermon-org-b", name="Sermon Org B")
         finalized = script_routes.finalize_sermon(

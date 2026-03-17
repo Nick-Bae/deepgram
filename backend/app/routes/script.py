@@ -33,6 +33,13 @@ def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
 SERMON_TRANSLATION_CONCURRENCY = _env_int("SERMON_TRANSLATION_CONCURRENCY", 2, min_value=1, max_value=6)
 
 
+def _resolve_sermon_translation_concurrency(segment_count: int) -> int:
+    if segment_count <= 0:
+        return SERMON_TRANSLATION_CONCURRENCY
+    extra_workers = max(0, (segment_count - 1) // 20)
+    return min(6, SERMON_TRANSLATION_CONCURRENCY + extra_workers)
+
+
 class Pair(BaseModel):
     source: str = Field(..., min_length=1, description="Korean source text")
     target: str = Field(..., min_length=1, description="English target text")
@@ -95,7 +102,7 @@ async def _translate_segments(
     org_id: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     custom_prompt, service_prompt = _resolve_org_prompt_overrides(org_id)
-    semaphore = asyncio.Semaphore(SERMON_TRANSLATION_CONCURRENCY)
+    semaphore = asyncio.Semaphore(_resolve_sermon_translation_concurrency(len(segments)))
 
     async def _translate_one(idx: int, source_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
         async with semaphore:
