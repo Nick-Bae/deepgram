@@ -35,7 +35,7 @@ async def translate(
     data: dict,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
-    text = (data.get("text") or "").trim() if hasattr(str, "trim") else (data.get("text") or "").strip()
+    text = (data.get("text") or "").strip()
     source = (data.get("source") or "ko").strip()
     target = (data.get("target") or "en").strip()
     is_final = bool(data.get("final", False))
@@ -73,9 +73,9 @@ async def translate(
                 service_prompt=service_prompt_override,
             )
         )
-    except Exception as e:
+    except Exception:
         logger.exception("translate_text raised")
-        raise HTTPException(status_code=500, detail=f"translator_error: {e}")
+        raise HTTPException(status_code=500, detail="translation_failed")
 
     dt_ms = int((perf_counter() - t0) * 1000)
 

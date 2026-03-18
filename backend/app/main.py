@@ -113,6 +113,12 @@ _tx_window_lock = Lock()
 _tx_window_entries: dict[str, deque[dict[str, float]]] = {}
 _room_sweeper_task: asyncio.Task | None = None
 
+# Per-IP concurrent connection limit for unauthenticated /ws/translate viewers.
+# Prevents a single IP from exhausting the connection manager.
+_WS_VIEWER_MAX_CONNS_PER_IP = _env_int("WS_VIEWER_MAX_CONNS_PER_IP", 20, min_value=1, max_value=500)
+_ws_viewer_ip_conns: dict[str, int] = {}
+_ws_viewer_ip_lock = Lock()
+
 
 # Localhost-only defaults — used in local development when no env var is set.
 # Raw IP addresses are intentionally excluded: browsers treat http://127.0.0.1
@@ -643,6 +649,18 @@ async def ws_translate(ws: WebSocket):
         await ws.close(code=1008)
         return
 
+    # Per-IP concurrent connection limit — prevents a single client from exhausting
+    # the connection manager before authentication completes.
+    _viewer_ip = _security_client_ip(ws)
+    with _ws_viewer_ip_lock:
+        _current = _ws_viewer_ip_conns.get(_viewer_ip, 0)
+        if _current >= _WS_VIEWER_MAX_CONNS_PER_IP:
+            security_event("ws_conn_limit", path="/ws/translate", ip=_viewer_ip,
+                           detail=f"limit={_WS_VIEWER_MAX_CONNS_PER_IP}")
+            await ws.close(code=1008)
+            return
+        _ws_viewer_ip_conns[_viewer_ip] = _current + 1
+
     await manager.connect(ws)
     display_config = {"type": "display_config", "speed": APP_DISPLAY_SPEED["speed"]}
     try:
@@ -909,12 +927,11 @@ async def ws_translate(ws: WebSocket):
                 joined_church_slug = _clean_token(msg.get("churchSlug") or msg.get("church_slug") or msg.get("slug")) or joined_church_slug
                 req_org_id = _clean_token(msg.get("orgId") or msg.get("org_id")) or joined_org_id
                 req_room_id = _clean_token(msg.get("roomId") or msg.get("room_id")) or joined_room_id
-                host_uid, host_token, id_token = _host_claims_from_payload(msg, qctx)
+                _host_uid_unused, host_token, id_token = _host_claims_from_payload(msg, qctx)
                 verified_uid = _uid_from_id_token(id_token)
                 if verified_uid:
                     host_uid_claim = verified_uid
-                elif host_uid:
-                    host_uid_claim = host_uid
+                # Unverified hostUid from message payload is intentionally ignored
                 if host_token:
                     host_token_claim = host_token
                 resolved_org_id, resolved_room_id = _resolve_room_context(
@@ -995,6 +1012,12 @@ async def ws_translate(ws: WebSocket):
                 await handle_commit(msg, is_partial=True)
                 continue
     finally:
+        with _ws_viewer_ip_lock:
+            _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
+            if _remaining <= 0:
+                _ws_viewer_ip_conns.pop(_viewer_ip, None)
+            else:
+                _ws_viewer_ip_conns[_viewer_ip] = _remaining
         room_before = manager.get_room(ws)
         manager.disconnect(ws)
         if room_before:
@@ -1627,31 +1650,6 @@ async def ws_stt_deepgram(websocket: WebSocket):
     except:
         pass
 
-# ------------------------------------------------------------------------------
-# Quick debug to prove the FE consumer is listening
-# ------------------------------------------------------------------------------
-@app.get("/debug/broadcast")
-async def debug_broadcast(org_id: Optional[str] = Query(default=None), room_id: Optional[str] = Query(default=None)):
-    msg_new = {"mode": "live", "text": "**TEST BROADCAST**", "seq": 999, "tgt": {"lang": "en"}}
-    msg_legacy = {
-        "type": "translation",
-        "payload": "**TEST BROADCAST**",
-        "lang": "en",
-        "meta": {"mode": "realtime", "partial": False, "segment_id": 999, "rev": 0, "seq": 999},
-    }
-    clean_org = _clean_token(org_id)
-    clean_room = _clean_token(room_id)
-    if clean_org and clean_room:
-        msg_new["orgId"] = clean_org
-        msg_new["roomId"] = clean_room
-        msg_legacy["orgId"] = clean_org
-        msg_legacy["roomId"] = clean_room
-        await manager.broadcast_room(clean_org, clean_room, msg_new)
-        await manager.broadcast_room(clean_org, clean_room, msg_legacy)
-        return {"ok": True, "scoped": True, "orgId": clean_org, "roomId": clean_room}
-    await manager.broadcast(msg_new)
-    await manager.broadcast(msg_legacy)
-    return {"ok": True, "scoped": False}
 DEFAULT_DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 
 

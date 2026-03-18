@@ -4,15 +4,30 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app import validators
 from app.security_log import security_event, client_ip as _client_ip
+
+logger = logging.getLogger(__name__)
+
+
+def _validate_redirect_url(url: str) -> str:
+    """Accept only http(s) URLs; reject javascript:, data:, protocol-relative, etc."""
+    stripped = (url or "").strip()
+    parsed = urlsplit(stripped)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("redirect_url_must_be_http_or_https")
+    if not parsed.netloc:
+        raise ValueError("redirect_url_invalid_host")
+    return stripped
 
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.auth.guards import require_org_role
@@ -35,10 +50,20 @@ class CheckoutSessionRequest(BaseModel):
     successUrl: str = Field(..., min_length=8, max_length=2048)
     cancelUrl: str = Field(..., min_length=8, max_length=2048)
 
+    @field_validator("successUrl", "cancelUrl")
+    @classmethod
+    def _check_redirect_url(cls, v: str) -> str:
+        return _validate_redirect_url(v)
+
 
 class PortalSessionRequest(BaseModel):
     orgId: str = Field(..., min_length=2, max_length=120, pattern=validators.ORG_ID)
     returnUrl: str = Field(..., min_length=8, max_length=2048)
+
+    @field_validator("returnUrl")
+    @classmethod
+    def _check_redirect_url(cls, v: str) -> str:
+        return _validate_redirect_url(v)
 
 
 def _clean(value: Any) -> str:
@@ -456,7 +481,8 @@ def billing_status(
         )
     except StripeClientError as exc:
         if refresh:
-            raise HTTPException(status_code=502, detail=str(exc) or "stripe_sync_failed") from exc
+            logger.warning("stripe_sync_failed org=%s: %s", org_id, exc)
+            raise HTTPException(status_code=502, detail="stripe_sync_failed") from exc
         # Keep returning local billing snapshot even if Stripe sync is temporarily unavailable.
     except ValueError as exc:
         if refresh:
@@ -549,9 +575,11 @@ def create_checkout_session(
                     metadata={"orgId": body.orgId, "planKey": target_plan.key, "requestedByUid": user.uid},
                 )
             except StripeClientError as retry_exc:
-                raise HTTPException(status_code=502, detail=str(retry_exc)) from retry_exc
+                logger.warning("stripe_checkout_failed (retry) org=%s: %s", body.orgId, retry_exc)
+                raise HTTPException(status_code=502, detail="stripe_checkout_failed") from retry_exc
         else:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            logger.warning("stripe_checkout_failed org=%s: %s", body.orgId, exc)
+            raise HTTPException(status_code=502, detail="stripe_checkout_failed") from exc
 
     checkout_url = _clean((session or {}).get("url"))
     session_id = _clean((session or {}).get("id"))
@@ -591,7 +619,8 @@ def create_portal_session(
         if _is_missing_customer_error(exc):
             _clear_stale_stripe_refs(org_id=body.orgId, billing=billing)
             raise HTTPException(status_code=404, detail="billing_customer_not_found") from exc
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.warning("stripe_portal_failed org=%s: %s", body.orgId, exc)
+        raise HTTPException(status_code=502, detail="stripe_portal_failed") from exc
 
     portal_url = _clean((session or {}).get("url"))
     if not portal_url:
@@ -627,7 +656,10 @@ async def stripe_webhook(
             payload={"type": event_type},
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc) or "invalid_webhook_event") from exc
+        detail = str(exc)
+        if detail in {"invalid_event_id", "invalid_event_type"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=400, detail="invalid_webhook_event") from exc
     if not fresh:
         return {"ok": True, "deduped": True}
 
