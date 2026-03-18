@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field
 
+from app import validators
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.services.multichurch_store import multichurch_store
 
@@ -10,8 +11,8 @@ router = APIRouter()
 
 
 class StartServiceRequest(BaseModel):
-    source: str = Field(default="ko", min_length=2, max_length=20)
-    target: str = Field(default="en", min_length=2, max_length=20)
+    source: str = Field(default="ko", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    target: str = Field(default="en", min_length=2, max_length=20, pattern=validators.LANG_CODE)
     hostUid: str | None = Field(default=None)
     hostToken: str | None = Field(default=None)
     host_token: str | None = Field(default=None)
@@ -28,11 +29,11 @@ class EndRoomRequest(BaseModel):
 
 
 class CreateServiceRequest(BaseModel):
-    serviceKey: str = Field(..., min_length=2, max_length=80)
+    serviceKey: str = Field(..., min_length=2, max_length=80, pattern=validators.SERVICE_KEY)
     title: str | None = Field(default=None, min_length=1, max_length=120)
     timezone: str | None = Field(default=None, min_length=2, max_length=80)
-    source: str = Field(default="ko", min_length=2, max_length=20)
-    target: str = Field(default="en", min_length=2, max_length=20)
+    source: str = Field(default="ko", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    target: str = Field(default="en", min_length=2, max_length=20, pattern=validators.LANG_CODE)
 
 
 class UpdateOrgProfileRequest(BaseModel):
@@ -77,7 +78,10 @@ def _start_service_for_org(
 
 
 @router.get("/c/{slug}/s/{service_key}/resolve")
-def resolve_service(slug: str, service_key: str):
+def resolve_service(
+    slug: str = Path(pattern=validators.CHURCH_SLUG),
+    service_key: str = Path(pattern=validators.SERVICE_KEY),
+):
     data = multichurch_store.resolve_service(slug=slug, service_key=service_key)
     if not data:
         raise HTTPException(status_code=404, detail="service_not_found")
@@ -85,7 +89,7 @@ def resolve_service(slug: str, service_key: str):
 
 
 @router.get("/c/{slug}/services")
-def list_services(slug: str):
+def list_services(slug: str = Path(pattern=validators.CHURCH_SLUG)):
     data = multichurch_store.list_services(slug=slug)
     if not data:
         raise HTTPException(status_code=404, detail="org_not_found")
@@ -94,7 +98,8 @@ def list_services(slug: str):
 
 @router.post("/org/{org_id}/services")
 def create_service(
-    org_id: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
     payload: CreateServiceRequest,
     current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -131,8 +136,9 @@ def create_service(
 
 @router.delete("/org/{org_id}/services/{service_key}")
 def delete_service(
-    org_id: str,
-    service_key: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
+    service_key: str = Path(pattern=validators.SERVICE_KEY),
     current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     try:
@@ -156,7 +162,8 @@ def delete_service(
 
 @router.post("/org/{org_id}/profile")
 def update_org_profile(
-    org_id: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
     payload: UpdateOrgProfileRequest,
     current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -179,8 +186,9 @@ def update_org_profile(
 
 @router.post("/org/{org_id}/service/{service_key}/start")
 def start_service(
-    org_id: str,
-    service_key: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
+    service_key: str = Path(pattern=validators.SERVICE_KEY),
     payload: StartServiceRequest,
     current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -194,8 +202,9 @@ def start_service(
 
 @router.post("/c/{slug}/service/{service_key}/start")
 def start_service_by_slug(
-    slug: str,
-    service_key: str,
+    *,
+    slug: str = Path(pattern=validators.CHURCH_SLUG),
+    service_key: str = Path(pattern=validators.SERVICE_KEY),
     payload: StartServiceRequest,
     current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -215,8 +224,9 @@ def start_service_by_slug(
 
 @router.post("/org/{org_id}/room/{room_id}/end")
 def end_room(
-    org_id: str,
-    room_id: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
+    room_id: str = Path(pattern=validators.ORG_ID),
     payload: EndRoomRequest,
     current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):

@@ -1,6 +1,7 @@
 // utils/useSubtitleSocket.ts
 import { useEffect, useMemo, useRef, useState } from "react";
 import { appendStreamContextToUrl, resolveStreamContext, type StreamContext } from "./streamContext";
+import { enforceSecureProtocol } from "./urls";
 
 type InterimKR = { type: "interim_kr"; text: string };
 type FinalKR   = { type: "final_kr";  text: string };
@@ -65,7 +66,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     if (explicitUrl) return appendStreamContextToUrl(explicitUrl, streamContext, { role: "viewer" });
 
     const env = process.env.NEXT_PUBLIC_WS_URL;
-    if (env && /^wss?:\/\//i.test(env)) return appendStreamContextToUrl(env, streamContext, { role: "viewer" });
+    if (env && /^wss?:\/\//i.test(env)) return appendStreamContextToUrl(enforceSecureProtocol(env), streamContext, { role: "viewer" });
 
     if (typeof window !== "undefined") {
       const { protocol, host } = window.location;

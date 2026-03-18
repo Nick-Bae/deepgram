@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app import validators
 from app.auth.guards import require_org_role, resolve_default_org_id_for_roles
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.env import ENV
@@ -51,12 +52,12 @@ class UploadPayload(BaseModel):
 
 
 class SermonDraftRequest(BaseModel):
-    sermon_id: str = Field(..., min_length=1, max_length=120)
+    sermon_id: str = Field(..., min_length=1, max_length=120, pattern=validators.SERMON_ID)
     korean: str = Field(..., min_length=1)
     auto_split: bool = True
     threshold: float = Field(default=0.8, ge=0.0, le=1.0)
-    lang_src: str = Field(default="ko", min_length=2, max_length=20)
-    lang_tgt: str = Field(default="en", min_length=2, max_length=20)
+    lang_src: str = Field(default="ko", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    lang_tgt: str = Field(default="en", min_length=2, max_length=20, pattern=validators.LANG_CODE)
 
 
 class SermonSegment(BaseModel):
@@ -66,10 +67,10 @@ class SermonSegment(BaseModel):
 
 
 class SermonFinalizeRequest(BaseModel):
-    sermon_id: str = Field(..., min_length=1, max_length=120)
+    sermon_id: str = Field(..., min_length=1, max_length=120, pattern=validators.SERMON_ID)
     threshold: float = Field(default=0.8, ge=0.0, le=1.0)
-    lang_src: str = Field(default="ko", min_length=2, max_length=20)
-    lang_tgt: str = Field(default="en", min_length=2, max_length=20)
+    lang_src: str = Field(default="ko", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    lang_tgt: str = Field(default="en", min_length=2, max_length=20, pattern=validators.LANG_CODE)
     segments: list[SermonSegment] = Field(default_factory=list)
 
 

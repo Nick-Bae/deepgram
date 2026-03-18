@@ -9,8 +9,11 @@ from threading import Lock
 from typing import Deque, Dict, Tuple
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
+
+from app import validators
+from app.security_log import security_event
 
 from app.auth.firebase_auth import (
     AuthenticatedUser,
@@ -64,6 +67,7 @@ def _enforce_invite_rate_limit(uid: str, *, action: str, max_hits: int) -> None:
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
         if len(bucket) >= max_hits:
+            security_event("rate_limit_hit", detail="invite_rate_limited", uid=clean_uid, action=action)
             raise HTTPException(status_code=429, detail="invite_rate_limited")
         bucket.append(now)
         if len(_invite_rate_hits) > 4096:
@@ -74,18 +78,18 @@ def _enforce_invite_rate_limit(uid: str, *, action: str, max_hits: int) -> None:
 
 class BootstrapOwnerRequest(BaseModel):
     churchName: str = Field(..., min_length=2, max_length=120)
-    churchSlug: str = Field(..., min_length=2, max_length=80)
+    churchSlug: str = Field(..., min_length=2, max_length=80, pattern=validators.CHURCH_SLUG)
     timezone: str = Field(default="America/Chicago", min_length=2, max_length=80)
-    source: str = Field(default="ko", min_length=2, max_length=20)
-    target: str = Field(default="en", min_length=2, max_length=20)
+    source: str = Field(default="ko", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    target: str = Field(default="en", min_length=2, max_length=20, pattern=validators.LANG_CODE)
 
 
 class SetCurrentOrgRequest(BaseModel):
-    orgId: str = Field(..., min_length=2, max_length=120)
+    orgId: str = Field(..., min_length=2, max_length=120, pattern=validators.ORG_ID)
 
 
 class CreateInviteRequest(BaseModel):
-    role: str = Field(default="host", min_length=4, max_length=20)
+    role: str = Field(default="host", min_length=4, max_length=20, pattern=validators.ROLE)
     expiresHours: int = Field(default=DEFAULT_INVITE_EXPIRY_HOURS, ge=1, le=24 * 30)
 
 
@@ -114,13 +118,37 @@ def _sanitize_auth_payload(payload: dict) -> dict:
     return item
 
 
+# Number of trusted reverse proxies (e.g. nginx, load balancer) that sit between
+# the internet and this app.  Set TRUSTED_PROXY_COUNT=1 when running behind one
+# proxy, 2 for two, etc.  Defaults to 0 (direct connection — XFF is ignored).
+#
+# XFF format: "client, proxy1, proxy2"  (proxies append to the right)
+# With N trusted proxies the true client IP is at parts[-N] (Nth from the right),
+# because the rightmost N entries were added by our own infrastructure.
+_TRUSTED_PROXY_COUNT: int = max(
+    0, _env_int("TRUSTED_PROXY_COUNT", 0, min_value=0, max_value=10)
+)
+_IP_RE = re.compile(r"^[\d.]+$|^[0-9a-fA-F:]+$")  # rough IPv4 / IPv6 check
+
+
 def _client_ip(request: Request) -> str:
-    forwarded = (request.headers.get("x-forwarded-for") or "").strip()
-    if forwarded:
-        return forwarded.split(",")[0].strip() or "unknown"
-    real_ip = (request.headers.get("x-real-ip") or "").strip()
-    if real_ip:
-        return real_ip
+    if _TRUSTED_PROXY_COUNT > 0:
+        forwarded = (request.headers.get("x-forwarded-for") or "").strip()
+        if forwarded:
+            parts = [p.strip() for p in forwarded.split(",")]
+            # XFF is built left-to-right as the request travels through proxies:
+            #   "client, proxy1, proxy2, ..."
+            # Each trusted proxy appends the previous hop's IP, so with N trusted
+            # proxies the true client IP is at parts[-N] (Nth from the right).
+            # Entries to the left of that position are attacker-controlled and ignored.
+            idx = len(parts) - _TRUSTED_PROXY_COUNT
+            if idx >= 0:
+                ip = parts[idx]
+                if ip and _IP_RE.match(ip):
+                    return ip
+
+    # Default / fallback: use the direct TCP connection address, which cannot
+    # be spoofed by the client regardless of what headers they send.
     client = getattr(request, "client", None)
     host = getattr(client, "host", None)
     return str(host or "unknown")
@@ -139,6 +167,7 @@ def _enforce_password_reset_rate_limit(ip: str, email: str) -> None:
         while ip_bucket and ip_bucket[0] <= cutoff:
             ip_bucket.popleft()
         if len(ip_bucket) >= _PASSWORD_RESET_RATE_MAX_PER_IP:
+            security_event("rate_limit_hit", detail="password_reset_rate_limited_by_ip", ip=clean_ip)
             raise HTTPException(status_code=429, detail="password_reset_rate_limited")
         ip_bucket.append(now)
 
@@ -149,6 +178,7 @@ def _enforce_password_reset_rate_limit(ip: str, email: str) -> None:
         while email_bucket and email_bucket[0] <= cutoff:
             email_bucket.popleft()
         if len(email_bucket) >= _PASSWORD_RESET_RATE_MAX_PER_EMAIL:
+            security_event("rate_limit_hit", detail="password_reset_rate_limited_by_email", ip=clean_ip)
             raise HTTPException(status_code=429, detail="password_reset_rate_limited")
         email_bucket.append(now)
 
@@ -382,7 +412,7 @@ def auth_set_current_org(
 
 @router.get("/auth/org/{org_id}/billing-limits")
 def auth_get_org_billing_limits(
-    org_id: str,
+    org_id: str = Path(pattern=validators.ORG_ID),
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     try:
@@ -405,7 +435,8 @@ def auth_get_org_billing_limits(
 
 @router.post("/auth/org/{org_id}/billing-limits")
 def auth_set_org_billing_limits(
-    org_id: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
     payload: SetOrgBillingLimitsRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -430,7 +461,8 @@ def auth_set_org_billing_limits(
 
 @router.post("/auth/org/{org_id}/invites")
 def auth_create_invite(
-    org_id: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
     payload: CreateInviteRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -459,7 +491,7 @@ def auth_create_invite(
 
 @router.get("/auth/org/{org_id}/invites")
 def auth_list_invites(
-    org_id: str,
+    org_id: str = Path(pattern=validators.ORG_ID),
     status: str | None = Query(default="active"),
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -538,7 +570,8 @@ def auth_redeem_invite(
 
 @router.post("/auth/org/{org_id}/invites/{invite_id}/revoke")
 def auth_revoke_invite(
-    org_id: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
     invite_id: str,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):

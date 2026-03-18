@@ -7,6 +7,7 @@ import {
   resolveStreamContext,
   type StreamContext,
 } from "../utils/streamContext";
+import { enforceSecureProtocol } from "../utils/urls";
 
 type StartOptions = {
   sourceLang?: string;
@@ -40,7 +41,7 @@ function sanitizeLang(code?: string) {
 }
 
 function wsDeepgramURL(opts?: StartOptions, streamContext?: StreamContext) {
-  const env = process.env.NEXT_PUBLIC_WS_URL || "";
+  const env = enforceSecureProtocol(process.env.NEXT_PUBLIC_WS_URL || "");
   const params = new URLSearchParams();
   const src = sanitizeLang(opts?.sourceLang);
   const tgt = sanitizeLang(opts?.targetLang);

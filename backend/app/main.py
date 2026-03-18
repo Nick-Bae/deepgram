@@ -45,6 +45,7 @@ from app.routes import auth as auth_routes
 from app.routes import billing as billing_routes
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
+from app.security_log import security_event, client_ip as _security_client_ip
 
 # Global display pacing config (broadcast to display clients)
 APP_DISPLAY_SPEED = {"speed": 1.0}
@@ -113,16 +114,24 @@ _tx_window_entries: dict[str, deque[dict[str, float]]] = {}
 _room_sweeper_task: asyncio.Task | None = None
 
 
+# Localhost-only defaults — used in local development when no env var is set.
+# Raw IP addresses are intentionally excluded: browsers treat http://127.0.0.1
+# as a distinct origin from http://localhost, and IP-based CORS origins are
+# harder to reason about and unnecessary for dev workflows.
 _DEFAULT_CORS_ALLOW_ORIGINS = (
     "http://localhost:3000",
-    "http://127.0.0.1:3000",
     "http://localhost:5173",
-    "http://127.0.0.1:5173",
 )
+
+# Cloud Run always sets K_SERVICE; use it to detect a production deployment.
+_IS_PRODUCTION = bool(os.getenv("K_SERVICE") or (os.getenv("APP_ENV") or "").lower() == "production")
 
 
 def _split_csv(raw: str) -> list[str]:
     return [part.strip() for part in (raw or "").split(",") if part and part.strip()]
+
+
+_IP_HOST_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}(:\d+)?$|^\[?[0-9a-fA-F:]+\]?(:\d+)?$")
 
 
 def _normalize_origin(raw_origin: str) -> Optional[str]:
@@ -140,6 +149,14 @@ def _normalize_origin(raw_origin: str) -> Optional[str]:
         return None
     if parsed.query or parsed.fragment:
         return None
+    # Reject raw IP addresses (including loopback) as CORS origins in production.
+    # In development the default list only uses "localhost", so this only blocks
+    # someone explicitly adding an IP to CORS_ALLOW_ORIGINS in production.
+    if _IS_PRODUCTION and _IP_HOST_RE.match(parsed.netloc):
+        raise RuntimeError(
+            f"IP-address CORS origin '{token}' is not allowed in production. "
+            "Use a hostname instead."
+        )
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
@@ -153,6 +170,12 @@ def _resolve_cors_allow_origins() -> list[str]:
         if token:
             origins_raw.append(token)
     if not origins_raw:
+        if _IS_PRODUCTION:
+            raise RuntimeError(
+                "CORS_ALLOW_ORIGINS is not configured. "
+                "Set it to your frontend origin (e.g. https://yourapp.vercel.app) "
+                "before deploying to production."
+            )
         origins_raw.extend(_DEFAULT_CORS_ALLOW_ORIGINS)
 
     seen: set[str] = set()
@@ -178,6 +201,39 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+# Security events logged:
+#   401 — authentication failure (bad/missing token)
+#   403 — authorization failure (authenticated but no permission)
+#   422 — validation failure (malformed request body / path param)
+#   429 — rate limit hit
+_SECURITY_LOG_STATUSES = {401, 403, 422, 429}
+
+
+@app.middleware("http")
+async def log_security_events(request, call_next):
+    response = await call_next(request)
+    if response.status_code in _SECURITY_LOG_STATUSES:
+        security_event(
+            "http_security_response",
+            status=response.status_code,
+            method=request.method,
+            path=request.url.path,
+            ip=_security_client_ip(request),
+        )
+    return response
 
 # Keep your existing HTTP routes under /api
 app.include_router(translate_routes.router, prefix="/api")
@@ -569,6 +625,24 @@ async def _on_shutdown():
 # ------------------------------------------------------------------------------
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
+    # Parse query params before accepting — ws.query_params is available at HTTP
+    # upgrade time, so we can validate and reject without establishing the connection.
+    qctx = _context_from_query_params(ws.query_params)
+    joined_org_id, joined_room_id = _resolve_room_context(
+        org_id=qctx.get("orgId"),
+        room_id=qctx.get("roomId"),
+        service_key=qctx.get("serviceKey"),
+        church_slug=qctx.get("churchSlug"),
+    )
+
+    # Require a valid org+room — prevents anonymous orphan connections that would
+    # accumulate in the connection manager and enable DoS.
+    if not joined_org_id or not joined_room_id:
+        security_event("ws_auth_rejected", path="/ws/translate", ip=_security_client_ip(ws),
+                       detail="missing_org_or_room")
+        await ws.close(code=1008)
+        return
+
     await manager.connect(ws)
     display_config = {"type": "display_config", "speed": APP_DISPLAY_SPEED["speed"]}
     try:
@@ -577,21 +651,23 @@ async def ws_translate(ws: WebSocket):
         pass
     translation_ctx = TranslationContext()
     seq = 0
-    qctx = _context_from_query_params(ws.query_params)
-    joined_org_id, joined_room_id = _resolve_room_context(
-        org_id=qctx.get("orgId"),
-        room_id=qctx.get("roomId"),
-        service_key=qctx.get("serviceKey"),
-        church_slug=qctx.get("churchSlug"),
-    )
-    claimed_role = (qctx.get("role") or "listener").strip().lower()
-    joined_role = claimed_role if claimed_role in {"host", "listener", "viewer"} else "listener"
-    host_uid_claim = _uid_from_id_token(qctx.get("idToken")) or qctx.get("hostUid")
+    # Only accept a UID that has been cryptographically verified via Firebase ID token.
+    # Raw hostUid from query params is intentionally ignored — it can be trivially spoofed
+    # by anyone who knows an admin's Firebase UID.
+    host_uid_claim = _uid_from_id_token(qctx.get("idToken"))
     host_token_claim = qctx.get("hostToken")
-    host_authed = False
     joined_service_key = qctx.get("serviceKey")
     joined_church_slug = qctx.get("churchSlug")
     prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
+
+    # Verify host credentials before granting the role — never trust the role param alone.
+    claimed_role = (qctx.get("role") or "listener").strip().lower()
+    if claimed_role == "host":
+        host_authed = _can_host(joined_org_id, host_uid=host_uid_claim, host_token=host_token_claim)
+        joined_role = "host" if host_authed else "listener"
+    else:
+        joined_role = claimed_role if claimed_role in {"listener", "viewer"} else "listener"
+        host_authed = False
 
     def _cached_prompt_overrides(org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         clean_org_id = _clean_token(org_id)
@@ -625,10 +701,7 @@ async def ws_translate(ws: WebSocket):
         )
 
     if joined_org_id and joined_room_id:
-        if joined_role == "host":
-            host_authed = _can_host(joined_org_id, host_uid=host_uid_claim, host_token=host_token_claim)
-            if not host_authed:
-                joined_role = "listener"
+        # Role already verified above — no second auth check needed.
         viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
         try:
             multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
@@ -660,12 +733,12 @@ async def ws_translate(ws: WebSocket):
             return
 
         ws_role = manager.get_role(ws)
-        host_uid, host_token, id_token = _host_claims_from_payload(payload, qctx)
+        _host_uid_unused, host_token, id_token = _host_claims_from_payload(payload, qctx)
         verified_uid = _uid_from_id_token(id_token)
         if verified_uid:
             host_uid_claim = verified_uid
-        elif host_uid:
-            host_uid_claim = host_uid
+        # Unverified hostUid from message payload is intentionally ignored —
+        # only a Firebase-verified idToken may update the trusted UID.
         if host_token:
             host_token_claim = host_token
 
@@ -1006,20 +1079,24 @@ async def ws_stt_deepgram(websocket: WebSocket):
     )
     service_key = ctx.get("serviceKey")
     church_slug = ctx.get("churchSlug")
-    host_uid_claim = _uid_from_id_token(ctx.get("idToken")) or ctx.get("hostUid")
+    # Raw hostUid from query params is not accepted — only a Firebase-verified idToken.
+    host_uid_claim = _uid_from_id_token(ctx.get("idToken"))
     host_token_claim = ctx.get("hostToken")
     early_commit = str(websocket.query_params.get("early") or websocket.query_params.get("early_commit") or "").lower() in {"1", "true", "yes", "on"}
     dg_language = _deepgram_language_preference(src_lang_full)
     dg_keywords = None if src_lang.startswith("ko") else []
 
-    if org_id and not room_id:
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "message": "room_not_live"})
+    # Reject BEFORE accepting — prevents establishing Deepgram/OpenAI sessions
+    # for unauthenticated callers and eliminates accept-then-close race.
+    # org_id is always required; anonymous callers cannot use this endpoint.
+    if not org_id or not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+        security_event("ws_auth_rejected", path="/ws/stt/deepgram", org_id=org_id or "",
+                       ip=_security_client_ip(websocket), detail="host_auth_failed")
         await websocket.close(code=1008)
         return
-    if org_id and not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "message": "host_auth_failed"})
+    if not room_id:
+        security_event("ws_auth_rejected", path="/ws/stt/deepgram", org_id=org_id,
+                       ip=_security_client_ip(websocket), detail="missing_room_id")
         await websocket.close(code=1008)
         return
 

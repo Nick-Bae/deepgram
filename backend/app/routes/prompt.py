@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field
 
+from app import validators
 from app.auth.guards import require_org_role
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.services.multichurch_store import multichurch_store
@@ -10,13 +11,13 @@ PROMPT_EDITOR_ROLES = {"owner", "admin", "host"}
 
 
 class PromptPayload(BaseModel):
-    prompt: str = Field(default="", max_length=16000)
-    service_prompt: str = Field(default="", max_length=16000)
+    prompt: str = Field(default="", max_length=2000)
+    service_prompt: str = Field(default="", max_length=2000)
 
 
 @router.get("/org/{org_id}/prompt")
 def get_org_prompt(
-    org_id: str,
+    org_id: str = Path(pattern=validators.ORG_ID),
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     require_org_role(
@@ -44,7 +45,8 @@ def get_org_prompt(
 
 @router.post("/org/{org_id}/prompt")
 def set_org_prompt(
-    org_id: str,
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
     payload: PromptPayload,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):

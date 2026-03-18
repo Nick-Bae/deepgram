@@ -8,8 +8,11 @@ import os
 import re
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
+
+from app import validators
+from app.security_log import security_event, client_ip as _client_ip
 
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.auth.guards import require_org_role
@@ -22,19 +25,19 @@ router = APIRouter(tags=["billing"])
 
 _WEBHOOK_TOLERANCE_SECONDS = max(
     30,
-    min(3600, int((os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS") or "300").strip() or "300")),
+    min(300, int((os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS") or "60").strip() or "60")),
 )
 
 
 class CheckoutSessionRequest(BaseModel):
-    orgId: str = Field(..., min_length=2, max_length=120)
-    planKey: str = Field(..., min_length=3, max_length=32)
+    orgId: str = Field(..., min_length=2, max_length=120, pattern=validators.ORG_ID)
+    planKey: str = Field(..., min_length=3, max_length=32, pattern=validators.PLAN_KEY)
     successUrl: str = Field(..., min_length=8, max_length=2048)
     cancelUrl: str = Field(..., min_length=8, max_length=2048)
 
 
 class PortalSessionRequest(BaseModel):
-    orgId: str = Field(..., min_length=2, max_length=120)
+    orgId: str = Field(..., min_length=2, max_length=120, pattern=validators.ORG_ID)
     returnUrl: str = Field(..., min_length=8, max_length=2048)
 
 
@@ -394,17 +397,20 @@ def _parse_stripe_signature(raw_header: str) -> tuple[int, list[str]]:
     return timestamp, signatures
 
 
-def _verify_webhook_signature(*, payload: bytes, signature_header: str) -> None:
+def _verify_webhook_signature(*, payload: bytes, signature_header: str, client_ip: str = "") -> None:
     secret = _clean(BILLING_CONFIG.stripe_webhook_secret)
     if not secret:
         raise HTTPException(status_code=503, detail="stripe_webhook_not_configured")
     timestamp, signatures = _parse_stripe_signature(signature_header)
     now_ts = int(_utcnow().timestamp())
     if abs(now_ts - timestamp) > _WEBHOOK_TOLERANCE_SECONDS:
+        security_event("webhook_sig_expired", severity="ERROR", ip=client_ip,
+                       detail=f"age_seconds={abs(now_ts - timestamp)}")
         raise HTTPException(status_code=400, detail="stripe_signature_timestamp_out_of_range")
     signed = f"{timestamp}.{payload.decode('utf-8')}".encode("utf-8")
     expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
     if not any(hmac.compare_digest(expected, sig) for sig in signatures):
+        security_event("webhook_sig_invalid", severity="ERROR", ip=client_ip)
         raise HTTPException(status_code=400, detail="invalid_stripe_signature")
 
 
@@ -426,7 +432,7 @@ def _resolve_org_id_from_event(event_type: str, stripe_obj: Dict[str, Any]) -> O
 
 @router.get("/billing/org/{org_id}/status")
 def billing_status(
-    org_id: str,
+    org_id: str = Path(pattern=validators.ORG_ID),
     refresh: bool = Query(default=False),
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
@@ -599,7 +605,8 @@ async def stripe_webhook(
     stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
 ):
     payload_raw = await request.body()
-    _verify_webhook_signature(payload=payload_raw, signature_header=_clean(stripe_signature))
+    _verify_webhook_signature(payload=payload_raw, signature_header=_clean(stripe_signature),
+                              client_ip=_client_ip(request))
     try:
         event = json.loads(payload_raw.decode("utf-8"))
     except Exception as exc:
