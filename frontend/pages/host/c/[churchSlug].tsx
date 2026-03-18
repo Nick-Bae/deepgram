@@ -139,6 +139,10 @@ function mapStatusMessage(status: number, action: HostAction): string | null {
   return null;
 }
 
+function isNetworkError(err: unknown): boolean {
+  return err instanceof TypeError && /fetch|network|failed/i.test((err as TypeError).message);
+}
+
 async function readErrorMessage(res: Response, action: HostAction): Promise<string> {
   try {
     const data = await res.clone().json();
@@ -220,6 +224,8 @@ export default function HostChurchPage() {
   const [origin, setOrigin] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const [backendReachable, setBackendReachable] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [orgData, setOrgData] = useState<ServicesResponse | null>(null);
   const [serviceKey, setServiceKey] = useState("");
@@ -547,12 +553,20 @@ export default function HostChurchPage() {
 
     const run = async () => {
       if (typeof document !== "undefined" && document.hidden) return;
+      // Don't poll while a user action is in flight — avoids overwriting action errors.
+      if (busyRef.current) return;
       try {
         await refreshServices();
+        if (!disposed) setBackendReachable(true);
       } catch (err: unknown) {
         if (disposed) return;
-        const message = err instanceof Error ? err.message : String(err);
-        setErrorMsg(message || "services_failed");
+        if (isNetworkError(err)) {
+          setBackendReachable(false);
+        } else {
+          setBackendReachable(true);
+          const message = err instanceof Error ? err.message : String(err);
+          setErrorMsg(message || "services_failed");
+        }
       } finally {
         if (!disposed) setLoading(false);
       }
@@ -584,7 +598,7 @@ export default function HostChurchPage() {
     if (selectedService.defaultLanguagePair?.target) setTargetLang(selectedService.defaultLanguagePair.target);
   }, [selectedService?.serviceKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const listenerUrl = useMemo(() => {
+  const displayUrl = useMemo(() => {
     const listenerServiceKey = (normalizedServiceKey || serviceKeyForStart).trim();
     if (!origin || !slug || !listenerServiceKey) return "";
     return `${origin}/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(listenerServiceKey)}`;
@@ -1247,6 +1261,7 @@ export default function HostChurchPage() {
       return;
     }
     if (startKey !== serviceKey) setServiceKey(startKey);
+    busyRef.current = true;
     setBusy(true);
     try {
       const idToken = await getIdToken();
@@ -1300,15 +1315,17 @@ export default function HostChurchPage() {
         void loadBillingProfile({ refresh: true });
       }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = isNetworkError(err) ? "Server unreachable. Check your connection and try again." : err instanceof Error ? err.message : String(err);
       setErrorMsg(message || "start_failed");
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
 
   const endService = async () => {
     if (!resolvedOrgId || !activeRoomId) return;
+    busyRef.current = true;
     setBusy(true);
     try {
       const idToken = await getIdToken();
@@ -1340,9 +1357,10 @@ export default function HostChurchPage() {
       setErrorMsg(null);
       void loadBillingProfile({ refresh: true });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = isNetworkError(err) ? "Server unreachable. Check your connection and try again." : err instanceof Error ? err.message : String(err);
       setErrorMsg(message || "end_failed");
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -1807,6 +1825,21 @@ export default function HostChurchPage() {
               </div>
             </div>
           </div>
+          {!backendReachable ? (
+            <div style={{ marginBottom: 8, padding: "8px 12px", borderRadius: 10, background: "rgba(120,53,15,0.18)", border: "1px solid rgba(251,191,36,0.5)", color: "#92400e", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#f59e0b", flexShrink: 0, display: "inline-block" }} />
+              <span style={{ flex: 1 }}>Server unreachable — reconnecting…</span>
+              <button
+                type="button"
+                onClick={() => {
+                  void refreshServices().then(() => setBackendReachable(true)).catch(() => {});
+                }}
+                style={{ background: "rgba(245,158,11,0.18)", border: "1px solid rgba(245,158,11,0.45)", color: "#92400e", borderRadius: 6, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+              >
+                Retry now
+              </button>
+            </div>
+          ) : null}
           {errorMsg ? <p style={{ color: "#b91c1c", marginTop: 0 }}>Error: {errorMsg}</p> : null}
           {memberships.length > 1 ? (
             <div style={{ marginBottom: 12, display: "grid", gap: 4, maxWidth: 380 }}>
@@ -2024,10 +2057,11 @@ export default function HostChurchPage() {
                   {trialBroadcastNotice}
                 </div>
               ) : null}
-              {listenerUrl ? (
-                <p style={{ marginTop: 10, marginBottom: 0, fontSize: 13, opacity: 0.84 }}>
-                  Listener URL: <a href={listenerUrl} target="_blank" rel="noreferrer" style={{ color: "#2563eb" }}>{listenerUrl}</a>
-                </p>
+              {displayUrl ? (
+                <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 10, background: "rgba(79,115,170,0.07)", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: "#4f73aa", flexShrink: 0 }}>Display URL</span>
+                  <a href={displayUrl} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: "#2563eb", wordBreak: "break-all", lineHeight: 1.4 }}>{displayUrl}</a>
+                </div>
               ) : null}
               <p style={{ marginTop: 8, marginBottom: 0, fontSize: 12, opacity: 0.72 }}>
                 Signed-in hosts are authorized by account role. Manual host token entry is not required.
@@ -2822,8 +2856,32 @@ export default function HostChurchPage() {
             </section>
             )
           ) : (
-            <section style={{ border: "1px dashed rgba(255,255,255,0.2)", borderRadius: 14, padding: 16, opacity: 0.82 }}>
-              Start a service to enable producer controls.
+            <section
+              style={{
+                borderRadius: 16,
+                background: "linear-gradient(160deg, rgba(240,246,255,0.7) 0%, rgba(225,234,248,0.45) 100%)",
+                padding: "32px 24px",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                gap: 12,
+                textAlign: "center",
+              }}
+            >
+              <div style={{ width: 48, height: 48, borderRadius: 14, background: "rgba(79,115,170,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+                  {/* broadcast signal arcs */}
+                  <circle cx="14" cy="18" r="2.5" fill="#4f73aa" />
+                  <path d="M9.5 14.5 a6.5 6.5 0 0 1 9 0" stroke="#4f73aa" strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.7" />
+                  <path d="M6 11 a11 11 0 0 1 16 0" stroke="#4f73aa" strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.4" />
+                </svg>
+              </div>
+              <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#2c3e5a", letterSpacing: "-0.02em" }}>
+                Select a service and press <span style={{ color: "#4f73aa" }}>Start Service</span> to open the controls
+              </p>
+              <p style={{ margin: 0, fontSize: 13, color: "#7a8da8", lineHeight: 1.55, maxWidth: 380 }}>
+                Translation, audio controls, and live monitoring will appear here once a room is active.
+              </p>
             </section>
           )
         ) : null}

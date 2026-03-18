@@ -16,6 +16,9 @@ class StripeBillingClient:
         self._api_base = (api_base or "https://api.stripe.com/v1").rstrip("/")
         self._timeout = max(3.0, float(timeout_seconds))
 
+    # Pin to a specific Stripe API version to prevent silent breakage on upstream upgrades.
+    _STRIPE_API_VERSION = "2023-10-16"
+
     def _request(
         self,
         method: str,
@@ -23,14 +26,21 @@ class StripeBillingClient:
         *,
         data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not self._secret_key:
             raise StripeClientError("stripe_secret_key_missing")
         url = f"{self._api_base}{path}"
         try:
             with httpx.Client(timeout=self._timeout) as client:
+                headers: Dict[str, str] = {
+                    "Authorization": f"Bearer {self._secret_key}",
+                    "Stripe-Version": self._STRIPE_API_VERSION,
+                }
+                if idempotency_key:
+                    headers["Idempotency-Key"] = idempotency_key
                 request_kwargs: Dict[str, Any] = {
-                    "headers": {"Authorization": f"Bearer {self._secret_key}"},
+                    "headers": headers,
                 }
                 if data:
                     request_kwargs["data"] = data
@@ -62,6 +72,7 @@ class StripeBillingClient:
         email: Optional[str],
         name: Optional[str],
         metadata: Optional[Dict[str, str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
         if email:
@@ -70,7 +81,7 @@ class StripeBillingClient:
             payload["name"] = str(name).strip()
         for key, value in (metadata or {}).items():
             payload[f"metadata[{key}]"] = str(value)
-        return self._request("POST", "/customers", data=payload)
+        return self._request("POST", "/customers", data=payload, idempotency_key=idempotency_key)
 
     def create_checkout_session(
         self,

@@ -274,7 +274,9 @@ def _merge_subscription_snapshot(
         next_billing["stripeSubscriptionId"] = subscription_id
 
     if stripe_status == "past_due":
-        next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
+        # Only set graceEndsAt when first entering past_due; don't reset on repeated updates.
+        if not next_billing.get("graceEndsAt"):
+            next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
     elif stripe_status in {"active", "trialing"}:
         next_billing["graceEndsAt"] = None
 
@@ -330,7 +332,13 @@ def _should_sync_billing_from_stripe(*, billing: Dict[str, Any], force_refresh: 
         return True
     has_current_period = bool((billing or {}).get("currentPeriodStart")) and bool((billing or {}).get("currentPeriodEnd"))
     plan_token = _clean((billing or {}).get("planKey")).lower()
-    return (not has_current_period) or plan_token == "trial"
+    if (not has_current_period) or plan_token == "trial":
+        return True
+    # Auto-refresh if the stored billing period has already expired (missed webhook recovery).
+    period_end = (billing or {}).get("currentPeriodEnd")
+    if isinstance(period_end, datetime) and period_end < _utcnow():
+        return True
+    return False
 
 
 def _hydrate_billing_from_stripe(
@@ -540,6 +548,7 @@ def create_checkout_session(
                 email=user.email,
                 name=user.displayName,
                 metadata={"orgId": body.orgId, "createdByUid": user.uid},
+                idempotency_key=f"create-customer-{body.orgId}",
             )
             customer_id = _clean_customer_id((customer or {}).get("id"))
             if not customer_id:
@@ -564,6 +573,7 @@ def create_checkout_session(
                     email=user.email,
                     name=user.displayName,
                     metadata={"orgId": body.orgId, "createdByUid": user.uid},
+                    idempotency_key=f"create-customer-retry-{body.orgId}",
                 )
                 customer_id = _clean_customer_id((customer or {}).get("id"))
                 if not customer_id:
@@ -729,8 +739,12 @@ async def stripe_webhook(
             next_billing["graceEndsAt"] = None
 
     elif event_type == "invoice.payment_failed":
-        next_billing["status"] = "past_due"
-        next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
+        # Only act on subscription invoices; ignore setup intents and one-time charges.
+        if _clean(payload_obj.get("subscription")):
+            next_billing["status"] = "past_due"
+            # Only set graceEndsAt on the first failure; don't reset on each Stripe retry.
+            if not next_billing.get("graceEndsAt"):
+                next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
 
     next_billing.setdefault("entitlements", {})
     next_billing["entitlements"]["canStartService"] = _can_start_from_status(
@@ -740,13 +754,7 @@ async def stripe_webhook(
     )
 
     try:
-        updated = multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
+        multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
-    return {
-        "ok": True,
-        "orgId": org_id,
-        "eventId": event_id,
-        "eventType": event_type,
-        "status": str(updated.get("status") or ""),
-    }
+    return {"ok": True}
