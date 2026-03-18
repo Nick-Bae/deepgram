@@ -379,7 +379,8 @@ def auth_bootstrap_owner(
 
 @router.get("/auth/slug-availability")
 def auth_slug_availability(
-    slug: str = Query(..., min_length=1, max_length=120),
+    slug: str = Query(..., min_length=2, max_length=80, pattern=validators.CHURCH_SLUG),
+    user: AuthenticatedUser = Depends(get_current_user_required),
 ):
     try:
         return multichurch_store.check_org_slug_availability(slug=slug, max_suggestions=3)
@@ -387,7 +388,7 @@ def auth_slug_availability(
         detail = str(exc)
         if detail == "invalid_slug":
             raise HTTPException(status_code=400, detail=detail) from exc
-        raise HTTPException(status_code=400, detail=detail or "slug_check_failed") from exc
+        raise HTTPException(status_code=400, detail="slug_check_failed") from exc
 
 
 @router.post("/auth/current-org")

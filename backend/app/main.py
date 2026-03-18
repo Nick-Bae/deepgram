@@ -677,6 +677,7 @@ async def ws_translate(ws: WebSocket):
     joined_service_key = qctx.get("serviceKey")
     joined_church_slug = qctx.get("churchSlug")
     prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    _last_display_config_ts: float = 0.0
 
     # Verify host credentials before granting the role — never trust the role param alone.
     claimed_role = (qctx.get("role") or "listener").strip().lower()
@@ -988,6 +989,11 @@ async def ws_translate(ws: WebSocket):
                     except Exception:
                         pass
                     continue
+                # Rate-limit: at most 1 display_config update per second per host.
+                _now = time.time()
+                if _now - _last_display_config_ts < 1.0:
+                    continue
+                _last_display_config_ts = _now
                 raw_speed = msg.get("speed")
                 if raw_speed is None:
                     raw_speed = msg.get("speedFactor")

@@ -434,7 +434,12 @@ def _verify_webhook_signature(*, payload: bytes, signature_header: str, client_i
         raise HTTPException(status_code=400, detail="stripe_signature_timestamp_out_of_range")
     signed = f"{timestamp}.{payload.decode('utf-8')}".encode("utf-8")
     expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
-    if not any(hmac.compare_digest(expected, sig) for sig in signatures):
+    # Compare against ALL signatures without early exit to avoid timing side-channels.
+    matched = False
+    for sig in signatures:
+        if hmac.compare_digest(expected, sig):
+            matched = True
+    if not matched:
         security_event("webhook_sig_invalid", severity="ERROR", ip=client_ip)
         raise HTTPException(status_code=400, detail="invalid_stripe_signature")
 

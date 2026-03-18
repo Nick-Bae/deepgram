@@ -142,7 +142,8 @@ async def synthesize_tts(
             pitch=payload.pitch,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.warning("tts_invalid_request provider=%s: %s", provider, exc)
+        raise HTTPException(status_code=400, detail="tts_invalid_request") from exc
     except Exception as exc:  # pragma: no cover - log + hide details from client
         logger.exception("tts synth failed")
         raise HTTPException(status_code=502, detail="tts_failed") from exc
