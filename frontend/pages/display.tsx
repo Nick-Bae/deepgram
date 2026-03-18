@@ -245,13 +245,12 @@ export default function Display() {
             <div
               style={{
                 fontSize: "clamp(52px, 12vw, 164px)",
-                fontWeight: 800,
+                fontWeight: enLines.length > 0 ? 800 : 300,
                 lineHeight: 1.04,
                 letterSpacing: "-0.01em",
                 textShadow: "0 4px 48px rgba(0,0,0,0.9), 0 1px 6px rgba(0,0,0,0.6)",
                 color: enLines.length > 0 ? "#fff" : "rgba(255,255,255,0.28)",
                 fontStyle: enLines.length > 0 ? "normal" : "italic",
-                fontWeight: enLines.length > 0 ? 800 : 300,
                 transition: "color 300ms ease",
               }}
             >

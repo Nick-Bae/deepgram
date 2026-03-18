@@ -157,7 +157,7 @@ export function AuthProvider({ children }: Props) {
       sendPasswordReset: sendPasswordResetValue,
       logout,
     }),
-    [getIdToken, loading, login, logout, profileVersion, sendPasswordResetValue, signup, updateDisplayNameValue, user],
+    [getIdToken, loading, login, logout, sendPasswordResetValue, signup, updateDisplayNameValue, user],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -1037,7 +1037,7 @@ export default function TranslationBox() {
             <div className="flex flex-col gap-2 rounded-[1.75rem] border border-white/80 px-4 py-4" style={panelStyle}>
               <label className="text-xs font-black uppercase tracking-[0.28em] text-slate-400">Source Language</label>
               <div className="mt-3 flex items-center gap-3">
-                <span className="text-2xl">{languageFlag(sourceLang)}</span>
+                <span className="text-lg leading-none" style={{ display: 'flex', alignItems: 'center', lineHeight: 1 }}>{languageFlag(sourceLang)}</span>
                 <select
                   value={sourceLang}
                   onChange={e => setSourceLang(e.target.value)}
@@ -1050,7 +1050,7 @@ export default function TranslationBox() {
             <div className="flex flex-col gap-2 rounded-[1.75rem] border border-white/80 px-4 py-4" style={panelStyle}>
               <label className="text-xs font-black uppercase tracking-[0.28em] text-slate-400">Target Language</label>
               <div className="mt-3 flex items-center gap-3">
-                <span className="text-2xl">{languageFlag(targetLang)}</span>
+                <span className="text-lg leading-none" style={{ display: 'flex', alignItems: 'center', lineHeight: 1 }}>{languageFlag(targetLang)}</span>
                 <select
                   value={targetLang}
                   onChange={e => setTargetLang(e.target.value)}
@@ -1071,7 +1071,7 @@ export default function TranslationBox() {
                       <div className="flex items-center justify-between gap-4">
                         <div>
                           <p className="text-xs font-black uppercase tracking-[0.34em] text-slate-400">Live Audio Stream</p>
-                          <p className="mt-1 text-lg font-black text-slate-800">{languageFlag(sourceLang)} {sourceLabel}</p>
+                          <p className="mt-1 flex items-center gap-1.5 text-lg font-black text-slate-800"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(sourceLang)}</span><span>{sourceLabel}</span></p>
                         </div>
                         <div className="flex items-center gap-3 text-sm text-slate-500">
                           <span className={`relative inline-flex h-11 w-11 items-center justify-center rounded-full border ${micActive ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-white/80 bg-white/60 text-slate-400'}`}>
@@ -1102,7 +1102,7 @@ export default function TranslationBox() {
                     <div className="flex items-center justify-between">
                       <div>
                         <p className="text-xs font-black uppercase tracking-[0.35em] text-[#5c7698]">Translation Output</p>
-                        <p className="text-lg font-black text-slate-900">{languageFlag(targetLang)} {targetLabel}</p>
+                        <p className="flex items-center gap-1.5 text-lg font-black text-slate-900"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(targetLang)}</span><span>{targetLabel}</span></p>
                       </div>
                       <span className="rounded-full border border-[#b9c8d9] bg-white/65 px-3 py-1 text-xs font-black uppercase tracking-[0.22em] text-[#5c7698]" style={pillStyle}>Broadcast Ready</span>
                     </div>
