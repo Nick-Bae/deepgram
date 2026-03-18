@@ -35,8 +35,34 @@ from app.billing.config import BILLING_CONFIG
 from app.billing.models import plan_spec
 from app.billing.stripe_client import StripeBillingClient, StripeClientError
 from app.services.multichurch_store import multichurch_store
+from app.services import email_service
 
 router = APIRouter(tags=["billing"])
+
+
+def _send_billing_email(event: str, *, org_id: str, plan_key: str = "") -> None:
+    """Fire-and-forget billing email dispatcher. Never raises."""
+    try:
+        admin_emails = multichurch_store.get_org_admin_emails(org_id=org_id)
+        org_name = multichurch_store.get_org_name(org_id=org_id)
+        if event == "subscription_started":
+            email_service.send_subscription_started_email(
+                admin_emails=admin_emails, org_name=org_name, plan_key=plan_key or "pro"
+            )
+        elif event == "subscription_canceled":
+            email_service.send_subscription_canceled_email(
+                admin_emails=admin_emails, org_name=org_name
+            )
+        elif event == "payment_failed":
+            email_service.send_payment_failed_email(
+                admin_emails=admin_emails, org_name=org_name, grace_days=int(BILLING_CONFIG.grace_days)
+            )
+        elif event == "payment_recovered":
+            email_service.send_payment_recovered_email(
+                admin_emails=admin_emails, org_name=org_name
+            )
+    except Exception:
+        logger.exception("billing_email_dispatch_error event=%s org=%s", event, org_id)
 
 _WEBHOOK_TOLERANCE_SECONDS = max(
     30,
@@ -708,6 +734,8 @@ async def stripe_webhook(
         next_billing["planKey"] = requested_plan.key
         next_billing.setdefault("limits", {})
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
+        if requested_plan.key != "trial":
+            _send_billing_email("subscription_started", org_id=org_id, plan_key=requested_plan.key)
 
     elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
         next_billing = _merge_subscription_snapshot(
@@ -725,8 +753,10 @@ async def stripe_webhook(
             next_billing["status"] = "canceled"
             next_billing["trialEndsAt"] = None
             stripe_status = "canceled"
+            _send_billing_email("subscription_canceled", org_id=org_id)
         if stripe_status == "past_due":
-            next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
+            if not next_billing.get("graceEndsAt"):
+                next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
         elif stripe_status in {"active", "trialing"}:
             next_billing["graceEndsAt"] = None
         else:
@@ -737,6 +767,7 @@ async def stripe_webhook(
         if current_status in {"past_due", "incomplete", "unpaid"}:
             next_billing["status"] = "active"
             next_billing["graceEndsAt"] = None
+            _send_billing_email("payment_recovered", org_id=org_id)
 
     elif event_type == "invoice.payment_failed":
         # Only act on subscription invoices; ignore setup intents and one-time charges.
@@ -745,6 +776,7 @@ async def stripe_webhook(
             # Only set graceEndsAt on the first failure; don't reset on each Stripe retry.
             if not next_billing.get("graceEndsAt"):
                 next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
+                _send_billing_email("payment_failed", org_id=org_id)
 
     next_billing.setdefault("entitlements", {})
     next_billing["entitlements"]["canStartService"] = _can_start_from_status(

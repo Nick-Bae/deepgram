@@ -1052,6 +1052,33 @@ class InMemoryMultiChurchStore:
     def is_master_user(self, uid: str) -> bool:
         return _is_master_uid(uid)
 
+    def get_org_admin_emails(self, *, org_id: str) -> List[str]:
+        """Return email addresses for all owner/admin members of the org (non-empty only)."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return []
+        emails: List[str] = []
+        with self._lock:
+            for (oid, uid), member in self._members.items():
+                if oid != clean_org_id:
+                    continue
+                role = str(member.get("role") or "").strip().lower()
+                if role not in {"owner", "admin"}:
+                    continue
+                email = _clean_token(member.get("email"))
+                if email and email not in emails:
+                    emails.append(email)
+        return emails
+
+    def get_org_name(self, *, org_id: str) -> str:
+        """Return the display name for an org, falling back to org_id."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return org_id or ""
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            return str((org or {}).get("name") or clean_org_id)
+
     def get_org_billing_profile(self, *, org_id: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
@@ -2902,6 +2929,38 @@ class FirestoreMultiChurchStore:
 
     def is_master_user(self, uid: str) -> bool:
         return _is_master_uid(uid)
+
+    def get_org_admin_emails(self, *, org_id: str) -> List[str]:
+        """Return email addresses for all owner/admin members of the org (non-empty only)."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return []
+        try:
+            emails: List[str] = []
+            for doc in self._org_ref(clean_org_id).collection("members").stream():
+                data = doc.to_dict() or {}
+                role = str(data.get("role") or "").strip().lower()
+                if role not in {"owner", "admin"}:
+                    continue
+                email = _clean_token(data.get("email"))
+                if email and email not in emails:
+                    emails.append(email)
+            return emails
+        except Exception:
+            return []
+
+    def get_org_name(self, *, org_id: str) -> str:
+        """Return the display name for an org, falling back to org_id."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return org_id or ""
+        try:
+            org_snap = self._org_ref(clean_org_id).get()
+            if org_snap.exists:
+                return str((org_snap.to_dict() or {}).get("name") or clean_org_id)
+        except Exception:
+            pass
+        return clean_org_id
 
     def get_org_billing_profile(self, *, org_id: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)

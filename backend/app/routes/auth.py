@@ -362,6 +362,14 @@ def auth_bootstrap_owner(
             raise HTTPException(status_code=409, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "bootstrap_failed") from exc
 
+    if user.email and result.get("created", True):
+        from app.services.email_service import send_welcome_email
+        send_welcome_email(
+            email=user.email,
+            display_name=user.displayName,
+            org_name=str(result.get("name") or payload.churchName),
+        )
+
     memberships = multichurch_store.list_memberships(user.uid)
     org_payload = {
         "orgId": result.get("orgId"),
@@ -553,7 +561,6 @@ def auth_redeem_invite(
             email=user.email,
             display_name=user.displayName,
         )
-        return _sanitize_auth_payload(redeemed)
     except ValueError as exc:
         detail = str(exc)
         if detail == "invite_not_found":
@@ -567,6 +574,26 @@ def auth_redeem_invite(
         if detail == "org_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "invite_redeem_failed") from exc
+
+    org_id = str(redeemed.get("orgId") or "")
+    org_name = str(redeemed.get("name") or org_id)
+    role = str(redeemed.get("role") or "member")
+    if user.email:
+        from app.services.email_service import send_you_joined_email, send_member_joined_email
+        send_you_joined_email(email=user.email, display_name=user.displayName, org_name=org_name, role=role)
+        if org_id:
+            admin_emails = multichurch_store.get_org_admin_emails(org_id=org_id)
+            # Don't notify the new member about themselves if they happen to be an admin.
+            admin_emails = [e for e in admin_emails if e.lower() != (user.email or "").lower()]
+            send_member_joined_email(
+                admin_emails=admin_emails,
+                member_name=user.displayName,
+                member_email=user.email,
+                org_name=org_name,
+                role=role,
+            )
+
+    return _sanitize_auth_payload(redeemed)
 
 
 @router.post("/auth/org/{org_id}/invites/{invite_id}/revoke")
