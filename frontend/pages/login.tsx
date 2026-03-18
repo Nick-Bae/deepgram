@@ -265,9 +265,6 @@ export default function LoginPage() {
             <Link href="/recover-account" style={{ color: "#3f6093", fontWeight: 700, fontSize: 13 }}>
               Forgot password?
             </Link>
-            <Link href="/recover-account" style={{ color: "#3f6093", fontWeight: 700, fontSize: 13 }}>
-              Forgot login email?
-            </Link>
           </div>
 
           <button type="submit" disabled={!configured || busy} style={buildStudioButtonStyle({ disabled: !configured || busy })}>

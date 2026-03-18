@@ -1357,55 +1357,44 @@ export default function HostChurchPage() {
   const dashboardCardShadow = "0 14px 30px rgba(122,138,163,0.1)";
   const dashboardCompactShadow = "0 10px 22px rgba(122,138,163,0.08)";
   const hostTopPanelStyle = {
-    border: "1px solid rgba(255,255,255,0.88)",
     borderRadius: 24,
-    background: "linear-gradient(145deg, rgba(242,246,251,0.98), rgba(220,228,240,0.94))",
-    boxShadow: dashboardPanelShadow,
+    background: "linear-gradient(160deg, rgba(240,246,255,0.82) 0%, rgba(225,234,248,0.6) 100%)",
+    boxShadow: "0 8px 32px rgba(79,115,170,0.08)",
     padding: 16,
   } as const;
   const hostTopIntroStyle = {
     margin: "0 0 18px",
     width: "100%",
-    padding: "22px 24px",
-    borderRadius: 22,
+    padding: "28px 28px 24px",
+    borderRadius: 18,
     position: "relative" as const,
     overflow: "hidden" as const,
-    background: "linear-gradient(135deg, rgba(237,252,247,0.98), rgba(224,242,254,0.96) 52%, rgba(255,255,255,0.84))",
-    boxShadow: "0 20px 38px rgba(44,95,123,0.14), inset 0 1px 0 rgba(255,255,255,0.72)",
+    background: "transparent",
   } as const;
   const hostTopIntroGlowStyle = {
     position: "absolute" as const,
-    inset: "auto -70px -110px auto",
-    width: 260,
-    height: 210,
+    inset: "auto -40px -80px auto",
+    width: 320,
+    height: 220,
     borderRadius: 999,
-    background: "radial-gradient(circle, rgba(45,212,191,0.24) 0%, rgba(45,212,191,0) 72%)",
-    filter: "blur(10px)",
+    background: "radial-gradient(circle, rgba(127,165,219,0.18) 0%, rgba(79,115,170,0) 70%)",
+    filter: "blur(18px)",
+    pointerEvents: "none" as const,
   } as const;
-  const hostTopIntroRailStyle = {
-    position: "absolute" as const,
-    left: 0,
-    top: 18,
-    bottom: 18,
-    width: 6,
-    borderRadius: 999,
-    background: "linear-gradient(180deg, #14b8a6, #0f766e)",
-    boxShadow: "0 0 22px rgba(20,184,166,0.28)",
-  } as const;
+  const hostTopIntroRailStyle = { display: "none" } as const;
   const hostTopIntroContentStyle = {
     position: "relative" as const,
     display: "grid",
-    gap: 8,
-    paddingLeft: 18,
+    gap: 10,
   } as const;
   const hostTopIntroBadgeStyle = {
     display: "inline-flex",
     alignItems: "center",
     width: "fit-content",
-    padding: "6px 10px",
+    padding: "4px 10px",
     borderRadius: 999,
-    background: "rgba(15,118,110,0.1)",
-    color: "#0f766e",
+    background: "rgba(79,115,170,0.1)",
+    color: "#4f73aa",
     fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
     fontSize: 11,
     lineHeight: 1,
@@ -1417,14 +1406,14 @@ export default function HostChurchPage() {
     margin: 0,
     color: "#16324f",
     fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
-    fontSize: "clamp(26px, 3.4vw, 36px)",
-    lineHeight: 1.02,
+    fontSize: "clamp(24px, 3.2vw, 34px)",
+    lineHeight: 1.05,
     fontWeight: 900,
-    letterSpacing: "-0.06em",
+    letterSpacing: "-0.05em",
   } as const;
   const hostTopIntroAccentStyle = {
-    color: "#0f766e",
-    background: "linear-gradient(135deg, #14b8a6, #0f766e)",
+    color: "#4f73aa",
+    background: "linear-gradient(135deg, #7fa5db, #4f73aa)",
     backgroundClip: "text" as const,
     WebkitBackgroundClip: "text" as const,
     WebkitTextFillColor: "transparent",
@@ -1434,7 +1423,7 @@ export default function HostChurchPage() {
     maxWidth: 760,
     color: "#45607d",
     fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
-    fontSize: "clamp(14px, 1.7vw, 16px)",
+    fontSize: "clamp(13px, 1.6vw, 15px)",
     lineHeight: 1.55,
     fontWeight: 500,
     letterSpacing: "-0.01em",
@@ -1800,15 +1789,22 @@ export default function HostChurchPage() {
         <section style={hostTopPanelStyle}>
           <div style={hostTopIntroStyle}>
             <div aria-hidden="true" style={hostTopIntroGlowStyle} />
-            <div aria-hidden="true" style={hostTopIntroRailStyle} />
             <div style={hostTopIntroContentStyle}>
-              <span style={hostTopIntroBadgeStyle}>Step-by-Step</span>
+              <span style={hostTopIntroBadgeStyle}>How to broadcast</span>
               <h2 style={hostTopIntroHeadlineStyle}>
                 Launch Your <span style={hostTopIntroAccentStyle}>Broadcast</span>
               </h2>
-              <p style={hostTopIntroSubtextStyle}>
-                Select a service to open the Control Panel, then click Start Translation to go live.
-              </p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 4, alignItems: "center" }}>
+                {(["Select a service", "Open the Control Panel", "Start Translation"] as const).map((label, i) => (
+                  <div key={label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "6px 14px 6px 8px", borderRadius: 999, background: "rgba(79,115,170,0.08)" }}>
+                      <span style={{ width: 22, height: 22, borderRadius: "50%", background: accentPrimaryGradient, color: "#fff", fontSize: 11, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: "0 2px 8px rgba(79,115,170,0.28)" }}>{i + 1}</span>
+                      <span style={hostTopIntroSubtextStyle}>{label}</span>
+                    </div>
+                    {i < 2 && <span style={{ color: "rgba(79,115,170,0.4)", fontSize: 16, fontWeight: 300, lineHeight: 1 }}>→</span>}
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
           {errorMsg ? <p style={{ color: "#b91c1c", marginTop: 0 }}>Error: {errorMsg}</p> : null}

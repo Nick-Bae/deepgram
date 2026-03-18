@@ -20,28 +20,25 @@ export default function Display() {
         toggleDisplayMode();
       }
     };
-
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [toggleDisplayMode]);
 
   const {
     connected,
-    // krInterim,    if you want to show a faint preview
     krLines,
     enLines,
   } = useSubtitleSocket(
     process.env.NEXT_PUBLIC_WS_URL
       ? `${process.env.NEXT_PUBLIC_WS_URL}?role=viewer`
       : undefined,
-    { maxLines: 4, track: "en" } // "en" | "kr" | "both"
+    { maxLines: 4, track: "en" }
   );
 
   const lastKr = krLines[krLines.length - 1] || "";
   const waitingMessage = connected
-    ? "Live translation connected. Waiting for speech..."
-    : "Waiting for translation stream to start...";
-  const connectionLabel = connected ? "Connection: Connected" : "Connection: Disconnected";
+    ? "Live translation connected — waiting for speech…"
+    : "Waiting for translation stream…";
 
   const isSubtitleMode = displayMode === "subtitle";
 
@@ -54,9 +51,8 @@ export default function Display() {
     padding: isSubtitleMode ? "2.4rem 6vw 1.8rem" : "5vh 6vw",
     boxSizing: "border-box",
     overflow: "hidden",
-    fontFamily:
-      "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
-    transition: "background-color 180ms ease, padding 180ms ease",
+    fontFamily: "Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+    transition: "padding 200ms ease",
   };
 
   if (isSubtitleMode) {
@@ -74,106 +70,117 @@ export default function Display() {
       position: "relative",
       width: "100%",
       minHeight: "100vh",
-      backgroundColor: "#000",
+      background: "radial-gradient(ellipse at 50% -10%, rgba(30,50,100,0.55) 0%, transparent 65%), #060b18",
       pointerEvents: "auto",
     });
   }
 
-  const subtitleSurfaceStyle: CSSProperties = {
-    width: "100%",
-    maxWidth: "100%",
-    margin: 0,
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "flex-end",
-    gap: "1em",
-    textAlign: "left",
-    transition: "background-color 180ms ease, backdrop-filter 180ms ease, box-shadow 180ms ease",
-    backgroundColor: "rgba(0, 0, 0, 0.65)",
-    backdropFilter: "blur(8px)",
-    borderRadius: 0,
-    padding: "1.2rem 1.6rem",
-    boxShadow: "0 18px 48px rgba(0, 0, 0, 0.4)",
-  };
-
-  const fullScreenSurfaceStyle: CSSProperties = {
-    maxWidth: "min(1280px, 94vw)",
-    width: "100%",
-    margin: "0 auto",
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: "1.8rem",
-    textAlign: "center",
-  };
-
   return (
     <>
+      <style>{`
+        @keyframes pulse-live {
+          0%   { box-shadow: 0 0 0 0 rgba(52,211,153,0.5); }
+          70%  { box-shadow: 0 0 0 7px rgba(52,211,153,0); }
+          100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
+        }
+        .dot-live   { animation: pulse-live 2s ease infinite; }
+        .toggle-btn:hover { background: rgba(255,255,255,0.18) !important; }
+        .toggle-btn:active { transform: scale(0.96); }
+      `}</style>
+
+      {/* Toggle button */}
       <button
         type="button"
         onClick={toggleDisplayMode}
+        className="toggle-btn"
         style={{
           position: "fixed",
-          top: 12,
-          right: 12,
+          top: 14,
+          right: 14,
           zIndex: 2147483647,
-          background: "rgba(0,0,0,0.65)",
-          color: "#fff",
-          border: "1px solid rgba(255,255,255,0.35)",
-          padding: "0.45rem 1.2rem",
-          borderRadius: "999px",
-          fontSize: 14,
-          letterSpacing: "0.03em",
+          background: "rgba(0,0,0,0.55)",
+          color: "rgba(255,255,255,0.9)",
+          border: "1px solid rgba(255,255,255,0.22)",
+          padding: "6px 14px",
+          borderRadius: 999,
+          fontSize: 12,
+          letterSpacing: "0.06em",
           textTransform: "uppercase",
-          fontWeight: 600,
+          fontWeight: 700,
           cursor: "pointer",
-          backdropFilter: "blur(6px)",
-          transition: "background 160ms ease, color 160ms ease",
+          backdropFilter: "blur(8px)",
+          transition: "background 150ms ease, transform 100ms ease",
         }}
         aria-pressed={displayMode === "fullScreen"}
       >
-        {displayMode === "subtitle" ? "Full Screen (F)" : "Subtitle (F)"}
+        {displayMode === "subtitle" ? "Full Screen" : "Subtitle"} <span style={{ opacity: 0.55, fontWeight: 400 }}>[F]</span>
       </button>
 
+      {/* Connection indicator */}
       <div
         style={{
           position: "fixed",
-          top: 12,
-          left: 12,
-          fontSize: 14,
-          opacity: 0.85,
-          color: "#fff",
+          top: 14,
+          left: 14,
           zIndex: 2147483646,
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          fontSize: 12,
+          fontWeight: 700,
+          color: connected ? "rgba(52,211,153,0.9)" : "rgba(255,255,255,0.38)",
+          letterSpacing: "0.05em",
+          textTransform: "uppercase",
+          fontFamily: "Inter, system-ui, sans-serif",
         }}
       >
-        {connectionLabel}
+        <span
+          className={connected ? "dot-live" : ""}
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: "50%",
+            display: "inline-block",
+            background: connected ? "#34d399" : "rgba(255,255,255,0.25)",
+            flexShrink: 0,
+          }}
+        />
+        {connected ? "Live" : "Standby"}
       </div>
 
       <div style={containerStyle}>
         {isSubtitleMode ? (
-          <div style={subtitleSurfaceStyle}>
+          <div
+            style={{
+              width: "100%",
+              maxWidth: "100%",
+              display: "flex",
+              flexDirection: "column",
+              gap: "0.75em",
+              textAlign: "left",
+              background: "linear-gradient(to right, rgba(0,0,0,0.78), rgba(0,0,0,0.62))",
+              backdropFilter: "blur(10px)",
+              borderLeft: connected ? "3px solid rgba(52,211,153,0.6)" : "3px solid rgba(255,255,255,0.1)",
+              padding: "1.1rem 1.6rem 1.1rem 1.4rem",
+              boxShadow: "0 -4px 40px rgba(0,0,0,0.5)",
+              transition: "border-color 400ms ease",
+            }}
+          >
             {lastKr && (
               <div
                 style={{
-                  opacity: 0.75,
-                  fontSize: "clamp(18px, 2.6vw, 44px)",
+                  opacity: 0.68,
+                  fontSize: "clamp(17px, 2.4vw, 42px)",
                   letterSpacing: "0.01em",
-                  textTransform: "none",
-                  lineHeight: 1.2,
+                  lineHeight: 1.25,
+                  color: "rgba(255,255,255,0.85)",
                 }}
               >
                 {lastKr}
               </div>
             )}
 
-            <div
-              style={{
-                lineHeight: 1.16,
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.35em",
-              }}
-            >
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.28em", lineHeight: 1.15 }}>
               {enLines.length > 0 ? (
                 enLines.map((line, i) => {
                   const isCurrent = i === enLines.length - 1;
@@ -181,17 +188,13 @@ export default function Display() {
                     <div
                       key={`${i}-${line.slice(0, 12)}`}
                       style={{
-                        fontSize: isCurrent ? "clamp(30px, 7vw, 90px)" : "clamp(26px, 6.2vw, 82px)",
-                        fontWeight: isCurrent ? 700 : 500,
+                        fontSize: isCurrent ? "clamp(28px, 6.5vw, 88px)" : "clamp(24px, 5.8vw, 78px)",
+                        fontWeight: isCurrent ? 800 : 500,
                         wordBreak: "break-word",
-                        opacity: isCurrent ? 1 : 0.72,
-                        background: isCurrent ? "rgba(255, 255, 255, 0.12)" : "transparent",
-                        padding: "0.15em 0.35em",
-                        borderRadius: "0.45em",
-                        boxShadow: isCurrent ? "0 12px 32px rgba(0,0,0,0.35)" : "none",
-                        transition: "all 160ms ease",
-                        filter: isCurrent ? "none" : "blur(0px)",
-                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.85)",
+                        opacity: isCurrent ? 1 : 0.55,
+                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.7)",
+                        textShadow: isCurrent ? "0 2px 24px rgba(0,0,0,0.8)" : "none",
+                        transition: "opacity 200ms ease, font-size 200ms ease",
                       }}
                     >
                       {line}
@@ -199,20 +202,40 @@ export default function Display() {
                   );
                 })
               ) : (
-                <div style={{ fontSize: "clamp(22px, 4.8vw, 58px)", opacity: 0.68 }}>{waitingMessage}</div>
+                <div
+                  style={{
+                    fontSize: "clamp(20px, 4.4vw, 56px)",
+                    opacity: 0.42,
+                    fontStyle: "italic",
+                    fontWeight: 400,
+                  }}
+                >
+                  {waitingMessage}
+                </div>
               )}
             </div>
           </div>
         ) : (
-          <div style={fullScreenSurfaceStyle}>
+          <div
+            style={{
+              maxWidth: "min(1320px, 94vw)",
+              width: "100%",
+              margin: "0 auto",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: "1.6rem",
+              textAlign: "center",
+            }}
+          >
             {lastKr && (
               <div
                 style={{
-                  opacity: 0.8,
-                  fontSize: "clamp(20px, 3vw, 56px)",
-                  letterSpacing: "0.02em",
-                  textTransform: "none",
-                  lineHeight: 1.2,
+                  opacity: 0.72,
+                  fontSize: "clamp(18px, 2.8vw, 52px)",
+                  letterSpacing: "0.04em",
+                  lineHeight: 1.3,
+                  color: "rgba(255,255,255,0.8)",
                 }}
               >
                 {lastKr}
@@ -221,10 +244,15 @@ export default function Display() {
 
             <div
               style={{
-                fontSize: "clamp(48px, 12vw, 160px)",
-                fontWeight: 700,
-                lineHeight: 1.05,
-                padding: "0.25em 0",
+                fontSize: "clamp(52px, 12vw, 164px)",
+                fontWeight: 800,
+                lineHeight: 1.04,
+                letterSpacing: "-0.01em",
+                textShadow: "0 4px 48px rgba(0,0,0,0.9), 0 1px 6px rgba(0,0,0,0.6)",
+                color: enLines.length > 0 ? "#fff" : "rgba(255,255,255,0.28)",
+                fontStyle: enLines.length > 0 ? "normal" : "italic",
+                fontWeight: enLines.length > 0 ? 800 : 300,
+                transition: "color 300ms ease",
               }}
             >
               {enLines.length > 0 ? enLines[enLines.length - 1] : waitingMessage}
@@ -235,16 +263,15 @@ export default function Display() {
                 style={{
                   display: "flex",
                   flexDirection: "column",
-                  gap: "0.35em",
-                  opacity: 0.6,
-                  fontSize: "clamp(20px, 3.5vw, 48px)",
+                  gap: "0.3em",
+                  opacity: 0.45,
+                  fontSize: "clamp(18px, 3.2vw, 46px)",
+                  fontWeight: 400,
                 }}
               >
-                {enLines
-                  .slice(-3, -1)
-                  .map((line, idx) => (
-                    <div key={`${idx}-${line.slice(0, 12)}`}>{line}</div>
-                  ))}
+                {enLines.slice(-3, -1).map((line, idx) => (
+                  <div key={`${idx}-${line.slice(0, 12)}`}>{line}</div>
+                ))}
               </div>
             )}
           </div>

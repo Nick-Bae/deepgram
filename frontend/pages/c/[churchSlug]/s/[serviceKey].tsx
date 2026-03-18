@@ -19,6 +19,14 @@ const RESOLVE_POLL_MS = 8000;
 const DISPLAY_TOGGLE_KEY = "f";
 type DisplayMode = "subtitle" | "fullScreen";
 
+function friendlyError(msg: string): string {
+  if (msg.includes("404")) return "Service not found. Check your link and try again.";
+  if (msg.includes("403")) return "Access denied.";
+  if (msg.includes("500") || msg.includes("502") || msg.includes("503")) return "Server error. Will retry automatically.";
+  if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) return "Network error. Check your connection.";
+  return "Could not connect. Will retry automatically.";
+}
+
 export default function ChurchServiceListenerPage() {
   const router = useRouter();
   const slug = typeof router.query.churchSlug === "string" ? router.query.churchSlug : "";
@@ -107,29 +115,50 @@ export default function ChurchServiceListenerPage() {
   const lastKr = krLines[krLines.length - 1] || "";
   const lastEn = enLines[enLines.length - 1] || "";
   const waitingMessage = loading
-    ? "Resolving service..."
+    ? `Loading ${serviceTitle}…`
     : !resolveData || !resolveData.activeRoomId || resolveData.roomStatus !== "live"
-      ? "Waiting for host to start translation."
+      ? `Waiting for ${serviceTitle} to begin…`
       : connected
-        ? "Live translation is connected. Waiting for the first line..."
-        : "Host started translation. Connecting now...";
+        ? "Live — waiting for speech…"
+        : "Connecting…";
   const currentEn = lastEn || waitingMessage;
   const recentEn = enLines.slice(0, -1).slice(-2);
-  const connectionLabel = connected ? "Connection: Connected" : socketEnabled ? "Connection: Connecting..." : "Connection: Standby";
-  const connectionColor = connected ? "#34d399" : socketEnabled ? "#f59e0b" : "#6b7280";
-  const stageWidth = "min(92vw, calc(92vh * 16 / 9))";
+
+  const isLive = connected;
+  const isConnecting = socketEnabled && !connected;
+  const dotColor = isLive ? "#34d399" : isConnecting ? "#f59e0b" : "rgba(255,255,255,0.25)";
+  const labelColor = isLive ? "rgba(52,211,153,0.9)" : isConnecting ? "rgba(245,158,11,0.85)" : "rgba(255,255,255,0.38)";
+  const statusLabel = isLive ? "Live" : isConnecting ? "Connecting" : "Standby";
 
   return (
     <main
       style={{
         minHeight: "100vh",
-        background: "#000",
+        background: "radial-gradient(ellipse at 50% -10%, rgba(30,50,100,0.55) 0%, transparent 65%), #060b18",
         color: "#fff",
         fontFamily: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         position: "relative",
         overflow: "hidden",
       }}
     >
+      <style>{`
+        @keyframes pulse-live {
+          0%   { box-shadow: 0 0 0 0 rgba(52,211,153,0.5); }
+          70%  { box-shadow: 0 0 0 7px rgba(52,211,153,0); }
+          100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
+        }
+        @keyframes pulse-connecting {
+          0%   { box-shadow: 0 0 0 0 rgba(245,158,11,0.5); }
+          70%  { box-shadow: 0 0 0 7px rgba(245,158,11,0); }
+          100% { box-shadow: 0 0 0 0 rgba(245,158,11,0); }
+        }
+        .dot-live        { animation: pulse-live 2s ease infinite; }
+        .dot-connecting  { animation: pulse-connecting 1.2s ease infinite; }
+        .toggle-btn:hover  { background: rgba(255,255,255,0.18) !important; }
+        .toggle-btn:active { transform: scale(0.96); }
+      `}</style>
+
+      {/* Connection indicator */}
       <div
         style={{
           position: "fixed",
@@ -138,49 +167,60 @@ export default function ChurchServiceListenerPage() {
           zIndex: 20,
           display: "flex",
           alignItems: "center",
-          gap: 8,
+          gap: 7,
           fontSize: 12,
-          fontWeight: 600,
-          color: "rgba(255,255,255,0.85)",
+          fontWeight: 700,
+          color: labelColor,
+          letterSpacing: "0.05em",
+          textTransform: "uppercase",
+          fontFamily: "Inter, system-ui, sans-serif",
         }}
       >
         <span
+          className={isLive ? "dot-live" : isConnecting ? "dot-connecting" : ""}
           style={{
-            width: 10,
-            height: 10,
-            borderRadius: 999,
+            width: 8,
+            height: 8,
+            borderRadius: "50%",
             display: "inline-block",
-            background: connectionColor,
-            boxShadow: `0 0 0 3px ${connected ? "rgba(16,185,129,0.16)" : socketEnabled ? "rgba(245,158,11,0.12)" : "rgba(107,114,128,0.12)"}`,
+            background: dotColor,
+            flexShrink: 0,
           }}
         />
-        {connectionLabel}
+        {statusLabel}
       </div>
 
+      {/* Toggle button */}
       <button
         type="button"
         onClick={toggleDisplayMode}
+        className="toggle-btn"
         style={{
           position: "fixed",
-          top: 12,
-          right: 12,
+          top: 14,
+          right: 14,
           zIndex: 20,
+          background: "rgba(0,0,0,0.55)",
+          color: "rgba(255,255,255,0.9)",
+          border: "1px solid rgba(255,255,255,0.22)",
+          padding: "6px 14px",
           borderRadius: 999,
-          border: "1px solid rgba(255,255,255,0.28)",
-          background: "rgba(0,0,0,0.52)",
-          color: "#fff",
-          padding: "7px 14px",
           fontSize: 12,
+          letterSpacing: "0.06em",
+          textTransform: "uppercase",
           fontWeight: 700,
           cursor: "pointer",
-          letterSpacing: "0.03em",
-          textTransform: "uppercase",
+          backdropFilter: "blur(8px)",
+          transition: "background 150ms ease, transform 100ms ease",
         }}
+        aria-pressed={displayMode === "fullScreen"}
       >
-        {displayMode === "subtitle" ? "Full Screen (F)" : "Subtitle (F)"}
+        {displayMode === "subtitle" ? "Full Screen" : "Subtitle"}{" "}
+        <span style={{ opacity: 0.55, fontWeight: 400 }}>[F]</span>
       </button>
 
-      {errorMsg ? (
+      {/* Error banner */}
+      {errorMsg && (
         <div
           style={{
             position: "fixed",
@@ -190,71 +230,62 @@ export default function ChurchServiceListenerPage() {
             zIndex: 20,
             color: "#fca5a5",
             fontSize: 13,
-            background: "rgba(127,29,29,0.35)",
-            border: "1px solid rgba(252,165,165,0.4)",
+            background: "rgba(127,29,29,0.45)",
+            border: "1px solid rgba(252,165,165,0.35)",
             borderRadius: 10,
-            padding: "6px 10px",
+            padding: "7px 14px",
+            backdropFilter: "blur(8px)",
+            whiteSpace: "nowrap",
           }}
         >
-          Failed to resolve service: {errorMsg}
+          {friendlyError(errorMsg)}
         </div>
-      ) : null}
+      )}
 
-      {loading ? (
-        <div
-          style={{
-            position: "fixed",
-            top: 48,
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 19,
-            fontSize: 12,
-            opacity: 0.75,
-          }}
-        >
-          Resolving {serviceTitle}...
-        </div>
-      ) : null}
-
+      {/* Subtitle mode */}
       {displayMode === "subtitle" ? (
         <div
           style={{
             position: "fixed",
-            left: 0,
-            right: 0,
-            bottom: 42,
-            padding: "0 5vw",
+            inset: 0,
             display: "flex",
-            justifyContent: "center",
+            flexDirection: "column",
+            justifyContent: "flex-end",
+            padding: "2.4rem 6vw 1.8rem",
+            boxSizing: "border-box",
+            pointerEvents: "none",
             zIndex: 10,
           }}
         >
-          <section
+          <div
             style={{
-              width: `min(${stageWidth}, 100%)`,
-              border: "1px solid rgba(255,255,255,0.12)",
-              background: "rgba(0,0,0,0.56)",
-              boxShadow: "0 20px 45px rgba(0,0,0,0.45)",
-              padding: "18px 22px",
+              width: "100%",
               display: "flex",
               flexDirection: "column",
-              gap: "0.7em",
+              gap: "0.75em",
               textAlign: "left",
+              background: "linear-gradient(to right, rgba(0,0,0,0.78), rgba(0,0,0,0.62))",
+              backdropFilter: "blur(10px)",
+              borderLeft: connected ? "3px solid rgba(52,211,153,0.6)" : "3px solid rgba(255,255,255,0.1)",
+              padding: "1.1rem 1.6rem 1.1rem 1.4rem",
+              boxShadow: "0 -4px 40px rgba(0,0,0,0.5)",
+              transition: "border-color 400ms ease",
             }}
           >
-            {lastKr ? (
+            {lastKr && (
               <div
                 style={{
-                  opacity: 0.72,
-                  fontSize: "clamp(16px, 2.2vw, 38px)",
+                  opacity: 0.68,
+                  fontSize: "clamp(17px, 2.4vw, 42px)",
                   letterSpacing: "0.01em",
-                  lineHeight: 1.22,
+                  lineHeight: 1.25,
+                  color: "rgba(255,255,255,0.85)",
                 }}
               >
                 {lastKr}
               </div>
-            ) : null}
-            <div style={{ lineHeight: 1.14, display: "flex", flexDirection: "column", gap: "0.28em" }}>
+            )}
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.28em", lineHeight: 1.15 }}>
               {enLines.length > 0 ? (
                 enLines.map((line, i) => {
                   const isCurrent = i === enLines.length - 1;
@@ -262,15 +293,13 @@ export default function ChurchServiceListenerPage() {
                     <div
                       key={`${i}-${line.slice(0, 12)}`}
                       style={{
-                        fontSize: isCurrent ? "clamp(26px, 4.7vw, 78px)" : "clamp(22px, 4.1vw, 70px)",
-                        fontWeight: isCurrent ? 700 : 500,
+                        fontSize: isCurrent ? "clamp(28px, 6.5vw, 88px)" : "clamp(24px, 5.8vw, 78px)",
+                        fontWeight: isCurrent ? 800 : 500,
                         wordBreak: "break-word",
-                        opacity: isCurrent ? 1 : 0.6,
-                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.76)",
-                        background: isCurrent ? "rgba(255,255,255,0.1)" : "transparent",
-                        borderRadius: isCurrent ? 12 : 0,
-                        padding: isCurrent ? "0.12em 0.28em" : "0",
-                        boxShadow: isCurrent ? "0 10px 26px rgba(0,0,0,0.35)" : "none",
+                        opacity: isCurrent ? 1 : 0.55,
+                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.7)",
+                        textShadow: isCurrent ? "0 2px 24px rgba(0,0,0,0.8)" : "none",
+                        transition: "opacity 200ms ease, font-size 200ms ease",
                       }}
                     >
                       {line}
@@ -278,12 +307,22 @@ export default function ChurchServiceListenerPage() {
                   );
                 })
               ) : (
-                <div style={{ fontSize: "clamp(22px, 4.1vw, 58px)", opacity: 0.68 }}>{waitingMessage}</div>
+                <div
+                  style={{
+                    fontSize: "clamp(20px, 4.4vw, 56px)",
+                    opacity: 0.42,
+                    fontStyle: "italic",
+                    fontWeight: 400,
+                  }}
+                >
+                  {waitingMessage}
+                </div>
               )}
             </div>
-          </section>
+          </div>
         </div>
       ) : (
+        /* Fullscreen mode */
         <div
           style={{
             position: "fixed",
@@ -296,40 +335,62 @@ export default function ChurchServiceListenerPage() {
             zIndex: 8,
           }}
         >
-          <section
+          <div
             style={{
-              width: stageWidth,
+              maxWidth: "min(1320px, 94vw)",
+              width: "100%",
               display: "flex",
               flexDirection: "column",
               alignItems: "center",
-              gap: "1.2rem",
+              gap: "1.6rem",
             }}
           >
-            {lastKr ? (
+            {lastKr && (
               <div
                 style={{
-                  opacity: 0.76,
-                  fontSize: "clamp(20px, 3vw, 56px)",
-                  letterSpacing: "0.02em",
-                  lineHeight: 1.2,
+                  opacity: 0.72,
+                  fontSize: "clamp(18px, 2.8vw, 52px)",
+                  letterSpacing: "0.04em",
+                  lineHeight: 1.3,
+                  color: "rgba(255,255,255,0.8)",
                 }}
               >
                 {lastKr}
               </div>
-            ) : null}
+            )}
 
-            <div style={{ fontSize: "clamp(72px, 11vw, 180px)", fontWeight: 700, lineHeight: 1.04 }}>
+            <div
+              style={{
+                fontSize: "clamp(52px, 12vw, 164px)",
+                fontWeight: enLines.length > 0 ? 800 : 300,
+                lineHeight: 1.04,
+                letterSpacing: "-0.01em",
+                textShadow: enLines.length > 0 ? "0 4px 48px rgba(0,0,0,0.9), 0 1px 6px rgba(0,0,0,0.6)" : "none",
+                color: enLines.length > 0 ? "#fff" : "rgba(255,255,255,0.28)",
+                fontStyle: enLines.length > 0 ? "normal" : "italic",
+                transition: "color 300ms ease",
+              }}
+            >
               {currentEn}
             </div>
 
-            {recentEn.length > 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: "0.22em", opacity: 0.52, fontSize: "clamp(22px, 3.3vw, 50px)" }}>
+            {recentEn.length > 0 && (
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.3em",
+                  opacity: 0.45,
+                  fontSize: "clamp(18px, 3.2vw, 46px)",
+                  fontWeight: 400,
+                }}
+              >
                 {recentEn.map((line, idx) => (
                   <div key={`${idx}-${line.slice(0, 12)}`}>{line}</div>
                 ))}
               </div>
-            ) : null}
-          </section>
+            )}
+          </div>
         </div>
       )}
     </main>
