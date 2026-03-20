@@ -162,13 +162,6 @@ function fmtDate(iso: string | null): string {
   }
 }
 
-function fmtSeconds(s: number): string {
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  const rem = m % 60;
-  return `${h}h ${rem}m`;
-}
 
 function trialMinsRemaining(seconds: number | null): string {
   if (seconds === null) return "—";

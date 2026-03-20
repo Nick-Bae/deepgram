@@ -32,7 +32,7 @@ type Props = { children: ReactNode };
 export function AuthProvider({ children }: Props) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [profileVersion, setProfileVersion] = useState(0);
+  const [_profileVersion, setProfileVersion] = useState(0);
 
   useEffect(() => {
     if (!firebaseConfigured) {

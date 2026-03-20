@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { useRouter } from "next/router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -69,7 +70,7 @@ type PaidPlanKey = Exclude<BillingPlanKey, "trial">;
 type HostTab = "broadcast" | "settings" | "billing" | "team";
 const PAID_PLAN_KEYS: PaidPlanKey[] = ["starter", "growth", "premium"];
 
-const PLAN_LABELS: Record<PaidPlanKey, string> = {
+const _PLAN_LABELS: Record<PaidPlanKey, string> = {
   starter: "Starter (5 services / $20)",
   growth: "Growth (12 services / $40)",
   premium: "Premium (Unlimited / $60)",
@@ -1371,7 +1372,7 @@ export default function HostChurchPage() {
     color: "#0f172a",
     padding: "20px 14px 34px",
   } as const;
-  const dashboardPanelShadow = "0 18px 38px rgba(122,138,163,0.12)";
+  const _dashboardPanelShadow = "0 18px 38px rgba(122,138,163,0.12)";
   const dashboardCardShadow = "0 14px 30px rgba(122,138,163,0.1)";
   const dashboardCompactShadow = "0 10px 22px rgba(122,138,163,0.08)";
   const hostTopPanelStyle = {
@@ -1399,7 +1400,7 @@ export default function HostChurchPage() {
     filter: "blur(18px)",
     pointerEvents: "none" as const,
   } as const;
-  const hostTopIntroRailStyle = { display: "none" } as const;
+  const _hostTopIntroRailStyle = { display: "none" } as const;
   const hostTopIntroContentStyle = {
     position: "relative" as const,
     display: "grid",
@@ -1804,9 +1805,9 @@ export default function HostChurchPage() {
                 </span>
               </div>
               {isMasterUser && (
-                <a href="/admin" style={studioAdminButtonStyle}>
+                <Link href="/admin" style={studioAdminButtonStyle}>
                   Admin
-                </a>
+                </Link>
               )}
               <button
                 onClick={async () => {
