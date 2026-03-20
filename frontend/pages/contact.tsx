@@ -59,6 +59,7 @@ export default function ContactPage() {
   const [directEmail, setDirectEmail] = useState("");
   const [directEmailMsg, setDirectEmailMsg] = useState<string | null>(null);
   const [copiedDirectEmail, setCopiedDirectEmail] = useState(false);
+  const [unconfiguredFallback, setUnconfiguredFallback] = useState(false);
   const [busy, setBusy] = useState(false);
   const widgetHostRef = useRef<HTMLDivElement | null>(null);
   const widgetIdRef = useRef<string | null>(null);
@@ -212,7 +213,12 @@ export default function ContactPage() {
         window.turnstile.reset(widgetIdRef.current);
       }
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to submit contact request.");
+      const msg = err instanceof Error ? err.message : "Failed to submit contact request.";
+      if (msg === "Support inbox is not configured yet.") {
+        setUnconfiguredFallback(true);
+      } else {
+        setErrorMsg(msg);
+      }
     } finally {
       setBusy(false);
     }
@@ -513,7 +519,33 @@ export default function ContactPage() {
                 </h2>
               </div>
 
-              {errorMsg ? (
+              {unconfiguredFallback ? (
+                <div
+                  style={{
+                    margin: 0,
+                    borderRadius: 14,
+                    padding: "16px 18px",
+                    background: "rgba(249,245,230,0.9)",
+                    border: "1px solid rgba(210,190,130,0.5)",
+                    color: "#5a4a20",
+                    display: "grid",
+                    gap: 10,
+                  }}
+                >
+                  <p style={{ margin: 0, fontSize: 14, fontWeight: 700 }}>
+                    Contact form is temporarily unavailable.
+                  </p>
+                  <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7 }}>
+                    Please email us directly:
+                  </p>
+                  <a
+                    href={`mailto:${buildSupportEmail()}`}
+                    style={{ color: "#3f6093", fontWeight: 700, wordBreak: "break-all" }}
+                  >
+                    {buildSupportEmail()}
+                  </a>
+                </div>
+              ) : errorMsg ? (
                 <p style={{ margin: 0, borderRadius: 14, padding: "12px 14px", background: "rgba(188,95,111,0.12)", color: "#a33d51", fontSize: 14 }}>
                   {errorMsg}
                 </p>

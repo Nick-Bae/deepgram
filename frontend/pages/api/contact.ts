@@ -58,6 +58,12 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+// NOTE: This rate store lives in `globalThis` and is per-serverless-instance.
+// In Vercel production, multiple concurrent cold-start instances each maintain
+// independent state, so the rate limits are enforced per-instance, not globally.
+// This is acceptable for a low-traffic contact form — the limits still prevent
+// casual abuse from a single session. For strict cross-instance enforcement,
+// replace the Map-based store with a shared KV store (e.g. Vercel KV / Upstash).
 function getRateStore(): RateStore {
   const scope = globalThis as typeof globalThis & { __contactRateStore?: RateStore };
   if (!scope.__contactRateStore) {
@@ -258,6 +264,52 @@ async function sendContactEmail(payload: {
   }
 }
 
+async function sendConfirmationEmail(params: {
+  email: string;
+  name: string;
+  topic: ContactTopic;
+}): Promise<void> {
+  const resendApiKey = (process.env.RESEND_API_KEY || "").trim();
+  const fromEmail = (process.env.CONTACT_FROM_EMAIL || "").trim();
+  const fallbackFromEmail = (process.env.RESEND_FALLBACK_FROM_EMAIL || "Worship <onboarding@resend.dev>").trim();
+
+  if (!resendApiKey || !fromEmail) return; // not configured — skip silently
+
+  const topicLabel = TOPIC_LABELS[params.topic] || TOPIC_LABELS.other;
+  const subject = "We received your message — Worship Support";
+  const text = [
+    `Hi ${params.name},`,
+    "",
+    `We received your message about "${topicLabel}". Our support team will follow up within 1 business day.`,
+    "",
+    "You don't need to reply to this email. If you'd like to add more details, send a new message at worshiptranslation.com/contact.",
+    "",
+    "— Worship Support Team",
+  ].join("\n");
+
+  const send = async (activeFrom: string) =>
+    fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${resendApiKey}`,
+      },
+      body: JSON.stringify({
+        from: activeFrom,
+        to: [params.email],
+        subject,
+        text,
+        tags: [{ name: "source", value: "worship-contact-confirmation" }],
+      }),
+    });
+
+  let res = await send(fromEmail);
+  if (!res.ok && isResendDomainNotVerified(res.status, await res.text()) && fallbackFromEmail !== fromEmail) {
+    res = await send(fallbackFromEmail);
+  }
+  // Result intentionally ignored — confirmation failure must not block the primary response.
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ContactResponse>) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -316,6 +368,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       authenticated: sender.authenticated,
       sender,
     });
+    sendConfirmationEmail({
+      email: payload.email,
+      name: payload.name,
+      topic: payload.topic,
+    }).catch(() => {});
 
     return res.status(200).json({ ok: true });
   } catch (err) {
