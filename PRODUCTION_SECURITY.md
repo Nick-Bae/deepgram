@@ -8,7 +8,7 @@ This document defines the production security baseline for this repository.
   - Use Firebase custom claim `super_admin=true`.
   - Intended for a very small set of trusted operators.
 - Church/org privileges:
-  - Use app membership roles in Firestore: `owner`, `admin`, `host`, `viewer`.
+  - Use app membership roles in Firestore: `admin`, `host`.
   - Store at `organizations/{orgId}/members/{uid}.role`.
 
 Do not use org membership roles as a replacement for global `super_admin`.

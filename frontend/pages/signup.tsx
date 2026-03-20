@@ -16,11 +16,19 @@ import { useAuth } from "../lib/authContext";
 import { normalizeChurchSlug } from "../lib/churchSlug";
 import { clearHostToken, persistAuthToken, persistStreamContext } from "../utils/streamContext";
 
+function passwordStrength(pwd: string): "weak" | "ok" | "strong" | null {
+  if (!pwd) return null;
+  if (pwd.length < 8) return "weak";
+  if (!/[^a-zA-Z]/.test(pwd)) return "weak";
+  if (pwd.length >= 10) return "strong";
+  return "ok";
+}
+
 function mapFirebaseError(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
   if (code === "auth/email-already-in-use") return "This email is already in use.";
   if (code === "auth/invalid-email") return "Email format is invalid.";
-  if (code === "auth/weak-password") return "Password must be at least 6 characters.";
+  if (code === "auth/weak-password") return "Password must be at least 8 characters.";
   if (err instanceof Error) return err.message;
   return "Sign up failed.";
 }
@@ -258,10 +266,17 @@ export default function SignupPage() {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             autoComplete="new-password"
-            minLength={6}
+            minLength={8}
             required
             style={studioFieldStyle}
           />
+          {(() => {
+            const s = passwordStrength(password);
+            if (!s) return null;
+            const color = s === "weak" ? "#a33d51" : s === "ok" ? "#b07d29" : "#2f6d4f";
+            const label = s === "weak" ? "Weak" : s === "ok" ? "OK" : "Strong";
+            return <span style={{ ...studioHelperTextStyle, color }}>{label} password</span>;
+          })()}
         </label>
         <label style={studioLabelStyle}>
           <span style={studioLabelTextStyle}>Confirm password</span>
@@ -270,7 +285,7 @@ export default function SignupPage() {
             value={confirmPassword}
             onChange={(e) => setConfirmPassword(e.target.value)}
             autoComplete="new-password"
-            minLength={6}
+            minLength={8}
             required
             style={studioFieldStyle}
           />

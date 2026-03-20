@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import TranslationBox from "../../../components/TranslationBox";
 import { useAuth } from "../../../lib/authContext";
+import { getFirebaseClient } from "../../../lib/firebaseClient";
 import {
   createBillingCheckoutSession,
   createBillingPortalSession,
@@ -277,6 +278,9 @@ export default function HostChurchPage() {
   const [sermonBudgetBusy, setSermonBudgetBusy] = useState(false);
   const [sermonBudgetError, setSermonBudgetError] = useState<string | null>(null);
   const [sermonBudgetNotice, setSermonBudgetNotice] = useState<string | null>(null);
+  const [verificationRequired, setVerificationRequired] = useState(false);
+  const [verificationSending, setVerificationSending] = useState(false);
+  const [verificationError, setVerificationError] = useState<string | null>(null);
   const normalizedServiceKey = serviceKey.trim();
   const normalizedQueryServiceKey = queryServiceKey.trim();
   const activeTab = resolveHostTab(querySection);
@@ -446,6 +450,43 @@ export default function HostChurchPage() {
     const nextPath = router.asPath || `/host/c/${encodeURIComponent(slug || "demo")}/broadcast`;
     router.replace(`/login?next=${encodeURIComponent(nextPath)}`);
   }, [authLoading, router, slug, user]);
+
+  useEffect(() => {
+    if (authLoading || !user) return;
+    setVerificationRequired(!user.emailVerified);
+  }, [authLoading, user]);
+
+  const handleResendVerification = useCallback(async () => {
+    if (!user) return;
+    setVerificationSending(true);
+    setVerificationError(null);
+    try {
+      await user.sendEmailVerification();
+    } catch (err) {
+      setVerificationError(err instanceof Error ? err.message : "Failed to send verification email.");
+    } finally {
+      setVerificationSending(false);
+    }
+  }, [user]);
+
+  const handleCheckVerification = useCallback(async () => {
+    if (!user) return;
+    setVerificationSending(true);
+    setVerificationError(null);
+    try {
+      await user.reload();
+      const fresh = getFirebaseClient()?.auth.currentUser;
+      if (fresh?.emailVerified) {
+        setVerificationRequired(false);
+      } else {
+        setVerificationError("Email not yet verified. Check your inbox and click the link.");
+      }
+    } catch (err) {
+      setVerificationError(err instanceof Error ? err.message : "Failed to check verification status.");
+    } finally {
+      setVerificationSending(false);
+    }
+  }, [user]);
 
   useEffect(() => {
     if (authLoading || !user) return;
@@ -1726,6 +1767,69 @@ export default function HostChurchPage() {
     return (
       <main style={{ ...hostPageStyle, display: "grid", placeItems: "center" }}>
         Redirecting to login...
+      </main>
+    );
+  }
+
+  if (!authLoading && user && verificationRequired) {
+    return (
+      <main style={{ ...hostPageStyle, display: "grid", placeItems: "center" }}>
+        <div
+          style={{
+            background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.12)",
+            borderRadius: 16,
+            padding: "32px 28px",
+            maxWidth: 440,
+            display: "grid",
+            gap: 16,
+            color: "#e8e8e8",
+            fontFamily: "inherit",
+          }}
+        >
+          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>Verify Your Email</h2>
+          <p style={{ margin: 0, fontSize: 14, lineHeight: 1.6, color: "#b0b8c8" }}>
+            A verification link was sent to <strong style={{ color: "#e8e8e8" }}>{user.email}</strong>.
+            Please click the link in that email before accessing the host console.
+          </p>
+          {verificationError ? (
+            <p style={{ margin: 0, fontSize: 13, color: "#e88a8a" }}>{verificationError}</p>
+          ) : null}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button
+              onClick={handleResendVerification}
+              disabled={verificationSending}
+              style={{
+                padding: "9px 16px",
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: "rgba(255,255,255,0.08)",
+                color: "#e8e8e8",
+                fontSize: 13,
+                cursor: verificationSending ? "not-allowed" : "pointer",
+                opacity: verificationSending ? 0.6 : 1,
+              }}
+            >
+              {verificationSending ? "Sending..." : "Resend Verification Email"}
+            </button>
+            <button
+              onClick={handleCheckVerification}
+              disabled={verificationSending}
+              style={{
+                padding: "9px 16px",
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: "rgba(255,255,255,0.08)",
+                color: "#e8e8e8",
+                fontSize: 13,
+                cursor: verificationSending ? "not-allowed" : "pointer",
+                opacity: verificationSending ? 0.6 : 1,
+              }}
+            >
+              {verificationSending ? "Checking..." : "Check Again"}
+            </button>
+          </div>
+        </div>
       </main>
     );
   }

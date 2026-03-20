@@ -1,13 +1,24 @@
 {
   "version": "3.0",
-  "lastUpdated": "2026-03-20T20:38:50.121Z",
+  "lastUpdated": "2026-03-20T21:16:35.611Z",
   "activeFeatures": [
     "billing",
     "admin",
-    "routes"
+    "routes",
+    "auth-hardening",
+    "frontend",
+    "c"
   ],
-  "primaryFeature": "billing",
+  "primaryFeature": "auth-hardening",
   "features": {
+    "auth-hardening": {
+      "phase": "check",
+      "matchRate": 100,
+      "startedAt": "2026-03-20T20:45:00.000Z",
+      "planDoc": "docs/01-plan/features/auth-hardening.plan.md",
+      "designDoc": "docs/02-design/features/auth-hardening.design.md",
+      "analysisDoc": "docs/03-analysis/auth-hardening.analysis.md"
+    },
     "billing": {
       "phase": "check",
       "matchRate": 94,
@@ -38,9 +49,35 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T20:38:50.121Z",
-        "lastUpdated": "2026-03-20T20:38:50.121Z"
+        "lastUpdated": "2026-03-20T21:11:50.793Z"
       },
-      "lastFile": "/home/namju/project/real-time-translation/backend/app/routes/admin.py"
+      "lastFile": "/home/namju/project/real-time-translation/backend/app/routes/auth.py"
+    },
+    "frontend": {
+      "phase": "do",
+      "phaseNumber": 3,
+      "matchRate": null,
+      "iterationCount": 0,
+      "requirements": [],
+      "documents": {},
+      "timestamps": {
+        "started": "2026-03-20T21:11:56.820Z",
+        "lastUpdated": "2026-03-20T21:16:35.611Z"
+      },
+      "lastFile": "/home/namju/project/real-time-translation/frontend/pages/login.tsx"
+    },
+    "c": {
+      "phase": "do",
+      "phaseNumber": 3,
+      "matchRate": null,
+      "iterationCount": 0,
+      "requirements": [],
+      "documents": {},
+      "timestamps": {
+        "started": "2026-03-20T21:12:40.289Z",
+        "lastUpdated": "2026-03-20T21:13:40.944Z"
+      },
+      "lastFile": "/home/namju/project/real-time-translation/frontend/pages/host/c/[churchSlug].tsx"
     }
   },
   "pipeline": {
@@ -51,7 +88,7 @@
   "session": {
     "startedAt": "2026-03-20T20:05:09.411Z",
     "onboardingCompleted": false,
-    "lastActivity": "2026-03-20T20:38:50.121Z"
+    "lastActivity": "2026-03-20T21:16:35.611Z"
   },
   "history": [
     {
@@ -87,6 +124,96 @@
     {
       "timestamp": "2026-03-20T20:38:50.121Z",
       "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:10:51.122Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:11:06.672Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:11:14.547Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:11:21.226Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:11:50.793Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:11:56.820Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:12:00.605Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:12:10.091Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:12:20.806Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:12:26.599Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:12:40.289Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:13:01.748Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:13:14.900Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:13:40.944Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-20T21:16:35.611Z",
+      "feature": "frontend",
       "phase": "do",
       "action": "updated"
     }

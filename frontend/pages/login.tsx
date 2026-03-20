@@ -15,6 +15,28 @@ import { fetchAuthMe, type OrgMembership } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
 import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../lib/dashboardRoute";
 import { clearHostToken, persistAuthToken } from "../utils/streamContext";
+import { API_URL } from "../utils/urls";
+
+async function hashEmail(email: string): Promise<string> {
+  const data = new TextEncoder().encode(email.toLowerCase().trim());
+  const buffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function reportLoginFailed(email: string): Promise<void> {
+  try {
+    const emailHash = await hashEmail(email);
+    await fetch(`${API_URL}/api/auth/login-failed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email_hash: emailHash }),
+    });
+  } catch {
+    // fire-and-forget; never surfaces to the user
+  }
+}
 
 function mapFirebaseError(err: unknown): string {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
@@ -161,6 +183,10 @@ export default function LoginPage() {
       await login(email.trim(), password);
       await redirectWithFreshSession();
     } catch (err) {
+      const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
+      if (code === "auth/too-many-requests" || code === "auth/wrong-password" || code === "auth/invalid-credential") {
+        void reportLoginFailed(email.trim());
+      }
       if (isInvalidSessionError(err)) {
         try {
           await logout();

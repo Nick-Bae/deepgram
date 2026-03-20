@@ -50,6 +50,18 @@ _password_reset_ip_hits: Dict[str, Deque[float]] = {}
 _password_reset_email_hits: Dict[str, Deque[float]] = {}
 _password_reset_rate_lock = Lock()
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", re.I)
+_BOOTSTRAP_ORG_RATE_WINDOW_SECONDS = _env_int(
+    "BOOTSTRAP_ORG_RATE_WINDOW_SECONDS", 3600, min_value=60, max_value=86400
+)
+_BOOTSTRAP_ORG_RATE_MAX = _env_int(
+    "BOOTSTRAP_ORG_RATE_MAX_PER_WINDOW", 3, min_value=1, max_value=100
+)
+_bootstrap_org_rate_hits: Dict[str, Deque[float]] = {}
+_bootstrap_org_rate_lock = Lock()
+_LOGIN_FAILED_RATE_WINDOW_SECONDS = 60
+_LOGIN_FAILED_RATE_MAX_PER_IP = 30
+_login_failed_ip_hits: Dict[str, Deque[float]] = {}
+_login_failed_rate_lock = Lock()
 
 
 def _enforce_invite_rate_limit(uid: str, *, action: str, max_hits: int) -> None:
@@ -99,6 +111,10 @@ class SetOrgBillingLimitsRequest(BaseModel):
 
 class PasswordResetRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=320)
+
+
+class LoginFailedRequest(BaseModel):
+    email_hash: str = Field(..., min_length=1, max_length=128)
 
 
 def _sanitize_membership_payload(rows: list[dict]) -> list[dict]:
@@ -181,6 +197,49 @@ def _enforce_password_reset_rate_limit(ip: str, email: str) -> None:
             security_event("rate_limit_hit", detail="password_reset_rate_limited_by_email", ip=clean_ip)
             raise HTTPException(status_code=429, detail="password_reset_rate_limited")
         email_bucket.append(now)
+
+
+def _enforce_bootstrap_org_rate_limit(uid: str) -> None:
+    clean_uid = (uid or "").strip()
+    if not clean_uid:
+        return
+    now = time.monotonic()
+    cutoff = now - _BOOTSTRAP_ORG_RATE_WINDOW_SECONDS
+    with _bootstrap_org_rate_lock:
+        bucket = _bootstrap_org_rate_hits.get(clean_uid)
+        if bucket is None:
+            bucket = deque()
+            _bootstrap_org_rate_hits[clean_uid] = bucket
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= _BOOTSTRAP_ORG_RATE_MAX:
+            security_event("rate_limit_hit", detail="bootstrap_org_rate_limited", uid=clean_uid)
+            raise HTTPException(status_code=429, detail="bootstrap_org_rate_limited")
+        bucket.append(now)
+        if len(_bootstrap_org_rate_hits) > 4096:
+            stale = [k for k, v in _bootstrap_org_rate_hits.items() if not v or v[-1] <= cutoff]
+            for sk in stale:
+                _bootstrap_org_rate_hits.pop(sk, None)
+
+
+def _enforce_login_failed_rate_limit(ip: str) -> None:
+    clean_ip = (ip or "").strip() or "unknown"
+    now = time.monotonic()
+    cutoff = now - _LOGIN_FAILED_RATE_WINDOW_SECONDS
+    with _login_failed_rate_lock:
+        bucket = _login_failed_ip_hits.get(clean_ip)
+        if bucket is None:
+            bucket = deque()
+            _login_failed_ip_hits[clean_ip] = bucket
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= _LOGIN_FAILED_RATE_MAX_PER_IP:
+            raise HTTPException(status_code=429, detail="login_failed_rate_limited")
+        bucket.append(now)
+        if len(_login_failed_ip_hits) > 4096:
+            stale = [k for k, v in _login_failed_ip_hits.items() if not v or v[-1] <= cutoff]
+            for sk in stale:
+                _login_failed_ip_hits.pop(sk, None)
 
 
 def _password_reset_continue_url() -> str | None:
@@ -343,6 +402,7 @@ def auth_bootstrap_owner(
     payload: BootstrapOwnerRequest,
     user: AuthenticatedUser = Depends(get_current_user_required),
 ):
+    _enforce_bootstrap_org_rate_limit(user.uid)
     try:
         result = multichurch_store.bootstrap_owner_org(
             owner_uid=user.uid,
@@ -625,3 +685,12 @@ def auth_revoke_invite(
     except PermissionError as exc:
         detail = str(exc) or "forbidden"
         raise HTTPException(status_code=403, detail=detail) from exc
+
+
+@router.post("/auth/login-failed")
+def auth_login_failed(payload: LoginFailedRequest, request: Request):
+    """Observability-only endpoint. No auth required. No Firestore writes."""
+    ip = _client_ip(request)
+    _enforce_login_failed_rate_limit(ip)
+    security_event("login_failed", email_hash=payload.email_hash, ip=ip)
+    return {"ok": True}
