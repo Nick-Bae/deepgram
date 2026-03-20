@@ -1,0 +1,1027 @@
+import Head from "next/head";
+import Link from "next/link";
+import { useRouter } from "next/router";
+import { useCallback, useEffect, useState } from "react";
+
+import { useAuth } from "../../lib/authContext";
+import { fetchAuthMe } from "../../lib/backendAuth";
+import { API_URL } from "../../utils/urls";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+type LiveRoom = {
+  roomId: string;
+  serviceKey: string;
+  source: string;
+  target: string;
+  startedAt: string | null;
+  elapsedMinutes: number | null;
+  orgId?: string;
+  orgName?: string;
+};
+
+type OrgRow = {
+  orgId: string;
+  name: string;
+  slug: string;
+  plan: string;
+  status: string;
+  billingStatus: string;
+  hardCapReached: boolean;
+  memberCount: number;
+  serviceCount: number;
+  liveRoomCount: number;
+  liveRooms: LiveRoom[];
+  currentMonthMinutes: number;
+  maxMinutesPerMonth: number;
+  trialSecondsRemaining: number | null;
+  sermonPrepUsageUsd: number;
+  sermonPrepBudgetUsd: number;
+  createdAt: string | null;
+  stripeCustomerId: string;
+  stripeSubscriptionId: string;
+};
+
+type DashboardData = {
+  generatedAt: string;
+  summary: {
+    totalOrgs: number;
+    totalMembers: number;
+    liveRoomCount: number;
+    planCounts: Record<string, number>;
+    billingStatusCounts: Record<string, number>;
+  };
+  organizations: OrgRow[];
+  liveRooms: LiveRoom[];
+};
+
+type UsageStat = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimatedUsd: number;
+  requestsCount: number;
+};
+
+type PlatformUsage = {
+  periodKey: string;
+  generatedAt: string;
+  liveTranslation: UsageStat;
+  sermonPrep: UsageStat;
+  deepgram: { audioSeconds: number; estimatedUsd: number };
+};
+
+type PlatformConfig = {
+  liveTranslationInputCostPerMillion: number;
+  liveTranslationOutputCostPerMillion: number;
+  deepgramCostPerMinute: number;
+  gcpBillingAccountId: string;
+};
+
+type GcpUsage = {
+  available: boolean;
+  error?: string;
+  projectId?: string;
+  periodKey?: string;
+  firestore?: { reads: number; writes: number; deletes: number; estimatedUsd: number };
+  billing?: { spendUsd: number | null; budgetUsd: number | null; error: string | null };
+  billingAccountId?: string;
+  billingConsoleUrl?: string;
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+const PLAN_LABEL: Record<string, string> = {
+  trial: "Trial",
+  starter: "Starter",
+  growth: "Growth",
+  premium: "Premium",
+};
+
+const PLAN_COLOR: Record<string, string> = {
+  trial: "#6b7280",
+  starter: "#3b82f6",
+  growth: "#8b5cf6",
+  premium: "#f59e0b",
+};
+
+const BILLING_STATUS_COLOR: Record<string, string> = {
+  trialing: "#6b7280",
+  active: "#10b981",
+  past_due: "#f59e0b",
+  canceled: "#ef4444",
+  unpaid: "#ef4444",
+  incomplete: "#f59e0b",
+};
+
+function planBadge(plan: string) {
+  const color = PLAN_COLOR[plan] || "#6b7280";
+  const label = PLAN_LABEL[plan] || plan;
+  return (
+    <span
+      style={{
+        background: color + "20",
+        color,
+        border: `1px solid ${color}40`,
+        borderRadius: 4,
+        padding: "2px 8px",
+        fontSize: 12,
+        fontWeight: 600,
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+function statusBadge(status: string) {
+  const color = BILLING_STATUS_COLOR[status] || "#6b7280";
+  return (
+    <span
+      style={{
+        background: color + "18",
+        color,
+        border: `1px solid ${color}40`,
+        borderRadius: 4,
+        padding: "2px 8px",
+        fontSize: 12,
+        fontWeight: 500,
+      }}
+    >
+      {status}
+    </span>
+  );
+}
+
+function fmtDate(iso: string | null): string {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  } catch {
+    return iso;
+  }
+}
+
+function fmtSeconds(s: number): string {
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return `${h}h ${rem}m`;
+}
+
+function trialMinsRemaining(seconds: number | null): string {
+  if (seconds === null) return "—";
+  const mins = Math.floor(seconds / 60);
+  if (mins <= 0) return "Exhausted";
+  return `${mins} min left`;
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
+export default function AdminDashboardPage() {
+  const router = useRouter();
+  const { user, loading: authLoading, getIdToken } = useAuth();
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [platformUsage, setPlatformUsage] = useState<PlatformUsage | null>(null);
+  const [platformConfig, setPlatformConfig] = useState<PlatformConfig | null>(null);
+  const [configDraft, setConfigDraft] = useState<PlatformConfig | null>(null);
+  const [configSaving, setConfigSaving] = useState(false);
+  const [configSaved, setConfigSaved] = useState(false);
+  const [gcpUsage, setGcpUsage] = useState<GcpUsage | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
+  const [search, setSearch] = useState("");
+  const [planFilter, setPlanFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+
+  const load = useCallback(async () => {
+    if (!user) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const token = await getIdToken();
+      if (!token) throw new Error("Not authenticated");
+      // Verify user is master admin
+      const me = await fetchAuthMe(token);
+      if (!me.user.isMaster) {
+        void router.replace("/admin");
+        return;
+      }
+      const [res, usageRes, cfgRes, gcpRes] = await Promise.all([
+        fetch(`${API_URL}/api/admin/dashboard`, { headers: { Authorization: `Bearer ${token as string}` } }),
+        fetch(`${API_URL}/api/admin/platform-usage`, { headers: { Authorization: `Bearer ${token as string}` } }),
+        fetch(`${API_URL}/api/admin/platform-config`, { headers: { Authorization: `Bearer ${token as string}` } }),
+        fetch(`${API_URL}/api/admin/gcp-usage`, { headers: { Authorization: `Bearer ${token as string}` } }),
+      ]);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.detail || `HTTP ${res.status}`);
+      }
+      const payload = (await res.json()) as DashboardData;
+      setData(payload);
+      if (usageRes.ok) {
+        setPlatformUsage((await usageRes.json()) as PlatformUsage);
+      }
+      if (cfgRes.ok) {
+        const cfg = (await cfgRes.json()) as PlatformConfig;
+        setPlatformConfig(cfg);
+        setConfigDraft(cfg);
+      }
+      if (gcpRes.ok) {
+        setGcpUsage((await gcpRes.json()) as GcpUsage);
+      }
+      setLastRefreshed(new Date());
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [user, getIdToken, router]);
+
+  useEffect(() => {
+    if (authLoading) return;
+    if (!user) {
+      void router.replace(`/login?next=${encodeURIComponent("/admin/dashboard")}`);
+      return;
+    }
+    void load();
+  }, [authLoading, user, load, router]);
+
+  const filtered = (data?.organizations ?? []).filter((org) => {
+    if (planFilter !== "all" && org.plan !== planFilter) return false;
+    if (statusFilter !== "all" && org.billingStatus !== statusFilter) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      return org.name.toLowerCase().includes(q) || org.slug.toLowerCase().includes(q) || org.orgId.toLowerCase().includes(q);
+    }
+    return true;
+  });
+
+  // ─── Render ───────────────────────────────────────────────────────────────
+
+  if (authLoading || (loading && !data)) {
+    return (
+      <div style={styles.page}>
+        <div style={styles.loadingBox}>
+          <div style={styles.spinner} />
+          <span style={{ color: "#6b7280", marginLeft: 12 }}>Loading dashboard…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={styles.page}>
+        <div style={styles.errorBox}>
+          <strong>Error:</strong> {error}
+          <button onClick={() => void load()} style={styles.refreshBtn}>
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const summary = data?.summary;
+  const plans = Object.entries(summary?.planCounts ?? {}).sort((a, b) => b[1] - a[1]);
+  const billingStatuses = Object.entries(summary?.billingStatusCounts ?? {}).sort((a, b) => b[1] - a[1]);
+
+  return (
+    <>
+      <Head>
+        <title>Admin Dashboard – Worship Translation Studio</title>
+      </Head>
+      <div style={styles.page}>
+        {/* Header */}
+        <div style={styles.header}>
+          <div>
+            <h1 style={styles.title}>Admin Dashboard</h1>
+            <p style={styles.subtitle}>
+              System overview · {lastRefreshed ? `Refreshed ${lastRefreshed.toLocaleTimeString()}` : "Loading…"}
+            </p>
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <Link href="/admin" style={styles.backLink}>
+              ← Admin Tools
+            </Link>
+            <button onClick={() => void load()} style={styles.refreshBtn} disabled={loading}>
+              {loading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+        </div>
+
+        {/* Summary Cards */}
+        {summary && (
+          <div style={styles.cardRow}>
+            <div style={styles.card}>
+              <div style={styles.cardValue}>{summary.totalOrgs}</div>
+              <div style={styles.cardLabel}>Organizations</div>
+            </div>
+            <div style={styles.card}>
+              <div style={styles.cardValue}>{summary.totalMembers}</div>
+              <div style={styles.cardLabel}>Total Members</div>
+            </div>
+            <div style={{ ...styles.card, borderColor: summary.liveRoomCount > 0 ? "#10b981" : "#e5e7eb" }}>
+              <div style={{ ...styles.cardValue, color: summary.liveRoomCount > 0 ? "#10b981" : "#111827" }}>
+                {summary.liveRoomCount}
+              </div>
+              <div style={styles.cardLabel}>Live Rooms Now</div>
+            </div>
+            <div style={styles.card}>
+              <div style={styles.cardBreakdown}>
+                {plans.map(([plan, count]) => (
+                  <span key={plan} style={{ marginRight: 8 }}>
+                    {planBadge(plan)} <strong>{count}</strong>
+                  </span>
+                ))}
+              </div>
+              <div style={styles.cardLabel}>Plan Distribution</div>
+            </div>
+            <div style={styles.card}>
+              <div style={styles.cardBreakdown}>
+                {billingStatuses.map(([s, count]) => (
+                  <span key={s} style={{ marginRight: 8 }}>
+                    {statusBadge(s)} <strong>{count}</strong>
+                  </span>
+                ))}
+              </div>
+              <div style={styles.cardLabel}>Billing Status</div>
+            </div>
+          </div>
+        )}
+
+        {/* Platform Usage */}
+        {platformUsage && (
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>
+              Platform Usage
+              <span style={{ fontSize: 12, color: "#9ca3af", fontWeight: 400, marginLeft: 8 }}>
+                {platformUsage.periodKey.slice(0, 4)}-{platformUsage.periodKey.slice(4)} · estimates only
+              </span>
+            </h2>
+            <div style={styles.cardRow}>
+              <div style={styles.usageCard}>
+                <div style={styles.usageCardHeader}>
+                  <span style={styles.usageCardIcon}>⚡</span>
+                  <span style={styles.usageCardTitle}>OpenAI — Live Translation</span>
+                </div>
+                <div style={styles.usageCardStat}>${platformUsage.liveTranslation.estimatedUsd.toFixed(4)}</div>
+                <div style={styles.usageCardMeta}>{platformUsage.liveTranslation.totalTokens.toLocaleString()} tokens · {platformUsage.liveTranslation.requestsCount.toLocaleString()} requests</div>
+                <div style={styles.usageCardMeta}>{platformUsage.liveTranslation.promptTokens.toLocaleString()} in · {platformUsage.liveTranslation.completionTokens.toLocaleString()} out</div>
+              </div>
+              <div style={styles.usageCard}>
+                <div style={styles.usageCardHeader}>
+                  <span style={styles.usageCardIcon}>📖</span>
+                  <span style={styles.usageCardTitle}>OpenAI — Sermon Prep</span>
+                </div>
+                <div style={styles.usageCardStat}>${platformUsage.sermonPrep.estimatedUsd.toFixed(4)}</div>
+                <div style={styles.usageCardMeta}>{platformUsage.sermonPrep.totalTokens.toLocaleString()} tokens · {platformUsage.sermonPrep.requestsCount.toLocaleString()} requests</div>
+                <div style={styles.usageCardMeta}>{platformUsage.sermonPrep.promptTokens.toLocaleString()} in · {platformUsage.sermonPrep.completionTokens.toLocaleString()} out</div>
+              </div>
+              <div style={styles.usageCard}>
+                <div style={styles.usageCardHeader}>
+                  <span style={styles.usageCardIcon}>🎙️</span>
+                  <span style={styles.usageCardTitle}>Deepgram — Speech-to-Text</span>
+                </div>
+                <div style={styles.usageCardStat}>${platformUsage.deepgram.estimatedUsd.toFixed(4)}</div>
+                <div style={styles.usageCardMeta}>{Math.floor(platformUsage.deepgram.audioSeconds / 60)}m {Math.round(platformUsage.deepgram.audioSeconds % 60)}s audio processed</div>
+              </div>
+              <div style={styles.usageCard}>
+                <div style={styles.usageCardHeader}>
+                  <span style={styles.usageCardIcon}>☁️</span>
+                  <span style={styles.usageCardTitle}>Firestore</span>
+                </div>
+                {gcpUsage?.available && gcpUsage.firestore ? (
+                  <>
+                    <div style={styles.usageCardStat}>${gcpUsage.firestore.estimatedUsd.toFixed(4)}</div>
+                    <div style={styles.usageCardMeta}>{gcpUsage.firestore.reads.toLocaleString()} reads</div>
+                    <div style={styles.usageCardMeta}>{gcpUsage.firestore.writes.toLocaleString()} writes · {gcpUsage.firestore.deletes.toLocaleString()} deletes</div>
+                  </>
+                ) : (
+                  <div style={{ ...styles.usageCardMeta, marginTop: 8, color: "#f59e0b", whiteSpace: "normal", lineHeight: 1.4 }}>
+                    {gcpUsage?.error ?? "Loading…"}
+                  </div>
+                )}
+              </div>
+              <div style={styles.usageCard}>
+                <div style={styles.usageCardHeader}>
+                  <span style={styles.usageCardIcon}>🧾</span>
+                  <span style={styles.usageCardTitle}>Google Cloud Billing</span>
+                </div>
+                {gcpUsage?.billing?.spendUsd != null ? (
+                  <>
+                    <div style={styles.usageCardStat}>${gcpUsage.billing.spendUsd.toFixed(2)}</div>
+                    <div style={styles.usageCardMeta}>this month</div>
+                    {gcpUsage.billing.budgetUsd != null && (
+                      <div style={styles.usageCardMeta}>budget: ${gcpUsage.billing.budgetUsd.toFixed(0)}</div>
+                    )}
+                  </>
+                ) : (
+                  <div style={{ ...styles.usageCardMeta, marginTop: 8, color: gcpUsage?.billing?.error ? "#f59e0b" : "#6b7280", whiteSpace: "normal", lineHeight: 1.4 }}>
+                    {gcpUsage?.billing?.error ?? (gcpUsage?.billingAccountId ? "Loading…" : "Set billing account ID in Pricing Rates below")}
+                  </div>
+                )}
+                <a href={gcpUsage?.billingConsoleUrl ?? "https://console.cloud.google.com/billing"} target="_blank" rel="noopener noreferrer" style={styles.externalLink}>
+                  View Billing Console →
+                </a>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Pricing Rates */}
+        {configDraft && (
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>Pricing Rates</h2>
+            <div style={styles.configBox}>
+              <div style={styles.configGrid}>
+                <div style={styles.configField}>
+                  <label style={styles.configLabel}>OpenAI Input ($/M tokens)</label>
+                  <input
+                    type="number"
+                    step="0.001"
+                    min="0"
+                    style={styles.configInput}
+                    value={configDraft.liveTranslationInputCostPerMillion}
+                    onChange={(e) => setConfigDraft((d) => d && { ...d, liveTranslationInputCostPerMillion: parseFloat(e.target.value) || 0 })}
+                  />
+                  <span style={styles.configHint}>Live translation &amp; sermon prep input tokens</span>
+                </div>
+                <div style={styles.configField}>
+                  <label style={styles.configLabel}>OpenAI Output ($/M tokens)</label>
+                  <input
+                    type="number"
+                    step="0.001"
+                    min="0"
+                    style={styles.configInput}
+                    value={configDraft.liveTranslationOutputCostPerMillion}
+                    onChange={(e) => setConfigDraft((d) => d && { ...d, liveTranslationOutputCostPerMillion: parseFloat(e.target.value) || 0 })}
+                  />
+                  <span style={styles.configHint}>Live translation &amp; sermon prep output tokens</span>
+                </div>
+                <div style={styles.configField}>
+                  <label style={styles.configLabel}>Deepgram ($/min)</label>
+                  <input
+                    type="number"
+                    step="0.0001"
+                    min="0"
+                    style={styles.configInput}
+                    value={configDraft.deepgramCostPerMinute}
+                    onChange={(e) => setConfigDraft((d) => d && { ...d, deepgramCostPerMinute: parseFloat(e.target.value) || 0 })}
+                  />
+                  <span style={styles.configHint}>Nova-2 streaming default: $0.0059/min</span>
+                </div>
+                <div style={styles.configField}>
+                  <label style={styles.configLabel}>GCP Billing Account ID</label>
+                  <input
+                    type="text"
+                    style={styles.configInput}
+                    placeholder="XXXXXX-XXXXXX-XXXXXX"
+                    value={configDraft.gcpBillingAccountId}
+                    onChange={(e) => setConfigDraft((d) => d && { ...d, gcpBillingAccountId: e.target.value })}
+                  />
+                  <span style={styles.configHint}>Used to generate direct billing report links</span>
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 16 }}>
+                <button
+                  style={{ ...styles.refreshBtn, opacity: configSaving ? 0.6 : 1 }}
+                  disabled={configSaving}
+                  onClick={async () => {
+                    if (!configDraft) return;
+                    setConfigSaving(true);
+                    setConfigSaved(false);
+                    try {
+                      const token = await getIdToken();
+                      const res = await fetch(`${API_URL}/api/admin/platform-config`, {
+                        method: "POST",
+                        headers: { Authorization: `Bearer ${token as string}`, "Content-Type": "application/json" },
+                        body: JSON.stringify(configDraft),
+                      });
+                      if (res.ok) {
+                        const updated = (await res.json()) as PlatformConfig;
+                        setPlatformConfig(updated);
+                        setConfigDraft(updated);
+                        setConfigSaved(true);
+                        setTimeout(() => setConfigSaved(false), 3000);
+                      }
+                    } finally {
+                      setConfigSaving(false);
+                    }
+                  }}
+                >
+                  {configSaving ? "Saving…" : "Save Rates"}
+                </button>
+                {configSaved && <span style={{ color: "#10b981", fontSize: 14, fontWeight: 500 }}>Saved</span>}
+                {configDraft && platformConfig && JSON.stringify(configDraft) !== JSON.stringify(platformConfig) && (
+                  <button
+                    style={{ background: "none", border: "none", color: "#9ca3af", fontSize: 13, cursor: "pointer" }}
+                    onClick={() => setConfigDraft(platformConfig)}
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Live Rooms */}
+        {(data?.liveRooms ?? []).length > 0 && (
+          <section style={styles.section}>
+            <h2 style={styles.sectionTitle}>
+              <span style={styles.liveDot} /> Live Right Now
+            </h2>
+            <div style={styles.tableWrap}>
+              <table style={styles.table}>
+                <thead>
+                  <tr>
+                    {["Church", "Service", "Languages", "Started At", "Duration"].map((h) => (
+                      <th key={h} style={styles.th}>
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data!.liveRooms.map((r) => (
+                    <tr key={r.roomId} style={{ background: "#f0fdf4" }}>
+                      <td style={styles.td}>
+                        <Link href={`/host/c/${r.orgName}`} style={styles.tableLink}>
+                          {r.orgName}
+                        </Link>
+                      </td>
+                      <td style={styles.td}>
+                        <code style={styles.code}>{r.serviceKey}</code>
+                      </td>
+                      <td style={styles.td}>
+                        {r.source} → {r.target}
+                      </td>
+                      <td style={styles.td}>{r.startedAt ? new Date(r.startedAt).toLocaleTimeString() : "—"}</td>
+                      <td style={styles.td}>
+                        {r.elapsedMinutes !== null ? (
+                          <span style={{ color: "#10b981", fontWeight: 600 }}>{r.elapsedMinutes} min</span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {/* Organizations Table */}
+        <section style={styles.section}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+            <h2 style={{ ...styles.sectionTitle, margin: 0 }}>Organizations ({filtered.length})</h2>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <input
+                style={styles.searchInput}
+                placeholder="Search name / slug / ID…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+              <select style={styles.select} value={planFilter} onChange={(e) => setPlanFilter(e.target.value)}>
+                <option value="all">All Plans</option>
+                <option value="trial">Trial</option>
+                <option value="starter">Starter</option>
+                <option value="growth">Growth</option>
+                <option value="premium">Premium</option>
+              </select>
+              <select style={styles.select} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+                <option value="all">All Statuses</option>
+                <option value="trialing">Trialing</option>
+                <option value="active">Active</option>
+                <option value="past_due">Past Due</option>
+                <option value="canceled">Canceled</option>
+                <option value="unpaid">Unpaid</option>
+              </select>
+            </div>
+          </div>
+          <div style={styles.tableWrap}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  {["Church", "Plan", "Billing", "Members", "Services", "Live", "Usage (mo)", "Trial Left", "Sermon $", "Created"].map((h) => (
+                    <th key={h} style={styles.th}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((org) => (
+                  <tr
+                    key={org.orgId}
+                    style={{
+                      background: org.liveRoomCount > 0 ? "#f0fdf4" : org.hardCapReached ? "#fef2f2" : "white",
+                    }}
+                  >
+                    <td style={styles.td}>
+                      <div>
+                        <Link href={`/host/c/${org.slug}`} style={styles.tableLink}>
+                          {org.name}
+                        </Link>
+                        <div style={{ fontSize: 11, color: "#9ca3af" }}>{org.slug}</div>
+                      </div>
+                    </td>
+                    <td style={styles.td}>{planBadge(org.plan)}</td>
+                    <td style={styles.td}>
+                      <div>
+                        {statusBadge(org.billingStatus)}
+                        {org.hardCapReached && (
+                          <div style={{ fontSize: 11, color: "#ef4444", fontWeight: 600, marginTop: 2 }}>⚠ Cap reached</div>
+                        )}
+                      </div>
+                    </td>
+                    <td style={{ ...styles.td, textAlign: "center" }}>{org.memberCount}</td>
+                    <td style={{ ...styles.td, textAlign: "center" }}>{org.serviceCount}</td>
+                    <td style={{ ...styles.td, textAlign: "center" }}>
+                      {org.liveRoomCount > 0 ? (
+                        <span style={{ color: "#10b981", fontWeight: 700 }}>● {org.liveRoomCount}</span>
+                      ) : (
+                        <span style={{ color: "#d1d5db" }}>—</span>
+                      )}
+                    </td>
+                    <td style={styles.td}>
+                      {org.maxMinutesPerMonth > 0 ? (
+                        <span>
+                          {org.currentMonthMinutes} / {org.maxMinutesPerMonth} min
+                        </span>
+                      ) : org.currentMonthMinutes > 0 ? (
+                        `${org.currentMonthMinutes} min`
+                      ) : (
+                        <span style={{ color: "#d1d5db" }}>—</span>
+                      )}
+                    </td>
+                    <td style={styles.td}>
+                      <span
+                        style={{
+                          color:
+                            org.trialSecondsRemaining === null
+                              ? "#d1d5db"
+                              : org.trialSecondsRemaining === 0
+                              ? "#ef4444"
+                              : org.trialSecondsRemaining < 300
+                              ? "#f59e0b"
+                              : "#374151",
+                        }}
+                      >
+                        {trialMinsRemaining(org.trialSecondsRemaining)}
+                      </span>
+                    </td>
+                    <td style={styles.td}>
+                      {org.sermonPrepUsageUsd > 0 ? (
+                        <span>
+                          ${org.sermonPrepUsageUsd.toFixed(3)}
+                          {org.sermonPrepBudgetUsd > 0 && (
+                            <span style={{ color: "#9ca3af" }}> / ${org.sermonPrepBudgetUsd.toFixed(2)}</span>
+                          )}
+                        </span>
+                      ) : (
+                        <span style={{ color: "#d1d5db" }}>—</span>
+                      )}
+                    </td>
+                    <td style={{ ...styles.td, color: "#9ca3af", fontSize: 12 }}>{fmtDate(org.createdAt)}</td>
+                  </tr>
+                ))}
+                {filtered.length === 0 && (
+                  <tr>
+                    <td colSpan={10} style={{ ...styles.td, textAlign: "center", color: "#9ca3af", padding: "32px 16px" }}>
+                      No organizations match the current filters.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        {/* Admin Tool Links */}
+        <section style={styles.section}>
+          <h2 style={styles.sectionTitle}>Admin Tools</h2>
+          <div style={styles.toolGrid}>
+            {[
+              { href: "/admin/sermon-prep", label: "Sermon Prep", desc: "Draft & finalize sermon translations" },
+              { href: "/admin/examples", label: "Translation Examples", desc: "Review, correct, export few-shots" },
+              { href: "/admin/prompt", label: "Custom Prompt", desc: "Edit the translator system prompt" },
+              { href: "/admin/display", label: "Display Speed", desc: "Adjust caption pacing on public displays" },
+            ].map((tool) => (
+              <Link key={tool.href} href={tool.href} style={styles.toolCard}>
+                <div style={styles.toolLabel}>{tool.label}</div>
+                <div style={styles.toolDesc}>{tool.desc}</div>
+              </Link>
+            ))}
+          </div>
+        </section>
+      </div>
+    </>
+  );
+}
+
+// ─── Styles ──────────────────────────────────────────────────────────────────
+
+const styles: Record<string, React.CSSProperties> = {
+  page: {
+    padding: "28px 32px",
+    fontFamily: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    background: "#f5f6f8",
+    minHeight: "100vh",
+    maxWidth: 1400,
+    margin: "0 auto",
+  },
+  header: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 24,
+    flexWrap: "wrap",
+    gap: 12,
+  },
+  title: {
+    fontSize: 26,
+    fontWeight: 700,
+    margin: 0,
+    color: "#111827",
+  },
+  subtitle: {
+    color: "#6b7280",
+    fontSize: 14,
+    margin: "4px 0 0",
+  },
+  backLink: {
+    color: "#6b7280",
+    textDecoration: "none",
+    fontSize: 14,
+    padding: "6px 12px",
+    background: "white",
+    borderRadius: 6,
+    border: "1px solid #e5e7eb",
+  },
+  refreshBtn: {
+    background: "#111827",
+    color: "white",
+    border: "none",
+    borderRadius: 6,
+    padding: "6px 14px",
+    fontSize: 14,
+    cursor: "pointer",
+    fontWeight: 500,
+  },
+  cardRow: {
+    display: "flex",
+    gap: 12,
+    marginBottom: 24,
+    flexWrap: "wrap",
+  },
+  card: {
+    background: "white",
+    borderRadius: 10,
+    padding: "16px 20px",
+    border: "1px solid #e5e7eb",
+    flex: "1 1 160px",
+    boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+    minWidth: 140,
+  },
+  cardValue: {
+    fontSize: 28,
+    fontWeight: 700,
+    color: "#111827",
+    lineHeight: 1,
+    marginBottom: 6,
+  },
+  cardLabel: {
+    fontSize: 12,
+    color: "#6b7280",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    fontWeight: 500,
+  },
+  cardBreakdown: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 4,
+    marginBottom: 6,
+    alignItems: "center",
+  },
+  section: {
+    marginBottom: 28,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: 600,
+    color: "#374151",
+    marginBottom: 12,
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+  },
+  liveDot: {
+    display: "inline-block",
+    width: 10,
+    height: 10,
+    borderRadius: "50%",
+    background: "#10b981",
+    boxShadow: "0 0 0 3px #10b98130",
+    animation: "pulse 2s infinite",
+  },
+  tableWrap: {
+    overflowX: "auto",
+    background: "white",
+    borderRadius: 10,
+    border: "1px solid #e5e7eb",
+    boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+  },
+  table: {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: 14,
+  },
+  th: {
+    textAlign: "left" as const,
+    padding: "10px 14px",
+    background: "#f9fafb",
+    fontWeight: 600,
+    color: "#374151",
+    fontSize: 12,
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.04em",
+    borderBottom: "1px solid #e5e7eb",
+    whiteSpace: "nowrap" as const,
+  },
+  td: {
+    padding: "10px 14px",
+    color: "#374151",
+    borderBottom: "1px solid #f3f4f6",
+    verticalAlign: "middle" as const,
+    whiteSpace: "nowrap" as const,
+  },
+  tableLink: {
+    color: "#111827",
+    fontWeight: 600,
+    textDecoration: "none",
+  },
+  code: {
+    fontFamily: "monospace",
+    background: "#f3f4f6",
+    borderRadius: 3,
+    padding: "1px 5px",
+    fontSize: 12,
+  },
+  searchInput: {
+    border: "1px solid #e5e7eb",
+    borderRadius: 6,
+    padding: "6px 10px",
+    fontSize: 13,
+    outline: "none",
+    width: 200,
+  },
+  select: {
+    border: "1px solid #e5e7eb",
+    borderRadius: 6,
+    padding: "6px 10px",
+    fontSize: 13,
+    background: "white",
+    cursor: "pointer",
+    outline: "none",
+  },
+  toolGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+    gap: 12,
+  },
+  toolCard: {
+    background: "white",
+    border: "1px solid #e5e7eb",
+    borderRadius: 10,
+    padding: "16px 18px",
+    textDecoration: "none",
+    boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+    display: "block",
+  },
+  toolLabel: {
+    fontWeight: 600,
+    color: "#111827",
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  toolDesc: {
+    color: "#6b7280",
+    fontSize: 13,
+  },
+  loadingBox: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: "60vh",
+  },
+  spinner: {
+    width: 24,
+    height: 24,
+    border: "3px solid #e5e7eb",
+    borderTopColor: "#6366f1",
+    borderRadius: "50%",
+    animation: "spin 0.8s linear infinite",
+  },
+  usageCard: {
+    background: "white",
+    borderRadius: 10,
+    padding: "16px 18px",
+    border: "1px solid #e5e7eb",
+    flex: "1 1 180px",
+    boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+    minWidth: 160,
+  },
+  usageCardHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    marginBottom: 8,
+  },
+  usageCardIcon: {
+    fontSize: 16,
+  },
+  usageCardTitle: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: "#374151",
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.04em",
+  },
+  usageCardStat: {
+    fontSize: 26,
+    fontWeight: 700,
+    color: "#111827",
+    lineHeight: 1,
+    marginBottom: 6,
+  },
+  usageCardMeta: {
+    fontSize: 12,
+    color: "#6b7280",
+    marginTop: 2,
+  },
+  configBox: {
+    background: "white",
+    borderRadius: 10,
+    border: "1px solid #e5e7eb",
+    padding: "20px 24px",
+    boxShadow: "0 1px 4px rgba(0,0,0,0.04)",
+  },
+  configGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+    gap: 20,
+  },
+  configField: {
+    display: "flex",
+    flexDirection: "column" as const,
+    gap: 4,
+  },
+  configLabel: {
+    fontSize: 12,
+    fontWeight: 600,
+    color: "#374151",
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.04em",
+  },
+  configInput: {
+    border: "1px solid #d1d5db",
+    borderRadius: 6,
+    padding: "8px 10px",
+    fontSize: 15,
+    fontWeight: 500,
+    color: "#111827",
+    outline: "none",
+    width: "100%",
+  },
+  configHint: {
+    fontSize: 11,
+    color: "#9ca3af",
+  },
+  externalLink: {
+    display: "inline-block",
+    marginTop: 10,
+    fontSize: 13,
+    color: "#6366f1",
+    textDecoration: "none",
+    fontWeight: 500,
+  },
+  errorBox: {
+    background: "#fef2f2",
+    border: "1px solid #fecaca",
+    color: "#b91c1c",
+    borderRadius: 8,
+    padding: "16px 20px",
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    margin: "40px auto",
+    maxWidth: 600,
+  },
+};

@@ -646,6 +646,7 @@ class InMemoryMultiChurchStore:
         self._org_invites: Dict[str, Dict[str, Any]] = {}
         self._invite_audits: List[Dict[str, Any]] = []
         self._billing_events: Dict[str, Dict[str, Any]] = {}
+        self._platform_config: Dict[str, Any] = {}
         self._seed_dev_data()
 
     def _seed_dev_data(self) -> None:
@@ -1455,6 +1456,129 @@ class InMemoryMultiChurchStore:
             )
             payload["sermons"] = (payload.get("sermons") or [])[:25]
             return payload
+
+    def record_live_translation_usage(
+        self,
+        *,
+        org_id: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        estimated_usd: float,
+        requests_count: int = 1,
+    ) -> None:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return
+        prompt = _int_tokens(prompt_tokens)
+        completion = _int_tokens(completion_tokens)
+        total = _int_tokens(total_tokens) or (prompt + completion)
+        calls = max(0, _int_tokens(requests_count) or 0)
+        usd = _round_usd(estimated_usd)
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        with self._lock:
+            usage_key = (clean_org_id, period_key)
+            usage = self._usage.get(usage_key) or {}
+            usage["livePromptTokens"] = _int_tokens(usage.get("livePromptTokens")) + prompt
+            usage["liveCompletionTokens"] = _int_tokens(usage.get("liveCompletionTokens")) + completion
+            usage["liveTotalTokens"] = _int_tokens(usage.get("liveTotalTokens")) + total
+            usage["liveEstimatedUsd"] = _round_usd(_safe_float(usage.get("liveEstimatedUsd"), 0.0) + usd)
+            usage["liveRequestsCount"] = _int_tokens(usage.get("liveRequestsCount")) + calls
+            usage["updatedAt"] = now
+            self._usage[usage_key] = usage
+
+    def record_deepgram_usage(
+        self,
+        *,
+        org_id: str,
+        audio_seconds: float,
+        estimated_usd: float,
+    ) -> None:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return
+        secs = max(0.0, float(audio_seconds or 0))
+        usd = _round_usd(estimated_usd)
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        with self._lock:
+            usage_key = (clean_org_id, period_key)
+            usage = self._usage.get(usage_key) or {}
+            usage["deepgramAudioSeconds"] = _safe_float(usage.get("deepgramAudioSeconds"), 0.0) + secs
+            usage["deepgramEstimatedUsd"] = _round_usd(_safe_float(usage.get("deepgramEstimatedUsd"), 0.0) + usd)
+            usage["updatedAt"] = now
+            self._usage[usage_key] = usage
+
+    _DEFAULT_PLATFORM_CONFIG: Dict[str, Any] = {
+        "liveTranslationInputCostPerMillion": 0.15,
+        "liveTranslationOutputCostPerMillion": 0.60,
+        "deepgramCostPerMinute": 0.0059,
+        "gcpBillingAccountId": "",
+    }
+
+    def get_platform_config(self) -> Dict[str, Any]:
+        with self._lock:
+            return {**self._DEFAULT_PLATFORM_CONFIG, **self._platform_config}
+
+    def save_platform_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = set(self._DEFAULT_PLATFORM_CONFIG.keys())
+        cleaned: Dict[str, Any] = {}
+        for k, v in updates.items():
+            if k not in allowed or v is None:
+                continue
+            if k == "gcpBillingAccountId":
+                cleaned[k] = str(v).strip()
+            else:
+                cleaned[k] = float(v)
+        with self._lock:
+            self._platform_config.update(cleaned)
+            return {**self._DEFAULT_PLATFORM_CONFIG, **self._platform_config}
+
+    def get_platform_usage_summary(self, *, period_key: Optional[str] = None) -> Dict[str, Any]:
+        now = _utcnow()
+        pk = period_key or _yyyymm(now)
+        live_prompt = live_completion = live_total = live_requests = 0
+        live_usd = sermon_prompt = sermon_completion = sermon_total = sermon_requests = 0
+        sermon_usd = deepgram_secs = deepgram_usd = 0.0
+        with self._lock:
+            for (_, period), usage in self._usage.items():
+                if period != pk:
+                    continue
+                live_prompt += _int_tokens(usage.get("livePromptTokens"))
+                live_completion += _int_tokens(usage.get("liveCompletionTokens"))
+                live_total += _int_tokens(usage.get("liveTotalTokens"))
+                live_usd += _safe_float(usage.get("liveEstimatedUsd"), 0.0)
+                live_requests += _int_tokens(usage.get("liveRequestsCount"))
+                sermon_prompt += _int_tokens(usage.get("sermonPromptTokens"))
+                sermon_completion += _int_tokens(usage.get("sermonCompletionTokens"))
+                sermon_total += _int_tokens(usage.get("sermonTotalTokens"))
+                sermon_usd += _safe_float(usage.get("sermonEstimatedUsd"), 0.0)
+                sermon_requests += _int_tokens(usage.get("sermonRequestsCount"))
+                deepgram_secs += _safe_float(usage.get("deepgramAudioSeconds"), 0.0)
+                deepgram_usd += _safe_float(usage.get("deepgramEstimatedUsd"), 0.0)
+        return {
+            "periodKey": pk,
+            "generatedAt": now.isoformat(),
+            "liveTranslation": {
+                "promptTokens": live_prompt,
+                "completionTokens": live_completion,
+                "totalTokens": live_total,
+                "estimatedUsd": round(live_usd, 6),
+                "requestsCount": live_requests,
+            },
+            "sermonPrep": {
+                "promptTokens": sermon_prompt,
+                "completionTokens": sermon_completion,
+                "totalTokens": sermon_total,
+                "estimatedUsd": round(sermon_usd, 6),
+                "requestsCount": sermon_requests,
+            },
+            "deepgram": {
+                "audioSeconds": round(deepgram_secs, 1),
+                "estimatedUsd": round(deepgram_usd, 6),
+            },
+        }
 
     def get_org_prompt(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -2311,6 +2435,9 @@ class FirestoreMultiChurchStore:
         )
         self._prompt_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._prompt_cache_lock = Lock()
+        self._platform_config: Dict[str, Any] = {}
+        self._platform_config_lock = Lock()
+        self._platform_config_loaded = False
 
     def _where(self, query: Any, field_path: str, op_string: str, value: Any):
         field_filter_cls = getattr(gcf_firestore, "FieldFilter", None)
@@ -3358,6 +3485,157 @@ class FirestoreMultiChurchStore:
         )
         payload["sermons"] = (payload.get("sermons") or [])[:25]
         return payload
+
+    def record_live_translation_usage(
+        self,
+        *,
+        org_id: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        estimated_usd: float,
+        requests_count: int = 1,
+    ) -> None:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return
+        prompt = _int_tokens(prompt_tokens)
+        completion = _int_tokens(completion_tokens)
+        total = _int_tokens(total_tokens) or (prompt + completion)
+        calls = max(0, _int_tokens(requests_count) or 0)
+        usd = _round_usd(estimated_usd)
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        try:
+            self._usage_ref(clean_org_id, period_key).set(
+                {
+                    "livePromptTokens": gcf_firestore.Increment(prompt),
+                    "liveCompletionTokens": gcf_firestore.Increment(completion),
+                    "liveTotalTokens": gcf_firestore.Increment(total),
+                    "liveEstimatedUsd": gcf_firestore.Increment(float(usd)),
+                    "liveRequestsCount": gcf_firestore.Increment(calls),
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        except Exception:
+            pass
+
+    def record_deepgram_usage(
+        self,
+        *,
+        org_id: str,
+        audio_seconds: float,
+        estimated_usd: float,
+    ) -> None:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return
+        secs = max(0.0, float(audio_seconds or 0))
+        usd = _round_usd(estimated_usd)
+        now = _utcnow()
+        period_key = _yyyymm(now)
+        try:
+            self._usage_ref(clean_org_id, period_key).set(
+                {
+                    "deepgramAudioSeconds": gcf_firestore.Increment(secs),
+                    "deepgramEstimatedUsd": gcf_firestore.Increment(float(usd)),
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+        except Exception:
+            pass
+
+    _DEFAULT_PLATFORM_CONFIG: Dict[str, Any] = {
+        "liveTranslationInputCostPerMillion": 0.15,
+        "liveTranslationOutputCostPerMillion": 0.60,
+        "deepgramCostPerMinute": 0.0059,
+        "gcpBillingAccountId": "",
+    }
+
+    def _config_ref(self):
+        return self._db.collection("_config").document("platform")
+
+    def get_platform_config(self) -> Dict[str, Any]:
+        with self._platform_config_lock:
+            if not self._platform_config_loaded:
+                try:
+                    snap = self._config_ref().get()
+                    if snap.exists:
+                        self._platform_config = snap.to_dict() or {}
+                except Exception:
+                    pass
+                self._platform_config_loaded = True
+            return {**self._DEFAULT_PLATFORM_CONFIG, **self._platform_config}
+
+    def save_platform_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = set(self._DEFAULT_PLATFORM_CONFIG.keys())
+        cleaned: Dict[str, Any] = {}
+        for k, v in updates.items():
+            if k not in allowed or v is None:
+                continue
+            if k == "gcpBillingAccountId":
+                cleaned[k] = str(v).strip()
+            else:
+                cleaned[k] = float(v)
+        try:
+            self._config_ref().set(cleaned, merge=True)
+        except Exception:
+            pass
+        with self._platform_config_lock:
+            self._platform_config.update(cleaned)
+            self._platform_config_loaded = True
+            return {**self._DEFAULT_PLATFORM_CONFIG, **self._platform_config}
+
+    def get_platform_usage_summary(self, *, period_key: Optional[str] = None) -> Dict[str, Any]:
+        now = _utcnow()
+        pk = period_key or _yyyymm(now)
+        live_prompt = live_completion = live_total = live_requests = 0
+        live_usd = sermon_prompt = sermon_completion = sermon_total = sermon_requests = 0
+        sermon_usd = deepgram_secs = deepgram_usd = 0.0
+        try:
+            for org_snap in self._db.collection("organizations").stream():
+                usage_snap = self._usage_ref(org_snap.id, pk).get()
+                if not usage_snap.exists:
+                    continue
+                usage = usage_snap.to_dict() or {}
+                live_prompt += _int_tokens(usage.get("livePromptTokens"))
+                live_completion += _int_tokens(usage.get("liveCompletionTokens"))
+                live_total += _int_tokens(usage.get("liveTotalTokens"))
+                live_usd += _safe_float(usage.get("liveEstimatedUsd"), 0.0)
+                live_requests += _int_tokens(usage.get("liveRequestsCount"))
+                sermon_prompt += _int_tokens(usage.get("sermonPromptTokens"))
+                sermon_completion += _int_tokens(usage.get("sermonCompletionTokens"))
+                sermon_total += _int_tokens(usage.get("sermonTotalTokens"))
+                sermon_usd += _safe_float(usage.get("sermonEstimatedUsd"), 0.0)
+                sermon_requests += _int_tokens(usage.get("sermonRequestsCount"))
+                deepgram_secs += _safe_float(usage.get("deepgramAudioSeconds"), 0.0)
+                deepgram_usd += _safe_float(usage.get("deepgramEstimatedUsd"), 0.0)
+        except Exception:
+            pass
+        return {
+            "periodKey": pk,
+            "generatedAt": now.isoformat(),
+            "liveTranslation": {
+                "promptTokens": live_prompt,
+                "completionTokens": live_completion,
+                "totalTokens": live_total,
+                "estimatedUsd": round(live_usd, 6),
+                "requestsCount": live_requests,
+            },
+            "sermonPrep": {
+                "promptTokens": sermon_prompt,
+                "completionTokens": sermon_completion,
+                "totalTokens": sermon_total,
+                "estimatedUsd": round(sermon_usd, 6),
+                "requestsCount": sermon_requests,
+            },
+            "deepgram": {
+                "audioSeconds": round(deepgram_secs, 1),
+                "estimatedUsd": round(deepgram_usd, 6),
+            },
+        }
 
     def create_invite(
         self,

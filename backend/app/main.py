@@ -43,6 +43,7 @@ from app.routes import prompt as prompt_routes
 from app.routes import multichurch as multichurch_routes
 from app.routes import auth as auth_routes
 from app.routes import billing as billing_routes
+from app.routes import admin as admin_routes
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.security_log import security_event, client_ip as _security_client_ip
@@ -111,6 +112,9 @@ WS_TRANSLATION_PROMPT_TOKEN_OVERHEAD = _env_int(
 )
 _tx_window_lock = Lock()
 _tx_window_entries: dict[str, deque[dict[str, float]]] = {}
+
+# 16-bit PCM @ 48 kHz: 48000 samples/s × 2 bytes/sample = 96000 bytes/s
+_DEEPGRAM_BYTES_PER_SECOND = 96000
 _room_sweeper_task: asyncio.Task | None = None
 
 # Per-IP concurrent connection limit for unauthenticated /ws/translate viewers.
@@ -249,6 +253,7 @@ app.include_router(prompt_routes.router, prefix="/api")
 app.include_router(multichurch_routes.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
 app.include_router(billing_routes.router, prefix="/api")
+app.include_router(admin_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
@@ -412,6 +417,7 @@ async def _translate_text_guarded(
     service_prompt: Optional[str] = None,
     compact_prompt: bool = False,
     max_tokens: Optional[int] = None,
+    out_usage: Optional[dict] = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
     reservations, blocked = _reserve_translation_budget(org_id=org_id, host_uid=host_uid, source_text=source_text)
     if blocked is not None:
@@ -444,6 +450,8 @@ async def _translate_text_guarded(
     if source_primary != target_primary and bool(usage.get("failOpen")):
         error_message = str(usage.get("errorMessage") or "translation_failed")
         return "", _fail_open_meta(RuntimeError(error_message))
+    if out_usage is not None:
+        out_usage.update(usage)
     return translated, None
 
 
@@ -838,6 +846,7 @@ async def ws_translate(ws: WebSocket):
         else:
             try:
                 custom_prompt, service_prompt = _cached_prompt_overrides(target_org_id)
+                _tx_usage: dict[str, Any] = {}
                 translated, limit_meta = await _translate_text_guarded(
                     src_text,
                     src_lang_full,
@@ -848,9 +857,26 @@ async def ws_translate(ws: WebSocket):
                     update_ctx=True,
                     custom_prompt=custom_prompt,
                     service_prompt=service_prompt,
+                    out_usage=_tx_usage,
                 )
                 if limit_meta:
                     meta_payload.update(limit_meta)
+                if target_org_id and _tx_usage.get("totalTokens"):
+                    _p = int(_tx_usage.get("promptTokens") or 0)
+                    _c = int(_tx_usage.get("completionTokens") or 0)
+                    _t = int(_tx_usage.get("totalTokens") or 0)
+                    _cfg = multichurch_store.get_platform_config()
+                    _usd = (_p * _cfg["liveTranslationInputCostPerMillion"] + _c * _cfg["liveTranslationOutputCostPerMillion"]) / 1_000_000
+                    try:
+                        multichurch_store.record_live_translation_usage(
+                            org_id=target_org_id,
+                            prompt_tokens=_p,
+                            completion_tokens=_c,
+                            total_tokens=_t,
+                            estimated_usd=_usd,
+                        )
+                    except Exception:
+                        pass
             except Exception as exc:
                 print("[WS translate][producer_commit][error]", exc)
                 translated = src_text
@@ -1148,6 +1174,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     closed = asyncio.Event()
     finalize_event = asyncio.Event()
     last_audio_touch_ts = 0.0
+    total_audio_bytes = 0
     prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
 
     def _cached_prompt_overrides(active_org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -1165,7 +1192,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         prompt_overrides_cache[org_id] = _prompt_overrides_for_org(org_id)
 
     async def from_client_to_deepgram():
-        nonlocal last_audio_touch_ts
+        nonlocal last_audio_touch_ts, total_audio_bytes
         try:
             while True:
                 msg = await websocket.receive()
@@ -1177,6 +1204,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     break
                 if (b := msg.get("bytes")):
                     # your AudioWorklet streams raw 16-bit PCM @ 48k
+                    total_audio_bytes += len(b)
                     await dg.send(b)
                     if org_id and room_id:
                         now_ts = time.time()
@@ -1655,6 +1683,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
         producer.cancel()
     except:
         pass
+    if org_id and total_audio_bytes > 0:
+        _audio_secs = total_audio_bytes / _DEEPGRAM_BYTES_PER_SECOND
+        _cfg = multichurch_store.get_platform_config()
+        _dg_usd = (_audio_secs / 60.0) * _cfg["deepgramCostPerMinute"]
+        try:
+            multichurch_store.record_deepgram_usage(
+                org_id=org_id,
+                audio_seconds=_audio_secs,
+                estimated_usd=_dg_usd,
+            )
+        except Exception:
+            pass
 
 DEFAULT_DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 

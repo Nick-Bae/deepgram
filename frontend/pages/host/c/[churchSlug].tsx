@@ -1485,6 +1485,19 @@ export default function HostChurchPage() {
     gap: 16,
     padding: 0,
   } as const;
+  const studioAdminButtonStyle = {
+    borderRadius: 18,
+    border: "1px solid rgba(99,102,241,0.5)",
+    background: "rgba(99,102,241,0.15)",
+    color: "#a5b4fc",
+    fontSize: 12,
+    fontWeight: 800,
+    letterSpacing: "0.16em",
+    textTransform: "uppercase" as const,
+    padding: "12px 22px",
+    cursor: "pointer",
+    textDecoration: "none",
+  } as const;
   const studioLogoutButtonStyle = {
     borderRadius: 18,
     border: "1px solid rgba(255,255,255,0.18)",
@@ -1790,6 +1803,11 @@ export default function HostChurchPage() {
                   {currentUserName}
                 </span>
               </div>
+              {isMasterUser && (
+                <a href="/admin" style={studioAdminButtonStyle}>
+                  Admin
+                </a>
+              )}
               <button
                 onClick={async () => {
                   clearHostToken();
