@@ -295,10 +295,19 @@ def get_gcp_usage(current_user: AuthenticatedUser = Depends(get_current_user_req
 
 
 @router.get("/admin/platform-usage")
-def get_platform_usage(current_user: AuthenticatedUser = Depends(get_current_user_required)):
+def get_platform_usage(
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+    period: Optional[str] = None,
+):
     _require_master(current_user)
+    import re as _re
+    clean_period: Optional[str] = None
+    if period:
+        if not _re.fullmatch(r"\d{6}", period.strip()):
+            raise HTTPException(status_code=422, detail="period must be YYYYMM (e.g. 202603)")
+        clean_period = period.strip()
     try:
-        return multichurch_store.get_platform_usage_summary()
+        return multichurch_store.get_platform_usage_summary(period_key=clean_period)
     except Exception as exc:
         logger.exception("Failed to get platform usage summary")
         raise HTTPException(status_code=500, detail="platform_usage_error") from exc

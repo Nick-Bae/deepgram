@@ -92,7 +92,15 @@ type GcpUsage = {
   billingConsoleUrl?: string;
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+// Must match billing/models.py PLAN_SPECS amounts
+const PLAN_MRR: Record<string, number> = {
+  trial: 0,
+  starter: 20,
+  growth: 40,
+  premium: 60,
+};
 
 const PLAN_LABEL: Record<string, string> = {
   trial: "Trial",
@@ -116,6 +124,8 @@ const BILLING_STATUS_COLOR: Record<string, string> = {
   unpaid: "#ef4444",
   incomplete: "#f59e0b",
 };
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function planBadge(plan: string) {
   const color = PLAN_COLOR[plan] || "#6b7280";
@@ -165,12 +175,48 @@ function fmtDate(iso: string | null): string {
   }
 }
 
-
 function trialMinsRemaining(seconds: number | null): string {
   if (seconds === null) return "—";
   const mins = Math.floor(seconds / 60);
   if (mins <= 0) return "Exhausted";
   return `${mins} min left`;
+}
+
+function fmtMonthKey(yyyymm: string): string {
+  const year = yyyymm.slice(0, 4);
+  const month = parseInt(yyyymm.slice(4));
+  return new Date(parseInt(year), month - 1, 1).toLocaleDateString("en-US", { month: "short", year: "numeric" });
+}
+
+function deltaLabel(current: number, prev: number): React.ReactElement | null {
+  if (prev === 0) return null;
+  const pct = ((current - prev) / prev) * 100;
+  const up = pct >= 0;
+  return (
+    <span style={{ fontSize: 11, color: up ? "#10b981" : "#ef4444", fontWeight: 600, marginLeft: 4 }}>
+      {up ? "▲" : "▼"} {Math.abs(pct).toFixed(0)}%
+    </span>
+  );
+}
+
+// ─── Sub-components ──────────────────────────────────────────────────────────
+
+function UsageBar({ used, max }: { used: number; max: number }) {
+  if (max <= 0) {
+    return <span style={{ color: "#9ca3af", fontSize: 13 }}>{used > 0 ? `${used} min` : "—"}</span>;
+  }
+  const pct = Math.min(100, (used / max) * 100);
+  const color = pct >= 90 ? "#ef4444" : pct >= 70 ? "#f59e0b" : "#10b981";
+  return (
+    <div style={{ minWidth: 100 }}>
+      <div style={{ fontSize: 12, color: "#374151", marginBottom: 3 }}>
+        {used} / {max} min
+      </div>
+      <div style={{ background: "#e5e7eb", borderRadius: 4, height: 6, overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, background: color, height: "100%", borderRadius: 4, transition: "width 0.3s" }} />
+      </div>
+    </div>
+  );
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -180,6 +226,8 @@ export default function AdminDashboardPage() {
   const { user, loading: authLoading, getIdToken } = useAuth();
   const [data, setData] = useState<DashboardData | null>(null);
   const [platformUsage, setPlatformUsage] = useState<PlatformUsage | null>(null);
+  const [prevUsage, setPrevUsage] = useState<PlatformUsage | null>(null);
+  const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
   const [platformConfig, setPlatformConfig] = useState<PlatformConfig | null>(null);
   const [configDraft, setConfigDraft] = useState<PlatformConfig | null>(null);
   const [configSaving, setConfigSaving] = useState(false);
@@ -199,17 +247,27 @@ export default function AdminDashboardPage() {
     try {
       const token = await getIdToken();
       if (!token) throw new Error("Not authenticated");
-      // Verify user is master admin
       const me = await fetchAuthMe(token);
       if (!me.user.isMaster) {
         void router.replace("/admin");
         return;
       }
-      const [res, usageRes, cfgRes, gcpRes] = await Promise.all([
-        fetch(`${API_URL}/api/admin/dashboard`, { headers: { Authorization: `Bearer ${token as string}` } }),
-        fetch(`${API_URL}/api/admin/platform-usage`, { headers: { Authorization: `Bearer ${token as string}` } }),
-        fetch(`${API_URL}/api/admin/platform-config`, { headers: { Authorization: `Bearer ${token as string}` } }),
-        fetch(`${API_URL}/api/admin/gcp-usage`, { headers: { Authorization: `Bearer ${token as string}` } }),
+
+      // Compute previous month key
+      const now = new Date();
+      const curYear = now.getFullYear();
+      const curMonth = now.getMonth() + 1;
+      const prevYear = curMonth === 1 ? curYear - 1 : curYear;
+      const prevMonth = curMonth === 1 ? 12 : curMonth - 1;
+      const prevPeriodKey = `${prevYear}${String(prevMonth).padStart(2, "0")}`;
+
+      const authHeader = { Authorization: `Bearer ${token as string}` };
+      const [res, usageRes, prevUsageRes, cfgRes, gcpRes] = await Promise.all([
+        fetch(`${API_URL}/api/admin/dashboard`, { headers: authHeader }),
+        fetch(`${API_URL}/api/admin/platform-usage`, { headers: authHeader }),
+        fetch(`${API_URL}/api/admin/platform-usage?period=${prevPeriodKey}`, { headers: authHeader }),
+        fetch(`${API_URL}/api/admin/platform-config`, { headers: authHeader }),
+        fetch(`${API_URL}/api/admin/gcp-usage`, { headers: authHeader }),
       ]);
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -217,17 +275,14 @@ export default function AdminDashboardPage() {
       }
       const payload = (await res.json()) as DashboardData;
       setData(payload);
-      if (usageRes.ok) {
-        setPlatformUsage((await usageRes.json()) as PlatformUsage);
-      }
+      if (usageRes.ok) setPlatformUsage((await usageRes.json()) as PlatformUsage);
+      if (prevUsageRes.ok) setPrevUsage((await prevUsageRes.json()) as PlatformUsage);
       if (cfgRes.ok) {
         const cfg = (await cfgRes.json()) as PlatformConfig;
         setPlatformConfig(cfg);
         setConfigDraft(cfg);
       }
-      if (gcpRes.ok) {
-        setGcpUsage((await gcpRes.json()) as GcpUsage);
-      }
+      if (gcpRes.ok) setGcpUsage((await gcpRes.json()) as GcpUsage);
       setLastRefreshed(new Date());
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -235,6 +290,28 @@ export default function AdminDashboardPage() {
       setLoading(false);
     }
   }, [user, getIdToken, router]);
+
+  const loadPeriodUsage = useCallback(async (periodKey: string) => {
+    if (!user) return;
+    try {
+      const token = await getIdToken();
+      if (!token) return;
+      const authHeader = { Authorization: `Bearer ${token as string}` };
+      const curYear = parseInt(periodKey.slice(0, 4));
+      const curMonth = parseInt(periodKey.slice(4));
+      const prevYear = curMonth === 1 ? curYear - 1 : curYear;
+      const prevMonth = curMonth === 1 ? 12 : curMonth - 1;
+      const prevKey = `${prevYear}${String(prevMonth).padStart(2, "0")}`;
+      const [usageRes, prevUsageRes] = await Promise.all([
+        fetch(`${API_URL}/api/admin/platform-usage?period=${periodKey}`, { headers: authHeader }),
+        fetch(`${API_URL}/api/admin/platform-usage?period=${prevKey}`, { headers: authHeader }),
+      ]);
+      if (usageRes.ok) setPlatformUsage((await usageRes.json()) as PlatformUsage);
+      if (prevUsageRes.ok) setPrevUsage((await prevUsageRes.json()) as PlatformUsage);
+    } catch {
+      // non-critical — period usage failure doesn't block the dashboard
+    }
+  }, [user, getIdToken]);
 
   useEffect(() => {
     if (authLoading) return;
@@ -254,6 +331,75 @@ export default function AdminDashboardPage() {
     }
     return true;
   });
+
+  // ─── Computed metrics ────────────────────────────────────────────────────
+
+  const orgs = data?.organizations ?? [];
+
+  // MRR: only count active billing status
+  const mrr = orgs
+    .filter((o) => o.billingStatus === "active")
+    .reduce((sum, o) => sum + (PLAN_MRR[o.plan] || 0), 0);
+
+  // Trial conversion funnel
+  const trialing = orgs.filter((o) => o.billingStatus === "trialing");
+  const trialActive = trialing.filter((o) => o.trialSecondsRemaining === null || o.trialSecondsRemaining > 0);
+  const trialExhausted = trialing.filter((o) => o.trialSecondsRemaining !== null && o.trialSecondsRemaining === 0);
+  const paidActive = orgs.filter((o) => o.plan !== "trial" && o.billingStatus === "active");
+
+  // At-risk orgs
+  const atRisk = orgs.filter((o) => ["past_due", "unpaid", "canceled"].includes(o.billingStatus));
+
+  // Sermon prep budget warnings (> 80% used)
+  const sermonWarnings = orgs.filter(
+    (o) => o.sermonPrepBudgetUsd > 0 && o.sermonPrepUsageUsd / o.sermonPrepBudgetUsd >= 0.8
+  );
+
+  // Top consumers by minutes
+  const topConsumers = [...orgs]
+    .filter((o) => o.currentMonthMinutes > 0)
+    .sort((a, b) => b.currentMonthMinutes - a.currentMonthMinutes)
+    .slice(0, 5);
+
+  // Recent signups
+  const recentSignups = [...orgs]
+    .filter((o) => o.createdAt)
+    .sort((a, b) => new Date(b.createdAt!).getTime() - new Date(a.createdAt!).getTime())
+    .slice(0, 8);
+
+  // Growth chart: signups per week over last 5 weeks
+  const growthBuckets: { label: string; count: number }[] = [];
+  {
+    const now = Date.now();
+    for (let w = 4; w >= 0; w--) {
+      const weekStart = now - (w + 1) * 7 * 86400 * 1000;
+      const weekEnd = now - w * 7 * 86400 * 1000;
+      const count = orgs.filter((o) => {
+        if (!o.createdAt) return false;
+        const t = new Date(o.createdAt).getTime();
+        return t >= weekStart && t < weekEnd;
+      }).length;
+      const d = new Date(weekStart);
+      const label = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      growthBuckets.push({ label, count });
+    }
+  }
+  const maxBucketCount = Math.max(1, ...growthBuckets.map((b) => b.count));
+
+  // Period selector: last 6 months
+  const periodOptions: { value: string; label: string }[] = [];
+  {
+    const now = new Date();
+    for (let i = 0; i < 6; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const y = d.getFullYear();
+      const m = d.getMonth() + 1;
+      const key = `${y}${String(m).padStart(2, "0")}`;
+      periodOptions.push({ value: key, label: fmtMonthKey(key) });
+    }
+  }
+  const currentPeriodKey = periodOptions[0]?.value ?? "";
+  const activePeriodKey = selectedPeriod ?? currentPeriodKey;
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
@@ -326,6 +472,11 @@ export default function AdminDashboardPage() {
               </div>
               <div style={styles.cardLabel}>Live Rooms Now</div>
             </div>
+            <div style={{ ...styles.card, borderColor: mrr > 0 ? "#6366f1" : "#e5e7eb" }}>
+              <div style={{ ...styles.cardValue, color: "#6366f1" }}>${mrr.toLocaleString()}</div>
+              <div style={styles.cardLabel}>Est. MRR</div>
+              <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>active subscriptions only</div>
+            </div>
             <div style={styles.card}>
               <div style={styles.cardBreakdown}>
                 {plans.map(([plan, count]) => (
@@ -349,14 +500,79 @@ export default function AdminDashboardPage() {
           </div>
         )}
 
+        {/* Trial Conversion Funnel */}
+        <section style={styles.section}>
+          <h2 style={styles.sectionTitle}>Trial Conversion Funnel</h2>
+          <div style={styles.cardRow}>
+            <div style={{ ...styles.card, borderColor: "#6b7280", flex: "1 1 140px" }}>
+              <div style={{ ...styles.cardValue, color: "#6b7280" }}>{trialActive.length}</div>
+              <div style={styles.cardLabel}>Active Trials</div>
+              <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>minutes remaining</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", fontSize: 20, color: "#d1d5db", padding: "0 4px" }}>→</div>
+            <div style={{ ...styles.card, borderColor: trialExhausted.length > 0 ? "#f59e0b" : "#e5e7eb", flex: "1 1 140px" }}>
+              <div style={{ ...styles.cardValue, color: trialExhausted.length > 0 ? "#f59e0b" : "#374151" }}>
+                {trialExhausted.length}
+              </div>
+              <div style={styles.cardLabel}>Trial Exhausted</div>
+              <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>need to convert</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", fontSize: 20, color: "#d1d5db", padding: "0 4px" }}>→</div>
+            <div style={{ ...styles.card, borderColor: "#10b981", flex: "1 1 140px" }}>
+              <div style={{ ...styles.cardValue, color: "#10b981" }}>{paidActive.length}</div>
+              <div style={styles.cardLabel}>Paid & Active</div>
+              <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>
+                {trialing.length + paidActive.length > 0
+                  ? `${Math.round((paidActive.length / (trialing.length + paidActive.length)) * 100)}% conversion`
+                  : "no data"}
+              </div>
+            </div>
+            <div style={{ ...styles.card, flex: "2 1 200px" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "#374151", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                New Signups — Last 5 Weeks
+              </div>
+              <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height: 48 }}>
+                {growthBuckets.map((b) => (
+                  <div key={b.label} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "#6366f1" }}>{b.count || ""}</div>
+                    <div
+                      style={{
+                        width: "100%",
+                        background: b.count > 0 ? "#6366f1" : "#e5e7eb",
+                        borderRadius: "3px 3px 0 0",
+                        height: b.count > 0 ? `${Math.max(8, (b.count / maxBucketCount) * 36)}px` : "4px",
+                        transition: "height 0.3s",
+                      }}
+                    />
+                    <div style={{ fontSize: 10, color: "#9ca3af", whiteSpace: "nowrap" }}>{b.label}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
         {/* Platform Usage */}
         {platformUsage && (
           <section style={styles.section}>
-            <h2 style={styles.sectionTitle}>
+            <h2 style={{ ...styles.sectionTitle, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
               Platform Usage
-              <span style={{ fontSize: 12, color: "#9ca3af", fontWeight: 400, marginLeft: 8 }}>
-                {platformUsage.periodKey.slice(0, 4)}-{platformUsage.periodKey.slice(4)} · estimates only
-              </span>
+              <span style={{ fontSize: 12, color: "#9ca3af", fontWeight: 400 }}>estimates only</span>
+              <select
+                value={activePeriodKey}
+                onChange={(e) => {
+                  const key = e.target.value;
+                  setSelectedPeriod(key === currentPeriodKey ? null : key);
+                  void loadPeriodUsage(key);
+                }}
+                style={{ fontSize: 12, padding: "2px 6px", borderRadius: 4, border: "1px solid #d1d5db", color: "#374151", fontWeight: 400, cursor: "pointer" }}
+              >
+                {periodOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}{opt.value === currentPeriodKey ? " (current)" : ""}
+                  </option>
+                ))}
+              </select>
             </h2>
             <div style={styles.cardRow}>
               <div style={styles.usageCard}>
@@ -364,26 +580,50 @@ export default function AdminDashboardPage() {
                   <span style={styles.usageCardIcon}>⚡</span>
                   <span style={styles.usageCardTitle}>OpenAI — Live Translation</span>
                 </div>
-                <div style={styles.usageCardStat}>${platformUsage.liveTranslation.estimatedUsd.toFixed(4)}</div>
+                <div style={styles.usageCardStat}>
+                  ${platformUsage.liveTranslation.estimatedUsd.toFixed(4)}
+                  {prevUsage && deltaLabel(platformUsage.liveTranslation.estimatedUsd, prevUsage.liveTranslation.estimatedUsd)}
+                </div>
                 <div style={styles.usageCardMeta}>{platformUsage.liveTranslation.totalTokens.toLocaleString()} tokens · {platformUsage.liveTranslation.requestsCount.toLocaleString()} requests</div>
                 <div style={styles.usageCardMeta}>{platformUsage.liveTranslation.promptTokens.toLocaleString()} in · {platformUsage.liveTranslation.completionTokens.toLocaleString()} out</div>
+                {prevUsage && (
+                  <div style={{ ...styles.usageCardMeta, marginTop: 6, color: "#9ca3af", fontStyle: "italic" }}>
+                    {fmtMonthKey(prevUsage.periodKey)}: ${prevUsage.liveTranslation.estimatedUsd.toFixed(4)}
+                  </div>
+                )}
               </div>
               <div style={styles.usageCard}>
                 <div style={styles.usageCardHeader}>
                   <span style={styles.usageCardIcon}>📖</span>
                   <span style={styles.usageCardTitle}>OpenAI — Sermon Prep</span>
                 </div>
-                <div style={styles.usageCardStat}>${platformUsage.sermonPrep.estimatedUsd.toFixed(4)}</div>
+                <div style={styles.usageCardStat}>
+                  ${platformUsage.sermonPrep.estimatedUsd.toFixed(4)}
+                  {prevUsage && deltaLabel(platformUsage.sermonPrep.estimatedUsd, prevUsage.sermonPrep.estimatedUsd)}
+                </div>
                 <div style={styles.usageCardMeta}>{platformUsage.sermonPrep.totalTokens.toLocaleString()} tokens · {platformUsage.sermonPrep.requestsCount.toLocaleString()} requests</div>
                 <div style={styles.usageCardMeta}>{platformUsage.sermonPrep.promptTokens.toLocaleString()} in · {platformUsage.sermonPrep.completionTokens.toLocaleString()} out</div>
+                {prevUsage && (
+                  <div style={{ ...styles.usageCardMeta, marginTop: 6, color: "#9ca3af", fontStyle: "italic" }}>
+                    {fmtMonthKey(prevUsage.periodKey)}: ${prevUsage.sermonPrep.estimatedUsd.toFixed(4)}
+                  </div>
+                )}
               </div>
               <div style={styles.usageCard}>
                 <div style={styles.usageCardHeader}>
                   <span style={styles.usageCardIcon}>🎙️</span>
                   <span style={styles.usageCardTitle}>Deepgram — Speech-to-Text</span>
                 </div>
-                <div style={styles.usageCardStat}>${platformUsage.deepgram.estimatedUsd.toFixed(4)}</div>
+                <div style={styles.usageCardStat}>
+                  ${platformUsage.deepgram.estimatedUsd.toFixed(4)}
+                  {prevUsage && deltaLabel(platformUsage.deepgram.estimatedUsd, prevUsage.deepgram.estimatedUsd)}
+                </div>
                 <div style={styles.usageCardMeta}>{Math.floor(platformUsage.deepgram.audioSeconds / 60)}m {Math.round(platformUsage.deepgram.audioSeconds % 60)}s audio processed</div>
+                {prevUsage && (
+                  <div style={{ ...styles.usageCardMeta, marginTop: 6, color: "#9ca3af", fontStyle: "italic" }}>
+                    {fmtMonthKey(prevUsage.periodKey)}: ${prevUsage.deepgram.estimatedUsd.toFixed(4)}
+                  </div>
+                )}
               </div>
               <div style={styles.usageCard}>
                 <div style={styles.usageCardHeader}>
@@ -562,6 +802,160 @@ export default function AdminDashboardPage() {
           </section>
         )}
 
+        {/* At-Risk / Churn */}
+        {atRisk.length > 0 && (
+          <section style={styles.section}>
+            <h2 style={{ ...styles.sectionTitle, color: "#b91c1c" }}>
+              ⚠ At-Risk Organizations ({atRisk.length})
+            </h2>
+            <div style={styles.tableWrap}>
+              <table style={styles.table}>
+                <thead>
+                  <tr>
+                    {["Church", "Plan", "Billing Status", "Members", "Usage (mo)", "Since"].map((h) => (
+                      <th key={h} style={styles.th}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {atRisk.map((org) => (
+                    <tr key={org.orgId} style={{ background: "#fef2f2" }}>
+                      <td style={styles.td}>
+                        <div>
+                          <Link href={`/host/c/${org.slug}`} style={styles.tableLink}>{org.name}</Link>
+                          <div style={{ fontSize: 11, color: "#9ca3af" }}>{org.slug}</div>
+                        </div>
+                      </td>
+                      <td style={styles.td}>{planBadge(org.plan)}</td>
+                      <td style={styles.td}>{statusBadge(org.billingStatus)}</td>
+                      <td style={{ ...styles.td, textAlign: "center" }}>{org.memberCount}</td>
+                      <td style={styles.td}>
+                        <UsageBar used={org.currentMonthMinutes} max={org.maxMinutesPerMonth} />
+                      </td>
+                      <td style={{ ...styles.td, color: "#9ca3af", fontSize: 12 }}>{fmtDate(org.createdAt)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {/* Sermon Prep Budget Warnings */}
+        {sermonWarnings.length > 0 && (
+          <section style={styles.section}>
+            <h2 style={{ ...styles.sectionTitle, color: "#92400e" }}>
+              Sermon Prep Near Budget ({sermonWarnings.length})
+            </h2>
+            <div style={styles.tableWrap}>
+              <table style={styles.table}>
+                <thead>
+                  <tr>
+                    {["Church", "Plan", "Sermon Spend", "Budget", "% Used"].map((h) => (
+                      <th key={h} style={styles.th}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sermonWarnings
+                    .sort((a, b) => b.sermonPrepUsageUsd / b.sermonPrepBudgetUsd - a.sermonPrepUsageUsd / a.sermonPrepBudgetUsd)
+                    .map((org) => {
+                      const pct = Math.round((org.sermonPrepUsageUsd / org.sermonPrepBudgetUsd) * 100);
+                      const color = pct >= 100 ? "#ef4444" : pct >= 90 ? "#f59e0b" : "#d97706";
+                      return (
+                        <tr key={org.orgId} style={{ background: "#fffbeb" }}>
+                          <td style={styles.td}>
+                            <Link href={`/host/c/${org.slug}`} style={styles.tableLink}>{org.name}</Link>
+                          </td>
+                          <td style={styles.td}>{planBadge(org.plan)}</td>
+                          <td style={styles.td}>${org.sermonPrepUsageUsd.toFixed(3)}</td>
+                          <td style={styles.td}>${org.sermonPrepBudgetUsd.toFixed(2)}</td>
+                          <td style={styles.td}>
+                            <span style={{ color, fontWeight: 700 }}>{pct}%</span>
+                            <div style={{ background: "#e5e7eb", borderRadius: 4, height: 6, overflow: "hidden", marginTop: 4, width: 80 }}>
+                              <div style={{ width: `${Math.min(100, pct)}%`, background: color, height: "100%", borderRadius: 4 }} />
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {/* Top Consumers + Recent Signups */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 28 }}>
+          {/* Top Consumers */}
+          <section style={{ ...styles.section, marginBottom: 0 }}>
+            <h2 style={styles.sectionTitle}>Top Consumers This Month</h2>
+            {topConsumers.length === 0 ? (
+              <div style={styles.emptyNote}>No usage data this month.</div>
+            ) : (
+              <div style={styles.tableWrap}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      {["Church", "Plan", "Minutes Used"].map((h) => (
+                        <th key={h} style={styles.th}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topConsumers.map((org, i) => (
+                      <tr key={org.orgId}>
+                        <td style={styles.td}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <span style={{ fontSize: 11, color: "#9ca3af", width: 16 }}>#{i + 1}</span>
+                            <Link href={`/host/c/${org.slug}`} style={styles.tableLink}>{org.name}</Link>
+                          </div>
+                        </td>
+                        <td style={styles.td}>{planBadge(org.plan)}</td>
+                        <td style={styles.td}>
+                          <UsageBar used={org.currentMonthMinutes} max={org.maxMinutesPerMonth} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          {/* Recent Signups */}
+          <section style={{ ...styles.section, marginBottom: 0 }}>
+            <h2 style={styles.sectionTitle}>Recent Signups</h2>
+            {recentSignups.length === 0 ? (
+              <div style={styles.emptyNote}>No signups yet.</div>
+            ) : (
+              <div style={styles.tableWrap}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      {["Church", "Plan", "Joined"].map((h) => (
+                        <th key={h} style={styles.th}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recentSignups.map((org) => (
+                      <tr key={org.orgId}>
+                        <td style={styles.td}>
+                          <Link href={`/host/c/${org.slug}`} style={styles.tableLink}>{org.name}</Link>
+                          <div style={{ fontSize: 11, color: "#9ca3af" }}>{org.slug}</div>
+                        </td>
+                        <td style={styles.td}>{planBadge(org.plan)}</td>
+                        <td style={{ ...styles.td, color: "#6b7280", fontSize: 12 }}>{fmtDate(org.createdAt)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </div>
+
         {/* Live Rooms */}
         {(data?.liveRooms ?? []).length > 0 && (
           <section style={styles.section}>
@@ -573,9 +967,7 @@ export default function AdminDashboardPage() {
                 <thead>
                   <tr>
                     {["Church", "Service", "Languages", "Started At", "Duration"].map((h) => (
-                      <th key={h} style={styles.th}>
-                        {h}
-                      </th>
+                      <th key={h} style={styles.th}>{h}</th>
                     ))}
                   </tr>
                 </thead>
@@ -583,23 +975,15 @@ export default function AdminDashboardPage() {
                   {data!.liveRooms.map((r) => (
                     <tr key={r.roomId} style={{ background: "#f0fdf4" }}>
                       <td style={styles.td}>
-                        <Link href={`/host/c/${r.orgName}`} style={styles.tableLink}>
-                          {r.orgName}
-                        </Link>
+                        <Link href={`/host/c/${r.orgName}`} style={styles.tableLink}>{r.orgName}</Link>
                       </td>
-                      <td style={styles.td}>
-                        <code style={styles.code}>{r.serviceKey}</code>
-                      </td>
-                      <td style={styles.td}>
-                        {r.source} → {r.target}
-                      </td>
+                      <td style={styles.td}><code style={styles.code}>{r.serviceKey}</code></td>
+                      <td style={styles.td}>{r.source} → {r.target}</td>
                       <td style={styles.td}>{r.startedAt ? new Date(r.startedAt).toLocaleTimeString() : "—"}</td>
                       <td style={styles.td}>
                         {r.elapsedMinutes !== null ? (
                           <span style={{ color: "#10b981", fontWeight: 600 }}>{r.elapsedMinutes} min</span>
-                        ) : (
-                          "—"
-                        )}
+                        ) : "—"}
                       </td>
                     </tr>
                   ))}
@@ -641,10 +1025,8 @@ export default function AdminDashboardPage() {
             <table style={styles.table}>
               <thead>
                 <tr>
-                  {["Church", "Plan", "Billing", "Members", "Services", "Live", "Usage (mo)", "Trial Left", "Sermon $", "Created"].map((h) => (
-                    <th key={h} style={styles.th}>
-                      {h}
-                    </th>
+                  {["Church", "Plan", "Billing", "Members", "Services", "Live", "Usage (mo)", "Trial Left", "Sermon $", "Created", "Actions"].map((h) => (
+                    <th key={h} style={styles.th}>{h}</th>
                   ))}
                 </tr>
               </thead>
@@ -658,9 +1040,7 @@ export default function AdminDashboardPage() {
                   >
                     <td style={styles.td}>
                       <div>
-                        <Link href={`/host/c/${org.slug}`} style={styles.tableLink}>
-                          {org.name}
-                        </Link>
+                        <Link href={`/host/c/${org.slug}`} style={styles.tableLink}>{org.name}</Link>
                         <div style={{ fontSize: 11, color: "#9ca3af" }}>{org.slug}</div>
                       </div>
                     </td>
@@ -683,15 +1063,7 @@ export default function AdminDashboardPage() {
                       )}
                     </td>
                     <td style={styles.td}>
-                      {org.maxMinutesPerMonth > 0 ? (
-                        <span>
-                          {org.currentMonthMinutes} / {org.maxMinutesPerMonth} min
-                        </span>
-                      ) : org.currentMonthMinutes > 0 ? (
-                        `${org.currentMonthMinutes} min`
-                      ) : (
-                        <span style={{ color: "#d1d5db" }}>—</span>
-                      )}
+                      <UsageBar used={org.currentMonthMinutes} max={org.maxMinutesPerMonth} />
                     </td>
                     <td style={styles.td}>
                       <span
@@ -722,11 +1094,26 @@ export default function AdminDashboardPage() {
                       )}
                     </td>
                     <td style={{ ...styles.td, color: "#9ca3af", fontSize: 12 }}>{fmtDate(org.createdAt)}</td>
+                    <td style={styles.td}>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        {org.stripeCustomerId && (
+                          <a
+                            href={`https://dashboard.stripe.com/customers/${org.stripeCustomerId}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={styles.actionBtn}
+                            title="View in Stripe"
+                          >
+                            Stripe
+                          </a>
+                        )}
+                      </div>
+                    </td>
                   </tr>
                 ))}
                 {filtered.length === 0 && (
                   <tr>
-                    <td colSpan={10} style={{ ...styles.td, textAlign: "center", color: "#9ca3af", padding: "32px 16px" }}>
+                    <td colSpan={11} style={{ ...styles.td, textAlign: "center", color: "#9ca3af", padding: "32px 16px" }}>
                       No organizations match the current filters.
                     </td>
                   </tr>
@@ -1056,5 +1443,25 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 12,
     margin: "40px auto",
     maxWidth: 600,
+  },
+  actionBtn: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: "#6366f1",
+    border: "1px solid #e0e7ff",
+    borderRadius: 4,
+    padding: "2px 8px",
+    textDecoration: "none",
+    background: "#eef2ff",
+    whiteSpace: "nowrap" as const,
+  },
+  emptyNote: {
+    background: "white",
+    borderRadius: 10,
+    border: "1px solid #e5e7eb",
+    padding: "20px",
+    color: "#9ca3af",
+    fontSize: 14,
+    textAlign: "center" as const,
   },
 };
