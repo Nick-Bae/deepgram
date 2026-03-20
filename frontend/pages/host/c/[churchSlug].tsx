@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { useRouter } from "next/router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { sendEmailVerification } from "firebase/auth";
 
 import TranslationBox from "../../../components/TranslationBox";
 import { useAuth } from "../../../lib/authContext";
@@ -461,7 +462,7 @@ export default function HostChurchPage() {
     setVerificationSending(true);
     setVerificationError(null);
     try {
-      await user.sendEmailVerification();
+      await sendEmailVerification(user);
     } catch (err) {
       setVerificationError(err instanceof Error ? err.message : "Failed to send verification email.");
     } finally {
