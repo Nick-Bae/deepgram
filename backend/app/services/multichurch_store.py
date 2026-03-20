@@ -1515,7 +1515,12 @@ class InMemoryMultiChurchStore:
         "liveTranslationOutputCostPerMillion": 0.60,
         "deepgramCostPerMinute": 0.0059,
         "gcpBillingAccountId": "",
+        "spendAlertEmail": "",
+        "spendAlertOpenaiThresholdUsd": 0.0,
+        "spendAlertDeepgramThresholdUsd": 0.0,
     }
+
+    _STRING_CONFIG_KEYS = {"gcpBillingAccountId", "spendAlertEmail"}
 
     def get_platform_config(self) -> Dict[str, Any]:
         with self._lock:
@@ -1527,7 +1532,7 @@ class InMemoryMultiChurchStore:
         for k, v in updates.items():
             if k not in allowed or v is None:
                 continue
-            if k == "gcpBillingAccountId":
+            if k in self._STRING_CONFIG_KEYS:
                 cleaned[k] = str(v).strip()
             else:
                 cleaned[k] = float(v)
@@ -3552,7 +3557,12 @@ class FirestoreMultiChurchStore:
         "liveTranslationOutputCostPerMillion": 0.60,
         "deepgramCostPerMinute": 0.0059,
         "gcpBillingAccountId": "",
+        "spendAlertEmail": "",
+        "spendAlertOpenaiThresholdUsd": 0.0,
+        "spendAlertDeepgramThresholdUsd": 0.0,
     }
+
+    _STRING_CONFIG_KEYS = {"gcpBillingAccountId", "spendAlertEmail"}
 
     def _config_ref(self):
         return self._db.collection("_config").document("platform")
@@ -3575,7 +3585,7 @@ class FirestoreMultiChurchStore:
         for k, v in updates.items():
             if k not in allowed or v is None:
                 continue
-            if k == "gcpBillingAccountId":
+            if k in self._STRING_CONFIG_KEYS:
                 cleaned[k] = str(v).strip()
             else:
                 cleaned[k] = float(v)

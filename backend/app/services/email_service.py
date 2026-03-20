@@ -338,6 +338,48 @@ def send_payment_failed_email(
     )
 
 
+def send_spend_alert_email(
+    *,
+    to: str,
+    provider: str,
+    spend_usd: float,
+    threshold_usd: float,
+    period_key: str,
+) -> None:
+    """Alert the platform admin when monthly spend exceeds a threshold."""
+    if not to:
+        return
+    brand = _brand()
+    admin_url = _app_url() + "/admin/dashboard" if _app_url() else ""
+    month_label = f"{period_key[:4]}-{period_key[4:]}" if len(period_key) == 6 else period_key
+    html = _layout(
+        heading=f"⚠️ {provider} spend alert",
+        body_html=(
+            f"<p>Your <strong>{provider}</strong> spend this month ({month_label}) has exceeded your alert threshold.</p>"
+            f"<table style='border-collapse:collapse;margin:12px 0;'>"
+            f"<tr><td style='padding:4px 16px 4px 0;color:#64748b;'>Current spend</td>"
+            f"<td style='padding:4px 0;font-weight:700;'>${spend_usd:.4f}</td></tr>"
+            f"<tr><td style='padding:4px 16px 4px 0;color:#64748b;'>Alert threshold</td>"
+            f"<td style='padding:4px 0;'>${threshold_usd:.2f}</td></tr>"
+            f"</table>"
+            + (_btn("View Admin Dashboard", admin_url) if admin_url else "")
+            + "<p style='color:#64748b;font-size:13px;'>You can update alert thresholds in the Pricing Rates section of the admin dashboard.</p>"
+        ),
+    )
+    text = "\n".join([
+        f"⚠️ {provider} spend alert — {month_label}",
+        "",
+        f"Current spend: ${spend_usd:.4f}",
+        f"Alert threshold: ${threshold_usd:.2f}",
+        "",
+        admin_url or "",
+        "",
+        f"Thanks,",
+        brand,
+    ])
+    _send(to=[to], subject=f"⚠️ {provider} spend alert — ${spend_usd:.2f} this month", html=html, text=text, tag="spend-alert")
+
+
 def send_payment_recovered_email(
     *,
     admin_emails: List[str],

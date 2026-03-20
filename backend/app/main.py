@@ -561,6 +561,60 @@ def _can_host(org_id: Optional[str], *, host_uid: Optional[str], host_token: Opt
         return False
 
 
+_spend_alert_sent: dict[str, str] = {}  # key: "openai-YYYYMM" / "deepgram-YYYYMM" → "sent"
+_SPEND_ALERT_CHECK_INTERVAL = 3600  # 1 hour
+_spend_alert_last_check: float = 0.0
+
+
+def _check_spend_alerts() -> None:
+    global _spend_alert_last_check
+    now = time.time()
+    if now - _spend_alert_last_check < _SPEND_ALERT_CHECK_INTERVAL:
+        return
+    _spend_alert_last_check = now
+    try:
+        from app.services.email_service import send_spend_alert_email
+        cfg = multichurch_store.get_platform_config()
+        alert_email = str(cfg.get("spendAlertEmail") or "").strip()
+        openai_threshold = float(cfg.get("spendAlertOpenaiThresholdUsd") or 0)
+        deepgram_threshold = float(cfg.get("spendAlertDeepgramThresholdUsd") or 0)
+        if not alert_email or (openai_threshold <= 0 and deepgram_threshold <= 0):
+            return
+        usage = multichurch_store.get_platform_usage_summary()
+        period_key = usage.get("periodKey", "")
+        openai_spend = float((usage.get("liveTranslation") or {}).get("estimatedUsd") or 0) + \
+                       float((usage.get("sermonPrep") or {}).get("estimatedUsd") or 0)
+        deepgram_spend = float((usage.get("deepgram") or {}).get("estimatedUsd") or 0)
+
+        if openai_threshold > 0 and openai_spend >= openai_threshold:
+            alert_key = f"openai-{period_key}"
+            if _spend_alert_sent.get(alert_key) != "sent":
+                send_spend_alert_email(
+                    to=alert_email,
+                    provider="OpenAI",
+                    spend_usd=openai_spend,
+                    threshold_usd=openai_threshold,
+                    period_key=period_key,
+                )
+                _spend_alert_sent[alert_key] = "sent"
+                print(f"[SPEND_ALERT] OpenAI alert sent spend={openai_spend:.4f} threshold={openai_threshold}")
+
+        if deepgram_threshold > 0 and deepgram_spend >= deepgram_threshold:
+            alert_key = f"deepgram-{period_key}"
+            if _spend_alert_sent.get(alert_key) != "sent":
+                send_spend_alert_email(
+                    to=alert_email,
+                    provider="Deepgram",
+                    spend_usd=deepgram_spend,
+                    threshold_usd=deepgram_threshold,
+                    period_key=period_key,
+                )
+                _spend_alert_sent[alert_key] = "sent"
+                print(f"[SPEND_ALERT] Deepgram alert sent spend={deepgram_spend:.4f} threshold={deepgram_threshold}")
+    except Exception as exc:
+        print(f"[SPEND_ALERT] check failed: {exc}")
+
+
 async def _room_sweeper_loop() -> None:
     while True:
         try:
@@ -607,6 +661,7 @@ async def _room_sweeper_loop() -> None:
                     )
                 except Exception:
                     pass
+            _check_spend_alerts()
         except asyncio.CancelledError:
             break
         except Exception as exc:

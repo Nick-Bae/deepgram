@@ -76,6 +76,9 @@ type PlatformConfig = {
   liveTranslationOutputCostPerMillion: number;
   deepgramCostPerMinute: number;
   gcpBillingAccountId: string;
+  spendAlertEmail: string;
+  spendAlertOpenaiThresholdUsd: number;
+  spendAlertDeepgramThresholdUsd: number;
 };
 
 type GcpUsage = {
@@ -477,6 +480,43 @@ export default function AdminDashboardPage() {
                     onChange={(e) => setConfigDraft((d) => d && { ...d, gcpBillingAccountId: e.target.value })}
                   />
                   <span style={styles.configHint}>Used to generate direct billing report links</span>
+                </div>
+                <div style={styles.configField}>
+                  <label style={styles.configLabel}>Spend Alert Email</label>
+                  <input
+                    type="email"
+                    style={styles.configInput}
+                    placeholder="admin@example.com"
+                    value={configDraft.spendAlertEmail}
+                    onChange={(e) => setConfigDraft((d) => d && { ...d, spendAlertEmail: e.target.value })}
+                  />
+                  <span style={styles.configHint}>Receive an email when monthly spend exceeds thresholds below</span>
+                </div>
+                <div style={styles.configField}>
+                  <label style={styles.configLabel}>OpenAI Alert Threshold ($)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    style={styles.configInput}
+                    placeholder="0 = disabled"
+                    value={configDraft.spendAlertOpenaiThresholdUsd}
+                    onChange={(e) => setConfigDraft((d) => d && { ...d, spendAlertOpenaiThresholdUsd: parseFloat(e.target.value) || 0 })}
+                  />
+                  <span style={styles.configHint}>Alert when OpenAI (live + sermon) monthly spend exceeds this amount</span>
+                </div>
+                <div style={styles.configField}>
+                  <label style={styles.configLabel}>Deepgram Alert Threshold ($)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    style={styles.configInput}
+                    placeholder="0 = disabled"
+                    value={configDraft.spendAlertDeepgramThresholdUsd}
+                    onChange={(e) => setConfigDraft((d) => d && { ...d, spendAlertDeepgramThresholdUsd: parseFloat(e.target.value) || 0 })}
+                  />
+                  <span style={styles.configHint}>Alert when Deepgram monthly spend exceeds this amount</span>
                 </div>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 16 }}>
