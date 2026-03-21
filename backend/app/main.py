@@ -1307,8 +1307,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     # Auto-reload sermon from Firestore if script store is empty (fire-and-forget)
     if org_id:
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, _try_reload_sermon, org_id)
+        asyncio.get_running_loop().run_in_executor(None, _try_reload_sermon, org_id)
 
     chunker = KoChunker(
         waitk_lo=ENV.WAITK_LO,
