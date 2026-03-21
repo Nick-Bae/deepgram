@@ -43,6 +43,7 @@ class CorrectionPayload(BaseModel):
     stt_text: str = Field(..., min_length=1, description="Original STT text")
     auto_translation: str = Field(..., min_length=1, description="Auto-generated translation")
     final_translation: str = Field(..., min_length=1, description="Corrected translation to keep")
+    org_id: Optional[str] = Field(default=None, description="Organization ID for per-org correction isolation")
 
 
 def _load_records() -> tuple[list[dict[str, Any]], int]:
@@ -248,6 +249,7 @@ def add_correction(payload: CorrectionPayload):
             stt_text=payload.stt_text.strip(),
             auto_translation=payload.auto_translation.strip(),
             final_translation=payload.final_translation.strip(),
+            org_id=(payload.org_id or "").strip() or None,
         )
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"log_failed: {exc}") from exc

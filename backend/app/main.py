@@ -48,6 +48,32 @@ from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.security_log import security_event, client_ip as _security_client_ip
 
+
+def _safe_append_segment(
+    org_id: str,
+    room_id: str,
+    seq: int,
+    korean_text: str,
+    english_text: str,
+    mode: str,
+    match_score: Optional[float],
+    timestamp: str,
+) -> None:
+    try:
+        multichurch_store.append_translation_segment(
+            org_id,
+            room_id,
+            seq=seq,
+            korean_text=korean_text,
+            english_text=english_text,
+            mode=mode,
+            match_score=match_score,
+            timestamp=timestamp,
+        )
+    except Exception as exc:
+        print(f"[SEG] Failed to save segment org={org_id} room={room_id} seq={seq}: {exc}")
+
+
 # Global display pacing config (broadcast to display clients)
 APP_DISPLAY_SPEED = {"speed": 1.0}
 ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "900"))  # 15 min
@@ -416,6 +442,8 @@ async def _translate_text_guarded(
     custom_prompt: Optional[str] = None,
     service_prompt: Optional[str] = None,
     compact_prompt: bool = False,
+    script_examples: Optional[list] = None,
+    script_glossary: Optional[list] = None,
     max_tokens: Optional[int] = None,
     out_usage: Optional[dict] = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
@@ -440,6 +468,9 @@ async def _translate_text_guarded(
             custom_prompt=custom_prompt,
             service_prompt=service_prompt,
             compact_prompt=compact_prompt,
+            script_examples=script_examples,
+            script_glossary=script_glossary,
+            org_id=org_id,
             max_tokens=max_tokens,
             usage_out=usage,
         )
@@ -543,6 +574,28 @@ def _uid_from_id_token(raw_token: Optional[str]) -> Optional[str]:
     except Exception:
         return None
     return _clean_token(user.uid) if user else None
+
+
+def _try_reload_sermon(org_id: str) -> None:
+    """Load most recent Firestore sermon into script_store if store is empty. Never raises."""
+    try:
+        count, _, _ = script_store.stats(org_id=org_id)
+        if count > 0:
+            return
+        doc = multichurch_store.get_latest_sermon_pairs(org_id)
+        if not doc or not doc.get("pairs"):
+            return
+        # Re-check after Firestore round-trip — another connection may have loaded
+        count, _, _ = script_store.stats(org_id=org_id)
+        if count > 0:
+            return
+        script_store.load(
+            doc["pairs"],
+            doc.get("threshold"),
+            org_id=org_id,
+        )
+    except Exception:
+        pass
 
 
 def _can_host(org_id: Optional[str], *, host_uid: Optional[str], host_token: Optional[str]) -> bool:
@@ -732,6 +785,10 @@ async def ws_translate(ws: WebSocket):
         pass
     translation_ctx = TranslationContext()
     seq = 0
+    # Session-level script context cache (avoid recomputing on every utterance)
+    _cached_script_version_producer: int = -1
+    _cached_script_examples_producer: list = []
+    _cached_script_glossary_producer: list = []
     # Only accept a UID that has been cryptographically verified via Firebase ID token.
     # Raw hostUid from query params is intentionally ignored — it can be trivially spoofed
     # by anyone who knows an admin's Firebase UID.
@@ -809,7 +866,7 @@ async def ws_translate(ws: WebSocket):
             pass
 
     async def handle_commit(payload: dict, is_partial: bool = False):
-        nonlocal seq, joined_org_id, joined_room_id, joined_service_key, joined_church_slug, host_uid_claim, host_token_claim, host_authed
+        nonlocal seq, joined_org_id, joined_room_id, joined_service_key, joined_church_slug, host_uid_claim, host_token_claim, host_authed, _cached_script_version_producer, _cached_script_examples_producer, _cached_script_glossary_producer
         src_text = (payload.get("text") or "").strip()
         if not src_text:
             return
@@ -876,10 +933,24 @@ async def ws_translate(ws: WebSocket):
         if payload_service_key:
             meta_payload["service_key"] = payload_service_key
 
-        script_match, match_score, script_version, script_threshold = script_store.match(
+        # Refresh session-level script context cache when store version changes
+        _, _, _sv_check, _ = script_store.match("", org_id=target_org_id)  # lightweight stats
+        _sv_check = script_store.stats(org_id=target_org_id)[2]
+        if _sv_check != _cached_script_version_producer:
+            _cached_script_version_producer = _sv_check
+            _cached_script_glossary_producer = script_store.get_keyword_glossary(org_id=target_org_id)
+
+        # STT vocabulary correction using sermon vocab
+        _vocab_set_producer = script_store.get_vocab_set(org_id=target_org_id)
+        if _vocab_set_producer:
+            from app.utils.translate import _stt_vocab_correct
+            src_text = _stt_vocab_correct(src_text, _vocab_set_producer)
+
+        script_match, match_score, script_version, script_threshold, _script_examples_producer = script_store.match_with_examples(
             src_text,
             org_id=target_org_id,
         )
+        _cached_script_examples_producer = _script_examples_producer
         live_mode = "live"
 
         if script_match:
@@ -912,6 +983,8 @@ async def ws_translate(ws: WebSocket):
                     update_ctx=True,
                     custom_prompt=custom_prompt,
                     service_prompt=service_prompt,
+                    script_examples=_cached_script_examples_producer,
+                    script_glossary=_cached_script_glossary_producer,
                     out_usage=_tx_usage,
                 )
                 if limit_meta:
@@ -975,6 +1048,18 @@ async def ws_translate(ws: WebSocket):
             await ws.send_json(live_msg_legacy)
         except Exception:
             pass
+
+        if not is_partial and target_org_id and target_room_id and src_text and translated:
+            import datetime as _dt
+            _seg_ts = _dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+            _seg_score = meta_payload.get("match_score") if live_mode == "pre" else None
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _safe_append_segment(
+                    target_org_id, target_room_id, seq, src_text, translated, live_mode,
+                    _seg_score, _seg_ts,
+                ),
+            )
 
     try:
         while True:
@@ -1216,6 +1301,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     await websocket.accept()
     translation_ctx = TranslationContext()
+    # Session-level script context cache (avoid recomputing on every utterance)
+    _cached_script_version_dg: int = -1
+    _cached_script_glossary_dg: list = []
+
+    # Auto-reload sermon from Firestore if script store is empty (fire-and-forget)
+    if org_id:
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _try_reload_sermon, org_id)
+
     chunker = KoChunker(
         waitk_lo=ENV.WAITK_LO,
         waitk_hi=ENV.WAITK_HI,
@@ -1395,7 +1489,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
             translated = clean_src
 
             if not partial:
-                script_match, match_score, script_version, script_threshold = script_store.match(
+                # Refresh glossary cache when script store version changes
+                _sv_dg = script_store.stats(org_id=org_id)[2]
+                if _sv_dg != _cached_script_version_dg:
+                    _cached_script_version_dg = _sv_dg
+                    _cached_script_glossary_dg = script_store.get_keyword_glossary(org_id=org_id)
+
+                # STT vocabulary correction using sermon vocab
+                _vocab_set_dg = script_store.get_vocab_set(org_id=org_id)
+                if _vocab_set_dg:
+                    from app.utils.translate import _stt_vocab_correct
+                    clean_src = _stt_vocab_correct(clean_src, _vocab_set_dg)
+
+                script_match, match_score, script_version, script_threshold, _script_examples_dg = script_store.match_with_examples(
                     clean_src,
                     org_id=org_id,
                 )
@@ -1458,6 +1564,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             update_ctx=update_ctx,
                             custom_prompt=custom_prompt,
                             service_prompt=service_prompt,
+                            script_examples=_script_examples_dg,
+                            script_glossary=_cached_script_glossary_dg,
                         )
                         if limit_meta:
                             meta_payload.update(limit_meta)
@@ -1534,6 +1642,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print(f"[BROADCAST] seq={seq} '{translated[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
+
+            if not partial and org_id and room_id and clean_src and translated:
+                import datetime as _dt
+                _seg_ts = _dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+                _seg_score = meta_payload.get("match_score") if live_mode == "pre" else None
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _safe_append_segment(
+                        org_id, room_id, seq, clean_src, translated, live_mode,
+                        _seg_score, _seg_ts,
+                    ),
+                )
 
         async def emit_preview(src_text_raw: str):
             nonlocal last_preview_norm

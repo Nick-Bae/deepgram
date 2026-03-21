@@ -39,6 +39,7 @@ type ServiceRow = {
   title: string;
   timezone?: string;
   activeRoomId?: string | null;
+  lastRoomId?: string | null;
   roomStatus?: string;
   defaultLanguagePair?: { source?: string; target?: string };
 };
@@ -192,6 +193,32 @@ function formatCountdownSeconds(rawSeconds: number): string {
   return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
 }
 
+async function downloadTranslationLog(
+  orgId: string,
+  roomId: string,
+  getToken: () => Promise<string>,
+): Promise<void> {
+  const token = await getToken();
+  const res = await fetch(`${API_URL}/org/${orgId}/room/${roomId}/segments/export`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const data = await res.json();
+      detail = typeof data?.detail === "string" ? data.detail : "";
+    } catch {}
+    throw new Error(detail || `Export failed (HTTP ${res.status})`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `translation_${roomId}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 async function copyTextToClipboard(value: string): Promise<void> {
   const text = value.trim();
   if (!text) throw new Error("empty_text");
@@ -280,6 +307,8 @@ export default function HostChurchPage() {
   const [trialBroadcastNotice, setTrialBroadcastNotice] = useState<string | null>(null);
   const [trialCountdownSeconds, setTrialCountdownSeconds] = useState<number | null>(null);
   const [sermonUsageState, setSermonUsageState] = useState<OrgSermonUsageResponse | null>(null);
+  const [downloadingRoom, setDownloadingRoom] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [sermonBudgetInput, setSermonBudgetInput] = useState("0");
   const [sermonBudgetBusy, setSermonBudgetBusy] = useState(false);
   const [sermonBudgetError, setSermonBudgetError] = useState<string | null>(null);
@@ -2579,6 +2608,8 @@ export default function HostChurchPage() {
                       const isSelected = row.serviceKey === serviceKey;
                       const isLive = Boolean(row.activeRoomId);
                       const deleting = deletingServiceKey === row.serviceKey;
+                      const downloadRoomId = !isLive ? (row.lastRoomId || null) : null;
+                      const isDownloading = downloadingRoom === downloadRoomId;
                       return (
                         <div key={row.serviceKey} style={settingsServiceRowStyle}>
                           <div style={{ minWidth: 0 }}>
@@ -2597,21 +2628,51 @@ export default function HostChurchPage() {
                               ) : null}
                             </div>
                           </div>
-                          <button
-                            onClick={() => removeService(row.serviceKey)}
-                            disabled={serviceManageBusy || deletingServiceKey.length > 0 || isLive}
-                            style={{
-                              ...settingsButtonDangerStyle,
-                              padding: "9px 12px",
-                              opacity: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? 0.55 : 1,
-                              cursor: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? "not-allowed" : "pointer",
-                            }}
-                          >
-                            {deleting ? "Deleting..." : "Delete"}
-                          </button>
+                          <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
+                            {downloadRoomId ? (
+                              <button
+                                onClick={async () => {
+                                  if (!resolvedOrgId || !downloadRoomId) return;
+                                  setDownloadingRoom(downloadRoomId);
+                                  setDownloadError(null);
+                                  try {
+                                    await downloadTranslationLog(resolvedOrgId, downloadRoomId, getIdToken);
+                                  } catch (err) {
+                                    setDownloadError(err instanceof Error ? err.message : "Download failed");
+                                  } finally {
+                                    setDownloadingRoom(null);
+                                  }
+                                }}
+                                disabled={isDownloading}
+                                style={{
+                                  ...settingsButtonNeutralStyle,
+                                  padding: "9px 12px",
+                                  opacity: isDownloading ? 0.55 : 1,
+                                  cursor: isDownloading ? "not-allowed" : "pointer",
+                                }}
+                              >
+                                {isDownloading ? "Downloading..." : "Download Log"}
+                              </button>
+                            ) : null}
+                            <button
+                              onClick={() => removeService(row.serviceKey)}
+                              disabled={serviceManageBusy || deletingServiceKey.length > 0 || isLive}
+                              style={{
+                                ...settingsButtonDangerStyle,
+                                padding: "9px 12px",
+                                opacity: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? 0.55 : 1,
+                                cursor: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? "not-allowed" : "pointer",
+                              }}
+                            >
+                              {deleting ? "Deleting..." : "Delete"}
+                            </button>
+                          </div>
                         </div>
                       );
                     })}
+                    {downloadError ? (
+                      <p style={{ margin: "8px 0 0", fontSize: 12, color: "#bc5f6f" }}>{downloadError}</p>
+                    ) : null}
                   </div>
                 </section>
               </div>

@@ -4,7 +4,7 @@ import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
 import { API_URL } from '../utils/urls'
-import { getAuthTokenFromSession } from '../utils/streamContext'
+import { getAuthTokenFromSession, contextFromSession } from '../utils/streamContext'
 import { useDeepgramProducer } from '../lib/useDeepgramProducer'
 import type { DeepgramProducerController } from '../lib/useDeepgramProducer'
 
@@ -157,6 +157,11 @@ export default function TranslationBox() {
   const [displaySpeed, setDisplaySpeed] = useState(1)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const [socketClock, setSocketClock] = useState(() => Date.now())
+
+  const [committedLines, setCommittedLines] = useState<{ id: number; srcText: string; translated: string }[]>([])
+  const [correcting, setCorrecting] = useState<number | null>(null)
+  const [correctionDraft, setCorrectionDraft] = useState('')
+  const [correctionSaved, setCorrectionSaved] = useState<Set<number>>(new Set())
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
   const targetBaseLang = (targetLang || 'en').split('-')[0]
@@ -753,6 +758,13 @@ export default function TranslationBox() {
         } else if (incoming) {
           console.log('[FE][TTS][skip]', { isMuted, sameAsCurrent: incoming === currentSpokenRef.current });
         }
+        if (incoming) {
+          const srcForLog = committedSrc || clauseRef.current.trim() || lastInterimRef.current.trim()
+          setCommittedLines(prev => [
+            ...prev.slice(-19),
+            { id: Date.now(), srcText: srcForLog, translated: incoming },
+          ])
+        }
       }
 
       const bestSourceForLog = committedSrc || clauseRef.current.trim() || lastInterimRef.current.trim()
@@ -905,6 +917,35 @@ export default function TranslationBox() {
   const handleStopListening = () => {
     dgStop()
   }
+
+  const submitCorrection = useCallback(async (line: { id: number; srcText: string; translated: string }) => {
+    if (!correctionDraft.trim() || correctionDraft === line.translated) {
+      setCorrecting(null)
+      return
+    }
+    const { orgId } = contextFromSession()
+    const idToken = getAuthTokenFromSession()
+    try {
+      await fetch(`${API_URL}/examples/correct`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
+        body: JSON.stringify({
+          stt_text: line.srcText,
+          auto_translation: line.translated,
+          final_translation: correctionDraft.trim(),
+          org_id: orgId || undefined,
+        }),
+      })
+      setCorrectionSaved(prev => new Set([...prev, line.id]))
+    } catch {
+      // silent fail — non-critical
+    } finally {
+      setCorrecting(null)
+    }
+  }, [correctionDraft])
 
   const ttsAudienceEnabled = !isMuted
   const latencyLabel = latencyMs !== null ? `${Math.max(latencyMs, 0).toFixed(0)} ms` : 'Calibrating…'
@@ -1141,6 +1182,51 @@ export default function TranslationBox() {
                       <p className="text-xs font-black uppercase tracking-[0.3em] text-slate-400">Next Sentence Preview</p>
                       <p className="mt-1 text-base text-slate-800">{previewSnippet || 'Listening for the next clause...'}</p>
                     </div>
+                    {committedLines.length > 0 && (
+                      <div className="rounded-2xl border border-white/80 px-4 py-3" style={insetStyle}>
+                        <p className="mb-2 text-xs font-black uppercase tracking-[0.3em] text-slate-400">Recent Translations</p>
+                        <div className="max-h-48 space-y-2 overflow-y-auto">
+                          {[...committedLines].reverse().map(line => (
+                            <div key={line.id} className="group flex items-start gap-2">
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-xs text-slate-400">{line.srcText}</p>
+                                {correcting === line.id ? (
+                                  <div className="mt-1 flex gap-1">
+                                    <input
+                                      className="flex-1 rounded border border-slate-300 px-2 py-0.5 text-sm text-slate-800 focus:outline-none focus:border-slate-400"
+                                      value={correctionDraft}
+                                      onChange={e => setCorrectionDraft(e.target.value)}
+                                      onKeyDown={e => { if (e.key === 'Enter') submitCorrection(line); if (e.key === 'Escape') setCorrecting(null); }}
+                                      autoFocus
+                                    />
+                                    <button
+                                      onClick={() => submitCorrection(line)}
+                                      className="rounded bg-blue-600 px-2 py-0.5 text-xs text-white hover:bg-blue-700"
+                                    >Save</button>
+                                    <button
+                                      onClick={() => setCorrecting(null)}
+                                      className="rounded px-2 py-0.5 text-xs text-slate-500 hover:text-slate-700"
+                                    >Cancel</button>
+                                  </div>
+                                ) : (
+                                  <p className={`text-sm ${correctionSaved.has(line.id) ? 'text-green-700' : 'text-slate-700'}`}>
+                                    {line.translated}
+                                    {correctionSaved.has(line.id) && <span className="ml-1 text-xs text-green-600">✓</span>}
+                                  </p>
+                                )}
+                              </div>
+                              {correcting !== line.id && !correctionSaved.has(line.id) && (
+                                <button
+                                  title="Correct this translation"
+                                  className="mt-0.5 shrink-0 text-xs text-slate-300 opacity-0 transition-opacity hover:text-slate-600 group-hover:opacity-100"
+                                  onClick={() => { setCorrecting(line.id); setCorrectionDraft(line.translated); }}
+                                >✎</button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

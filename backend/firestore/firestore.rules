@@ -39,6 +39,11 @@ service cloud.firestore {
           allow read: if isOrgMember(orgId);
           allow create, update, delete: if false;
         }
+
+        match /segments/{segId} {
+          allow read: if isOrgMember(orgId);
+          allow create, update, delete: if false;
+        }
       }
 
       match /usage/{periodKey} {
@@ -49,6 +54,11 @@ service cloud.firestore {
       match /members/{uid} {
         allow read: if isOrgMember(orgId);
         allow create, update, delete: if false;
+      }
+
+      match /sermons/{sermonId} {
+        // Backend writes only via Admin SDK (bypasses rules). No client read or write.
+        allow read, write: if false;
       }
     }
   }

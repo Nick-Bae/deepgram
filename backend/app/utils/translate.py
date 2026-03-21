@@ -87,7 +87,7 @@ class TranslationContext:
     last_english: Optional[str] = None
     recent_pairs: list[dict[str, str]] = field(default_factory=list)
 
-    def remember(self, source_text: str, translated_text: str, *, max_items: int = 3) -> None:
+    def remember(self, source_text: str, translated_text: str, *, max_items: int = 5) -> None:
         clean_source = " ".join((source_text or "").split()).strip()
         clean_target = " ".join((translated_text or "").split()).strip()
         if not clean_target:
@@ -335,6 +335,45 @@ def _preprocess_source_text(text: str, source_lang: str) -> str:
     return cleaned
 
 
+_HANGUL_TOKEN_SPLIT_RE = re.compile(r"([\uac00-\ud7a3]+)")
+
+
+def _stt_vocab_correct(text: str, vocab_set: set) -> str:
+    """
+    Replace STT tokens that are edit distance 1 from a known sermon vocab word.
+    Only corrects Hangul tokens of length >= 3 to avoid particle collisions.
+    """
+    if not vocab_set or not text:
+        return text
+
+    def _edit1(a: str, b: str) -> bool:
+        if abs(len(a) - len(b)) > 1:
+            return False
+        if len(a) == len(b):
+            return sum(1 for x, y in zip(a, b) if x != y) == 1
+        short, long = (a, b) if len(a) < len(b) else (b, a)
+        i = j = found = 0
+        while i < len(short) and j < len(long):
+            if short[i] == long[j]:
+                i += 1; j += 1
+            elif found:
+                return False
+            else:
+                found = 1; j += 1
+        return True
+
+    def replace_token(m: re.Match) -> str:
+        tok = m.group(1)
+        if len(tok) < 3 or tok in vocab_set:
+            return tok
+        for v in vocab_set:
+            if len(v) >= 3 and _edit1(tok, v):
+                return v
+        return tok
+
+    return _HANGUL_TOKEN_SPLIT_RE.sub(replace_token, text)
+
+
 def _collapse_compacted_ko_repeat_tokens(text: str) -> str:
     if not text or not _HANGUL_RE.search(text):
         return text
@@ -376,6 +415,7 @@ def _log_translation_example(
     stt_text: str,
     auto_translation: str,
     final_translation: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> None:
     """
     Append an example to translation_examples.jsonl so we can reuse it later.
@@ -383,7 +423,7 @@ def _log_translation_example(
     if not stt_text or not auto_translation:
         return
 
-    record = {
+    record: Dict[str, Any] = {
         "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
         "source_lang": source_lang,
         "target_lang": target_lang,
@@ -392,6 +432,8 @@ def _log_translation_example(
         "final_translation": final_translation or auto_translation,
         "corrected": final_translation is not None,
     }
+    if org_id:
+        record["org_id"] = org_id
 
     try:
         _ensure_data_dir()
@@ -408,6 +450,7 @@ def log_corrected_translation(
     stt_text: str,
     auto_translation: str,
     final_translation: str,
+    org_id: Optional[str] = None,
 ) -> None:
     """
     Public helper for other modules to log manual corrections.
@@ -418,6 +461,7 @@ def log_corrected_translation(
         stt_text=stt_text,
         auto_translation=auto_translation,
         final_translation=final_translation,
+        org_id=org_id,
     )
 
 
@@ -433,16 +477,20 @@ def _load_fewshot_examples(
     *,
     max_examples: int = 3,
     current_source_text: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> List[dict[str, str]]:
     """Return up to N on-topic, corrected examples.
 
     Filters to corrected rows only and requires minimal lexical overlap with the
     current source clause (if provided) to avoid off-topic bias.
+    When org_id is provided, org-specific corrections are returned first, filled
+    with global corrections (no org_id) if needed.
     """
     if not _TRANSLATION_LOG_PATH.exists() or max_examples <= 0:
         return []
 
-    corrected: deque[dict[str, str]] = deque(maxlen=max_examples)
+    org_specific: deque[dict[str, str]] = deque(maxlen=max_examples)
+    global_pool: deque[dict[str, str]] = deque(maxlen=max_examples)
     overlap_ref = _token_set(current_source_text) if current_source_text else None
 
     try:
@@ -470,16 +518,28 @@ def _load_fewshot_examples(
                     if not _token_set(source_text) & overlap_ref:
                         continue  # skip off-topic examples
 
-                corrected.append({"source": source_text, "target": final_text})
+                example = {"source": source_text, "target": final_text}
+                rec_org = (record.get("org_id") or "").strip()
+                if org_id and rec_org == org_id:
+                    org_specific.append(example)
+                elif not rec_org:
+                    global_pool.append(example)
     except Exception as exc:
         print(f"[TX] Failed to read translation examples: {exc}")
         return []
 
-    return list(corrected)[-max_examples:]
+    if org_id:
+        combined = list(org_specific)
+        if len(combined) < max_examples:
+            needed = max_examples - len(combined)
+            combined = combined + list(global_pool)[-needed:]
+        return combined[-max_examples:]
+
+    return list(global_pool)[-max_examples:]
 
 
-def _build_fewshot_block(source: str, target: str, *, current_source_text: Optional[str] = None) -> str:
-    examples = _load_fewshot_examples(source, target, max_examples=3, current_source_text=current_source_text)
+def _build_fewshot_block(source: str, target: str, *, current_source_text: Optional[str] = None, org_id: Optional[str] = None) -> str:
+    examples = _load_fewshot_examples(source, target, max_examples=3, current_source_text=current_source_text, org_id=org_id)
     if not examples:
         return ""
 
@@ -674,11 +734,22 @@ def _should_include_prompt_context(text: str, *, update_ctx: bool) -> bool:
     return (not update_ctx) or _needs_recent_context(text)
 
 
+def _build_script_examples_block(examples: list, source: str, target: str) -> str:
+    """Build a few-shot style block from pre-script pairs for vocabulary/style alignment."""
+    if not examples:
+        return ""
+    lines = ["Style reference from this sermon (use for vocabulary and style only):"]
+    for pair in examples:
+        lines.append(f"  [{source.upper()}] {pair.source}")
+        lines.append(f"  [{target.upper()}] {pair.target}")
+    return "\n".join(lines)
+
+
 def _build_recent_context_block(
     ctx: Optional[TranslationContext],
     *,
     current_source_text: Optional[str] = None,
-    max_items: int = 2,
+    max_items: int = 4,
 ) -> str:
     if not ctx or not ctx.recent_pairs or max_items <= 0:
         return ""
@@ -1008,10 +1079,14 @@ def _build_system_prompt(
     custom_prompt: Optional[str] = None,
     service_prompt: Optional[str] = None,
     compact_prompt: bool = False,
+    script_examples: Optional[list] = None,
+    script_glossary: Optional[list] = None,
+    org_id: Optional[str] = None,
 ) -> str:
     """
     Core system prompt: neutral/cautious worship captioning with domain aids.
-    The static base is cached; only the per-call context block and few-shot block are appended fresh.
+    The static base is cached; only the per-call context block, few-shot block,
+    and sermon-specific examples/glossary are appended fresh.
     """
     service_text = ((service_prompt or "") if service_prompt is not None else (_get_service_prompt() or "")).strip()
     custom_text = ((custom_prompt or "") if custom_prompt is not None else (_get_custom_prompt() or "")).strip()
@@ -1022,8 +1097,21 @@ def _build_system_prompt(
         base = _build_system_prompt_base(source, target, service_text, custom_text, compact_prompt)
         _SYSTEM_PROMPT_BASE_CACHE[cache_key] = base
 
-    fewshot_block = "" if compact_prompt else _build_fewshot_block(source, target, current_source_text=current_source_text)
-    return base + fewshot_block + _build_context_block(ctx)
+    parts = [base]
+
+    if not compact_prompt:
+        if script_glossary:
+            glossary_str = ", ".join(f"{k}\u2192{v}" for k, v in script_glossary)
+            parts.append(f"\nKey terms in this sermon: {glossary_str}")
+        if script_examples:
+            examples_block = _build_script_examples_block(script_examples, source, target)
+            if examples_block:
+                parts.append("\n" + examples_block)
+
+    fewshot_block = "" if compact_prompt else _build_fewshot_block(source, target, current_source_text=current_source_text, org_id=org_id)
+    parts.append(fewshot_block)
+    parts.append(_build_context_block(ctx))
+    return "".join(parts)
 
 
 def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[TranslationContext]) -> str:
@@ -1190,6 +1278,9 @@ async def translate_text(
     custom_prompt: Optional[str] = None,
     service_prompt: Optional[str] = None,
     compact_prompt: bool = False,
+    script_examples: Optional[list] = None,
+    script_glossary: Optional[list] = None,
+    org_id: Optional[str] = None,
     max_tokens: Optional[int] = None,
     model_override: Optional[str] = None,
     usage_out: Optional[Dict[str, Any]] = None,
@@ -1232,6 +1323,9 @@ async def translate_text(
         custom_prompt=custom_prompt,
         service_prompt=service_prompt,
         compact_prompt=compact_prompt,
+        script_examples=script_examples,
+        script_glossary=script_glossary,
+        org_id=org_id,
     )
     user_content = masked_text
     if ctx_for_prompt:
