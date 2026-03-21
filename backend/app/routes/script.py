@@ -114,7 +114,6 @@ async def _translate_segments(
                 target_lang,
                 custom_prompt=custom_prompt,
                 service_prompt=service_prompt,
-                compact_prompt=True,
                 model_override=SERMON_TRANSLATION_MODEL,
                 usage_out=usage_out,
             )
@@ -334,6 +333,20 @@ def finalize_sermon(
         "segments": normalized_segments,
     }
     script_store.save_sermon(payload, org_id=org_id)
+
+    # Fire-and-forget Firestore persistence — never fails the finalize response
+    try:
+        multichurch_store.save_sermon_pairs(
+            org_id=org_id,
+            sermon_id=sermon_id,
+            pairs=pairs,
+            threshold=used_threshold,
+            lang_src=source_lang,
+            lang_tgt=target_lang,
+        )
+    except Exception:
+        pass
+
     return {
         "saved": True,
         "loaded": loaded,

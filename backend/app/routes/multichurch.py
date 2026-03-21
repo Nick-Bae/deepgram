@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import csv
+import io
+
 from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app import validators
@@ -247,3 +251,43 @@ def end_room(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return result
+
+
+@router.get("/org/{org_id}/room/{room_id}/segments/export")
+def export_room_segments(
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
+    room_id: str = Path(pattern=validators.ORG_ID),
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        segments = multichurch_store.export_room_segments(
+            org_id,
+            room_id,
+            requested_by_uid=current_user.uid,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="host_auth_failed")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except NotImplementedError:
+        raise HTTPException(status_code=501, detail="not_supported_in_dev_mode")
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["seq", "timestamp", "mode", "korean_text", "english_text"])
+    for seg in segments:
+        writer.writerow([
+            seg.get("seq", ""),
+            seg.get("timestamp", ""),
+            seg.get("mode", ""),
+            seg.get("koreanText", ""),
+            seg.get("englishText", ""),
+        ])
+
+    filename = f"{org_id}_{room_id}_translation.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

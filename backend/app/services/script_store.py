@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import re
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 def _norm(text: str) -> str:
@@ -114,6 +114,7 @@ class ScriptStore:
     def __init__(self):
         self._buffers: Dict[str, ScriptBuffer] = {}
         self._lock = Lock()
+        self._glossary_cache: Dict[Tuple[str, int], List[Tuple[str, str]]] = {}
 
     def _org_key(self, org_id: Optional[str]) -> str:
         clean = (org_id or "").strip()
@@ -207,6 +208,71 @@ class ScriptStore:
             hit = buffer.sermons.get(clean_sermon_id)
             return dict(hit) if hit else None
 
+    def match_with_examples(
+        self,
+        text: str,
+        *,
+        org_id: Optional[str] = None,
+        example_min_score: float = 0.20,
+        example_max: int = 3,
+    ) -> Tuple[Optional["ScriptPair"], float, int, float, List["ScriptPair"]]:
+        """
+        Single O(N) scan returning (best_match, score, version, threshold, examples).
+
+        examples: pairs with example_min_score <= score < threshold, sorted desc by score,
+        capped at example_max. Falls back to first 2 pairs as style anchors if none qualify.
+        Returns examples=[] when store is empty.
+        """
+        query = _norm(text)
+        key = self._org_key(org_id)
+
+        with self._lock:
+            buffer = self._buffers.get(key) or ScriptBuffer()
+            pairs_snapshot = list(buffer.pairs)
+            threshold = buffer.threshold
+            version = buffer.version
+
+        if not query:
+            return None, 0.0, version, threshold, []
+
+        scored: List[Tuple[float, ScriptPair]] = []
+        best: Optional[ScriptPair] = None
+        best_score = 0.0
+
+        for pair in pairs_snapshot:
+            score = _similarity(pair.source, query)
+            if score > best_score:
+                best_score = score
+                best = pair
+            if score >= example_min_score:
+                scored.append((score, pair))
+
+        # Adaptive threshold for short fragments
+        compact_query = _norm_compact(query)
+        effective_threshold = threshold
+        if len(compact_query) < 15:
+            effective_threshold = min(threshold, 0.72)
+
+        matched = best if best and best_score >= effective_threshold else None
+
+        # Build examples list: candidates below threshold (excluding the matched pair)
+        scored.sort(key=lambda x: -x[0])
+        examples: List[ScriptPair] = []
+        for sc, pair in scored:
+            if matched and pair.index == matched.index:
+                continue
+            if sc >= effective_threshold:
+                continue
+            examples.append(pair)
+            if len(examples) >= example_max:
+                break
+
+        # Style anchor fallback
+        if not examples and pairs_snapshot:
+            examples = [p for p in pairs_snapshot[:2] if not matched or p.index != matched.index]
+
+        return matched, best_score, version, threshold, examples
+
     def match(self, text: str, *, org_id: Optional[str] = None) -> Tuple[Optional[ScriptPair], float, int, float]:
         """
         Find the best matching pair for the given text using SequenceMatcher.
@@ -232,9 +298,81 @@ class ScriptStore:
                 best_score = score
                 best = pair
 
-        if best and best_score >= threshold:
+        compact_query = _norm_compact(query)
+        effective_threshold = min(threshold, 0.72) if len(compact_query) < 15 else threshold
+
+        if best and best_score >= effective_threshold:
             return best, best_score, version, threshold
         return None, best_score, version, threshold
+
+
+    def get_keyword_glossary(
+        self,
+        *,
+        org_id: Optional[str] = None,
+        max_terms: int = 15,
+        min_char_len: int = 2,
+        max_char_len: int = 6,
+        min_pair_count: int = 2,
+    ) -> List[Tuple[str, str]]:
+        """
+        Extract short recurring Korean terms appearing in >= min_pair_count source texts
+        with their first English equivalent word. Cached per (org_key, store_version).
+        Returns [] when fewer than min_pair_count pairs are loaded.
+        """
+        key = self._org_key(org_id)
+        with self._lock:
+            buffer = self._buffers.get(key) or ScriptBuffer()
+            pairs_snapshot = list(buffer.pairs)
+            version = buffer.version
+
+        cache_key = (key, version)
+        if cache_key in self._glossary_cache:
+            return self._glossary_cache[cache_key]
+
+        if len(pairs_snapshot) < min_pair_count:
+            self._glossary_cache[cache_key] = []
+            return []
+
+        _HANGUL_TOKEN_RE = re.compile(r"[\uac00-\ud7a3]+")
+        token_targets: Dict[str, List[str]] = {}
+
+        for pair in pairs_snapshot:
+            src_tokens = _HANGUL_TOKEN_RE.findall(pair.source)
+            for tok in set(src_tokens):
+                if min_char_len <= len(tok) <= max_char_len:
+                    token_targets.setdefault(tok, []).append(pair.target)
+
+        glossary: List[Tuple[str, str]] = []
+        for tok, targets in token_targets.items():
+            if len(targets) < min_pair_count:
+                continue
+            en_words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", targets[0])
+            if not en_words:
+                continue
+            glossary.append((tok, en_words[0]))
+
+        glossary = glossary[:max_terms]
+        self._glossary_cache[cache_key] = glossary
+        return glossary
+
+    def get_vocab_set(self, *, org_id: Optional[str] = None) -> Set[str]:
+        """
+        Return all unique Hangul tokens (length >= 3) from script source texts.
+        Used for STT error correction via edit distance 1.
+        """
+        key = self._org_key(org_id)
+        with self._lock:
+            buffer = self._buffers.get(key) or ScriptBuffer()
+            pairs_snapshot = list(buffer.pairs)
+
+        _HANGUL_TOKEN_RE = re.compile(r"[\uac00-\ud7a3]+")
+        vocab: Set[str] = set()
+        for pair in pairs_snapshot:
+            for tok in _HANGUL_TOKEN_RE.findall(pair.source):
+                if len(tok) >= 3:
+                    vocab.add(tok)
+        return vocab
 
 
 # Singleton instance used across the app

@@ -805,6 +805,7 @@ class InMemoryMultiChurchStore:
                         "title": service.get("title") or service_key,
                         "timezone": service.get("timezone") or "UTC",
                         "activeRoomId": active_room_id if room_doc and room_doc.get("status") == "live" else None,
+                        "lastRoomId": service.get("lastRoomId"),
                         "roomStatus": self._serialize_room_status(room_doc),
                         "defaultLanguagePair": service.get("defaultLanguagePair") or {"source": "ko", "target": "en"},
                     }
@@ -815,6 +816,29 @@ class InMemoryMultiChurchStore:
                 "name": self._orgs[org_id]["name"],
                 "services": rows,
             }
+
+    def append_translation_segment(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        seq: int,
+        korean_text: str,
+        english_text: str,
+        mode: str,
+        match_score: Optional[float] = None,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        pass  # In-memory store does not persist segments
+
+    def export_room_segments(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        requested_by_uid: str,
+    ) -> list:
+        raise NotImplementedError("segment export not supported in dev mode")
 
     def update_org_profile(
         self,
@@ -2412,6 +2436,21 @@ class InMemoryMultiChurchStore:
                 out.append({"orgId": org_id, "roomId": room_id, "reason": reason})
         return out
 
+    def save_sermon_pairs(
+        self,
+        org_id: str,
+        sermon_id: str,
+        pairs: List[dict],
+        *,
+        threshold: float = 0.84,
+        lang_src: str = "ko",
+        lang_tgt: str = "en",
+    ) -> None:
+        pass  # no-op for in-memory store
+
+    def get_latest_sermon_pairs(self, org_id: str) -> Optional[dict]:
+        return None  # no-op for in-memory store
+
 
 class FirestoreMultiChurchStore:
     def __init__(self) -> None:
@@ -2717,6 +2756,7 @@ class FirestoreMultiChurchStore:
                     "title": service.get("title") or service_key,
                     "timezone": service.get("timezone") or "UTC",
                     "activeRoomId": active_room_id,
+                    "lastRoomId": service.get("lastRoomId"),
                     "roomStatus": room_status,
                     "defaultLanguagePair": service.get("defaultLanguagePair") or {"source": "ko", "target": "en"},
                 }
@@ -4456,6 +4496,50 @@ class FirestoreMultiChurchStore:
             )
         return result
 
+    def append_translation_segment(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        seq: int,
+        korean_text: str,
+        english_text: str,
+        mode: str,
+        match_score: Optional[float] = None,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        doc: Dict[str, Any] = {
+            "seq": seq,
+            "timestamp": timestamp or (_utcnow().isoformat(timespec="milliseconds") + "Z"),
+            "koreanText": korean_text,
+            "englishText": english_text,
+            "mode": mode,
+        }
+        if match_score is not None:
+            doc["matchScore"] = match_score
+        self._room_ref(org_id, room_id).collection("segments").document(str(seq)).set(doc)
+
+    def export_room_segments(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        requested_by_uid: str,
+    ) -> list:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id or not clean_uid:
+            raise ValueError("room_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin", "host"}:
+            raise PermissionError("forbidden")
+        room_snap = self._room_ref(clean_org_id, room_id).get()
+        if not room_snap.exists:
+            raise ValueError("room_not_found")
+        segments_ref = self._room_ref(clean_org_id, room_id).collection("segments")
+        snaps = segments_ref.order_by("seq").stream()
+        return [snap.to_dict() for snap in snaps if snap.to_dict()]
+
     def touch_audio(self, org_id: str, room_id: str) -> None:
         self._room_ref(org_id, room_id).set({"lastAudioAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True)
 
@@ -4602,6 +4686,49 @@ class FirestoreMultiChurchStore:
                     out.append({"orgId": org_id, "roomId": room_id, "reason": reason})
 
         return out
+
+    def save_sermon_pairs(
+        self,
+        org_id: str,
+        sermon_id: str,
+        pairs: List[dict],
+        *,
+        threshold: float = 0.84,
+        lang_src: str = "ko",
+        lang_tgt: str = "en",
+    ) -> None:
+        """Write sermon pairs to Firestore. Fire-and-forget safe."""
+        try:
+            doc_ref = (
+                self._db
+                .collection("organizations").document(org_id)
+                .collection("sermons").document(sermon_id)
+            )
+            doc_ref.set({
+                "sermon_id": sermon_id,
+                "created_at": gcf_firestore.SERVER_TIMESTAMP,
+                "threshold": threshold,
+                "lang_src": lang_src,
+                "lang_tgt": lang_tgt,
+                "pairs": pairs,
+            })
+        except Exception:
+            pass
+
+    def get_latest_sermon_pairs(self, org_id: str) -> Optional[dict]:
+        """Return the most recently finalized sermon document for an org, or None."""
+        try:
+            col_ref = (
+                self._db
+                .collection("organizations").document(org_id)
+                .collection("sermons")
+            )
+            docs = col_ref.order_by("created_at", direction="DESCENDING").limit(1).get()
+            for doc in docs:
+                return doc.to_dict()
+        except Exception:
+            pass
+        return None
 
 
 def _build_store():
