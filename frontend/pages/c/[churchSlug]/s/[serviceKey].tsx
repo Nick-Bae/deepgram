@@ -1,10 +1,11 @@
 import Head from "next/head";
 import { useRouter } from "next/router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { API_URL, WS_URL } from "../../../../utils/urls";
 import { useSubtitleSocket } from "../../../../utils/useSubtitleSocket";
 import { appendStreamContextToUrl, clearRoomInSession, persistStreamContext } from "../../../../utils/streamContext";
+import { useTTS } from "../../../../utils/useTTS";
 
 type ResolveResponse = {
   orgId: string;
@@ -112,6 +113,17 @@ export default function ChurchServiceListenerPage() {
     enabled: socketEnabled,
   });
 
+  const targetLang = resolveData?.languagePair?.target || "en";
+  const { enabled: ttsEnabled, setEnabled: setTtsEnabled, speak } = useTTS(targetLang);
+  const lastSpokenLineRef = useRef("");
+
+  useEffect(() => {
+    const lastLine = enLines[enLines.length - 1];
+    if (!lastLine || lastLine === lastSpokenLineRef.current) return;
+    lastSpokenLineRef.current = lastLine;
+    speak(lastLine);
+  }, [enLines, speak]);
+
   const serviceTitle = resolveData?.service?.title || serviceKey || "Service";
   const lastKr = krLines[krLines.length - 1] || "";
   const lastEn = enLines[enLines.length - 1] || "";
@@ -197,34 +209,59 @@ export default function ChurchServiceListenerPage() {
         {statusLabel}
       </div>
 
-      {/* Toggle button */}
-      <button
-        type="button"
-        onClick={toggleDisplayMode}
-        className="toggle-btn"
-        style={{
-          position: "fixed",
-          top: 14,
-          right: 14,
-          zIndex: 20,
-          background: "rgba(0,0,0,0.55)",
-          color: "rgba(255,255,255,0.9)",
-          border: "1px solid rgba(255,255,255,0.22)",
-          padding: "6px 14px",
-          borderRadius: 999,
-          fontSize: 12,
-          letterSpacing: "0.06em",
-          textTransform: "uppercase",
-          fontWeight: 700,
-          cursor: "pointer",
-          backdropFilter: "blur(8px)",
-          transition: "background 150ms ease, transform 100ms ease",
-        }}
-        aria-pressed={displayMode === "fullScreen"}
-      >
-        {displayMode === "subtitle" ? "Full Screen" : "Subtitle"}{" "}
-        <span className="kb-hint" style={{ opacity: 0.55, fontWeight: 400 }}>[F]</span>
-      </button>
+      {/* Top-right controls */}
+      <div style={{ position: "fixed", top: 14, right: 14, zIndex: 20, display: "flex", gap: 8 }}>
+        {/* Audio toggle */}
+        <button
+          type="button"
+          onClick={() => setTtsEnabled((v) => !v)}
+          className="toggle-btn"
+          style={{
+            background: ttsEnabled ? "rgba(52,211,153,0.18)" : "rgba(0,0,0,0.55)",
+            color: ttsEnabled ? "rgba(52,211,153,1)" : "rgba(255,255,255,0.6)",
+            border: ttsEnabled ? "1px solid rgba(52,211,153,0.5)" : "1px solid rgba(255,255,255,0.22)",
+            padding: "6px 14px",
+            borderRadius: 999,
+            fontSize: 12,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+            fontWeight: 700,
+            cursor: "pointer",
+            backdropFilter: "blur(8px)",
+            transition: "all 150ms ease",
+          }}
+          aria-pressed={ttsEnabled}
+          title={ttsEnabled ? "Audio on — tap to mute" : "Tap to hear translation"}
+        >
+          {ttsEnabled ? "🔊 Audio" : "🔇 Audio"}
+        </button>
+
+        {/* Display mode toggle */}
+        <button
+          type="button"
+          onClick={toggleDisplayMode}
+          className="toggle-btn"
+          style={{
+            position: "relative",
+            background: "rgba(0,0,0,0.55)",
+            color: "rgba(255,255,255,0.9)",
+            border: "1px solid rgba(255,255,255,0.22)",
+            padding: "6px 14px",
+            borderRadius: 999,
+            fontSize: 12,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+            fontWeight: 700,
+            cursor: "pointer",
+            backdropFilter: "blur(8px)",
+            transition: "background 150ms ease, transform 100ms ease",
+          }}
+          aria-pressed={displayMode === "fullScreen"}
+        >
+          {displayMode === "subtitle" ? "Full Screen" : "Subtitle"}{" "}
+          <span className="kb-hint" style={{ opacity: 0.55, fontWeight: 400 }}>[F]</span>
+        </button>
+      </div>
 
       {/* Error banner */}
       {errorMsg && (
