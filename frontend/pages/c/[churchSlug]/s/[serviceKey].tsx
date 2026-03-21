@@ -124,6 +124,16 @@ export default function ChurchServiceListenerPage() {
     speak(lastLine);
   }, [enLines, speak]);
 
+  // iOS Safari: speechSynthesis stalls after ~30s. Resume it on a timer while audio is enabled.
+  useEffect(() => {
+    if (!ttsEnabled) return;
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const id = window.setInterval(() => {
+      try { window.speechSynthesis.resume(); } catch {}
+    }, 10000);
+    return () => clearInterval(id);
+  }, [ttsEnabled]);
+
   const serviceTitle = resolveData?.service?.title || serviceKey || "Service";
   const lastKr = krLines[krLines.length - 1] || "";
   const lastEn = enLines[enLines.length - 1] || "";
@@ -214,7 +224,18 @@ export default function ChurchServiceListenerPage() {
         {/* Audio toggle */}
         <button
           type="button"
-          onClick={() => setTtsEnabled((v) => !v)}
+          onClick={() => {
+            const next = !ttsEnabled;
+            setTtsEnabled(next);
+            // Must call speechSynthesis inside the user gesture to unlock it on iOS/Android.
+            if (next && typeof window !== "undefined" && "speechSynthesis" in window) {
+              try {
+                window.speechSynthesis.cancel();
+                const unlock = new SpeechSynthesisUtterance("");
+                window.speechSynthesis.speak(unlock);
+              } catch {}
+            }
+          }}
           className="toggle-btn"
           style={{
             background: ttsEnabled ? "rgba(52,211,153,0.18)" : "rgba(0,0,0,0.55)",
