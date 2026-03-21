@@ -963,6 +963,10 @@ def _unmask_hard_glossary(text: str, mapping: dict[str, str]) -> str:
     out = text or ""
     for token, replacement in mapping.items():
         out = out.replace(token, replacement)
+    # Remove any [[Tn]] tokens the model hallucinated (not present in our actual mapping)
+    out = re.sub(r"\[\[T\d+\]\]", "", out)
+    # Collapse any double spaces left behind
+    out = re.sub(r"  +", " ", out).strip()
     return out
 
 
@@ -1045,7 +1049,7 @@ def _build_system_prompt_base(
         "- Avoid slang, romantic/sexual nuance, or suggestive wording unless explicit in Korean.\n"
         "- Keep wording reverent and family-friendly for mixed ages.\n"
         "- Keep proper nouns; do not invent names or details.\n"
-        "- If you see placeholder tokens like [[T1]], [[T2]], leave them unchanged; they will be mapped to glossary terms after translation.\n"
+        "- Some Korean terms may have been replaced with placeholder tokens like [[T1]], [[T2]] before this text reached you. If you see such a token in the input, copy it to the output unchanged. Do NOT invent new [[T…]] tokens — only preserve ones already present in the input.\n"
         "\n"
         "Style:\n"
         "- Clear, contemporary, pastoral tone.\n"

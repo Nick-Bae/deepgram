@@ -37,7 +37,7 @@ export default function ChurchServiceListenerPage() {
   const [loading, setLoading] = useState(true);
   const [resolveData, setResolveData] = useState<ResolveResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [displayMode, setDisplayMode] = useState<DisplayMode>("fullScreen");
+  const [displayMode, setDisplayMode] = useState<DisplayMode>("subtitle");
 
   const toggleDisplayMode = useCallback(() => {
     setDisplayMode((prev) => (prev === "subtitle" ? "fullScreen" : "subtitle"));
@@ -307,87 +307,83 @@ export default function ChurchServiceListenerPage() {
         </div>
       )}
 
-      {/* Subtitle mode */}
+      {/* Subtitle mode — centered at bottom */}
       {displayMode === "subtitle" ? (
         <div
           style={{
             position: "fixed",
-            inset: 0,
-            display: "flex",
-            flexDirection: "column",
-            justifyContent: "flex-end",
-            padding: "2.4rem 6vw 1.8rem",
-            boxSizing: "border-box",
-            pointerEvents: "none",
+            bottom: 0,
+            left: 0,
+            right: 0,
             zIndex: 10,
+            pointerEvents: "none",
+            background: "linear-gradient(to top, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0.55) 60%, transparent 100%)",
+            padding: "5vh 4vw 4vh",
+            display: "flex",
+            justifyContent: "center",
           }}
         >
           <div
             style={{
-              width: "100%",
+              width: "min(1100px, 92vw)",
               display: "flex",
               flexDirection: "column",
-              gap: "0.75em",
-              textAlign: "left",
-              background: "linear-gradient(to right, rgba(0,0,0,0.78), rgba(0,0,0,0.62))",
-              backdropFilter: "blur(10px)",
-              borderLeft: connected ? "3px solid rgba(52,211,153,0.6)" : "3px solid rgba(255,255,255,0.1)",
-              padding: "1.1rem 1.6rem 1.1rem 1.4rem",
-              boxShadow: "0 -4px 40px rgba(0,0,0,0.5)",
-              transition: "border-color 400ms ease",
+              gap: "0.4em",
+              textAlign: "center",
             }}
           >
+            {/* Korean source line */}
             {lastKr && (
               <div
                 style={{
-                  opacity: 0.68,
-                  fontSize: "clamp(17px, 2.4vw, 42px)",
-                  letterSpacing: "0.01em",
-                  lineHeight: 1.25,
-                  color: "rgba(255,255,255,0.85)",
+                  fontSize: "clamp(13px, 1.6vw, 24px)",
+                  color: "rgba(255,255,255,0.6)",
+                  letterSpacing: "0.02em",
+                  lineHeight: 1.3,
                 }}
               >
                 {lastKr}
               </div>
             )}
-            <div style={{ display: "flex", flexDirection: "column", gap: "0.28em", lineHeight: 1.15 }}>
-              {enLines.length > 0 ? (
-                enLines.map((line, i) => {
-                  const isCurrent = i === enLines.length - 1;
-                  return (
-                    <div
-                      key={`${i}-${line.slice(0, 12)}`}
-                      style={{
-                        fontSize: isCurrent ? "clamp(28px, 6.5vw, 88px)" : "clamp(24px, 5.8vw, 78px)",
-                        fontWeight: isCurrent ? 800 : 500,
-                        wordBreak: "break-word",
-                        opacity: isCurrent ? 1 : 0.55,
-                        color: isCurrent ? "#fff" : "rgba(255,255,255,0.7)",
-                        textShadow: isCurrent ? "0 2px 24px rgba(0,0,0,0.8)" : "none",
-                        transition: "opacity 200ms ease, font-size 200ms ease",
-                      }}
-                    >
-                      {line}
-                    </div>
-                  );
-                })
-              ) : (
-                <div
-                  style={{
-                    fontSize: "clamp(20px, 4.4vw, 56px)",
-                    opacity: 0.42,
-                    fontStyle: "italic",
-                    fontWeight: 400,
-                  }}
-                >
-                  {waitingMessage}
-                </div>
-              )}
-            </div>
+
+            {/* English translation lines */}
+            {enLines.length > 0 ? (
+              enLines.map((line, i) => {
+                const isCurrent = i === enLines.length - 1;
+                return (
+                  <div
+                    key={`${i}-${line.slice(0, 12)}`}
+                    style={{
+                      fontSize: isCurrent ? "clamp(26px, 4.2vw, 64px)" : "clamp(18px, 3vw, 44px)",
+                      fontWeight: isCurrent ? 700 : 400,
+                      wordBreak: "break-word",
+                      lineHeight: 1.25,
+                      opacity: isCurrent ? 1 : 0.48,
+                      color: "#fff",
+                      transition: "opacity 250ms ease",
+                    }}
+                  >
+                    {line}
+                  </div>
+                );
+              })
+            ) : (
+              <div
+                style={{
+                  fontSize: "clamp(20px, 3.2vw, 48px)",
+                  fontWeight: 300,
+                  opacity: 0.38,
+                  fontStyle: "italic",
+                  color: "#fff",
+                }}
+              >
+                {waitingMessage}
+              </div>
+            )}
           </div>
         </div>
       ) : (
-        /* Fullscreen mode */
+        /* Fullscreen mode — large text, centered */
         <div
           style={{
             position: "fixed",
@@ -426,11 +422,11 @@ export default function ChurchServiceListenerPage() {
 
             <div
               style={{
-                fontSize: "clamp(52px, 12vw, 164px)",
-                fontWeight: enLines.length > 0 ? 800 : 300,
-                lineHeight: 1.04,
+                fontSize: "clamp(48px, 10vw, 140px)",
+                fontWeight: enLines.length > 0 ? 700 : 300,
+                lineHeight: 1.1,
                 letterSpacing: "-0.01em",
-                textShadow: enLines.length > 0 ? "0 4px 48px rgba(0,0,0,0.9), 0 1px 6px rgba(0,0,0,0.6)" : "none",
+                textShadow: enLines.length > 0 ? "0 2px 12px rgba(0,0,0,1), 0 4px 48px rgba(0,0,0,0.9), 0 1px 3px rgba(0,0,0,1)" : "none",
                 color: enLines.length > 0 ? "#fff" : "rgba(255,255,255,0.28)",
                 fontStyle: enLines.length > 0 ? "normal" : "italic",
                 transition: "color 300ms ease",
@@ -444,10 +440,11 @@ export default function ChurchServiceListenerPage() {
                 style={{
                   display: "flex",
                   flexDirection: "column",
-                  gap: "0.3em",
-                  opacity: 0.45,
-                  fontSize: "clamp(18px, 3.2vw, 46px)",
+                  gap: "0.25em",
+                  opacity: 0.42,
+                  fontSize: "clamp(16px, 2.8vw, 40px)",
                   fontWeight: 400,
+                  textShadow: "0 1px 8px rgba(0,0,0,1)",
                 }}
               >
                 {recentEn.map((line, idx) => (
