@@ -2636,7 +2636,7 @@ export default function HostChurchPage() {
                                   setDownloadingRoom(downloadRoomId);
                                   setDownloadError(null);
                                   try {
-                                    await downloadTranslationLog(resolvedOrgId, downloadRoomId, getIdToken);
+                                    await downloadTranslationLog(resolvedOrgId, downloadRoomId, async () => (await getIdToken()) ?? "");
                                   } catch (err) {
                                     setDownloadError(err instanceof Error ? err.message : "Download failed");
                                   } finally {
