@@ -959,11 +959,15 @@ async def ws_translate(ws: WebSocket):
 
         try:
             if target_org_id and target_room_id:
-                await manager.broadcast_room(target_org_id, target_room_id, live_msg_new)
-                await manager.broadcast_room(target_org_id, target_room_id, live_msg_legacy)
+                await asyncio.gather(
+                    manager.broadcast_room(target_org_id, target_room_id, live_msg_new),
+                    manager.broadcast_room(target_org_id, target_room_id, live_msg_legacy),
+                )
             else:
-                await manager.broadcast(live_msg_new)
-                await manager.broadcast(live_msg_legacy)
+                await asyncio.gather(
+                    manager.broadcast(live_msg_new),
+                    manager.broadcast(live_msg_legacy),
+                )
         except Exception as exc:
             print("[WS translate][broadcast][error]", exc)
 
@@ -1518,11 +1522,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
             try:
                 if org_id and room_id:
-                    await manager.broadcast_room(org_id, room_id, live_msg_new)
-                    await manager.broadcast_room(org_id, room_id, live_msg_legacy)
+                    await asyncio.gather(
+                        manager.broadcast_room(org_id, room_id, live_msg_new),
+                        manager.broadcast_room(org_id, room_id, live_msg_legacy),
+                    )
                 else:
-                    await manager.broadcast(live_msg_new)
-                    await manager.broadcast(live_msg_legacy)
+                    await asyncio.gather(
+                        manager.broadcast(live_msg_new),
+                        manager.broadcast(live_msg_legacy),
+                    )
                 print(f"[BROADCAST] seq={seq} '{translated[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)

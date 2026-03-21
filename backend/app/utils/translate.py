@@ -1,4 +1,5 @@
 # backend/app/utils/translate.py
+import asyncio
 import os
 import json
 import pathlib
@@ -1312,13 +1313,17 @@ async def translate_text(
             )
             ctx.remember(text, out)
 
-        _log_translation_example(
-            source_lang=source,
-            target_lang=target,
-            stt_text=text,
-            auto_translation=out,
-            final_translation=None,
-        )
+        # Defer the file write off the critical path so it never delays broadcast
+        _src, _tgt, _text, _out = source, target, text, out
+        async def _bg_log() -> None:
+            _log_translation_example(
+                source_lang=_src,
+                target_lang=_tgt,
+                stt_text=_text,
+                auto_translation=_out,
+                final_translation=None,
+            )
+        asyncio.create_task(_bg_log())
 
         return out
     except Exception as e:
