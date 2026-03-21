@@ -1,6 +1,6 @@
 {
   "version": "3.0",
-  "lastUpdated": "2026-03-21T05:52:13.222Z",
+  "lastUpdated": "2026-03-21T06:15:18.929Z",
   "activeFeatures": [
     "billing",
     "admin",
@@ -168,7 +168,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-21T05:50:11.126Z",
-        "lastUpdated": "2026-03-21T05:50:39.507Z"
+        "lastUpdated": "2026-03-21T06:15:18.929Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/frontend/pages/c/[churchSlug]/s/[serviceKey].tsx"
     }
@@ -181,7 +181,7 @@
   "session": {
     "startedAt": "2026-03-20T20:05:09.411Z",
     "onboardingCompleted": false,
-    "lastActivity": "2026-03-21T05:52:13.222Z"
+    "lastActivity": "2026-03-21T06:15:18.929Z"
   },
   "history": [
     {
@@ -499,6 +499,24 @@
     {
       "timestamp": "2026-03-21T05:52:13.222Z",
       "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-21T06:14:37.734Z",
+      "feature": "s",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-21T06:15:06.536Z",
+      "feature": "s",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-03-21T06:15:18.929Z",
+      "feature": "s",
       "phase": "do",
       "action": "updated"
     }
