@@ -1152,7 +1152,7 @@ export default function TranslationBox() {
                         Translation temporarily unavailable. {failReasonLabel}
                       </div>
                     )}
-                    <p className="min-h-[170px] whitespace-pre-wrap text-xl font-semibold leading-relaxed text-slate-900">
+                    <p className={`min-h-[100px] max-h-[220px] overflow-y-auto whitespace-pre-wrap font-semibold leading-relaxed text-slate-900 ${translated.length > 120 ? 'text-base' : translated.length > 60 ? 'text-lg' : 'text-xl'}`}>
                       {translated || 'Waiting for the next sentence...'}
                     </p>
                     {scriptureMeta && (
