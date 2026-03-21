@@ -1458,7 +1458,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             meta_extra: dict[str, Any] | None = None,
             update_ctx: bool = True,
         ) -> None:
-            nonlocal seq
+            nonlocal seq, _cached_script_version_dg, _cached_script_glossary_dg
 
             clean_src = norm_ws(_preprocess_source_text(src_text_raw, src_lang_full))
             if not clean_src:
