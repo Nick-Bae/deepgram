@@ -1774,62 +1774,99 @@ export default function HostChurchPage() {
 
   if (!authLoading && user && verificationRequired) {
     return (
-      <main style={{ ...hostPageStyle, display: "grid", placeItems: "center" }}>
+      <main style={{ ...hostPageStyle, display: "grid", placeItems: "center", minHeight: "100vh" }}>
         <div
           style={{
-            background: "rgba(255,255,255,0.06)",
-            border: "1px solid rgba(255,255,255,0.12)",
-            borderRadius: 16,
-            padding: "32px 28px",
-            maxWidth: 440,
+            width: "100%",
+            maxWidth: 480,
+            borderRadius: 24,
+            border: "1px solid rgba(255,255,255,0.72)",
+            background: "linear-gradient(180deg, rgba(248,251,255,0.92) 0%, rgba(228,237,250,0.78) 100%)",
+            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.6), 0 24px 48px rgba(88,106,137,0.14)",
+            padding: "36px 32px",
             display: "grid",
-            gap: 16,
-            color: "#e8e8e8",
-            fontFamily: "inherit",
+            gap: 20,
+            color: "#10213a",
           }}
         >
-          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>Verify Your Email</h2>
-          <p style={{ margin: 0, fontSize: 14, lineHeight: 1.6, color: "#b0b8c8" }}>
-            A verification link was sent to <strong style={{ color: "#e8e8e8" }}>{user.email}</strong>.
-            Please click the link in that email before accessing the host console.
+          <div style={{ display: "grid", gap: 6 }}>
+            <p style={{ margin: 0, fontSize: 11, fontWeight: 800, letterSpacing: "0.14em", textTransform: "uppercase", color: "#6b82a0" }}>
+              Account Setup
+            </p>
+            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: "#10213a", lineHeight: 1.2 }}>
+              Verify your email address
+            </h2>
+          </div>
+
+          <div
+            style={{
+              borderRadius: 14,
+              border: "1px solid rgba(79,115,170,0.18)",
+              background: "rgba(79,115,170,0.06)",
+              padding: "14px 16px",
+              display: "grid",
+              gap: 4,
+            }}
+          >
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: "#4f73aa", letterSpacing: "0.06em", textTransform: "uppercase" }}>
+              Verification email sent to
+            </p>
+            <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#10213a" }}>{user.email}</p>
+          </div>
+
+          <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#4a5f7a" }}>
+            Check your inbox and click the <strong style={{ color: "#10213a" }}>Verify email address</strong> link.
+            Once verified, return here and click <strong style={{ color: "#10213a" }}>I&apos;ve Verified</strong> below.
           </p>
+
           {verificationError ? (
-            <p style={{ margin: 0, fontSize: 13, color: "#e88a8a" }}>{verificationError}</p>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.6, borderRadius: 12, padding: "10px 14px", background: "rgba(188,95,111,0.1)", color: "#a33d51" }}>
+              {verificationError}
+            </p>
           ) : null}
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button
-              onClick={handleResendVerification}
-              disabled={verificationSending}
-              style={{
-                padding: "9px 16px",
-                borderRadius: 8,
-                border: "1px solid rgba(255,255,255,0.2)",
-                background: "rgba(255,255,255,0.08)",
-                color: "#e8e8e8",
-                fontSize: 13,
-                cursor: verificationSending ? "not-allowed" : "pointer",
-                opacity: verificationSending ? 0.6 : 1,
-              }}
-            >
-              {verificationSending ? "Sending..." : "Resend Verification Email"}
-            </button>
+
+          <div style={{ display: "grid", gap: 10 }}>
             <button
               onClick={handleCheckVerification}
               disabled={verificationSending}
               style={{
-                padding: "9px 16px",
-                borderRadius: 8,
-                border: "1px solid rgba(255,255,255,0.2)",
-                background: "rgba(255,255,255,0.08)",
-                color: "#e8e8e8",
-                fontSize: 13,
+                padding: "12px 18px",
+                borderRadius: 999,
+                border: "1px solid rgba(79,115,170,0.28)",
+                background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
+                color: "#f8fafc",
+                fontSize: 14,
+                fontWeight: 800,
                 cursor: verificationSending ? "not-allowed" : "pointer",
                 opacity: verificationSending ? 0.6 : 1,
+                boxShadow: "0 10px 24px rgba(79,115,170,0.22)",
               }}
             >
-              {verificationSending ? "Checking..." : "Check Again"}
+              {verificationSending ? "Checking..." : "I've Verified — Open Dashboard"}
+            </button>
+            <button
+              onClick={handleResendVerification}
+              disabled={verificationSending}
+              style={{
+                padding: "11px 18px",
+                borderRadius: 999,
+                border: "1px solid rgba(189,200,217,0.92)",
+                background: "rgba(247,250,253,0.82)",
+                color: "#42556f",
+                fontSize: 13,
+                fontWeight: 700,
+                cursor: verificationSending ? "not-allowed" : "pointer",
+                opacity: verificationSending ? 0.6 : 1,
+                boxShadow: "0 6px 16px rgba(122,138,163,0.08)",
+              }}
+            >
+              {verificationSending ? "Sending..." : "Resend Verification Email"}
             </button>
           </div>
+
+          <p style={{ margin: 0, fontSize: 12, color: "#7a8fa8", lineHeight: 1.6 }}>
+            Can&apos;t find the email? Check your spam folder. The link expires after 24 hours.
+          </p>
         </div>
       </main>
     );

@@ -32,19 +32,52 @@ export default function HostRedirectPage() {
   }, [router, target]);
 
   return (
-    <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 24, background: "#0b1220", color: "#f8fafc" }}>
-      <section style={{ width: "100%", maxWidth: 720, border: "1px solid rgba(255,255,255,0.14)", borderRadius: 14, padding: 18, background: "rgba(255,255,255,0.04)" }}>
+    <main style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 24, background: "linear-gradient(180deg, #e9edf4 0%, #dde4ee 56%, #d4dce8 100%)" }}>
+      <section
+        style={{
+          width: "100%",
+          maxWidth: 440,
+          borderRadius: 24,
+          border: "1px solid rgba(255,255,255,0.72)",
+          background: "linear-gradient(180deg, rgba(248,251,255,0.92) 0%, rgba(228,237,250,0.78) 100%)",
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.6), 0 24px 48px rgba(88,106,137,0.14)",
+          padding: "36px 32px",
+          display: "grid",
+          gap: 16,
+          color: "#10213a",
+        }}
+      >
         {target ? (
-          <p style={{ margin: 0, opacity: 0.9 }}>Redirecting to host dashboard...</p>
+          <p style={{ margin: 0, fontSize: 14, color: "#4a5f7a" }}>Redirecting to your host dashboard…</p>
         ) : (
-          <div style={{ display: "grid", gap: 8 }}>
-            <p style={{ margin: 0, opacity: 0.9 }}>
-              Host URL is now <code>/host/c/&lt;churchSlug&gt;/broadcast</code>.
+          <>
+            <div style={{ display: "grid", gap: 6 }}>
+              <p style={{ margin: 0, fontSize: 11, fontWeight: 800, letterSpacing: "0.14em", textTransform: "uppercase", color: "#6b82a0" }}>
+                Host Console
+              </p>
+              <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: "#10213a" }}>Sign in to continue</h2>
+            </div>
+            <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#4a5f7a" }}>
+              Please sign in to access your church host dashboard.
             </p>
-            <p style={{ margin: 0, opacity: 0.8 }}>
-              Example: <Link href="/host/c/arkchurch/broadcast" style={{ color: "#93c5fd" }}>/host/c/arkchurch/broadcast</Link>
-            </p>
-          </div>
+            <Link
+              href="/login"
+              style={{
+                padding: "12px 18px",
+                borderRadius: 999,
+                border: "1px solid rgba(79,115,170,0.28)",
+                background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
+                color: "#f8fafc",
+                fontSize: 14,
+                fontWeight: 800,
+                textDecoration: "none",
+                textAlign: "center",
+                boxShadow: "0 10px 24px rgba(79,115,170,0.22)",
+              }}
+            >
+              Sign In
+            </Link>
+          </>
         )}
       </section>
     </main>

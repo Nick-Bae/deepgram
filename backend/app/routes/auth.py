@@ -428,6 +428,7 @@ def auth_bootstrap_owner(
             email=user.email,
             display_name=user.displayName,
             org_name=str(result.get("name") or payload.churchName),
+            org_slug=str(result.get("slug") or payload.churchSlug or ""),
         )
 
     memberships = multichurch_store.list_memberships(user.uid)

@@ -123,20 +123,26 @@ def _layout(*, heading: str, body_html: str) -> str:
 # Email senders
 # ---------------------------------------------------------------------------
 
-def send_welcome_email(*, email: str, display_name: Optional[str], org_name: str) -> None:
+def send_welcome_email(*, email: str, display_name: Optional[str], org_name: str, org_slug: Optional[str] = None) -> None:
     """Sent to the org owner immediately after they create their church workspace."""
     if not email:
         return
     brand = _brand()
     name = display_name or "there"
-    dashboard_url = _app_url() + "/host" if _app_url() else ""
+    base = _app_url()
+    if base and org_slug:
+        dashboard_url = f"{base}/host/c/{org_slug}/broadcast"
+    elif base:
+        dashboard_url = f"{base}/host"
+    else:
+        dashboard_url = ""
     html = _layout(
         heading=f"Welcome to {brand}",
         body_html=(
             f"<p>Hi {name},</p>"
             f"<p>Your church workspace <strong>{org_name}</strong> is ready. "
-            f"You can start a live translation broadcast from the host dashboard.</p>"
-            + (_btn("Go to Dashboard", dashboard_url) if dashboard_url else "")
+            f"You can start a live translation broadcast from your host dashboard.</p>"
+            + (_btn("Open Host Dashboard", dashboard_url) if dashboard_url else "")
             + "<p>If you have any questions, just reply to this email.</p>"
         ),
     )
@@ -145,10 +151,10 @@ def send_welcome_email(*, email: str, display_name: Optional[str], org_name: str
         "",
         f"Hi {name},",
         f"Your church workspace '{org_name}' is ready.",
-        "Sign in and start a live broadcast from the host dashboard.",
+        "Open your host dashboard to start a live translation broadcast:",
         dashboard_url or "",
         "",
-        f"Thanks,",
+        "Thanks,",
         brand,
     ])
     _send(to=[email], subject=f"Welcome to {brand} — {org_name} is ready", html=html, text=text, tag="welcome")
