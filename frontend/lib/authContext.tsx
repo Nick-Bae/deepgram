@@ -2,6 +2,7 @@ import {
   User,
   createUserWithEmailAndPassword,
   onAuthStateChanged,
+  sendEmailVerification,
   signInWithEmailAndPassword,
   signOut,
   updateProfile,
@@ -77,6 +78,12 @@ export function AuthProvider({ children }: Props) {
       await updateProfile(cred.user, { displayName: displayName.trim() });
     }
     await cred.user.getIdToken(true);
+    // Send verification email immediately after account creation (best-effort, never blocks signup)
+    try {
+      await sendEmailVerification(cred.user);
+    } catch {
+      // Verification email failure is non-fatal
+    }
     setUser(cred.user);
     return cred.user;
   }, []);
