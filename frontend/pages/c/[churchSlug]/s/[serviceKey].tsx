@@ -1,3 +1,4 @@
+import Head from "next/head";
 import { useRouter } from "next/router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -131,6 +132,11 @@ export default function ChurchServiceListenerPage() {
   const statusLabel = isLive ? "Live" : isConnecting ? "Connecting" : "Standby";
 
   return (
+    <>
+    <Head>
+      <meta name="apple-mobile-web-app-capable" content="yes" />
+      <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    </Head>
     <main
       style={{
         minHeight: "100vh",
@@ -156,6 +162,7 @@ export default function ChurchServiceListenerPage() {
         .dot-connecting  { animation: pulse-connecting 1.2s ease infinite; }
         .toggle-btn:hover  { background: rgba(255,255,255,0.18) !important; }
         .toggle-btn:active { transform: scale(0.96); }
+        @media (hover: none) { .kb-hint { display: none; } }
       `}</style>
 
       {/* Connection indicator */}
@@ -216,7 +223,7 @@ export default function ChurchServiceListenerPage() {
         aria-pressed={displayMode === "fullScreen"}
       >
         {displayMode === "subtitle" ? "Full Screen" : "Subtitle"}{" "}
-        <span style={{ opacity: 0.55, fontWeight: 400 }}>[F]</span>
+        <span className="kb-hint" style={{ opacity: 0.55, fontWeight: 400 }}>[F]</span>
       </button>
 
       {/* Error banner */}
@@ -394,5 +401,6 @@ export default function ChurchServiceListenerPage() {
         </div>
       )}
     </main>
+    </>
   );
 }

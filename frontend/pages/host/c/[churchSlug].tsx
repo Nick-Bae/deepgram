@@ -2,6 +2,7 @@ import Link from "next/link";
 import { useRouter } from "next/router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { sendEmailVerification } from "firebase/auth";
+import QRCode from "qrcode";
 
 import TranslationBox from "../../../components/TranslationBox";
 import { useAuth } from "../../../lib/authContext";
@@ -250,6 +251,10 @@ export default function HostChurchPage() {
   const [revokingInviteId, setRevokingInviteId] = useState("");
   const [copyBusy, setCopyBusy] = useState(false);
   const [shareBusy, setShareBusy] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState("");
+  const [copyUrlBusy, setCopyUrlBusy] = useState(false);
+  const [copyUrlNotice, setCopyUrlNotice] = useState<string | null>(null);
+  const [shareUrlBusy, setShareUrlBusy] = useState(false);
   const [newServiceKey, setNewServiceKey] = useState("");
   const [newServiceTitle, setNewServiceTitle] = useState("");
   const [serviceManageBusy, setServiceManageBusy] = useState(false);
@@ -646,6 +651,46 @@ export default function HostChurchPage() {
     if (!origin || !slug || !listenerServiceKey) return "";
     return `${origin}/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(listenerServiceKey)}`;
   }, [normalizedServiceKey, origin, serviceKeyForStart, slug]);
+
+  useEffect(() => {
+    if (!displayUrl) { setQrDataUrl(""); return; }
+    let cancelled = false;
+    QRCode.toDataURL(displayUrl, { width: 200, margin: 1, color: { dark: "#0f172a", light: "#ffffff" } }).then((url) => {
+      if (!cancelled) setQrDataUrl(url);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [displayUrl]);
+
+  const copyListenerUrl = useCallback(async () => {
+    if (!displayUrl) return;
+    setCopyUrlBusy(true);
+    setCopyUrlNotice(null);
+    try {
+      await copyTextToClipboard(displayUrl);
+      setCopyUrlNotice("Copied!");
+      setTimeout(() => setCopyUrlNotice(null), 2500);
+    } catch {
+      setCopyUrlNotice("Copy failed — select manually.");
+    } finally {
+      setCopyUrlBusy(false);
+    }
+  }, [displayUrl]);
+
+  const shareListenerUrl = useCallback(async () => {
+    if (!displayUrl) return;
+    if (typeof navigator !== "undefined" && navigator.share) {
+      setShareUrlBusy(true);
+      try {
+        await navigator.share({ url: displayUrl, title: "Join live translation" });
+      } catch {
+        await copyListenerUrl();
+      } finally {
+        setShareUrlBusy(false);
+      }
+    } else {
+      await copyListenerUrl();
+    }
+  }, [copyListenerUrl, displayUrl]);
 
   const saveAccountProfile = useCallback(async () => {
     const nextName = accountDisplayNameInput.trim();
@@ -2219,9 +2264,46 @@ export default function HostChurchPage() {
                 </div>
               ) : null}
               {displayUrl ? (
-                <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 10, background: "rgba(79,115,170,0.07)", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: "#4f73aa", flexShrink: 0 }}>Display URL</span>
-                  <a href={displayUrl} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: "#2563eb", wordBreak: "break-all", lineHeight: 1.4 }}>{displayUrl}</a>
+                <div style={{ marginTop: 12, padding: "14px 16px", borderRadius: 12, background: "rgba(79,115,170,0.07)", border: "1px solid rgba(79,115,170,0.15)" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                    <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: "#4f73aa" }}>Listener Access</span>
+                    <a href={displayUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "#2563eb", textDecoration: "none", opacity: 0.75 }}>open ↗</a>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 16, alignItems: "flex-start" }}>
+                    {qrDataUrl ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={qrDataUrl}
+                        alt="Listener QR code"
+                        width={120}
+                        height={120}
+                        style={{ borderRadius: 8, border: "1px solid rgba(0,0,0,0.08)", flexShrink: 0 }}
+                      />
+                    ) : (
+                      <div style={{ width: 120, height: 120, borderRadius: 8, background: "rgba(0,0,0,0.05)", flexShrink: 0 }} />
+                    )}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minWidth: 160 }}>
+                      <p style={{ margin: 0, fontSize: 12, color: "#374151", wordBreak: "break-all", lineHeight: 1.5 }}>{displayUrl}</p>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                        <button
+                          type="button"
+                          onClick={() => { void copyListenerUrl(); }}
+                          disabled={copyUrlBusy}
+                          style={{ fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 8, border: "1px solid rgba(79,115,170,0.4)", background: "white", color: "#4f73aa", cursor: copyUrlBusy ? "not-allowed" : "pointer", opacity: copyUrlBusy ? 0.6 : 1 }}
+                        >
+                          {copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { void shareListenerUrl(); }}
+                          disabled={shareUrlBusy}
+                          style={{ fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 8, border: "none", background: "#4f73aa", color: "white", cursor: shareUrlBusy ? "not-allowed" : "pointer", opacity: shareUrlBusy ? 0.6 : 1 }}
+                        >
+                          {shareUrlBusy ? "Sharing…" : "Share via…"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               ) : null}
               <p style={{ marginTop: 8, marginBottom: 0, fontSize: 12, opacity: 0.72 }}>
