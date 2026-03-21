@@ -32,7 +32,7 @@ import {
   type OrgSermonUsageResponse,
 } from "../../../lib/backendAuth";
 import { API_URL } from "../../../utils/urls";
-import { clearAuthToken, clearHostToken, clearRoomInSession, persistAuthToken, persistHostToken, persistStreamContext } from "../../../utils/streamContext";
+import { clearAuthToken, clearHostToken, clearRoomInSession, clearStreamContext, persistAuthToken, persistHostToken, persistStreamContext } from "../../../utils/streamContext";
 
 type ServiceRow = {
   serviceKey: string;
@@ -2028,6 +2028,7 @@ export default function HostChurchPage() {
               )}
               <button
                 onClick={async () => {
+                  clearStreamContext();
                   clearHostToken();
                   clearAuthToken();
                   await logout();

@@ -49,6 +49,10 @@ from app.chunker.ko_chunker import KoChunker
 from app.security_log import security_event, client_ip as _security_client_ip
 
 
+import collections as _collections
+_failed_segments: _collections.deque = _collections.deque(maxlen=50)
+
+
 def _safe_append_segment(
     org_id: str,
     room_id: str,
@@ -59,19 +63,26 @@ def _safe_append_segment(
     match_score: Optional[float],
     timestamp: str,
 ) -> None:
+    # Flush previously failed segments first (best-effort retry)
+    while _failed_segments:
+        args = _failed_segments[0]
+        try:
+            multichurch_store.append_translation_segment(*args)
+            _failed_segments.popleft()
+        except Exception:
+            break  # Still failing — retry on next call
+
     try:
         multichurch_store.append_translation_segment(
-            org_id,
-            room_id,
-            seq=seq,
-            korean_text=korean_text,
-            english_text=english_text,
-            mode=mode,
-            match_score=match_score,
-            timestamp=timestamp,
+            org_id, room_id, seq=seq, korean_text=korean_text,
+            english_text=english_text, mode=mode,
+            match_score=match_score, timestamp=timestamp,
         )
     except Exception as exc:
         print(f"[SEG] Failed to save segment org={org_id} room={room_id} seq={seq}: {exc}")
+        _failed_segments.append(
+            (org_id, room_id, seq, korean_text, english_text, mode, match_score, timestamp)
+        )
 
 
 # Global display pacing config (broadcast to display clients)
@@ -688,6 +699,7 @@ async def _room_sweeper_loop() -> None:
                 try:
                     result = multichurch_store.end_room(org_id, room_id, reason=reason)
                     if result.get("alreadyEnded"):
+                        print(f"[ROOM_SWEEPER] room already ended — no double billing org={org_id} room={room_id}")
                         continue
                 except ValueError:
                     continue
@@ -1075,7 +1087,7 @@ async def ws_translate(ws: WebSocket):
             import datetime as _dt
             _seg_ts = _dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
             _seg_score = meta_payload.get("match_score") if live_mode == "pre" else None
-            asyncio.get_event_loop().run_in_executor(
+            asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: _safe_append_segment(
                     target_org_id, target_room_id, seq, src_text, translated, live_mode,
@@ -1668,7 +1680,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 import datetime as _dt
                 _seg_ts = _dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
                 _seg_score = meta_payload.get("match_score") if live_mode == "pre" else None
-                asyncio.get_event_loop().run_in_executor(
+                asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: _safe_append_segment(
                         org_id, room_id, seq, clean_src, translated, live_mode,
@@ -1882,10 +1894,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
     consumer = asyncio.create_task(from_client_to_deepgram())
     producer = asyncio.create_task(from_deepgram_to_server())
     await closed.wait()
+    consumer.cancel()
+    producer.cancel()
     try:
-        consumer.cancel()
-        producer.cancel()
-    except:
+        await asyncio.gather(consumer, producer, return_exceptions=True)
+    except Exception:
+        pass
+    try:
+        await dg.close()
+    except Exception:
         pass
     if org_id and total_audio_bytes > 0:
         _audio_secs = total_audio_bytes / _DEEPGRAM_BYTES_PER_SECOND
