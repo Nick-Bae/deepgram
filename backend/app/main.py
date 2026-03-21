@@ -721,10 +721,32 @@ async def _room_sweeper_loop() -> None:
             print(f"[ROOM_SWEEPER] loop error: {exc}")
 
 
+async def _cleanup_live_rooms_on_startup() -> None:
+    """End all Firestore rooms still marked live from a previous server run."""
+    try:
+        stale = multichurch_store.stale_live_rooms(idle_seconds=0, max_duration_seconds=0)
+        if not stale:
+            return
+        print(f"[STARTUP] Ending {len(stale)} stale live room(s) from previous run")
+        for room in stale:
+            org_id = room.get("orgId")
+            room_id = room.get("roomId")
+            if not org_id or not room_id:
+                continue
+            try:
+                multichurch_store.end_room(org_id, room_id, reason="server_restart")
+                print(f"[STARTUP] Ended stale room org={org_id} room={room_id}")
+            except Exception as exc:
+                print(f"[STARTUP] Could not end stale room org={org_id} room={room_id}: {exc}")
+    except Exception as exc:
+        print(f"[STARTUP] stale room cleanup failed: {exc}")
+
+
 @app.on_event("startup")
 async def _on_startup():
     global _room_sweeper_task
     print(f"[MULTICHURCH] store={type(multichurch_store).__name__}")
+    asyncio.create_task(_cleanup_live_rooms_on_startup())
     if _room_sweeper_task is None or _room_sweeper_task.done():
         _room_sweeper_task = asyncio.create_task(_room_sweeper_loop())
 

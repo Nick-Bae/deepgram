@@ -1441,14 +1441,15 @@ export default function HostChurchPage() {
   };
 
   const endService = async () => {
-    if (!resolvedOrgId || !activeRoomId) return;
+    const roomToEnd = activeRoomId || queryRoomId;
+    if (!resolvedOrgId || !roomToEnd) return;
     busyRef.current = true;
     setBusy(true);
     try {
       const idToken = await getIdToken();
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
-      const res = await fetch(`${API_URL}/api/org/${encodeURIComponent(resolvedOrgId)}/room/${encodeURIComponent(activeRoomId)}/end`, {
+      const res = await fetch(`${API_URL}/api/org/${encodeURIComponent(resolvedOrgId)}/room/${encodeURIComponent(roomToEnd)}/end`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -2242,7 +2243,7 @@ export default function HostChurchPage() {
                 </button>
                 <button
                   onClick={endService}
-                  disabled={busy || !orgData?.orgId || !activeRoomId}
+                  disabled={busy || !orgData?.orgId || (!activeRoomId && !queryRoomId)}
                   style={{
                     borderRadius: 10,
                     border: "1px solid rgba(188,95,111,0.3)",
@@ -2250,8 +2251,8 @@ export default function HostChurchPage() {
                     color: "#f8fafc",
                     fontWeight: 700,
                     padding: "9px 14px",
-                    cursor: busy || !orgData?.orgId || !activeRoomId ? "not-allowed" : "pointer",
-                    opacity: busy || !orgData?.orgId || !activeRoomId ? 0.6 : 1,
+                    cursor: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? "not-allowed" : "pointer",
+                    opacity: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? 0.6 : 1,
                     boxShadow: accentDangerShadow,
                   }}
                 >
