@@ -297,7 +297,7 @@ export default function HostChurchPage() {
   const [churchProfileBusy, setChurchProfileBusy] = useState(false);
   const [churchProfileError, setChurchProfileError] = useState<string | null>(null);
   const [churchProfileNotice, setChurchProfileNotice] = useState<string | null>(null);
-  const [selectedPlan, setSelectedPlan] = useState<PaidPlanKey>("starter");
+  const [selectedPlan, setSelectedPlan] = useState<PaidPlanKey | null>(null);
   const [billingBusy, setBillingBusy] = useState(false);
   const [billingCheckoutBusy, setBillingCheckoutBusy] = useState(false);
   const [billingPortalBusy, setBillingPortalBusy] = useState(false);
@@ -405,9 +405,14 @@ export default function HostChurchPage() {
   }, [memberships, resolvedOrgId, slug]);
 
   useEffect(() => {
-    if (selectablePaidPlans.includes(selectedPlan)) return;
-    setSelectedPlan(selectablePaidPlans[0] || "starter");
-  }, [selectablePaidPlans, selectedPlan]);
+    if (selectedPlan !== null && selectablePaidPlans.includes(selectedPlan)) return;
+    // Only auto-select a plan for users without an active paid subscription
+    if (!hasPaidPlan || !hasActiveLikeSubscription) {
+      setSelectedPlan((selectablePaidPlans[0] as PaidPlanKey) || "starter");
+    } else if (selectedPlan !== null && !selectablePaidPlans.includes(selectedPlan)) {
+      setSelectedPlan(null);
+    }
+  }, [selectablePaidPlans, selectedPlan, hasPaidPlan, hasActiveLikeSubscription]);
 
   useEffect(() => {
     setInviteLink("");
@@ -426,7 +431,7 @@ export default function HostChurchPage() {
     setDeletingServiceKey("");
     setBillingState(null);
     setBillingProfile(null);
-    setSelectedPlan("starter");
+    setSelectedPlan(null);
     setBillingBusy(false);
     setBillingCheckoutBusy(false);
     setBillingPortalBusy(false);
@@ -913,6 +918,10 @@ export default function HostChurchPage() {
       persistAuthToken(idToken);
       const payload = await fetchOrgBillingStatus(idToken, resolvedOrgId, { refresh: forceRefresh });
       setBillingProfile(payload.billing || null);
+      const loadedPlan = payload.billing?.planKey?.trim().toLowerCase();
+      if (loadedPlan && PAID_PLAN_KEYS.includes(loadedPlan as PaidPlanKey)) {
+        setSelectedPlan(loadedPlan as PaidPlanKey);
+      }
       if (forceRefresh) {
         setBillingNotice("Billing details refreshed.");
       }
@@ -982,6 +991,10 @@ export default function HostChurchPage() {
         const payload = await fetchOrgBillingStatus(idToken, resolvedOrgId);
         if (cancelled) return;
         setBillingProfile(payload.billing || null);
+        const loadedPlan = payload.billing?.planKey?.trim().toLowerCase();
+        if (loadedPlan && PAID_PLAN_KEYS.includes(loadedPlan as PaidPlanKey)) {
+          setSelectedPlan(loadedPlan as PaidPlanKey);
+        }
       } catch (err: unknown) {
         if (!cancelled && isBillingTab) {
           const message = err instanceof Error ? err.message : String(err);
@@ -1199,7 +1212,7 @@ export default function HostChurchPage() {
   };
 
   const openUpgradeCheckout = async () => {
-    if (!resolvedOrgId || !canManagePaidBilling) return;
+    if (!resolvedOrgId || !canManagePaidBilling || !selectedPlan) return;
     setBillingCheckoutBusy(true);
     setBillingError(null);
     setBillingNotice(null);
@@ -1689,7 +1702,7 @@ export default function HostChurchPage() {
     display: "grid",
     gap: 10,
     minHeight: 220,
-    background: "linear-gradient(145deg, rgba(255,255,255,0.9), rgba(242,236,229,0.9))",
+    background: "rgba(252,249,246,0.95)",
     boxShadow: dashboardCompactShadow,
   } as const;
   const billingAlertStyle = {
@@ -2805,35 +2818,45 @@ export default function HostChurchPage() {
                           style={{
                             ...billingPlanCardBaseStyle,
                             textAlign: "left",
-                            border: isSelectedPlan
-                              ? "1px solid rgba(79,115,170,0.3)"
-                              : isCurrentPlan
-                                ? "1px solid rgba(91,179,130,0.28)"
+                            border: isCurrentPlan
+                              ? "2px solid rgba(99,102,241,0.7)"
+                              : isSelectedPlan
+                                ? "2px solid rgba(79,115,170,0.5)"
                                 : "1px solid rgba(214,220,229,0.92)",
                             cursor: canManagePaidBilling ? "pointer" : "default",
                             opacity: canManagePaidBilling ? 1 : 0.82,
-                            boxShadow: isSelectedPlan
-                              ? accentPrimaryShadow
-                              : isCurrentPlan
-                                ? "0 14px 28px rgba(91,179,130,0.18)"
+                            background: isCurrentPlan
+                              ? "linear-gradient(135deg, rgba(238,242,255,0.8) 0%, rgba(255,255,255,1) 60%)"
+                              : billingPlanCardBaseStyle.background,
+                            boxShadow: isCurrentPlan
+                              ? "0 8px 24px rgba(99,102,241,0.2), 0 2px 8px rgba(99,102,241,0.1)"
+                              : isSelectedPlan
+                                ? accentPrimaryShadow
                                 : billingPlanCardBaseStyle.boxShadow,
                           }}
                         >
+                          {isCurrentPlan && (
+                            <div style={{
+                              display: "flex", alignItems: "center", gap: 6,
+                              background: "linear-gradient(90deg, #4f46e5, #6366f1)",
+                              color: "#fff", fontWeight: 700, fontSize: 12,
+                              letterSpacing: "0.04em", textTransform: "uppercase",
+                              padding: "5px 12px", borderRadius: 6,
+                              marginBottom: 10, alignSelf: "flex-start",
+                            }}>
+                              <span style={{ fontSize: 14 }}>✓</span> Current Plan
+                            </div>
+                          )}
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "start" }}>
                             <div style={{ display: "grid", gap: 4 }}>
                               <strong style={{ fontSize: 22, color: "#20324a" }}>{PLAN_SUMMARIES[plan].title}</strong>
                               <span style={{ fontSize: 13, color: "#5f6f86" }}>{PLAN_SUMMARIES[plan].serviceLimit}</span>
                             </div>
-                            {isCurrentPlan ? (
-                              <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(91,179,130,0.24)", background: "rgba(91,179,130,0.14)", color: "#3b7d5c" }}>
-                                Current
-                              </span>
-                            ) : null}
                           </div>
                           <div style={{ display: "grid", gap: 2 }}>
                             <span style={{ fontSize: 30, fontWeight: 900, letterSpacing: "-0.05em", color: "#20324a" }}>{PLAN_SUMMARIES[plan].monthlyPrice}</span>
                             <span style={{ fontSize: 12, color: "#6a7a91" }}>
-                              {isSelectedPlan ? "Selected for checkout" : "Click to select this plan"}
+                              {isCurrentPlan ? "Your active plan" : isSelectedPlan ? "Selected for checkout" : "Click to select this plan"}
                             </span>
                           </div>
                         </button>
@@ -2845,14 +2868,14 @@ export default function HostChurchPage() {
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
                       <button
                         onClick={openUpgradeCheckout}
-                        disabled={billingCheckoutBusy || !resolvedOrgId}
+                        disabled={billingCheckoutBusy || !resolvedOrgId || !selectedPlan}
                         style={{
                           ...settingsButtonPrimaryStyle,
-                          opacity: billingCheckoutBusy || !resolvedOrgId ? 0.6 : 1,
-                          cursor: billingCheckoutBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          opacity: billingCheckoutBusy || !resolvedOrgId || !selectedPlan ? 0.6 : 1,
+                          cursor: billingCheckoutBusy || !resolvedOrgId || !selectedPlan ? "not-allowed" : "pointer",
                         }}
                       >
-                        {billingCheckoutBusy ? "Opening Checkout..." : `Open Checkout for ${PLAN_SUMMARIES[selectedPlan].title}`}
+                        {billingCheckoutBusy ? "Opening Checkout..." : selectedPlan ? `Open Checkout for ${PLAN_SUMMARIES[selectedPlan].title}` : "Select a plan above"}
                       </button>
                       <button
                         onClick={openBillingPortal}
