@@ -78,17 +78,22 @@ def _get_token(scopes: List[str]) -> tuple[str, str]:
         or (os.getenv("GCP_PROJECT") or "").strip()
     )
 
-    if not cred_path or not os.path.exists(cred_path):
-        raise RuntimeError("No service account file found (GOOGLE_APPLICATION_CREDENTIALS)")
-
-    with open(cred_path) as f:
-        sa_info = json.load(f)
-    if not project_id:
-        project_id = sa_info.get("project_id", "")
-    if not project_id:
-        raise RuntimeError("GCP project ID not found. Set GOOGLE_CLOUD_PROJECT env var.")
-
-    credentials = sa_mod.Credentials.from_service_account_info(sa_info, scopes=scopes)
+    if cred_path and os.path.exists(cred_path):
+        with open(cred_path) as f:
+            sa_info = json.load(f)
+        if not project_id:
+            project_id = sa_info.get("project_id", "")
+        if not project_id:
+            raise RuntimeError("GCP project ID not found. Set GOOGLE_CLOUD_PROJECT env var.")
+        credentials = sa_mod.Credentials.from_service_account_info(sa_info, scopes=scopes)
+    else:
+        # On Cloud Run, use Application Default Credentials (no file needed)
+        import google.auth as _gauth
+        credentials, detected_project = _gauth.default(scopes=scopes)
+        if not project_id:
+            project_id = detected_project or ""
+        if not project_id:
+            raise RuntimeError("GCP project ID not found. Set GOOGLE_CLOUD_PROJECT env var.")
 
     token: Optional[str] = None
 
