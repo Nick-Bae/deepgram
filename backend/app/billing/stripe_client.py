@@ -125,6 +125,69 @@ class StripeBillingClient:
             raise StripeClientError("stripe_subscription_id_missing")
         return self._request("GET", f"/subscriptions/{clean_id}")
 
+    def update_subscription(
+        self,
+        *,
+        subscription_id: str,
+        subscription_item_id: str,
+        new_price_id: str,
+        proration_behavior: str = "create_prorations",
+    ) -> Dict[str, Any]:
+        clean_sub_id = str(subscription_id or "").strip()
+        clean_item_id = str(subscription_item_id or "").strip()
+        clean_price_id = str(new_price_id or "").strip()
+        if not clean_sub_id:
+            raise StripeClientError("stripe_subscription_id_missing")
+        if not clean_item_id:
+            raise StripeClientError("stripe_subscription_item_id_missing")
+        if not clean_price_id:
+            raise StripeClientError("stripe_price_id_missing")
+        payload: Dict[str, Any] = {
+            "items[0][id]": clean_item_id,
+            "items[0][price]": clean_price_id,
+            "proration_behavior": str(proration_behavior or "create_prorations"),
+        }
+        return self._request("POST", f"/subscriptions/{clean_sub_id}", data=payload)
+
+    def create_subscription_schedule(
+        self,
+        *,
+        subscription_id: str,
+        current_price_id: str,
+        new_price_id: str,
+        phase_end_unix: int,
+    ) -> Dict[str, Any]:
+        """Create a two-phase schedule: current plan until phase_end_unix, then new plan."""
+        clean_sub_id = str(subscription_id or "").strip()
+        if not clean_sub_id:
+            raise StripeClientError("stripe_subscription_id_missing")
+        # Step 1: create schedule from existing subscription
+        schedule = self._request(
+            "POST",
+            "/subscription_schedules",
+            data={"from_subscription": clean_sub_id},
+        )
+        schedule_id = str((schedule or {}).get("id") or "").strip()
+        if not schedule_id:
+            raise StripeClientError("stripe_schedule_create_failed")
+        # Step 2: update schedule with two explicit phases
+        phase_payload: Dict[str, Any] = {
+            "end_behavior": "release",
+            "phases[0][items][0][price]": str(current_price_id or "").strip(),
+            "phases[0][items][0][quantity]": "1",
+            "phases[0][end_date]": str(int(phase_end_unix)),
+            "phases[1][items][0][price]": str(new_price_id or "").strip(),
+            "phases[1][items][0][quantity]": "1",
+        }
+        return self._request("POST", f"/subscription_schedules/{schedule_id}", data=phase_payload)
+
+    def cancel_subscription_schedule(self, *, schedule_id: str) -> Dict[str, Any]:
+        """Release a subscription schedule, returning the subscription to normal."""
+        clean_id = str(schedule_id or "").strip()
+        if not clean_id:
+            raise StripeClientError("stripe_schedule_id_missing")
+        return self._request("POST", f"/subscription_schedules/{clean_id}/release")
+
     def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> Dict[str, Any]:
         clean_customer_id = str(customer_id or "").strip()
         if not clean_customer_id:

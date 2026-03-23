@@ -75,26 +75,29 @@ type HostTab = "broadcast" | "settings" | "billing" | "team";
 const PAID_PLAN_KEYS: PaidPlanKey[] = ["starter", "growth", "premium"];
 
 const _PLAN_LABELS: Record<PaidPlanKey, string> = {
-  starter: "Starter (5 services / $20)",
-  growth: "Growth (12 services / $40)",
+  starter: "Starter (600 min / $20)",
+  growth: "Growth (1,800 min / $40)",
   premium: "Premium (Unlimited / $60)",
 };
 
-const PLAN_SUMMARIES: Record<PaidPlanKey, { title: string; monthlyPrice: string; serviceLimit: string }> = {
+const PLAN_SUMMARIES: Record<PaidPlanKey, { title: string; monthlyPrice: string; minuteLimit: string; description: string }> = {
   starter: {
     title: "Starter",
     monthlyPrice: "$20 / month",
-    serviceLimit: "Up to 5 service keys",
+    minuteLimit: "600 min / month (~10 hrs)",
+    description: "Great for one weekly service with room to spare.",
   },
   growth: {
     title: "Growth",
     monthlyPrice: "$40 / month",
-    serviceLimit: "Up to 12 service keys",
+    minuteLimit: "1,800 min / month (~30 hrs)",
+    description: "Fits churches with 2–3 services per week.",
   },
   premium: {
     title: "Premium",
     monthlyPrice: "$60 / month",
-    serviceLimit: "Unlimited service keys",
+    minuteLimit: "Unlimited",
+    description: "No limits — ideal for large or multi-campus churches.",
   },
 };
 
@@ -347,6 +350,8 @@ export default function HostChurchPage() {
   const isTrialPlan = billingPlanToken === "trial";
   const hasSubscriptionPeriod = Boolean(billingProfile?.currentPeriodStart && billingProfile?.currentPeriodEnd);
   const billingMaxServiceKeys = Number(billingProfile?.limits?.maxServiceKeys || 0);
+  const billingMonthlyMinutesLimit = billingProfile?.monthlyMinutesLimit ?? null;
+  const billingMonthlyMinutesUsed = billingProfile?.monthlyMinutesUsed ?? null;
   const trialMinutesLimit = Number(billingProfile?.trialMinutesLimit || 0);
   const trialMinutesUsed = Number(billingProfile?.trialMinutesUsed || 0);
   const trialSecondsLimit = trialMinutesLimit > 0 ? trialMinutesLimit * 60 : 0;
@@ -2504,7 +2509,9 @@ export default function HostChurchPage() {
                         Status · {formatBillingStatus(billingStatusToken)}
                       </span>
                       <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(189,200,217,0.95)", background: "rgba(247,250,253,0.8)", color: "#55657d" }}>
-                        Services · {billingMaxServiceKeys > 0 ? `up to ${billingMaxServiceKeys}` : "unlimited"}
+                        {billingMonthlyMinutesLimit !== null
+                          ? `${billingMonthlyMinutesLimit === 0 ? "Unlimited" : `${billingMonthlyMinutesLimit} min/mo`}${billingMonthlyMinutesUsed !== null ? ` · ${billingMonthlyMinutesUsed} used` : ""}`
+                          : `Minutes · ${billingMaxServiceKeys > 0 ? "limited" : "unlimited"}`}
                       </span>
                     </div>
 
@@ -2798,7 +2805,7 @@ export default function HostChurchPage() {
                     <p style={settingsSectionLabelStyle}>Plans</p>
                     <h3 style={settingsTitleStyle}>Choose the next plan</h3>
                     <p style={settingsBodyTextStyle}>
-                      Review plan size and pricing here before opening Stripe checkout.
+                      Plans are billed monthly and measured in broadcast minutes — the time your congregation is actively receiving translation. Upgrades take effect immediately; downgrades apply at the end of your current billing period.
                     </p>
                   </div>
 
@@ -2850,7 +2857,8 @@ export default function HostChurchPage() {
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "start" }}>
                             <div style={{ display: "grid", gap: 4 }}>
                               <strong style={{ fontSize: 22, color: "#20324a" }}>{PLAN_SUMMARIES[plan].title}</strong>
-                              <span style={{ fontSize: 13, color: "#5f6f86" }}>{PLAN_SUMMARIES[plan].serviceLimit}</span>
+                              <span style={{ fontSize: 13, color: "#5f6f86", fontWeight: 600 }}>{PLAN_SUMMARIES[plan].minuteLimit}</span>
+                              <span style={{ fontSize: 12, color: "#7a8fa8" }}>{PLAN_SUMMARIES[plan].description}</span>
                             </div>
                           </div>
                           <div style={{ display: "grid", gap: 2 }}>

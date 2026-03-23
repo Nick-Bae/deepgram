@@ -149,6 +149,11 @@ export type OrgBillingStatus = {
   trialSecondsRemaining?: number;
   limits?: { maxServiceKeys?: number };
   entitlements?: { canStartService?: boolean };
+  monthlyMinutesLimit?: number;
+  monthlyMinutesUsed?: number;
+  softCapReached?: boolean;
+  pendingPlanKey?: string | null;
+  pendingPlanDate?: string | null;
   updatedAt?: string | null;
 };
 
