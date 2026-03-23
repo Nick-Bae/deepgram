@@ -14,6 +14,7 @@ class PlanSpec:
     key: str
     max_service_keys: int  # 0 means unlimited
     amount_usd: int
+    monthly_minutes: int  # 0 means unlimited; applies to paid plans only
 
 
 TRIAL_PLAN_KEY = "trial"
@@ -22,10 +23,10 @@ GROWTH_PLAN_KEY = "growth"
 PREMIUM_PLAN_KEY = "premium"
 
 PLAN_SPECS: Dict[str, PlanSpec] = {
-    TRIAL_PLAN_KEY: PlanSpec(key=TRIAL_PLAN_KEY, max_service_keys=2, amount_usd=0),
-    STARTER_PLAN_KEY: PlanSpec(key=STARTER_PLAN_KEY, max_service_keys=5, amount_usd=20),
-    GROWTH_PLAN_KEY: PlanSpec(key=GROWTH_PLAN_KEY, max_service_keys=12, amount_usd=40),
-    PREMIUM_PLAN_KEY: PlanSpec(key=PREMIUM_PLAN_KEY, max_service_keys=0, amount_usd=60),
+    TRIAL_PLAN_KEY: PlanSpec(key=TRIAL_PLAN_KEY, max_service_keys=2, amount_usd=0, monthly_minutes=20),
+    STARTER_PLAN_KEY: PlanSpec(key=STARTER_PLAN_KEY, max_service_keys=5, amount_usd=20, monthly_minutes=600),
+    GROWTH_PLAN_KEY: PlanSpec(key=GROWTH_PLAN_KEY, max_service_keys=12, amount_usd=40, monthly_minutes=1800),
+    PREMIUM_PLAN_KEY: PlanSpec(key=PREMIUM_PLAN_KEY, max_service_keys=0, amount_usd=60, monthly_minutes=0),
 }
 
 

@@ -222,11 +222,45 @@ def _billing_limits_payload(*, org_id: str, org: Dict[str, Any]) -> Dict[str, An
         "globalBillingLimitsEnabled": bool(BILLING_LIMITS_ENABLED),
         "effectiveBillingLimitsEnabled": bool(BILLING_LIMITS_ENABLED and enabled),
         "hardCapReached": bool(org.get("hardCapReached")),
+        "softCapReached": bool(org.get("softCapReached")),
         "maxMinutesPerMonth": int(org.get("maxMinutesPerMonth") or 0),
         "currentMonthMinutes": int(org.get("currentMonthMinutes") or 0),
         "currentMonthKey": str(org.get("currentMonthKey") or ""),
         "updatedAt": org.get("updatedAt"),
     }
+
+
+def _dispatch_soft_cap_email(org_id: str, org: Dict[str, Any]) -> None:
+    """Fire-and-forget: send soft cap email once per period. Never raises."""
+    import threading
+    from app.services import email_service as _email_svc
+
+    current_month_key = str(org.get("currentMonthKey") or "")
+    if org.get("softCapEmailSentKey") == current_month_key:
+        return
+    org["softCapEmailSentKey"] = current_month_key
+    billing = org.get("billing") or {}
+    plan_key = str(billing.get("planKey") or "trial")
+    minutes_used = int(org.get("currentMonthMinutes") or 0)
+    minutes_limit = int(org.get("maxMinutesPerMonth") or 0)
+
+    def _send() -> None:
+        try:
+            from app.services.multichurch_store import multichurch_store as _store
+            admin_emails = _store.get_org_admin_emails(org_id=org_id)
+            org_name = _store.get_org_name(org_id=org_id)
+            _email_svc.send_soft_cap_reached_email(
+                admin_emails=admin_emails,
+                org_name=org_name,
+                minutes_used=minutes_used,
+                minutes_limit=minutes_limit,
+                plan_key=plan_key,
+            )
+        except Exception:
+            import logging as _logging
+            _logging.getLogger(__name__).exception("soft_cap_email_failed org=%s", org_id)
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 _HARD_INACTIVE_ORG_STATUSES: set[str] = {"inactive", "disabled", "suspended", "deleted"}
@@ -731,6 +765,8 @@ class InMemoryMultiChurchStore:
         org["currentMonthKey"] = current_key
         org["currentMonthMinutes"] = 0
         org["hardCapReached"] = False
+        org["softCapReached"] = False
+        org["softCapEmailSentKey"] = None
 
     def authorize_host(self, org_id: str, *, host_uid: Optional[str] = None, host_token: Optional[str] = None) -> bool:
         with self._lock:
@@ -1288,6 +1324,20 @@ class InMemoryMultiChurchStore:
             org["billingLimitsEnabled"] = bool(enabled)
             org["updatedAt"] = _utcnow()
             return _billing_limits_payload(org_id=clean_org_id, org=org)
+
+    def set_org_monthly_minutes_limit(self, *, org_id: str, monthly_minutes: int) -> None:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return
+        limit = max(0, int(monthly_minutes))
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                return
+            org["maxMinutesPerMonth"] = limit
+            if limit == 0 or int(org.get("currentMonthMinutes") or 0) < limit:
+                org["softCapReached"] = False
+            org["updatedAt"] = _utcnow()
 
     def ensure_sermon_prep_budget_not_reached(self, *, org_id: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -2288,7 +2338,12 @@ class InMemoryMultiChurchStore:
                     if has_monthly_cap:
                         org["currentMonthMinutes"] = int(org.get("currentMonthMinutes") or 0) + delta_minutes
                         if int(org.get("currentMonthMinutes") or 0) >= int(org.get("maxMinutesPerMonth") or 0):
-                            org["hardCapReached"] = True
+                            plan_key = str((billing or {}).get("planKey") or "trial")
+                            if plan_key == "trial":
+                                org["hardCapReached"] = True
+                            elif not org.get("softCapReached"):
+                                org["softCapReached"] = True
+                                _dispatch_soft_cap_email(org_id, org)
                     if has_trial_cap:
                         _consume_billing_trial_seconds(billing, remainder_seconds)
                     room["lastUsageTickAt"] = now
@@ -2428,7 +2483,12 @@ class InMemoryMultiChurchStore:
                 monthly_reached = has_monthly_cap and int(org.get("currentMonthMinutes") or 0) >= max_minutes
                 trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(billing)
                 if monthly_reached:
-                    org["hardCapReached"] = True
+                    plan_key_tick = str((billing or {}).get("planKey") or "trial")
+                    if plan_key_tick == "trial":
+                        org["hardCapReached"] = True
+                    elif not org.get("softCapReached"):
+                        org["softCapReached"] = True
+                        _dispatch_soft_cap_email(org_id, org)
                 if monthly_reached or trial_reached:
                     flagged[(org_id, room_id)] = "trial_expired" if trial_reached else "monthly_limit_reached"
 
@@ -2682,6 +2742,8 @@ class FirestoreMultiChurchStore:
             "currentMonthKey": current_key,
             "currentMonthMinutes": 0,
             "hardCapReached": False,
+            "softCapReached": False,
+            "softCapEmailSentKey": None,
             "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
         }
         self._org_ref(org_id).set(update, merge=True)
@@ -3351,6 +3413,24 @@ class FirestoreMultiChurchStore:
         merged_org["billingLimitsEnabled"] = bool(enabled)
         merged_org["updatedAt"] = _utcnow()
         return _billing_limits_payload(org_id=clean_org_id, org=merged_org)
+
+    def set_org_monthly_minutes_limit(self, *, org_id: str, monthly_minutes: int) -> None:
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return
+        limit = max(0, int(monthly_minutes))
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            return
+        org = org_snap.to_dict() or {}
+        update: Dict[str, Any] = {
+            "maxMinutesPerMonth": limit,
+            "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+        }
+        if limit == 0 or int(org.get("currentMonthMinutes") or 0) < limit:
+            update["softCapReached"] = False
+        org_ref.set(update, merge=True)
 
     def ensure_sermon_prep_budget_not_reached(self, *, org_id: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -4315,12 +4395,16 @@ class FirestoreMultiChurchStore:
                 org["currentMonthKey"] = current_key
                 org["currentMonthMinutes"] = 0
                 org["hardCapReached"] = False
+                org["softCapReached"] = False
+                org["softCapEmailSentKey"] = None
                 transaction.set(
                     org_ref,
                     {
                         "currentMonthKey": current_key,
                         "currentMonthMinutes": 0,
                         "hardCapReached": False,
+                        "softCapReached": False,
+                        "softCapEmailSentKey": None,
                         "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                     },
                     merge=True,
@@ -4469,7 +4553,12 @@ class FirestoreMultiChurchStore:
                     next_month_minutes = int(org.get("currentMonthMinutes") or 0) + translated_delta_minutes
                     org_update["currentMonthMinutes"] = next_month_minutes
                     if next_month_minutes >= int(org.get("maxMinutesPerMonth") or 0):
-                        org_update["hardCapReached"] = True
+                        plan_key = str((billing or {}).get("planKey") or "trial")
+                        if plan_key == "trial":
+                            org_update["hardCapReached"] = True
+                        elif not org.get("softCapReached"):
+                            org_update["softCapReached"] = True
+                            _dispatch_soft_cap_email(org_id, {**org, "currentMonthMinutes": next_month_minutes, "billing": billing})
                 if has_trial_cap:
                     _consume_billing_trial_seconds(billing, remainder_seconds)
                     billing["updatedAt"] = now
@@ -4659,12 +4748,17 @@ class FirestoreMultiChurchStore:
                     trial_reached = True
 
             trial_usage_changed = has_trial_cap and _billing_trial_seconds_used(trial_billing_next) != _billing_trial_seconds_used(billing)
+            plan_key_for_cap = str((billing or {}).get("planKey") or "trial")
             if org_delta > 0 or cap_reached or trial_usage_changed:
                 org_update: Dict[str, Any] = {}
                 if org_delta > 0:
                     org_update["currentMonthMinutes"] = gcf_firestore.Increment(org_delta)
                 if cap_reached:
-                    org_update["hardCapReached"] = True
+                    if plan_key_for_cap == "trial":
+                        org_update["hardCapReached"] = True
+                    elif not org.get("softCapReached"):
+                        org_update["softCapReached"] = True
+                        _dispatch_soft_cap_email(org_id, {**org, "billing": billing})
                 if has_trial_cap:
                     trial_billing_next["updatedAt"] = now
                     org_update["billing"] = dict(trial_billing_next)

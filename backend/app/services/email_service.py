@@ -386,6 +386,56 @@ def send_spend_alert_email(
     _send(to=[to], subject=f"⚠️ {provider} spend alert — ${spend_usd:.2f} this month", html=html, text=text, tag="spend-alert")
 
 
+def send_soft_cap_reached_email(
+    *,
+    admin_emails: List[str],
+    org_name: str,
+    minutes_used: int,
+    minutes_limit: int,
+    plan_key: str,
+) -> None:
+    """Sent once per billing period when a paid plan hits its monthly broadcast limit.
+    Broadcasts continue uninterrupted — this is a notification, not a block.
+    """
+    if not admin_emails:
+        return
+    brand = _brand()
+    plan_label = plan_key.capitalize()
+    billing_url = _app_url() + "/host" if _app_url() else ""
+    html = _layout(
+        heading=f"Monthly broadcast limit reached — {org_name}",
+        body_html=(
+            f"<p>Your <strong>{org_name}</strong> workspace has used all "
+            f"<strong>{minutes_limit:,} minutes</strong> included in your {plan_label} plan this month.</p>"
+            f"<p><strong>Your broadcasts are continuing uninterrupted.</strong> "
+            f"You will still be able to run services for the rest of this billing period.</p>"
+            f"<p>To increase your monthly broadcast time, consider upgrading your plan.</p>"
+            + (_btn("Upgrade Plan", billing_url) if billing_url else "")
+            + f"<p style='color:#64748b;font-size:13px;'>Minutes used this month: {minutes_used:,} / {minutes_limit:,}</p>"
+        ),
+    )
+    text = "\n".join([
+        f"Monthly broadcast limit reached — {org_name}",
+        "",
+        f"You've used all {minutes_limit:,} minutes in your {plan_label} plan this month.",
+        "Your broadcasts are continuing uninterrupted.",
+        "Consider upgrading your plan to increase your monthly broadcast time.",
+        billing_url or "",
+        "",
+        f"Minutes used: {minutes_used:,} / {minutes_limit:,}",
+        "",
+        "Thanks,",
+        brand,
+    ])
+    _send(
+        to=admin_emails,
+        subject=f"{org_name} — monthly broadcast limit reached",
+        html=html,
+        text=text,
+        tag="soft-cap-reached",
+    )
+
+
 def send_payment_recovered_email(
     *,
     admin_emails: List[str],

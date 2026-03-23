@@ -92,6 +92,15 @@ class PortalSessionRequest(BaseModel):
         return _validate_redirect_url(v)
 
 
+class ChangePlanRequest(BaseModel):
+    orgId: str = Field(..., min_length=2, max_length=120, pattern=validators.ORG_ID)
+    targetPlanKey: str = Field(..., min_length=3, max_length=32, pattern=validators.PLAN_KEY)
+
+
+class CancelPendingDowngradeRequest(BaseModel):
+    orgId: str = Field(..., min_length=2, max_length=120, pattern=validators.ORG_ID)
+
+
 def _clean(value: Any) -> str:
     return str(value or "").strip()
 
@@ -669,6 +678,155 @@ def create_portal_session(
     return {"url": portal_url}
 
 
+def _is_upgrade(current_plan_key: str, target_plan_key: str) -> bool:
+    from app.billing.models import plan_spec as _ps
+    return _ps(target_plan_key).amount_usd > _ps(current_plan_key).amount_usd
+
+
+@router.post("/billing/change-plan")
+def change_plan(
+    body: ChangePlanRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    require_org_role(org_id=body.orgId, user=user, roles={"owner", "admin"}, store=multichurch_store, missing_membership_detail="forbidden")
+    target_plan = plan_spec(body.targetPlanKey)
+    if target_plan.key == "trial":
+        raise HTTPException(status_code=400, detail="invalid_plan")
+
+    price_id = _clean_price_id(BILLING_CONFIG.stripe_price_ids.get(target_plan.key))
+    if not price_id or not _is_valid_price_id(price_id):
+        raise HTTPException(status_code=503, detail="billing_not_configured")
+    if not _clean(BILLING_CONFIG.stripe_secret_key):
+        raise HTTPException(status_code=503, detail="billing_not_configured")
+
+    try:
+        billing = multichurch_store.get_org_billing_profile(org_id=body.orgId)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
+
+    billing, refs_changed = _normalize_billing_refs(billing=billing)
+    if refs_changed:
+        billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+
+    current_status = _clean(billing.get("status")).lower()
+    if current_status not in {"active", "past_due"}:
+        raise HTTPException(status_code=400, detail="no_active_subscription")
+
+    current_plan_key = _clean(billing.get("planKey")).lower() or "trial"
+    if current_plan_key == target_plan.key:
+        raise HTTPException(status_code=400, detail="same_plan")
+
+    subscription_id = _clean_subscription_id(billing.get("stripeSubscriptionId"))
+    if not subscription_id:
+        raise HTTPException(status_code=400, detail="no_active_subscription")
+
+    client = _stripe_client()
+    try:
+        subscription = client.retrieve_subscription(subscription_id=subscription_id)
+    except StripeClientError as exc:
+        logger.warning("change_plan_retrieve_sub_failed org=%s: %s", body.orgId, exc)
+        raise HTTPException(status_code=502, detail="stripe_update_failed") from exc
+
+    first_item = _first_subscription_item(subscription)
+    if not first_item or not first_item.get("id"):
+        raise HTTPException(status_code=502, detail="stripe_update_failed")
+    item_id = _clean(first_item["id"])
+
+    upgrading = _is_upgrade(current_plan_key, target_plan.key)
+
+    if upgrading:
+        try:
+            client.update_subscription(
+                subscription_id=subscription_id,
+                subscription_item_id=item_id,
+                new_price_id=price_id,
+                proration_behavior="create_prorations",
+            )
+        except StripeClientError as exc:
+            logger.warning("change_plan_upgrade_failed org=%s: %s", body.orgId, exc)
+            raise HTTPException(status_code=502, detail="stripe_update_failed") from exc
+        return {"ok": True, "effective": "immediate", "pendingPlanKey": None, "pendingPlanDate": None}
+
+    # Downgrade: create subscription schedule for period end
+    current_price_id = _clean_price_id(_price_id_from_subscription(subscription))
+    period_end_unix = subscription.get("current_period_end")
+    period_end_dt = _to_datetime(period_end_unix)
+    if not period_end_dt or not period_end_unix:
+        raise HTTPException(status_code=502, detail="stripe_update_failed")
+
+    try:
+        schedule = client.create_subscription_schedule(
+            subscription_id=subscription_id,
+            current_price_id=current_price_id or price_id,
+            new_price_id=price_id,
+            phase_end_unix=int(period_end_unix),
+        )
+    except StripeClientError as exc:
+        logger.warning("change_plan_schedule_failed org=%s: %s", body.orgId, exc)
+        raise HTTPException(status_code=502, detail="stripe_schedule_failed") from exc
+
+    schedule_id = _clean((schedule or {}).get("id"))
+    next_billing = dict(billing)
+    next_billing["pendingPlanKey"] = target_plan.key
+    next_billing["pendingPlanDate"] = period_end_dt
+    next_billing["pendingScheduleId"] = schedule_id
+    next_billing["updatedAt"] = _utcnow()
+    try:
+        multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=next_billing)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
+
+    return {
+        "ok": True,
+        "effective": period_end_dt.isoformat(),
+        "pendingPlanKey": target_plan.key,
+        "pendingPlanDate": period_end_dt.isoformat(),
+    }
+
+
+@router.post("/billing/cancel-pending-downgrade")
+def cancel_pending_downgrade(
+    body: CancelPendingDowngradeRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    require_org_role(org_id=body.orgId, user=user, roles={"owner", "admin"}, store=multichurch_store, missing_membership_detail="forbidden")
+    if not _clean(BILLING_CONFIG.stripe_secret_key):
+        raise HTTPException(status_code=503, detail="billing_not_configured")
+
+    try:
+        billing = multichurch_store.get_org_billing_profile(org_id=body.orgId)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
+
+    schedule_id = _clean(billing.get("pendingScheduleId"))
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="no_pending_downgrade")
+
+    try:
+        _stripe_client().cancel_subscription_schedule(schedule_id=schedule_id)
+    except StripeClientError as exc:
+        logger.warning("cancel_downgrade_failed org=%s: %s", body.orgId, exc)
+        raise HTTPException(status_code=502, detail="stripe_cancel_schedule_failed") from exc
+
+    next_billing = dict(billing)
+    next_billing["pendingPlanKey"] = None
+    next_billing["pendingPlanDate"] = None
+    next_billing["pendingScheduleId"] = None
+    next_billing["updatedAt"] = _utcnow()
+    try:
+        multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=next_billing)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
+
+    return {"ok": True}
+
+
 @router.post("/billing/webhook")
 async def stripe_webhook(
     request: Request,
@@ -748,6 +906,22 @@ async def stripe_webhook(
         next_billing["planKey"] = requested_plan.key
         next_billing.setdefault("limits", {})
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
+
+        # Clear pending downgrade if the active plan now matches the pending target
+        pending_plan_key = _clean(next_billing.get("pendingPlanKey")).lower()
+        if pending_plan_key and next_billing.get("planKey") == pending_plan_key:
+            next_billing["pendingPlanKey"] = None
+            next_billing["pendingPlanDate"] = None
+            next_billing["pendingScheduleId"] = None
+
+        # Sync org-level minute limit to match the new plan spec
+        try:
+            multichurch_store.set_org_monthly_minutes_limit(
+                org_id=org_id,
+                monthly_minutes=requested_plan.monthly_minutes,
+            )
+        except Exception:
+            logger.exception("set_org_monthly_minutes_limit_failed org=%s plan=%s", org_id, requested_plan.key)
 
         if event_type == "customer.subscription.deleted":
             next_billing["status"] = "canceled"
