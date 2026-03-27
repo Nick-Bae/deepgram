@@ -1529,8 +1529,10 @@ export default function HostChurchPage() {
   const dashboardCompactShadow = "0 1px 2px rgba(0,0,0,0.04)";
   const hostTopPanelStyle = {
     background: DC.white,
-    borderBottom: `1px solid ${DC.border}`,
+    border: `1px solid ${DC.border}`,
     padding: "0 28px",
+    borderRadius: 8,
+    overflow: "hidden" as const,
   } as const;
   const hostTopIntroStyle = {
     margin: "0 0 0",
@@ -1605,6 +1607,7 @@ export default function HostChurchPage() {
     background: DC.navy,
     padding: "18px 28px",
     color: DC.cream,
+    borderRadius: 8,
   } as const;
   const studioUserPanelStyle = {
     display: "flex",
@@ -1670,6 +1673,7 @@ export default function HostChurchPage() {
     padding: 24,
     display: "grid",
     gap: 16,
+    borderRadius: 8,
     boxShadow: dashboardCardShadow,
   } as const;
   const settingsSubscriptionCardStyle = {
@@ -1690,7 +1694,7 @@ export default function HostChurchPage() {
   const billingDeckStyle = {
     display: "grid",
     gap: 16,
-    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%), 1fr))",
   } as const;
   const billingPlanCardBaseStyle = {
     padding: 20,
@@ -1699,6 +1703,7 @@ export default function HostChurchPage() {
     minHeight: 200,
     background: DC.white,
     border: `1px solid ${DC.border}`,
+    borderRadius: 8,
     boxShadow: dashboardCompactShadow,
   } as const;
   const billingAlertStyle = {
@@ -1709,6 +1714,7 @@ export default function HostChurchPage() {
     fontSize: 13,
     fontWeight: 600,
     lineHeight: 1.5,
+    borderRadius: 6,
   } as const;
   const settingsSectionLabelStyle = {
     margin: 0,
@@ -1806,6 +1812,7 @@ export default function HostChurchPage() {
     border: `1px solid ${DC.border}`,
     padding: "16px 20px",
     background: DC.cream,
+    borderRadius: 6,
   } as const;
   const currentUserName = (
     user?.displayName ||
@@ -3119,6 +3126,7 @@ export default function HostChurchPage() {
               style={{
                 background: DC.white,
                 border: `1px solid ${DC.border}`,
+                borderRadius: 8,
                 padding: "32px 24px",
                 display: "flex",
                 flexDirection: "column",
