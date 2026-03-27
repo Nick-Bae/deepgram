@@ -256,6 +256,8 @@ export default function HostChurchPage() {
   const busyRef = useRef(false);
   const controlPanelRef = useRef<HTMLDivElement>(null);
   const scrollToPanelRef = useRef(false);
+  const roomStartTimeRef = useRef<number | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
   const [backendReachable, setBackendReachable] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [orgData, setOrgData] = useState<ServicesResponse | null>(null);
@@ -480,6 +482,14 @@ export default function HostChurchPage() {
       scrollToPanelRef.current = false;
       controlPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     }
+  }, [activeRoomId]);
+
+  useEffect(() => {
+    if (!activeRoomId) { setElapsedSec(0); return; }
+    const t = window.setInterval(() => {
+      setElapsedSec(roomStartTimeRef.current ? Math.floor((Date.now() - roomStartTimeRef.current) / 1000) : 0);
+    }, 1000);
+    return () => clearInterval(t);
   }, [activeRoomId]);
 
   useEffect(() => {
@@ -1430,6 +1440,8 @@ export default function HostChurchPage() {
       const data: StartResponse = await res.json();
       const nextOrgId = (data.orgId || resolvedOrgId || queryOrgId || "").trim();
       scrollToPanelRef.current = true;
+      roomStartTimeRef.current = Date.now();
+      setElapsedSec(0);
       setActiveRoomId(data.roomId);
       if (data.serviceKey && data.serviceKey !== serviceKey) setServiceKey(data.serviceKey);
       persistStreamContext({
@@ -2113,49 +2125,6 @@ export default function HostChurchPage() {
                   }}
                 >
                   {trialBroadcastNotice}
-                </div>
-              ) : null}
-              {displayUrl ? (
-                <div style={{ marginTop: 12, padding: "14px 16px", background: "rgba(184,154,94,0.06)", border: `1px solid ${DC.border}`, borderRadius: 8 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                    <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>Listener Access</span>
-                    <a href={displayUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: DC.gold, textDecoration: "none", opacity: 0.75 }}>open ↗</a>
-                  </div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 16, alignItems: "flex-start" }}>
-                    {qrDataUrl ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={qrDataUrl}
-                        alt="Listener QR code"
-                        width={120}
-                        height={120}
-                        style={{ border: `1px solid ${DC.border}`, flexShrink: 0 }}
-                      />
-                    ) : (
-                      <div style={{ width: 120, height: 120, background: "rgba(0,0,0,0.04)", flexShrink: 0 }} />
-                    )}
-                    <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minWidth: 160 }}>
-                      <p style={{ margin: 0, fontSize: 12, color: DC.mid, wordBreak: "break-all", lineHeight: 1.5 }}>{displayUrl}</p>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                        <button
-                          type="button"
-                          onClick={() => { void copyListenerUrl(); }}
-                          disabled={copyUrlBusy}
-                          style={{ ...settingsButtonNeutralStyle, fontSize: 12, padding: "6px 12px", cursor: copyUrlBusy ? "not-allowed" : "pointer", opacity: copyUrlBusy ? 0.6 : 1 }}
-                        >
-                          {copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => { void shareListenerUrl(); }}
-                          disabled={shareUrlBusy}
-                          style={{ ...settingsButtonPrimaryStyle, fontSize: 12, padding: "6px 12px", cursor: shareUrlBusy ? "not-allowed" : "pointer", opacity: shareUrlBusy ? 0.6 : 1 }}
-                        >
-                          {shareUrlBusy ? "Sharing…" : "Share via…"}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
                 </div>
               ) : null}
               <p style={{ marginTop: 8, marginBottom: 0, fontSize: 12, opacity: 0.72 }}>
@@ -2988,8 +2957,57 @@ export default function HostChurchPage() {
               Your trial has ended. Broadcasting is blocked until billing is added.
             </section>
           ) : (
-            <section ref={controlPanelRef} style={{ marginTop: 16 }}>
-              <TranslationBox />
+            <section ref={controlPanelRef} style={{ marginTop: 20, borderRadius: 12, overflow: "hidden", background: DC.navy, boxShadow: "0 8px 32px rgba(15,31,61,0.2)" }}>
+              {/* Window chrome bar */}
+              <div style={{ background: "rgba(0,0,0,0.25)", padding: "10px 16px", display: "flex", alignItems: "center", gap: 12 }}>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <span style={{ width: 12, height: 12, borderRadius: "50%", background: "#ff5f57", display: "block" }} />
+                  <span style={{ width: 12, height: 12, borderRadius: "50%", background: "#febc2e", display: "block" }} />
+                  <span style={{ width: 12, height: 12, borderRadius: "50%", background: "#28c840", display: "block" }} />
+                </div>
+                <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#22c55e", display: "block", boxShadow: "0 0 6px rgba(34,197,94,0.7)" }} />
+                  <span style={{ color: "#22c55e", fontSize: 11, fontWeight: 700, letterSpacing: "0.12em" }}>LIVE</span>
+                </div>
+                <span style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, flexShrink: 0 }}>
+                  {serviceKey} ({formatCountdownSeconds(elapsedSec)})
+                </span>
+              </div>
+              {/* Translation controls */}
+              <div style={{ color: DC.cream }}>
+                <TranslationBox />
+              </div>
+              {/* Listener access footer */}
+              {displayUrl && (
+                <div style={{ borderTop: "1px solid rgba(255,255,255,0.08)", padding: "16px 20px", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 16 }}>
+                  <div style={{ flex: 1, minWidth: 200, display: "grid", gap: 6 }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.goldLight }}>Listener Link</span>
+                    <p style={{ margin: 0, fontSize: 12, color: "rgba(255,255,255,0.55)", wordBreak: "break-all", lineHeight: 1.5 }}>{displayUrl}</p>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 }}>
+                      <button
+                        type="button"
+                        onClick={() => { void copyListenerUrl(); }}
+                        disabled={copyUrlBusy}
+                        style={{ border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.8)", fontSize: 12, fontWeight: 600, padding: "7px 14px", borderRadius: 4, cursor: copyUrlBusy ? "not-allowed" : "pointer" }}
+                      >
+                        {copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}
+                      </button>
+                      <a
+                        href={displayUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ display: "inline-flex", alignItems: "center", border: "none", background: DC.gold, color: DC.white, fontSize: 12, fontWeight: 700, padding: "7px 16px", borderRadius: 4, textDecoration: "none", letterSpacing: "0.04em" }}
+                      >
+                        Open Listener Page ↗
+                      </a>
+                    </div>
+                  </div>
+                  {qrDataUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={qrDataUrl} alt="Listener QR code" width={96} height={96} style={{ borderRadius: 6, flexShrink: 0 }} />
+                  ) : null}
+                </div>
+              )}
             </section>
           )
         ) : null}
