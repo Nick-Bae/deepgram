@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import SermonPrep from "../../components/SermonPrep";
 import { useAuth } from "../../lib/authContext";
-import { fetchAuthMe, type OrgMembership } from "../../lib/backendAuth";
+import { fetchAuthMe, fetchOrgServices, type OrgMembership } from "../../lib/backendAuth";
 
 const SCRIPT_MANAGER_ROLES = new Set(["owner", "admin", "host"]);
 
@@ -25,6 +25,8 @@ export default function AdminSermonPrepPage() {
   const [selectedOrgId, setSelectedOrgId] = useState("");
   const [membershipLoading, setMembershipLoading] = useState(true);
   const [membershipError, setMembershipError] = useState<string | null>(null);
+  const [services, setServices] = useState<Array<{ serviceKey: string; title: string; publishedSermonDate?: string }>>([]);
+  const [selectedServiceKey, setSelectedServiceKey] = useState("");
 
   const selectedMembership = useMemo(
     () => memberships.find((row) => row.orgId === selectedOrgId) || null,
@@ -114,8 +116,36 @@ export default function AdminSermonPrepPage() {
     };
   }, [authLoading, getIdToken, logout, queryOrgId, router, user]);
 
+  // Load services whenever org changes
+  useEffect(() => {
+    if (!selectedOrgId || !user) return;
+    let cancelled = false;
+    const loadServices = async () => {
+      try {
+        const idToken = await getIdToken();
+        if (!idToken || cancelled) return;
+        const result = await fetchOrgServices(idToken, selectedOrgId);
+        if (cancelled) return;
+        const rows = result.services || [];
+        setServices(rows);
+        setSelectedServiceKey((prev) => {
+          if (prev && rows.some((r) => r.serviceKey === prev)) return prev;
+          return rows[0]?.serviceKey || "";
+        });
+      } catch {
+        // Services are optional — silently fall back to no service selection
+        setServices([]);
+        setSelectedServiceKey("");
+      }
+    };
+    void loadServices();
+    return () => { cancelled = true; };
+  }, [selectedOrgId, user, getIdToken]);
+
   const onChangeOrg = async (nextOrgId: string) => {
     setSelectedOrgId(nextOrgId);
+    setSelectedServiceKey("");
+    setServices([]);
     await router.replace({ pathname: router.pathname, query: { ...router.query, orgId: nextOrgId } }, undefined, {
       shallow: true,
     });
@@ -173,12 +203,29 @@ export default function AdminSermonPrepPage() {
                   Role: {selectedMembership.role || "viewer"}
                 </span>
               ) : null}
+              {services.length > 0 ? (
+                <>
+                  <label className="text-sm font-medium text-slate-700">Service</label>
+                  <select
+                    value={selectedServiceKey}
+                    onChange={(e) => setSelectedServiceKey(e.target.value)}
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-sky-500 focus:outline-none"
+                  >
+                    {services.map((svc) => (
+                      <option key={svc.serviceKey} value={svc.serviceKey}>
+                        {svc.title || svc.serviceKey}
+                        {svc.publishedSermonDate ? ` ✓ ${svc.publishedSermonDate}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              ) : null}
             </div>
             {membershipError ? <p className="text-sm text-rose-600">{membershipError}</p> : null}
           </header>
 
           {canManageScript ? (
-            <SermonPrep orgId={selectedOrgId} />
+            <SermonPrep orgId={selectedOrgId} serviceKey={selectedServiceKey || undefined} />
           ) : (
             <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
               Sermon prep is available to owner/admin/host roles.

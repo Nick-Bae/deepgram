@@ -116,9 +116,27 @@ class ScriptStore:
         self._lock = Lock()
         self._glossary_cache: Dict[Tuple[str, int], List[Tuple[str, str]]] = {}
 
-    def _org_key(self, org_id: Optional[str]) -> str:
-        clean = (org_id or "").strip()
-        return clean or self._GLOBAL_KEY
+    def _org_key(
+        self,
+        org_id: Optional[str] = None,
+        *,
+        room_id: Optional[str] = None,
+        service_key: Optional[str] = None,
+        service_date: Optional[str] = None,
+    ) -> str:
+        # Priority 1: room_id — runtime isolation, most specific
+        if room_id:
+            return f"room::{room_id.strip()}"
+        # Priority 2: org + service + date — pre-warm on publish
+        org = (org_id or "").strip() or self._GLOBAL_KEY
+        svc = (service_key or "").strip()
+        date = (service_date or "").strip()
+        if svc and date:
+            return f"{org}::{svc}::{date}"
+        if svc:
+            return f"{org}::{svc}"
+        # Priority 3: org-only — legacy fallback
+        return org
 
     def load(
         self,
@@ -126,6 +144,9 @@ class ScriptStore:
         threshold: float | None = None,
         *,
         org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
+        service_key: Optional[str] = None,
+        service_date: Optional[str] = None,
     ) -> Tuple[int, float, int]:
         """
         Replace the buffer with the provided pairs.
@@ -140,7 +161,7 @@ class ScriptStore:
             cleaned.append(ScriptPair(source=src, target=tgt, index=idx))
 
         with self._lock:
-            key = self._org_key(org_id)
+            key = self._org_key(org_id, room_id=room_id, service_key=service_key, service_date=service_date)
             buffer = self._buffers.get(key) or ScriptBuffer()
             buffer.pairs = cleaned
             if threshold is not None:
@@ -149,10 +170,17 @@ class ScriptStore:
             self._buffers[key] = buffer
             return len(buffer.pairs), buffer.threshold, buffer.version
 
-    def clear(self, *, org_id: Optional[str] = None) -> Tuple[int, int]:
+    def clear(
+        self,
+        *,
+        org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
+        service_key: Optional[str] = None,
+        service_date: Optional[str] = None,
+    ) -> Tuple[int, int]:
         """Clear all pairs; returns (removed_count, new_version)."""
         with self._lock:
-            key = self._org_key(org_id)
+            key = self._org_key(org_id, room_id=room_id, service_key=service_key, service_date=service_date)
             buffer = self._buffers.get(key) or ScriptBuffer()
             removed = len(buffer.pairs)
             buffer.pairs = []
@@ -161,10 +189,17 @@ class ScriptStore:
             self._buffers[key] = buffer
             return removed, buffer.version
 
-    def stats(self, *, org_id: Optional[str] = None) -> Tuple[int, float, int]:
+    def stats(
+        self,
+        *,
+        org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
+        service_key: Optional[str] = None,
+        service_date: Optional[str] = None,
+    ) -> Tuple[int, float, int]:
         """Return (count, threshold, version) without exposing internal list."""
         with self._lock:
-            key = self._org_key(org_id)
+            key = self._org_key(org_id, room_id=room_id, service_key=service_key, service_date=service_date)
             buffer = self._buffers.get(key) or ScriptBuffer()
             return len(buffer.pairs), buffer.threshold, buffer.version
 
@@ -173,6 +208,7 @@ class ScriptStore:
         sermon: dict[str, Any],
         *,
         org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Store a finalized sermon payload keyed by sermon_id.
@@ -191,19 +227,25 @@ class ScriptStore:
         }
 
         with self._lock:
-            key = self._org_key(org_id)
+            key = self._org_key(org_id, room_id=room_id)
             buffer = self._buffers.get(key) or ScriptBuffer()
             buffer.sermons[sermon_id] = normalized
             self._buffers[key] = buffer
             return dict(normalized)
 
-    def get_sermon(self, sermon_id: str, *, org_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    def get_sermon(
+        self,
+        sermon_id: str,
+        *,
+        org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
         """Return a finalized sermon payload by sermon_id, if it exists."""
         clean_sermon_id = (sermon_id or "").strip()
         if not clean_sermon_id:
             return None
         with self._lock:
-            key = self._org_key(org_id)
+            key = self._org_key(org_id, room_id=room_id)
             buffer = self._buffers.get(key) or ScriptBuffer()
             hit = buffer.sermons.get(clean_sermon_id)
             return dict(hit) if hit else None
@@ -213,6 +255,7 @@ class ScriptStore:
         text: str,
         *,
         org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
         example_min_score: float = 0.20,
         example_max: int = 3,
     ) -> Tuple[Optional["ScriptPair"], float, int, float, List["ScriptPair"]]:
@@ -224,7 +267,7 @@ class ScriptStore:
         Returns examples=[] when store is empty.
         """
         query = _norm(text)
-        key = self._org_key(org_id)
+        key = self._org_key(org_id, room_id=room_id)
 
         with self._lock:
             buffer = self._buffers.get(key) or ScriptBuffer()
@@ -273,13 +316,19 @@ class ScriptStore:
 
         return matched, best_score, version, threshold, examples
 
-    def match(self, text: str, *, org_id: Optional[str] = None) -> Tuple[Optional[ScriptPair], float, int, float]:
+    def match(
+        self,
+        text: str,
+        *,
+        org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
+    ) -> Tuple[Optional[ScriptPair], float, int, float]:
         """
         Find the best matching pair for the given text using SequenceMatcher.
         Returns (pair | None, score, version, threshold_used).
         """
         query = _norm(text)
-        key = self._org_key(org_id)
+        key = self._org_key(org_id, room_id=room_id)
 
         with self._lock:
             buffer = self._buffers.get(key) or ScriptBuffer()
@@ -310,6 +359,7 @@ class ScriptStore:
         self,
         *,
         org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
         max_terms: int = 15,
         min_char_len: int = 2,
         max_char_len: int = 6,
@@ -320,7 +370,7 @@ class ScriptStore:
         with their first English equivalent word. Cached per (org_key, store_version).
         Returns [] when fewer than min_pair_count pairs are loaded.
         """
-        key = self._org_key(org_id)
+        key = self._org_key(org_id, room_id=room_id)
         with self._lock:
             buffer = self._buffers.get(key) or ScriptBuffer()
             pairs_snapshot = list(buffer.pairs)
@@ -356,12 +406,17 @@ class ScriptStore:
         self._glossary_cache[cache_key] = glossary
         return glossary
 
-    def get_vocab_set(self, *, org_id: Optional[str] = None) -> Set[str]:
+    def get_vocab_set(
+        self,
+        *,
+        org_id: Optional[str] = None,
+        room_id: Optional[str] = None,
+    ) -> Set[str]:
         """
         Return all unique Hangul tokens (length >= 3) from script source texts.
         Used for STT error correction via edit distance 1.
         """
-        key = self._org_key(org_id)
+        key = self._org_key(org_id, room_id=room_id)
         with self._lock:
             buffer = self._buffers.get(key) or ScriptBuffer()
             pairs_snapshot = list(buffer.pairs)

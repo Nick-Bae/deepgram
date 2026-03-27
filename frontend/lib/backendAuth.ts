@@ -705,6 +705,90 @@ export function finalizeOrgSermon(
   });
 }
 
+// Service-scoped sermon API (sermon-service-isolation)
+
+export function draftServiceSermon(
+  idToken: string,
+  orgId: string,
+  serviceKey: string,
+  payload: {
+    service_date: string;
+    korean: string;
+    auto_split?: boolean;
+    threshold?: number;
+    lang_src?: string;
+    lang_tgt?: string;
+  },
+): Promise<{
+  serviceKey: string;
+  serviceDate: string;
+  status: string;
+  segments: SermonDraftSegment[];
+  usage: Record<string, unknown>;
+}> {
+  return authFetch(
+    `/api/org/${encodeURIComponent(orgId)}/services/${encodeURIComponent(serviceKey)}/sermon/draft`,
+    idToken,
+    {
+      method: "POST",
+      timeoutMs: SERMON_DRAFT_FETCH_TIMEOUT_MS,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service_date: payload.service_date,
+        korean: payload.korean,
+        auto_split: payload.auto_split !== false,
+        threshold: payload.threshold ?? 0.84,
+        lang_src: payload.lang_src || "ko",
+        lang_tgt: payload.lang_tgt || "en",
+      }),
+    },
+  );
+}
+
+export function saveServiceSermon(
+  idToken: string,
+  orgId: string,
+  serviceKey: string,
+  serviceDate: string,
+  payload: {
+    segments: SermonDraftSegment[];
+    threshold?: number;
+  },
+): Promise<{ status: string; serviceKey: string; serviceDate: string; segmentCount: number }> {
+  return authFetch(
+    `/api/org/${encodeURIComponent(orgId)}/services/${encodeURIComponent(serviceKey)}/sermon/${encodeURIComponent(serviceDate)}`,
+    idToken,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        segments: payload.segments,
+        threshold: payload.threshold ?? 0.84,
+      }),
+    },
+  );
+}
+
+export function publishServiceSermon(
+  idToken: string,
+  orgId: string,
+  serviceKey: string,
+  serviceDate: string,
+): Promise<{ status: string; serviceKey: string; serviceDate: string; segmentCount: number; preWarmed: boolean }> {
+  return authFetch(
+    `/api/org/${encodeURIComponent(orgId)}/services/${encodeURIComponent(serviceKey)}/sermon/${encodeURIComponent(serviceDate)}/publish`,
+    idToken,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+  );
+}
+
+export function fetchOrgServices(
+  idToken: string,
+  orgId: string,
+): Promise<{ services: Array<{ serviceKey: string; title: string; publishedSermonDate?: string }> }> {
+  return authFetch(`/api/org/${encodeURIComponent(orgId)}/services`, idToken);
+}
+
 export function fetchOrgSermonUsage(
   idToken: string,
   orgId: string,

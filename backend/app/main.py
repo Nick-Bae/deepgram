@@ -587,26 +587,68 @@ def _uid_from_id_token(raw_token: Optional[str]) -> Optional[str]:
     return _clean_token(user.uid) if user else None
 
 
-def _try_reload_sermon(org_id: str) -> None:
-    """Load most recent Firestore sermon into script_store if store is empty. Never raises."""
+def _try_reload_sermon(
+    org_id: str,
+    *,
+    room_id: Optional[str] = None,
+    service_key: Optional[str] = None,
+    service_date: Optional[str] = None,
+) -> bool:
+    """
+    Load the correct sermon into script_store for this room.
+    Keyed by room_id when provided (service-isolation).
+    Falls back to org-latest for legacy orgs with no service-specific sermon.
+    Returns True if pairs were loaded, False otherwise. Never raises.
+    """
     try:
-        count, _, _ = script_store.stats(org_id=org_id)
-        if count > 0:
-            return
-        doc = multichurch_store.get_latest_sermon_pairs(org_id)
+        # If room_id given, check if already loaded for this room
+        if room_id:
+            count, _, _ = script_store.stats(room_id=room_id)
+            if count > 0:
+                return True
+        else:
+            count, _, _ = script_store.stats(org_id=org_id)
+            if count > 0:
+                return True
+
+        doc = None
+        # 1. Try service-specific published sermon (preferred)
+        if service_key and service_date:
+            doc = multichurch_store.get_published_sermon(org_id, service_key, service_date)
+            if not doc:
+                logger.warning(
+                    "no published sermon for %s/%s/%s, falling back to org-latest",
+                    org_id, service_key, service_date,
+                )
+
+        # 2. Fall back to org-latest (legacy orgs / single-service orgs)
+        if not doc:
+            doc = multichurch_store.get_latest_sermon_pairs(org_id)
+
         if not doc or not doc.get("pairs"):
-            return
-        # Re-check after Firestore round-trip — another connection may have loaded
-        count, _, _ = script_store.stats(org_id=org_id)
+            return False
+
+        # Re-check after Firestore round-trip
+        if room_id:
+            count, _, _ = script_store.stats(room_id=room_id)
+        else:
+            count, _, _ = script_store.stats(org_id=org_id)
         if count > 0:
-            return
+            return True
+
         script_store.load(
             doc["pairs"],
             doc.get("threshold"),
-            org_id=org_id,
+            room_id=room_id,
+            org_id=org_id if not room_id else None,
         )
+        logger.info(
+            "sermon loaded for room %s (%d pairs, service=%s, date=%s)",
+            room_id or org_id, len(doc["pairs"]), service_key or "n/a", service_date or "n/a",
+        )
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _can_host(org_id: Optional[str], *, host_uid: Optional[str], host_token: Optional[str]) -> bool:
@@ -968,21 +1010,20 @@ async def ws_translate(ws: WebSocket):
             meta_payload["service_key"] = payload_service_key
 
         # Refresh session-level script context cache when store version changes
-        _, _, _sv_check, _ = script_store.match("", org_id=target_org_id)  # lightweight stats
-        _sv_check = script_store.stats(org_id=target_org_id)[2]
+        _sv_check = script_store.stats(room_id=target_room_id)[2]
         if _sv_check != _cached_script_version_producer:
             _cached_script_version_producer = _sv_check
-            _cached_script_glossary_producer = script_store.get_keyword_glossary(org_id=target_org_id)
+            _cached_script_glossary_producer = script_store.get_keyword_glossary(room_id=target_room_id)
 
         # STT vocabulary correction using sermon vocab
-        _vocab_set_producer = script_store.get_vocab_set(org_id=target_org_id)
+        _vocab_set_producer = script_store.get_vocab_set(room_id=target_room_id)
         if _vocab_set_producer:
             from app.utils.translate import _stt_vocab_correct
             src_text = _stt_vocab_correct(src_text, _vocab_set_producer)
 
         script_match, match_score, script_version, script_threshold, _script_examples_producer = script_store.match_with_examples(
             src_text,
-            org_id=target_org_id,
+            room_id=target_room_id,
         )
         _cached_script_examples_producer = _script_examples_producer
         live_mode = "live"
@@ -1341,7 +1382,16 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     # Auto-reload sermon from Firestore if script store is empty (fire-and-forget)
     if org_id:
-        asyncio.get_running_loop().run_in_executor(None, _try_reload_sermon, org_id)
+        from datetime import datetime, timezone as _tz
+        _today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+        asyncio.get_running_loop().run_in_executor(
+            None, lambda: _try_reload_sermon(
+                org_id,
+                room_id=room_id,
+                service_key=service_key,
+                service_date=_today,
+            )
+        )
 
     chunker = KoChunker(
         waitk_lo=ENV.WAITK_LO,
@@ -1523,20 +1573,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
             if not partial:
                 # Refresh glossary cache when script store version changes
-                _sv_dg = script_store.stats(org_id=org_id)[2]
+                _sv_dg = script_store.stats(room_id=room_id)[2]
                 if _sv_dg != _cached_script_version_dg:
                     _cached_script_version_dg = _sv_dg
-                    _cached_script_glossary_dg = script_store.get_keyword_glossary(org_id=org_id)
+                    _cached_script_glossary_dg = script_store.get_keyword_glossary(room_id=room_id)
 
                 # STT vocabulary correction using sermon vocab
-                _vocab_set_dg = script_store.get_vocab_set(org_id=org_id)
+                _vocab_set_dg = script_store.get_vocab_set(room_id=room_id)
                 if _vocab_set_dg:
                     from app.utils.translate import _stt_vocab_correct
                     clean_src = _stt_vocab_correct(clean_src, _vocab_set_dg)
 
                 script_match, match_score, script_version, script_threshold, _script_examples_dg = script_store.match_with_examples(
                     clean_src,
-                    org_id=org_id,
+                    room_id=room_id,
                 )
                 scripture_hit = None
                 if src_lang.startswith("ko"):
