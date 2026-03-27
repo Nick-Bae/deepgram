@@ -2061,6 +2061,20 @@ export default function HostChurchPage() {
                 >
                   {activeRoomId ? "Restart / Rejoin Room" : "Start Service"}
                 </button>
+                <button
+                  onClick={endService}
+                  disabled={busy || !orgData?.orgId || (!activeRoomId && !queryRoomId)}
+                  style={{
+                    ...settingsButtonDangerStyle,
+                    cursor: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? "not-allowed" : "pointer",
+                    opacity: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? 0.6 : 1,
+                  }}
+                >
+                  End Service
+                </button>
+                <span style={{ opacity: 0.84, fontSize: 14 }}>
+                  {activeRoomId ? `Live room: ${activeRoomId}` : "No live room"}
+                </span>
                 {billingPlanToken === "trial" && effectiveTrialCountdownSeconds !== null ? (
                   <span
                     style={{
@@ -2077,29 +2091,6 @@ export default function HostChurchPage() {
                   </span>
                 ) : null}
               </div>
-              {activeRoomId ? (
-                <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12, paddingTop: 12, borderTop: `1px solid ${DC.border}` }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 0 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", flexShrink: 0, boxShadow: "0 0 6px rgba(34,197,94,0.6)" }} />
-                    <span style={{ fontSize: 12, color: DC.mid, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      Live · {activeRoomId}
-                    </span>
-                  </div>
-                  <button
-                    onClick={endService}
-                    disabled={busy}
-                    style={{
-                      ...settingsButtonDangerStyle,
-                      fontSize: 12,
-                      padding: "7px 14px",
-                      cursor: busy ? "not-allowed" : "pointer",
-                      opacity: busy ? 0.6 : 1,
-                    }}
-                  >
-                    End Service
-                  </button>
-                </div>
-              ) : null}
               {trialBroadcastNotice ? (
                 <div
                   style={{
