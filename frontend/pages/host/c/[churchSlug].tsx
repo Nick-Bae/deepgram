@@ -255,6 +255,7 @@ export default function HostChurchPage() {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const controlPanelRef = useRef<HTMLDivElement>(null);
+  const scrollToPanelRef = useRef(false);
   const [backendReachable, setBackendReachable] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [orgData, setOrgData] = useState<ServicesResponse | null>(null);
@@ -473,6 +474,13 @@ export default function HostChurchPage() {
       return Math.min(prev, nextSeconds);
     });
   }, [activeRoomId, billingPlanToken, isTrialPlan, resolvedOrgId, trialSecondsLimit, trialSecondsRemaining]);
+
+  useEffect(() => {
+    if (activeRoomId && scrollToPanelRef.current) {
+      scrollToPanelRef.current = false;
+      controlPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [activeRoomId]);
 
   useEffect(() => {
     if (!isTrialPlan || !activeRoomId) return;
@@ -1421,8 +1429,8 @@ export default function HostChurchPage() {
       }
       const data: StartResponse = await res.json();
       const nextOrgId = (data.orgId || resolvedOrgId || queryOrgId || "").trim();
+      scrollToPanelRef.current = true;
       setActiveRoomId(data.roomId);
-      setTimeout(() => controlPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 80);
       if (data.serviceKey && data.serviceKey !== serviceKey) setServiceKey(data.serviceKey);
       persistStreamContext({
         orgId: nextOrgId || undefined,
