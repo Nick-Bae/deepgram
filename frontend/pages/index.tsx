@@ -7,82 +7,91 @@ import { useAuth } from "../lib/authContext";
 import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../lib/dashboardRoute";
 import { persistAuthToken } from "../utils/streamContext";
 
-const publicQuickLinks = [
-  {
-    title: "Host Console",
-    desc: "Sign in to manage church services, room tokens, and broadcast controls.",
-    href: "/login",
-    cta: "Host Login",
-    accent: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-  },
-  {
-    title: "Create Church",
-    desc: "Create your church workspace and start with the built-in 30 minute host trial.",
-    href: "/signup",
-    cta: "Start Free Trial",
-    accent: "linear-gradient(145deg, #97b9ef, #6e8fc3)",
-  },
-  {
-    title: "Join By Invite",
-    desc: "Accept an invite code and join an existing organization workspace.",
-    href: "/join",
-    cta: "Open Join Page",
-    accent: "linear-gradient(145deg, #f5d38c, #d9a75b)",
-  },
-];
+// ─── palette ────────────────────────────────────────────────────────────────
+const C = {
+  cream:    "#f7f4ef",
+  navy:     "#0f1f3d",
+  navyMid:  "#162844",
+  charcoal: "#1c1c1c",
+  gold:     "#b89a5e",
+  goldLight:"#d4b87a",
+  mid:      "#5a5a52",
+  border:   "#e4ddd2",
+  white:    "#ffffff",
+};
 
-const signedInQuickLinks = [
-  {
-    title: "Continue Dashboard",
-    desc: "Open your church dashboard and continue the current broadcast workflow.",
-    cta: "Open Dashboard",
-    accent: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-  },
-  {
-    title: "Join Another Team",
-    desc: "Use an invite link to add another church workspace to your account.",
-    href: "/join",
-    cta: "Open Join Page",
-    accent: "linear-gradient(145deg, #f5d38c, #d9a75b)",
-  },
-];
-
-const landingStats = [
-  { value: "30 min", label: "Host trial included" },
-  { value: "QR", label: "Listener access flow" },
-  { value: "Live", label: "Translated captions" },
-];
-
+// ─── data ────────────────────────────────────────────────────────────────────
 const workflowSteps = [
   {
     id: "01",
+    icon: "▶",
     title: "Start the service",
-    desc: "Hosts open the church dashboard, choose a recurring service, and start the room.",
+    desc: "Choose your church service and begin the live session from the host dashboard.",
   },
   {
     id: "02",
+    icon: "⬡",
     title: "Share listener access",
-    desc: "Display the QR code or send the listener URL so attendees can join on their phone.",
+    desc: "Display the QR code or send the listener link so people can join on their phones.",
   },
   {
     id: "03",
+    icon: "≡",
     title: "Deliver translation live",
-    desc: "Translated captions update continuously while the speaker continues without changing workflow.",
+    desc: "Listeners follow the sermon in translated captions while the speaker stays focused.",
   },
 ];
 
-const productNotes = [
+const benefits = [
+  { title: "Simple for the host", desc: "The person leading setup does not need a technical workflow. One dashboard, one start button." },
+  { title: "Clear for the listener", desc: "Listeners open one page and follow along live. No account, no download." },
+  { title: "Built for worship flow", desc: "Designed for sermons and church services, not generic events or conference tools." },
+  { title: "QR code access", desc: "Let listeners join quickly without complicated setup — just scan and follow." },
+  { title: "Recurring service structure", desc: "Reuse the same Sunday service slots week after week without rebuilding anything." },
+  { title: "Prepared sermon support", desc: "Connect prepared content to improve translation consistency and flow." },
+];
+
+const scenarios = [
+  { title: "International worship services", desc: "Help multilingual congregations follow the message together in their own language." },
+  { title: "Guest listeners and visitors", desc: "Make access simple for newcomers through a QR code and phone link — no account needed." },
+  { title: "Large-screen and mobile support", desc: "Use live captions on a display screen or let listeners follow on their own device." },
+];
+
+const faqs = [
+  { q: "Do listeners need to create an account?", a: "No. Listeners open the listener page directly — no login, no download, no setup required." },
+  { q: "Can people use their phones?", a: "Yes. The listener view is fully mobile-optimized. Any smartphone browser works." },
+  { q: "Does this work for recurring Sunday services?", a: "Yes. You define service slots once and reuse the same structure every week." },
+  { q: "Can we prepare sermon content ahead of time?", a: "Yes. The sermon prep feature lets you connect prepared scripts to improve translation accuracy." },
+  { q: "Can we use captions on a screen?", a: "Yes. The listener URL can be displayed on any screen — phone, tablet, or large display." },
+  { q: "How quickly can we get started?", a: "Create a church workspace, set up one service, and you can run your first live session the same day." },
+];
+
+const pricingPlans = [
   {
-    title: "Built for service flow",
-    desc: "The console keeps room control, translation monitoring, and service scheduling in one place.",
+    name: "Free Trial",
+    price: "Free",
+    highlight: true,
+    features: ["30 minutes included", "Full host workflow", "QR listener access", "No long setup"],
+    cta: "Start Free Trial",
+    href: "/signup",
   },
   {
-    title: "Works for real church teams",
-    desc: "Invite hosts and admins, keep recurring services organized, and reuse the same structure every week.",
+    name: "Starter",
+    price: "$20",
+    period: "/mo",
+    highlight: false,
+    features: ["Up to 5 services", "Recurring service setup", "Host + admin roles", "Email support"],
+    cta: "Get Started",
+    href: "/signup",
   },
   {
-    title: "Simple listener experience",
-    desc: "Attendees do not need a host login. They open the listener page and follow the translated feed live.",
+    name: "Growth",
+    price: "$40",
+    period: "/mo",
+    highlight: false,
+    features: ["Up to 12 services", "More service hours", "Priority support", "Sermon prep tools"],
+    cta: "Get Started",
+    href: "/signup",
   },
 ];
 
@@ -102,39 +111,268 @@ function toEmbedVideoUrl(raw: string): string {
   return input;
 }
 
+// ─── sub-components ──────────────────────────────────────────────────────────
+function GoldDivider() {
+  return <div style={{ width: 40, height: 1, background: C.gold, margin: "20px 0" }} />;
+}
+
+function Eyebrow({ children }: { children: React.ReactNode }) {
+  return (
+    <p style={{ margin: 0, fontSize: "0.72rem", letterSpacing: "0.22em", textTransform: "uppercase", color: C.gold, fontWeight: 500 }}>
+      {children}
+    </p>
+  );
+}
+
+function SectionTitle({ children, light }: { children: React.ReactNode; light?: boolean }) {
+  return (
+    <h2
+      style={{
+        margin: 0,
+        fontFamily: "'Cormorant Garamond', Georgia, serif",
+        fontSize: "clamp(2rem, 3.5vw, 3rem)",
+        fontWeight: 300,
+        lineHeight: 1.12,
+        color: light ? C.cream : C.charcoal,
+      }}
+    >
+      {children}
+    </h2>
+  );
+}
+
+function ProductMockup({ isLoggedIn, dashboardHref, resolvingDashboard }: {
+  isLoggedIn: boolean;
+  dashboardHref: string;
+  resolvingDashboard: boolean;
+}) {
+  return (
+    <div
+      style={{
+        background: "rgba(255,255,255,0.04)",
+        border: "1px solid rgba(255,255,255,0.12)",
+        borderRadius: 20,
+        overflow: "hidden",
+        boxShadow: "0 40px 80px rgba(0,0,0,0.4)",
+      }}
+    >
+      {/* top bar */}
+      <div
+        style={{
+          background: "rgba(255,255,255,0.06)",
+          borderBottom: "1px solid rgba(255,255,255,0.08)",
+          padding: "12px 18px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+        }}
+      >
+        <div style={{ display: "flex", gap: 6 }}>
+          {["rgba(255,95,87,0.7)","rgba(255,188,46,0.7)","rgba(40,200,64,0.7)"].map((bg, i) => (
+            <div key={i} style={{ width: 10, height: 10, borderRadius: 999, background: bg }} />
+          ))}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ width: 8, height: 8, borderRadius: 999, background: "#4ade80", boxShadow: "0 0 6px #4ade80" }} />
+          <span style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", letterSpacing: "0.1em", textTransform: "uppercase" }}>
+            Live
+          </span>
+        </div>
+        <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Sunday 11 AM</span>
+      </div>
+
+      {/* body */}
+      <div style={{ padding: "20px 18px", display: "grid", gap: 14 }}>
+        {/* listener count */}
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", letterSpacing: "0.14em", textTransform: "uppercase" }}>
+            Listeners
+          </span>
+          <span style={{ fontSize: 20, fontWeight: 700, color: C.goldLight, letterSpacing: "-0.04em" }}>24</span>
+        </div>
+
+        {/* transcript box */}
+        <div
+          style={{
+            background: "rgba(0,0,0,0.3)",
+            border: "1px solid rgba(255,255,255,0.06)",
+            borderRadius: 12,
+            padding: "14px 16px",
+          }}
+        >
+          <p style={{ margin: "0 0 6px", fontSize: 10, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.3)" }}>
+            Korean → English
+          </p>
+          <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, color: "rgba(255,255,255,0.85)", fontWeight: 300 }}>
+            And he said, whoever believes in me will not walk in darkness, but will have the light of life.
+          </p>
+        </div>
+
+        {/* QR + controls row */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 12, alignItems: "end" }}>
+          <div style={{ display: "grid", gap: 8 }}>
+            <div
+              style={{
+                background: "rgba(184,154,94,0.12)",
+                border: "1px solid rgba(184,154,94,0.24)",
+                borderRadius: 10,
+                padding: "10px 14px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <span style={{ fontSize: 12, color: C.goldLight }}>Listener link ready</span>
+              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>Share QR ›</span>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {isLoggedIn ? (
+                <Link
+                  href={dashboardHref}
+                  style={{
+                    flex: 1,
+                    background: `linear-gradient(135deg, ${C.gold}, ${C.goldLight})`,
+                    color: C.navy,
+                    borderRadius: 8,
+                    padding: "10px 14px",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    textAlign: "center",
+                    letterSpacing: "0.06em",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  {resolvingDashboard ? "Loading..." : "Open Dashboard"}
+                </Link>
+              ) : (
+                <Link
+                  href="/signup"
+                  style={{
+                    flex: 1,
+                    background: `linear-gradient(135deg, ${C.gold}, ${C.goldLight})`,
+                    color: C.navy,
+                    borderRadius: 8,
+                    padding: "10px 14px",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    textAlign: "center",
+                    letterSpacing: "0.06em",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Start Free Trial
+                </Link>
+              )}
+              <div
+                style={{
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  borderRadius: 8,
+                  padding: "10px 14px",
+                  fontSize: 12,
+                  color: "rgba(255,255,255,0.5)",
+                  cursor: "default",
+                }}
+              >
+                ⏸
+              </div>
+            </div>
+          </div>
+
+          {/* QR placeholder */}
+          <div
+            style={{
+              width: 68,
+              height: 68,
+              background: C.white,
+              borderRadius: 8,
+              padding: 6,
+              display: "grid",
+              gridTemplateColumns: "repeat(5, 1fr)",
+              gap: 2,
+            }}
+          >
+            {Array.from({ length: 25 }).map((_, i) => {
+              const filled = [0,1,2,3,4,5,9,10,14,15,19,20,21,22,23,24,6,12].includes(i);
+              return (
+                <div
+                  key={i}
+                  style={{ borderRadius: 1, background: filled ? C.navy : "transparent" }}
+                />
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FAQItem({ q, a }: { q: string; a: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div
+      style={{
+        borderBottom: `1px solid ${C.border}`,
+        padding: "0",
+      }}
+    >
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          width: "100%",
+          background: "none",
+          border: "none",
+          padding: "22px 0",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          cursor: "pointer",
+          gap: 16,
+          textAlign: "left",
+        }}
+      >
+        <span style={{ fontSize: "1rem", fontWeight: 500, color: C.charcoal, lineHeight: 1.4 }}>{q}</span>
+        <span
+          style={{
+            color: C.gold,
+            fontSize: 18,
+            fontWeight: 300,
+            flexShrink: 0,
+            transition: "transform 0.2s",
+            transform: open ? "rotate(45deg)" : "none",
+          }}
+        >
+          +
+        </span>
+      </button>
+      {open && (
+        <p style={{ margin: "0 0 22px", fontSize: "0.95rem", lineHeight: 1.75, color: C.mid }}>
+          {a}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ─── main page ───────────────────────────────────────────────────────────────
 export default function HomePage() {
   const { user, loading: authLoading, configured, getIdToken } = useAuth();
   const [dashboardHref, setDashboardHref] = useState("/onboarding/create-church");
   const [resolvingDashboard, setResolvingDashboard] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const isLoggedIn = Boolean(user);
-  const quickLinks = useMemo(
-    () =>
-      isLoggedIn
-        ? signedInQuickLinks.map((card) => ({ ...card, href: card.href || dashboardHref }))
-        : publicQuickLinks,
-    [dashboardHref, isLoggedIn],
-  );
   const embedVideoUrl = toEmbedVideoUrl(VIDEO_URL);
-  const glassCardStyle = {
-    position: "relative" as const,
-    overflow: "hidden" as const,
-    border: "1px solid rgba(255,255,255,0.66)",
-    background:
-      "radial-gradient(circle at 14% 12%, rgba(255,255,255,0.34) 0%, rgba(255,255,255,0) 32%), linear-gradient(180deg, rgba(248,251,255,0.68) 0%, rgba(230,237,246,0.42) 54%, rgba(213,223,236,0.26) 100%)",
-    boxShadow:
-      "inset 0 1px 0 rgba(255,255,255,0.54), inset 0 -20px 28px rgba(108,126,156,0.08), 0 0 0 1px rgba(255,255,255,0.2), 0 28px 54px rgba(88,106,137,0.16)",
-    backdropFilter: "blur(24px)",
-  } as const;
-  const glassInnerCardStyle = {
-    position: "relative" as const,
-    overflow: "hidden" as const,
-    border: "1px solid rgba(255,255,255,0.58)",
-    background:
-      "radial-gradient(circle at 16% 10%, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0) 30%), linear-gradient(180deg, rgba(255,255,255,0.52) 0%, rgba(235,241,249,0.34) 58%, rgba(217,227,239,0.2) 100%)",
-    boxShadow:
-      "inset 0 1px 0 rgba(255,255,255,0.54), inset 0 -14px 22px rgba(110,128,158,0.06), 0 18px 30px rgba(102,120,151,0.1)",
-    backdropFilter: "blur(16px)",
-  } as const;
+
+  useMemo(() => dashboardHref, [dashboardHref]);
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 40);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
 
   useEffect(() => {
     if (authLoading || !user || !configured) {
@@ -157,743 +395,792 @@ export default function HomePage() {
         persistDashboardContext(membership);
         setDashboardHref(buildDashboardHref(membership));
       } catch {
-        if (!cancelled) {
-          setDashboardHref("/login");
-        }
+        if (!cancelled) setDashboardHref("/login");
       } finally {
-        if (!cancelled) {
-          setResolvingDashboard(false);
-        }
+        if (!cancelled) setResolvingDashboard(false);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [authLoading, configured, getIdToken, user]);
+
+  const primaryCta = isLoggedIn
+    ? { label: resolvingDashboard ? "Loading..." : "Open Dashboard", href: dashboardHref }
+    : { label: "Start Free Trial", href: "/signup" };
+
+  const MAX_W = 1160;
+  const container: React.CSSProperties = { maxWidth: MAX_W, margin: "0 auto", padding: "0 32px" };
 
   return (
     <>
       <Head>
-        <title>Worship | Live Church Translation</title>
-        <meta
-          name="description"
-          content="Launch live translated worship services, share QR listener access, and manage church broadcasts from one console."
-        />
+        <title>Worship Translation — Live Church Translation</title>
+        <meta name="description" content="Start the service once, share a QR code, and let translated captions reach listeners in real time. Built for multilingual church worship." />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
+        <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet" />
+        <style>{`
+          *, *::before, *::after { box-sizing: border-box; }
+          html { scroll-behavior: smooth; }
+          body { margin: 0; padding: 0; font-family: 'DM Sans', 'Segoe UI', sans-serif; background: ${C.cream}; color: ${C.charcoal}; line-height: 1.6; overflow-x: hidden; }
+          a { text-decoration: none; color: inherit; }
+          button { font-family: inherit; }
+        `}</style>
       </Head>
-      <main
+
+      {/* ── NAV ──────────────────────────────────────────────────────────── */}
+      <nav
         style={{
-          minHeight: "100vh",
-          position: "relative",
-          overflow: "hidden",
-          background:
-            "radial-gradient(circle at top left, rgba(154,179,219,0.3), transparent 28%), radial-gradient(circle at 86% 10%, rgba(223,190,131,0.18), transparent 22%), linear-gradient(180deg, #edf1f6 0%, #dfe6ef 54%, #d3dce7 100%)",
-          color: "#10213a",
-          padding: "28px 16px 40px",
-          fontFamily: "'Avenir Next', 'Segoe UI', sans-serif",
+          position: "fixed",
+          top: 0, left: 0, right: 0,
+          zIndex: 200,
+          height: 68,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "0 32px",
+          transition: "background 0.3s, box-shadow 0.3s",
+          background: scrolled ? "rgba(247,244,239,0.96)" : "transparent",
+          backdropFilter: scrolled ? "blur(12px)" : "none",
+          boxShadow: scrolled ? "0 1px 0 rgba(0,0,0,0.06)" : "none",
         }}
       >
-        <div
-          aria-hidden="true"
-          style={{
-            position: "absolute",
-            top: -120,
-            left: -100,
-            width: 360,
-            height: 360,
-            borderRadius: 999,
-            background: "radial-gradient(circle, rgba(157,180,214,0.3) 0%, rgba(157,180,214,0) 72%)",
-            filter: "blur(12px)",
-          }}
-        />
-        <div
-          aria-hidden="true"
-          style={{
-            position: "absolute",
-            right: -120,
-            top: 240,
-            width: 320,
-            height: 320,
-            borderRadius: 999,
-            background: "radial-gradient(circle, rgba(228,236,247,0.7) 0%, rgba(228,236,247,0) 72%)",
-            filter: "blur(14px)",
-          }}
-        />
-
-        <section style={{ position: "relative", maxWidth: 1180, margin: "0 auto", display: "grid", gap: 22 }}>
-          <header
+        {/* logo */}
+        <Link href="/" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div
             style={{
-              position: "relative",
-              overflow: "hidden",
-              borderRadius: 30,
-              border: "1px solid rgba(255,255,255,0.14)",
-              background: "linear-gradient(135deg, #566983 0%, #323d50 38%, #171d27 100%)",
-              boxShadow: "0 28px 56px rgba(32,42,58,0.24), inset 0 1px 0 rgba(255,255,255,0.08)",
-              padding: "18px 22px",
-              color: "#f8fafc",
+              width: 34, height: 34, borderRadius: 10,
+              background: scrolled ? C.navy : "rgba(255,255,255,0.12)",
+              border: `1px solid ${scrolled ? "transparent" : "rgba(255,255,255,0.18)"}`,
+              display: "grid", placeItems: "center",
+              color: C.goldLight, fontSize: 16, fontWeight: 800, fontStyle: "italic",
             }}
           >
-            <div
-              aria-hidden="true"
-              style={{
-                position: "absolute",
-                inset: "-30% auto auto -8%",
-                width: 240,
-                height: 180,
-                borderRadius: 999,
-                background: "radial-gradient(circle, rgba(141, 172, 214, 0.36) 0%, rgba(141, 172, 214, 0) 74%)",
-                filter: "blur(10px)",
-              }}
-            />
-            <div
-              aria-hidden="true"
-              style={{
-                position: "absolute",
-                inset: "auto -8% -80px auto",
-                width: 260,
-                height: 180,
-                borderRadius: 999,
-                background: "radial-gradient(circle, rgba(255, 183, 3, 0.14) 0%, rgba(255, 183, 3, 0) 74%)",
-                filter: "blur(12px)",
-              }}
-            />
-            <div
-              style={{
-                position: "relative",
-                display: "flex",
-                flexWrap: "wrap",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 16,
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-                <div
+            W
+          </div>
+          <span
+            style={{
+              fontFamily: "'Cormorant Garamond', Georgia, serif",
+              fontSize: "1.2rem",
+              fontWeight: 600,
+              letterSpacing: "0.04em",
+              color: scrolled ? C.charcoal : C.white,
+            }}
+          >
+            Worship Translation
+          </span>
+        </Link>
+
+        {/* desktop links */}
+        <ul
+          style={{
+            display: "flex", gap: 32, listStyle: "none", margin: 0, padding: 0,
+            ["@media(max-width:768px)" as string]: { display: "none" },
+          }}
+          className="nav-desktop-links"
+        >
+          {["How It Works", "Pricing", "Demo", "Churches"].map((label) => (
+            <li key={label}>
+              <a
+                href={`#${label.toLowerCase().replace(/\s+/g, "-")}`}
+                style={{
+                  fontSize: "0.8rem", fontWeight: 500, letterSpacing: "0.1em",
+                  textTransform: "uppercase",
+                  color: scrolled ? C.mid : "rgba(255,255,255,0.72)",
+                  transition: "color 0.2s",
+                }}
+              >
+                {label}
+              </a>
+            </li>
+          ))}
+        </ul>
+
+        {/* nav CTAs */}
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          {!authLoading && (
+            isLoggedIn ? (
+              <Link
+                href={dashboardHref}
+                style={{
+                  padding: "9px 20px",
+                  background: C.gold,
+                  color: C.white,
+                  fontSize: "0.8rem",
+                  fontWeight: 700,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  borderRadius: 4,
+                }}
+              >
+                Dashboard
+              </Link>
+            ) : (
+              <>
+                <Link
+                  href="/login"
                   style={{
-                    width: 58,
-                    height: 58,
-                    borderRadius: 18,
-                    background: "linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04))",
-                    border: "1px solid rgba(255,255,255,0.1)",
-                    color: "#ffb703",
-                    display: "grid",
-                    placeItems: "center",
-                    fontSize: 20,
-                    fontWeight: 900,
-                    fontStyle: "italic",
-                    boxShadow: "0 16px 28px rgba(13,18,28,0.22)",
+                    padding: "9px 16px",
+                    fontSize: "0.8rem",
+                    fontWeight: 500,
+                    color: scrolled ? C.mid : "rgba(255,255,255,0.72)",
+                    letterSpacing: "0.06em",
                   }}
                 >
-                  W
-                </div>
-                <div>
-                  <h1
+                  Sign In
+                </Link>
+                <Link
+                  href="/signup"
+                  style={{
+                    padding: "9px 20px",
+                    background: C.gold,
+                    color: C.white,
+                    fontSize: "0.8rem",
+                    fontWeight: 700,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    borderRadius: 4,
+                    transition: "background 0.2s",
+                  }}
+                >
+                  Free Trial
+                </Link>
+              </>
+            )
+          )}
+          <button
+            onClick={() => setMobileNavOpen(!mobileNavOpen)}
+            aria-label="Toggle menu"
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              display: "none", padding: 4,
+              color: scrolled ? C.charcoal : C.white,
+            }}
+            className="nav-mobile-toggle"
+          >
+            <svg width="22" height="16" viewBox="0 0 22 16" fill="none">
+              <rect width="22" height="2" rx="1" fill="currentColor"/>
+              <rect y="7" width="16" height="2" rx="1" fill="currentColor"/>
+              <rect y="14" width="22" height="2" rx="1" fill="currentColor"/>
+            </svg>
+          </button>
+        </div>
+      </nav>
+
+      {/* mobile nav drawer */}
+      {mobileNavOpen && (
+        <div
+          style={{
+            position: "fixed", inset: 0, zIndex: 190,
+            background: C.navy,
+            display: "flex", flexDirection: "column",
+            padding: "80px 32px 32px",
+            gap: 8,
+          }}
+        >
+          {["How It Works", "Pricing", "Demo", "Churches"].map((label) => (
+            <a
+              key={label}
+              href={`#${label.toLowerCase().replace(/\s+/g, "-")}`}
+              onClick={() => setMobileNavOpen(false)}
+              style={{
+                fontSize: "1.5rem", color: C.cream, fontWeight: 300,
+                fontFamily: "'Cormorant Garamond', Georgia, serif",
+                padding: "12px 0",
+                borderBottom: "1px solid rgba(255,255,255,0.08)",
+              }}
+            >
+              {label}
+            </a>
+          ))}
+          <div style={{ marginTop: 24, display: "flex", gap: 12 }}>
+            <Link href="/login" onClick={() => setMobileNavOpen(false)}
+              style={{ padding: "13px 20px", border: `1px solid rgba(255,255,255,0.2)`, color: C.cream, borderRadius: 4, fontSize: "0.9rem" }}>
+              Sign In
+            </Link>
+            <Link href="/signup" onClick={() => setMobileNavOpen(false)}
+              style={{ padding: "13px 24px", background: C.gold, color: C.white, borderRadius: 4, fontSize: "0.9rem", fontWeight: 700 }}>
+              Free Trial
+            </Link>
+          </div>
+        </div>
+      )}
+
+      <main>
+        {/* ── HERO ───────────────────────────────────────────────────────── */}
+        <section
+          id="hero"
+          style={{
+            background: `linear-gradient(160deg, #0a1628 0%, ${C.navy} 60%, #1a2f50 100%)`,
+            minHeight: "100vh",
+            paddingTop: 68,
+            display: "grid",
+            alignItems: "center",
+            position: "relative",
+            overflow: "hidden",
+          }}
+        >
+          {/* background glow */}
+          <div aria-hidden style={{ position: "absolute", top: "15%", left: "5%", width: 500, height: 500, borderRadius: "50%", background: "radial-gradient(circle, rgba(184,154,94,0.08) 0%, transparent 70%)", pointerEvents: "none" }} />
+          <div aria-hidden style={{ position: "absolute", bottom: "10%", right: "5%", width: 400, height: 400, borderRadius: "50%", background: "radial-gradient(circle, rgba(100,140,200,0.12) 0%, transparent 70%)", pointerEvents: "none" }} />
+
+          <div style={{ ...container, padding: "80px 32px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 64, alignItems: "center" }}>
+
+              {/* left text */}
+              <div>
+                <Eyebrow>Live translation for multilingual worship</Eyebrow>
+                <GoldDivider />
+                <h1
+                  style={{
+                    margin: 0,
+                    fontFamily: "'Cormorant Garamond', Georgia, serif",
+                    fontSize: "clamp(2.8rem, 5vw, 4.8rem)",
+                    fontWeight: 300,
+                    lineHeight: 1.06,
+                    letterSpacing: "-0.01em",
+                    color: C.white,
+                  }}
+                >
+                  Help every listener{" "}
+                  <em style={{ fontStyle: "italic", color: C.goldLight }}>follow the sermon live.</em>
+                </h1>
+                <p style={{ margin: "28px 0 0", fontSize: "1.05rem", lineHeight: 1.75, color: "rgba(255,255,255,0.6)", maxWidth: 420, fontWeight: 300 }}>
+                  Start the service once, share a QR code, and let translated captions reach listeners in real time.
+                </p>
+
+                <div style={{ marginTop: 40, display: "flex", gap: 14, flexWrap: "wrap" }}>
+                  <Link
+                    href={primaryCta.href}
                     style={{
-                      margin: 0,
-                      fontSize: "clamp(26px, 4vw, 34px)",
-                      lineHeight: 1,
-                      letterSpacing: "-0.05em",
-                      fontWeight: 800,
-                      color: "#f8fafc",
-                    }}
-                  >
-                    Worship
-                  </h1>
-                  <p
-                    style={{
-                      margin: "6px 0 0",
-                      fontSize: 11,
-                      letterSpacing: "0.36em",
+                      padding: "14px 30px",
+                      background: C.gold,
+                      color: C.white,
+                      fontSize: "0.82rem",
+                      fontWeight: 700,
+                      letterSpacing: "0.1em",
                       textTransform: "uppercase",
-                      color: "#b9c6da",
+                      borderRadius: 4,
+                      boxShadow: "0 8px 24px rgba(184,154,94,0.3)",
+                      transition: "background 0.2s",
                     }}
                   >
-                    Translation Studio
-                  </p>
+                    {primaryCta.label}
+                  </Link>
+                  {!isLoggedIn && (
+                    <a
+                      href="#demo"
+                      style={{
+                        padding: "14px 30px",
+                        border: "1px solid rgba(255,255,255,0.2)",
+                        color: "rgba(255,255,255,0.8)",
+                        fontSize: "0.82rem",
+                        fontWeight: 500,
+                        letterSpacing: "0.1em",
+                        textTransform: "uppercase",
+                        borderRadius: 4,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                    >
+                      Watch Demo
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6h8M6 2l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                    </a>
+                  )}
+                </div>
+
+                <div style={{ marginTop: 32, display: "flex", gap: 20, flexWrap: "wrap" }}>
+                  {["No listener login required", "Works on phones", "Built for church services"].map((s) => (
+                    <span key={s} style={{ fontSize: "0.78rem", color: "rgba(255,255,255,0.45)", letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: C.gold }}>·</span> {s}
+                    </span>
+                  ))}
                 </div>
               </div>
 
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-              {authLoading ? (
-                <span
+              {/* right mockup */}
+              <div>
+                <ProductMockup isLoggedIn={isLoggedIn} dashboardHref={dashboardHref} resolvingDashboard={resolvingDashboard} />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ── HOW IT WORKS ───────────────────────────────────────────────── */}
+        <section id="how-it-works" style={{ background: C.white, padding: "100px 0" }}>
+          <div style={container}>
+            <div style={{ textAlign: "center", marginBottom: 64 }}>
+              <Eyebrow>Simple by design</Eyebrow>
+              <GoldDivider />
+              <div style={{ width: 40, height: 1, background: C.gold, margin: "0 auto 20px" }} />
+              <SectionTitle>Three steps from setup to live service.</SectionTitle>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: 2 }}>
+              {workflowSteps.map((step, idx) => (
+                <div
+                  key={step.id}
                   style={{
-                      borderRadius: 999,
-                      padding: "12px 16px",
-                      background: "rgba(255,255,255,0.08)",
-                      border: "1px solid rgba(255,255,255,0.14)",
-                      color: "#d9e3f2",
-                      fontSize: 13,
-                      fontWeight: 700,
+                    padding: "48px 36px",
+                    borderLeft: idx > 0 ? `1px solid ${C.border}` : "none",
+                    position: "relative",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 48, height: 48, borderRadius: "50%",
+                      background: "rgba(184,154,94,0.1)",
+                      border: `1px solid rgba(184,154,94,0.25)`,
+                      display: "grid", placeItems: "center",
+                      color: C.gold, fontSize: 14, marginBottom: 24,
                     }}
                   >
-                    Checking session...
-                  </span>
-                ) : isLoggedIn ? (
-                  <>
-                    <Link
-                      href={dashboardHref}
-                      style={{
-                        borderRadius: 999,
-                        padding: "12px 18px",
-                        background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                        color: "#f8fafc",
-                        fontWeight: 800,
-                        boxShadow: "0 14px 30px rgba(79,115,170,0.28)",
-                      }}
-                    >
-                      {resolvingDashboard ? "Locating Dashboard..." : "Open Dashboard"}
-                    </Link>
-                    <Link
-                      href="/join"
-                      style={{
-                        borderRadius: 999,
-                        padding: "12px 18px",
-                        border: "1px solid rgba(255,255,255,0.14)",
-                        background: "rgba(255,255,255,0.08)",
-                        color: "#d9e3f2",
-                        fontWeight: 700,
-                        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)",
-                      }}
-                    >
-                      Join Team
-                    </Link>
-                  </>
+                    {step.id}
+                  </div>
+                  <h3 style={{ margin: "0 0 12px", fontSize: "1.1rem", fontWeight: 700, color: C.charcoal, letterSpacing: "-0.02em" }}>
+                    {step.title}
+                  </h3>
+                  <p style={{ margin: 0, fontSize: "0.92rem", lineHeight: 1.75, color: C.mid }}>
+                    {step.desc}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* ── PRODUCT PREVIEW ────────────────────────────────────────────── */}
+        <section id="churches" style={{ background: C.cream, padding: "100px 0" }}>
+          <div style={container}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 80, alignItems: "center" }}>
+              {/* callouts left */}
+              <div>
+                <Eyebrow>Host console</Eyebrow>
+                <GoldDivider />
+                <SectionTitle>A host console built for live worship.</SectionTitle>
+                <p style={{ margin: "20px 0 40px", fontSize: "1rem", lineHeight: 1.75, color: C.mid }}>
+                  Keep the service calm and organized while the translation runs in the background.
+                </p>
+                <div style={{ display: "grid", gap: 16 }}>
+                  {[
+                    "Start once for the whole service",
+                    "Monitor translated output live",
+                    "Share listener access in seconds",
+                    "Reuse recurring service settings",
+                  ].map((item) => (
+                    <div key={item} style={{ display: "flex", gap: 14, alignItems: "start" }}>
+                      <div style={{ width: 20, height: 20, flexShrink: 0, marginTop: 2, borderRadius: "50%", background: "rgba(184,154,94,0.15)", border: `1px solid rgba(184,154,94,0.3)`, display: "grid", placeItems: "center" }}>
+                        <svg width="8" height="6" viewBox="0 0 8 6" fill="none"><path d="M1 3l2 2 4-4" stroke={C.gold} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                      </div>
+                      <p style={{ margin: 0, fontSize: "0.92rem", color: C.charcoal, lineHeight: 1.6 }}>{item}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* mockup right */}
+              <div style={{ background: C.navy, borderRadius: 16, padding: 24, boxShadow: "0 40px 80px rgba(15,31,61,0.2)" }}>
+                <ProductMockup isLoggedIn={isLoggedIn} dashboardHref={dashboardHref} resolvingDashboard={resolvingDashboard} />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ── BENEFITS ───────────────────────────────────────────────────── */}
+        <section style={{ background: C.white, padding: "100px 0" }}>
+          <div style={container}>
+            <div style={{ marginBottom: 64 }}>
+              <Eyebrow>Why it works</Eyebrow>
+              <GoldDivider />
+              <SectionTitle>Simple for the host. Clear for the listener.<br />Built for worship.</SectionTitle>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 300px), 1fr))", gap: 1, border: `1px solid ${C.border}` }}>
+              {benefits.map((b, idx) => (
+                <div
+                  key={b.title}
+                  style={{
+                    padding: "36px 32px",
+                    borderRight: (idx % 3 !== 2) ? `1px solid ${C.border}` : "none",
+                    borderBottom: idx < 3 ? `1px solid ${C.border}` : "none",
+                  }}
+                >
+                  <h3 style={{ margin: "0 0 12px", fontSize: "1rem", fontWeight: 700, color: C.charcoal }}>
+                    {b.title}
+                  </h3>
+                  <p style={{ margin: 0, fontSize: "0.9rem", lineHeight: 1.75, color: C.mid }}>
+                    {b.desc}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* ── CHURCH SCENARIOS ───────────────────────────────────────────── */}
+        <section style={{ background: C.cream, padding: "100px 0" }}>
+          <div style={container}>
+            <div style={{ textAlign: "center", marginBottom: 64 }}>
+              <Eyebrow>Real church use</Eyebrow>
+              <GoldDivider />
+              <div style={{ width: 40, height: 1, background: C.gold, margin: "0 auto 20px" }} />
+              <SectionTitle>Designed for the way churches actually serve people.</SectionTitle>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: 24 }}>
+              {scenarios.map((s) => (
+                <div
+                  key={s.title}
+                  style={{
+                    padding: "40px 32px",
+                    background: C.white,
+                    border: `1px solid ${C.border}`,
+                    borderTop: `3px solid ${C.gold}`,
+                  }}
+                >
+                  <h3 style={{ margin: "0 0 14px", fontSize: "1.05rem", fontWeight: 700, color: C.charcoal }}>
+                    {s.title}
+                  </h3>
+                  <p style={{ margin: 0, fontSize: "0.92rem", lineHeight: 1.75, color: C.mid }}>
+                    {s.desc}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* ── TRUST ──────────────────────────────────────────────────────── */}
+        <section style={{ background: C.navy, padding: "80px 0" }}>
+          <div style={{ ...container, textAlign: "center" }}>
+            <Eyebrow>Dependable</Eyebrow>
+            <GoldDivider />
+            <div style={{ width: 40, height: 1, background: C.gold, margin: "0 auto 20px" }} />
+            <h2
+              style={{
+                margin: "0 0 20px",
+                fontFamily: "'Cormorant Garamond', Georgia, serif",
+                fontSize: "clamp(1.8rem, 3vw, 2.6rem)",
+                fontWeight: 300,
+                color: C.white,
+              }}
+            >
+              Calm, dependable service-day workflow.
+            </h2>
+            <p style={{ margin: "0 auto", maxWidth: 560, fontSize: "1rem", color: "rgba(255,255,255,0.5)", lineHeight: 1.75 }}>
+              From setup to live service, the experience stays simple and repeatable.
+            </p>
+            <div style={{ marginTop: 48, display: "flex", justifyContent: "center", flexWrap: "wrap", gap: 0, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
+              {[
+                ["Start in minutes", "No waiting, no configuration marathon."],
+                ["No complicated listener setup", "Scan a QR, follow along. That's it."],
+                ["Repeatable every Sunday", "Same setup, same structure, every week."],
+                ["Built for real services", "Not a demo product — built for live worship."],
+              ].map(([title, desc]) => (
+                <div
+                  key={title}
+                  style={{
+                    flex: "1 1 220px",
+                    padding: "36px 28px",
+                    borderRight: "1px solid rgba(255,255,255,0.08)",
+                    borderBottom: "1px solid rgba(255,255,255,0.08)",
+                    textAlign: "left",
+                  }}
+                >
+                  <div style={{ width: 24, height: 1, background: C.gold, marginBottom: 16 }} />
+                  <p style={{ margin: "0 0 8px", fontSize: "0.95rem", fontWeight: 700, color: C.cream }}>{title}</p>
+                  <p style={{ margin: 0, fontSize: "0.85rem", color: "rgba(255,255,255,0.4)", lineHeight: 1.65 }}>{desc}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* ── DEMO VIDEO ─────────────────────────────────────────────────── */}
+        <section id="demo" style={{ background: C.white, padding: "100px 0" }}>
+          <div style={container}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 80, alignItems: "center" }}>
+              <div>
+                <Eyebrow>See it in action</Eyebrow>
+                <GoldDivider />
+                <SectionTitle>See the full host-to-listener flow.</SectionTitle>
+                <div style={{ marginTop: 40, display: "grid", gap: 20 }}>
+                  {[
+                    ["Start the service", "Open the host dashboard and choose a service slot."],
+                    ["Show the QR", "Listeners scan to join — no login required."],
+                    ["Watch translation appear live", "Captions update in real time as the speaker continues."],
+                  ].map(([title, desc]) => (
+                    <div key={title} style={{ display: "flex", gap: 16, alignItems: "start" }}>
+                      <div style={{ width: 28, height: 28, flexShrink: 0, borderRadius: "50%", background: "rgba(184,154,94,0.1)", border: `1px solid rgba(184,154,94,0.25)`, display: "grid", placeItems: "center" }}>
+                        <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.gold }} />
+                      </div>
+                      <div>
+                        <p style={{ margin: "0 0 4px", fontSize: "0.92rem", fontWeight: 700, color: C.charcoal }}>{title}</p>
+                        <p style={{ margin: 0, fontSize: "0.88rem", color: C.mid, lineHeight: 1.6 }}>{desc}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                {embedVideoUrl ? (
+                  <div style={{ position: "relative", width: "100%", paddingTop: "56.25%", borderRadius: 8, overflow: "hidden", boxShadow: "0 24px 60px rgba(0,0,0,0.12)", border: `1px solid ${C.border}` }}>
+                    <iframe
+                      src={embedVideoUrl}
+                      title="Worship Translation demo"
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                      style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: "none" }}
+                    />
+                  </div>
                 ) : (
-                  <>
-                    <Link
-                      href="/contact"
-                      style={{
-                        borderRadius: 999,
-                        padding: "12px 18px",
-                        background: "rgba(255,255,255,0.08)",
-                        border: "1px solid rgba(255,255,255,0.14)",
-                        color: "#d9e3f2",
-                        fontWeight: 700,
-                      }}
-                    >
-                      Contact Us
-                    </Link>
-                    <Link
-                      href="/c/demo/s/sun-11am"
-                      style={{
-                        borderRadius: 999,
-                        padding: "12px 18px",
-                        background: "rgba(255,255,255,0.08)",
-                        border: "1px solid rgba(255,255,255,0.14)",
-                        color: "#d9e3f2",
-                        fontWeight: 700,
-                      }}
-                    >
-                      Listener Demo
-                    </Link>
-                    <Link
-                      href="/login"
-                      style={{
-                        borderRadius: 999,
-                        padding: "12px 18px",
-                        background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                        color: "#f8fafc",
-                        fontWeight: 800,
-                        boxShadow: "0 14px 30px rgba(79,115,170,0.28)",
-                      }}
-                    >
-                      Host Login
-                    </Link>
-                  </>
+                  <div
+                    style={{
+                      aspectRatio: "16/9",
+                      background: C.cream,
+                      border: `1px solid ${C.border}`,
+                      borderRadius: 8,
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 12,
+                    }}
+                  >
+                    <div style={{ width: 56, height: 56, borderRadius: "50%", background: "rgba(184,154,94,0.1)", border: `1px solid rgba(184,154,94,0.25)`, display: "grid", placeItems: "center" }}>
+                      <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M6 4l9 5-9 5V4z" fill={C.gold}/></svg>
+                    </div>
+                    <p style={{ margin: 0, fontSize: "0.82rem", color: C.mid, textAlign: "center", lineHeight: 1.6 }}>
+                      Set <code style={{ fontSize: "0.78rem", background: C.border, padding: "2px 6px", borderRadius: 3 }}>NEXT_PUBLIC_HOW_IT_WORKS_VIDEO_URL</code>
+                    </p>
+                  </div>
                 )}
               </div>
             </div>
-          </header>
-
-          <section
-            style={{
-              display: "grid",
-              gap: 22,
-              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
-              alignItems: "stretch",
-            }}
-          >
-            <article
-              style={{
-                ...glassCardStyle,
-                borderRadius: 34,
-                padding: "30px 28px",
-                display: "grid",
-                gap: 22,
-              }}
-            >
-              <div style={{ display: "grid", gap: 12 }}>
-                <p
-                  style={{
-                    margin: 0,
-                    color: "#7386a2",
-                    fontSize: 12,
-                    fontWeight: 800,
-                    letterSpacing: "0.26em",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  Live Multilingual Worship
-                </p>
-                <h2
-                  style={{
-                    margin: 0,
-                    fontSize: "clamp(34px, 6vw, 60px)",
-                    lineHeight: 0.96,
-                    letterSpacing: "-0.06em",
-                    fontWeight: 800,
-                    maxWidth: 620,
-                  }}
-                >
-                  Broadcast live translation without making the service feel technical.
-                </h2>
-                <p style={{ margin: 0, fontSize: 17, lineHeight: 1.7, color: "#50627c", maxWidth: 620 }}>
-                  Hosts start the room once, listeners join by QR, and translated captions keep moving while the speaker stays focused on the sermon.
-                </p>
-              </div>
-
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
-                {authLoading ? (
-                  <span style={{ fontSize: 14, color: "#5f6f86", fontWeight: 700 }}>Checking your session...</span>
-                ) : isLoggedIn && resolvingDashboard ? (
-                  <span style={{ fontSize: 14, color: "#5f6f86", fontWeight: 700 }}>Locating your dashboard...</span>
-                ) : isLoggedIn ? (
-                  <Link
-                    href={dashboardHref}
-                    style={{
-                      borderRadius: 999,
-                      background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                      color: "#f8fafc",
-                      fontWeight: 800,
-                      padding: "14px 20px",
-                      boxShadow: "0 16px 34px rgba(79,115,170,0.24)",
-                      display:"flex",
-                      alignItems: "center"
-                    }}
-                  >
-                    Continue To Dashboard
-                  </Link>
-                ) : (
-                  <>
-                    <Link
-                      href="/signup"
-                      style={{
-                        borderRadius: 999,
-                        background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                        color: "#f8fafc",
-                        fontWeight: 800,
-                        padding: "14px 20px",
-                        boxShadow: "0 16px 34px rgba(79,115,170,0.24)",
-                        display:"flex",
-                        alignItems: "center"
-                      }}
-                    >
-                      Start Free Trial
-                    </Link>
-                    <Link
-                      href="/c/demo/s/sun-11am"
-                      style={{
-                        borderRadius: 999,
-                        border: "1px solid rgba(189,200,217,0.94)",
-                        background: "rgba(247,250,253,0.84)",
-                        color: "#42556f",
-                        fontWeight: 700,
-                        padding: "14px 20px",
-                        display:"flex",
-                        alignItems: "center"
-                      }}
-                    >
-                      Try Listener Demo
-                    </Link>
-                  </>
-                )}
-              </div>
-
-              <div
-                style={{
-                  display: "grid",
-                  gap: 12,
-                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))",
-                }}
-              >
-                {landingStats.map((stat) => (
-                  <div
-                    key={stat.label}
-                    style={{
-                      ...glassInnerCardStyle,
-                      borderRadius: 22,
-                      padding: "16px 18px",
-                    }}
-                  >
-                    <p style={{ margin: 0, fontSize: 28, fontWeight: 800, letterSpacing: "-0.05em" }}>{stat.value}</p>
-                    <p style={{ margin: "4px 0 0", fontSize: 13, color: "#667791" }}>{stat.label}</p>
-                  </div>
-                ))}
-              </div>
-            </article>
-
-            <article
-              style={{
-                ...glassCardStyle,
-                borderRadius: 34,
-                padding: "24px 22px",
-                display: "grid",
-                gap: 18,
-                minHeight: 430,
-              }}
-            >
-              <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-                <div>
-                  <p style={{ margin: 0, fontSize: 12, color: "#7386a2", fontWeight: 800, letterSpacing: "0.22em", textTransform: "uppercase" }}>
-                    Studio Preview
-                  </p>
-                  <h3 style={{ margin: "8px 0 0", fontSize: 30, lineHeight: 1, letterSpacing: "-0.05em" }}>Broadcast control, translated output, listener-ready.</h3>
-                </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <span style={{ borderRadius: 999, padding: "8px 12px", background: "rgba(124,187,160,0.14)", color: "#3b7d5c", fontSize: 12, fontWeight: 700 }}>
-                    Connected
-                  </span>
-                  <span style={{ borderRadius: 999, padding: "8px 12px", background: "rgba(255,255,255,0.6)", color: "#61748e", fontSize: 12, fontWeight: 700 }}>
-                    English Output
-                  </span>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  display: "grid",
-                  gap: 14,
-                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 250px), 1fr))",
-                  alignItems: "stretch",
-                  flex: 1,
-                }}
-              >
-                <div
-                  style={{
-                    ...glassInnerCardStyle,
-                    borderRadius: 26,
-                    padding: 18,
-                    display: "grid",
-                    gap: 16,
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-                    <div>
-                      <p style={{ margin: 0, fontSize: 11, color: "#7c8ba3", letterSpacing: "0.22em", textTransform: "uppercase", fontWeight: 800 }}>
-                        Live Audio Stream
-                      </p>
-                      <p style={{ margin: "6px 0 0", fontSize: 14, color: "#23354d", fontWeight: 700 }}>KR Korean</p>
-                    </div>
-                    <div style={{ display: "flex", alignItems: "end", gap: 5, height: 28 }}>
-                      {[0.3, 0.72, 0.46, 0.88, 0.5].map((height, index) => (
-                        <span
-                          key={index}
-                          style={{
-                            width: 6,
-                            height: `${Math.round(28 * height)}px`,
-                            borderRadius: 999,
-                            background: index === 2 ? "#4f73aa" : "#c2cfdf",
-                          }}
-                        />
-                      ))}
-                    </div>
-                  </div>
-
-                  <div
-                    style={{
-                      ...glassInnerCardStyle,
-                      borderRadius: 20,
-                      minHeight: 150,
-                      padding: 18,
-                    }}
-                  >
-                    <p style={{ margin: 0, color: "#8696ad", fontSize: 14 }}>
-                      Listening to the speaker in Korean...
-                    </p>
-                  </div>
-
-                  <div
-                    style={{
-                      borderRadius: 18,
-                      background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                      color: "#f8fafc",
-                      textAlign: "center",
-                      fontSize: 13,
-                      fontWeight: 800,
-                      letterSpacing: "0.24em",
-                      textTransform: "uppercase",
-                      padding: "14px 16px",
-                      boxShadow: "0 16px 32px rgba(79,115,170,0.22)",
-                      display:"flex",
-                      alignItems: "center",
-                      justifyContent: "center"
-                    }}
-                  >
-                    Start Translation
-                  </div>
-                </div>
-
-                <div style={{ display: "grid", gap: 14 }}>
-                  <div
-                    style={{
-                      ...glassInnerCardStyle,
-                      borderRadius: 24,
-                      padding: 18,
-                      display: "grid",
-                      gap: 10,
-                    }}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                      <div>
-                        <p style={{ margin: 0, fontSize: 11, color: "#7c8ba3", letterSpacing: "0.22em", textTransform: "uppercase", fontWeight: 800 }}>
-                          Translation Output
-                        </p>
-                        <p style={{ margin: "6px 0 0", fontSize: 14, color: "#23354d", fontWeight: 700 }}>US English</p>
-                      </div>
-                      <span style={{ borderRadius: 999, padding: "7px 10px", background: "rgba(233,222,177,0.46)", color: "#7e6332", fontSize: 11, fontWeight: 800 }}>
-                        Broadcast Ready
-                      </span>
-                    </div>
-                    <p style={{ margin: "10px 0 0", fontSize: 26, lineHeight: 1.15, fontWeight: 700, color: "#1b2a40", letterSpacing: "-0.04em" }}>
-                      The message is delivered with clarity and stays easy to follow.
-                    </p>
-                  </div>
-
-                  <div
-                    style={{
-                      ...glassInnerCardStyle,
-                      borderRadius: 24,
-                      padding: 18,
-                      display: "grid",
-                      gap: 10,
-                    }}
-                  >
-                    <p style={{ margin: 0, fontSize: 11, color: "#7c8ba3", letterSpacing: "0.22em", textTransform: "uppercase", fontWeight: 800 }}>
-                      Broadcast Output
-                    </p>
-                    <p style={{ margin: 0, fontSize: 14, color: "#5f6f86", lineHeight: 1.7 }}>
-                      Stage and listener display feeds stay in sync while the speaker keeps moving through the service.
-                    </p>
-                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      <span style={{ borderRadius: 999, background: "rgba(247,250,253,0.82)", padding: "7px 10px", fontSize: 12, color: "#50627c", fontWeight: 700 }}>
-                        QR access
-                      </span>
-                      <span style={{ borderRadius: 999, background: "rgba(247,250,253,0.82)", padding: "7px 10px", fontSize: 12, color: "#50627c", fontWeight: 700 }}>
-                        Listener URL
-                      </span>
-                      <span style={{ borderRadius: 999, background: "rgba(247,250,253,0.82)", padding: "7px 10px", fontSize: 12, color: "#50627c", fontWeight: 700 }}>
-                        Live room status
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </article>
-          </section>
-
-          <section style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))" }}>
-            {quickLinks.map((card) => (
-              <article
-                key={card.title}
-                style={{
-                  ...glassCardStyle,
-                  borderRadius: 24,
-                  padding: 18,
-                  display: "grid",
-                  gap: 12,
-                }}
-              >
-                <div style={{ width: 56, height: 6, borderRadius: 999, background: card.accent }} />
-                <h2 style={{ margin: 0, fontSize: 21, letterSpacing: "-0.04em" }}>{card.title}</h2>
-                <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>{card.desc}</p>
-                <Link
-                  href={card.href}
-                  style={{
-                    marginTop: 6,
-                    justifySelf: "start",
-                    borderRadius: 999,
-                    padding: "11px 16px",
-                    background: "linear-gradient(180deg, rgba(255,255,255,0.5) 0%, rgba(236,242,249,0.28) 100%)",
-                    border: "1px solid rgba(255,255,255,0.48)",
-                    color: "#33465f",
-                    fontSize: 13,
-                    fontWeight: 800,
-                    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.48), 0 10px 18px rgba(100,119,149,0.08)",
-                  }}
-                >
-                  {card.cta}
-                </Link>
-              </article>
-            ))}
-          </section>
-
-          <p style={{ margin: "-4px 0 0", textAlign: "center", fontSize: 14, color: "#5d6d84" }}>
-            Need help before you start?{" "}
-            <Link href="/contact" style={{ color: "#3f6093", fontWeight: 700 }}>
-              Contact support
-            </Link>
-            .
-          </p>
-
-          <section
-            style={{
-              display: "grid",
-              gap: 18,
-              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
-            }}
-          >
-            <article
-              style={{
-                ...glassCardStyle,
-                borderRadius: 30,
-                padding: 22,
-                display: "grid",
-                gap: 16,
-              }}
-            >
-              <div
-                style={{
-                  ...glassInnerCardStyle,
-                  borderRadius: 20,
-                  padding: "14px 16px",
-                  background: "linear-gradient(180deg, rgba(246,239,227,0.62) 0%, rgba(236,227,209,0.34) 100%)",
-                  border: "1px solid rgba(204,218,238,0.92)",
-                }}
-              >
-                <p style={{ margin: 0, fontSize: 11, color: "#7386a2", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
-                  How It Works
-                </p>
-                <h2 style={{ margin: "10px 0 0", fontSize: 30, lineHeight: 1.05, letterSpacing: "-0.05em" }}>
-                  Host workflow. Clear listener experience.
-                </h2>
-              </div>
-              <div style={{ display: "grid", gap: 14 }}>
-                {workflowSteps.map((step) => (
-                  <div
-                    key={step.id}
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "auto minmax(0, 1fr)",
-                      gap: 14,
-                      alignItems: "start",
-                      padding: "14px 0",
-                      borderTop: step.id === "01" ? "none" : "1px solid rgba(210,220,232,0.88)",
-                    }}
-                  >
-                    <span
-                      style={{
-                        width: 42,
-                        height: 42,
-                        borderRadius: 14,
-                        display: "grid",
-                        placeItems: "center",
-                        background: "rgba(79,115,170,0.1)",
-                        color: "#4f73aa",
-                        fontWeight: 800,
-                        fontSize: 12,
-                      }}
-                    >
-                      {step.id}
-                    </span>
-                    <div>
-                      <p style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#22344c" }}>{step.title}</p>
-                      <p style={{ margin: "6px 0 0", fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>{step.desc}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div style={{ display: "grid", gap: 8, fontSize: 14, color: "#50627c" }}>
-                <p style={{ margin: 0 }}>
-                  1. Create church with <code>/signup</code> or sign in at <code>/login</code>.
-                </p>
-                <p style={{ margin: 0 }}>
-                  2. Hosts land at <code>/host/c/&lt;churchSlug&gt;/broadcast</code>.
-                </p>
-                <p style={{ margin: 0 }}>
-                  3. Listeners open <code>/c/&lt;churchSlug&gt;/s/&lt;serviceKey&gt;</code>.
-                </p>
-              </div>
-            </article>
-
-            <article
-              style={{
-                ...glassCardStyle,
-                borderRadius: 30,
-                padding: 22,
-                display: "grid",
-                gap: 16,
-              }}
-            >
-              <div
-                style={{
-                  ...glassInnerCardStyle,
-                  borderRadius: 20,
-                  padding: "14px 16px",
-                  background: "linear-gradient(180deg, rgba(246,239,227,0.62) 0%, rgba(236,227,209,0.34) 100%)",
-                  border: "1px solid rgba(225,214,191,0.92)",
-                }}
-              >
-                <p style={{ margin: 0, fontSize: 11, color: "#7386a2", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
-                  Demo Video
-                </p>
-                <h2 style={{ margin: "10px 0 0", fontSize: 30, lineHeight: 1.05, letterSpacing: "-0.05em" }}>
-                  Watch the full host-to-listener flow.
-                </h2>
-              </div>
-              {embedVideoUrl ? (
-                <div
-                  style={{
-                    position: "relative",
-                    width: "100%",
-                    paddingTop: "56.25%",
-                    borderRadius: 24,
-                    overflow: "hidden",
-                    border: "1px solid rgba(255,255,255,0.84)",
-                    boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.26)",
-                  }}
-                >
-                  <iframe
-                    src={embedVideoUrl}
-                    title="Yebon demo video"
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                    allowFullScreen
-                    style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: "none" }}
-                  />
-                </div>
-              ) : (
-                <div
-                  style={{
-                    borderRadius: 22,
-                    border: "1px dashed rgba(189,200,217,0.96)",
-                    background: "rgba(247,250,253,0.72)",
-                    padding: 16,
-                    fontSize: 14,
-                    color: "#5d6d84",
-                    lineHeight: 1.7,
-                  }}
-                >
-                  Add <code>NEXT_PUBLIC_HOW_IT_WORKS_VIDEO_URL</code> in <code>frontend/.env.local</code> with a Loom or YouTube URL.
-                </div>
-              )}
-              <div style={{ display: "grid", gap: 12 }}>
-                {productNotes.map((note) => (
-                  <div
-                    key={note.title}
-                    style={{
-                      borderRadius: 18,
-                      background: "rgba(255,255,255,0.56)",
-                      border: "1px solid rgba(219,227,238,0.9)",
-                      padding: "14px 16px",
-                    }}
-                  >
-                    <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#22344c" }}>{note.title}</p>
-                    <p style={{ margin: "6px 0 0", fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>{note.desc}</p>
-                  </div>
-                ))}
-              </div>
-            </article>
-          </section>
+          </div>
         </section>
+
+        {/* ── PRICING ────────────────────────────────────────────────────── */}
+        <section id="pricing" style={{ background: C.cream, padding: "100px 0" }}>
+          <div style={container}>
+            <div style={{ textAlign: "center", marginBottom: 64 }}>
+              <Eyebrow>Pricing</Eyebrow>
+              <GoldDivider />
+              <div style={{ width: 40, height: 1, background: C.gold, margin: "0 auto 20px" }} />
+              <SectionTitle>Start free. Scale when you&rsquo;re ready.</SectionTitle>
+              <p style={{ margin: "16px auto 0", maxWidth: 480, fontSize: "1rem", color: C.mid }}>
+                The free trial includes everything you need to run your first live service.
+              </p>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: 24, alignItems: "stretch" }}>
+              {pricingPlans.map((plan) => (
+                <div
+                  key={plan.name}
+                  style={{
+                    padding: "40px 32px",
+                    background: plan.highlight ? C.navy : C.white,
+                    border: plan.highlight ? "none" : `1px solid ${C.border}`,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 24,
+                    position: "relative",
+                  }}
+                >
+                  {plan.highlight && (
+                    <div style={{ position: "absolute", top: -1, left: 32, right: 32, height: 3, background: C.gold }} />
+                  )}
+                  <div>
+                    <p style={{ margin: "0 0 8px", fontSize: "0.75rem", letterSpacing: "0.18em", textTransform: "uppercase", color: plan.highlight ? C.goldLight : C.gold }}>
+                      {plan.name}
+                    </p>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+                      <span style={{ fontSize: "2.4rem", fontWeight: 700, letterSpacing: "-0.04em", color: plan.highlight ? C.white : C.charcoal, fontFamily: "'Cormorant Garamond', serif" }}>
+                        {plan.price}
+                      </span>
+                      {plan.period && <span style={{ fontSize: "0.9rem", color: plan.highlight ? "rgba(255,255,255,0.4)" : C.mid }}>{plan.period}</span>}
+                    </div>
+                  </div>
+
+                  <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "grid", gap: 10, flex: 1 }}>
+                    {plan.features.map((f) => (
+                      <li key={f} style={{ display: "flex", gap: 10, alignItems: "start", fontSize: "0.88rem", color: plan.highlight ? "rgba(255,255,255,0.7)" : C.mid }}>
+                        <span style={{ color: plan.highlight ? C.goldLight : C.gold, flexShrink: 0 }}>·</span>
+                        {f}
+                      </li>
+                    ))}
+                  </ul>
+
+                  <Link
+                    href={plan.href}
+                    style={{
+                      padding: "13px 24px",
+                      textAlign: "center",
+                      fontSize: "0.8rem",
+                      fontWeight: 700,
+                      letterSpacing: "0.1em",
+                      textTransform: "uppercase",
+                      borderRadius: 4,
+                      background: plan.highlight ? C.gold : "transparent",
+                      color: plan.highlight ? C.white : C.charcoal,
+                      border: plan.highlight ? "none" : `1px solid ${C.border}`,
+                      transition: "background 0.2s",
+                    }}
+                  >
+                    {plan.cta}
+                  </Link>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* ── FAQ ────────────────────────────────────────────────────────── */}
+        <section style={{ background: C.white, padding: "100px 0" }}>
+          <div style={{ ...container, maxWidth: 720 }}>
+            <div style={{ marginBottom: 64 }}>
+              <Eyebrow>Common questions</Eyebrow>
+              <GoldDivider />
+              <SectionTitle>Everything you need to know.</SectionTitle>
+            </div>
+            <div style={{ borderTop: `1px solid ${C.border}` }}>
+              {faqs.map((faq) => <FAQItem key={faq.q} q={faq.q} a={faq.a} />)}
+            </div>
+          </div>
+        </section>
+
+        {/* ── FINAL CTA ──────────────────────────────────────────────────── */}
+        <section
+          style={{
+            background: `linear-gradient(160deg, #0a1628 0%, ${C.navy} 100%)`,
+            padding: "120px 0",
+            textAlign: "center",
+            position: "relative",
+            overflow: "hidden",
+          }}
+        >
+          <div aria-hidden style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", width: 600, height: 400, background: "radial-gradient(ellipse, rgba(184,154,94,0.08) 0%, transparent 70%)", pointerEvents: "none" }} />
+          <div style={container}>
+            <Eyebrow>Get started today</Eyebrow>
+            <GoldDivider />
+            <div style={{ width: 40, height: 1, background: C.gold, margin: "0 auto 20px" }} />
+            <h2
+              style={{
+                margin: "0 auto 20px",
+                maxWidth: 640,
+                fontFamily: "'Cormorant Garamond', Georgia, serif",
+                fontSize: "clamp(2rem, 4vw, 3.2rem)",
+                fontWeight: 300,
+                lineHeight: 1.1,
+                color: C.white,
+              }}
+            >
+              Ready to try live worship translation in your church?
+            </h2>
+            <p style={{ margin: "0 auto 48px", maxWidth: 480, fontSize: "1rem", color: "rgba(255,255,255,0.5)", lineHeight: 1.75 }}>
+              Start a trial, test the host flow, and see how listeners follow the message live.
+            </p>
+            <div style={{ display: "flex", justifyContent: "center", gap: 16, flexWrap: "wrap" }}>
+              <Link
+                href={primaryCta.href}
+                style={{
+                  padding: "16px 36px",
+                  background: C.gold,
+                  color: C.white,
+                  fontSize: "0.82rem",
+                  fontWeight: 700,
+                  letterSpacing: "0.1em",
+                  textTransform: "uppercase",
+                  borderRadius: 4,
+                  boxShadow: "0 8px 32px rgba(184,154,94,0.25)",
+                }}
+              >
+                {primaryCta.label}
+              </Link>
+              <a
+                href="#demo"
+                style={{
+                  padding: "16px 36px",
+                  border: "1px solid rgba(255,255,255,0.18)",
+                  color: "rgba(255,255,255,0.72)",
+                  fontSize: "0.82rem",
+                  fontWeight: 500,
+                  letterSpacing: "0.1em",
+                  textTransform: "uppercase",
+                  borderRadius: 4,
+                }}
+              >
+                Watch Demo
+              </a>
+            </div>
+          </div>
+        </section>
+
+        {/* ── FOOTER ─────────────────────────────────────────────────────── */}
+        <footer style={{ background: "#080e1c", padding: "60px 0 40px" }}>
+          <div style={container}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 40, marginBottom: 48 }}>
+              <div>
+                <Link href="/" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                  <div style={{ width: 30, height: 30, borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", display: "grid", placeItems: "center", color: C.goldLight, fontSize: 14, fontWeight: 800, fontStyle: "italic" }}>
+                    W
+                  </div>
+                  <span style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: "1.1rem", fontWeight: 600, color: "rgba(255,255,255,0.7)" }}>
+                    Worship Translation
+                  </span>
+                </Link>
+                <p style={{ margin: 0, fontSize: "0.85rem", color: "rgba(255,255,255,0.3)", maxWidth: 280, lineHeight: 1.7 }}>
+                  Live translation for multilingual worship services.
+                </p>
+              </div>
+
+              <div style={{ display: "flex", gap: 48, flexWrap: "wrap" }}>
+                <div style={{ display: "grid", gap: 12, alignContent: "start" }}>
+                  <p style={{ margin: 0, fontSize: "0.72rem", letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.3)" }}>Product</p>
+                  {[["How It Works", "#how-it-works"], ["Pricing", "#pricing"], ["Demo", "#demo"]].map(([label, href]) => (
+                    <a key={label} href={href} style={{ fontSize: "0.85rem", color: "rgba(255,255,255,0.45)", transition: "color 0.2s" }}>{label}</a>
+                  ))}
+                </div>
+                <div style={{ display: "grid", gap: 12, alignContent: "start" }}>
+                  <p style={{ margin: 0, fontSize: "0.72rem", letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.3)" }}>Account</p>
+                  {[["Sign In", "/login"], ["Start Free Trial", "/signup"], ["Contact", "/contact"]].map(([label, href]) => (
+                    <Link key={label} href={href} style={{ fontSize: "0.85rem", color: "rgba(255,255,255,0.45)" }}>{label}</Link>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 28, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+              <p style={{ margin: 0, fontSize: "0.78rem", color: "rgba(255,255,255,0.2)" }}>
+                © {new Date().getFullYear()} Worship Translation. All rights reserved.
+              </p>
+              <div style={{ display: "flex", gap: 20 }}>
+                {[["Terms", "/terms"], ["Privacy", "/privacy"]].map(([label, href]) => (
+                  <Link key={label} href={href} style={{ fontSize: "0.78rem", color: "rgba(255,255,255,0.2)" }}>{label}</Link>
+                ))}
+              </div>
+            </div>
+          </div>
+        </footer>
       </main>
+
+      {/* responsive overrides */}
+      <style>{`
+        @media (max-width: 900px) {
+          #hero > div > div { grid-template-columns: 1fr !important; }
+          #hero > div > div > div:last-child { display: none; }
+          #churches > div > div { grid-template-columns: 1fr !important; }
+          #churches > div > div > div:last-child { display: none; }
+          #demo > div > div { grid-template-columns: 1fr !important; }
+          footer > div > div:first-child { grid-template-columns: 1fr !important; }
+        }
+        @media (max-width: 768px) {
+          .nav-desktop-links { display: none !important; }
+          .nav-mobile-toggle { display: block !important; }
+        }
+        a:hover { opacity: 0.85; }
+      `}</style>
     </>
   );
 }
