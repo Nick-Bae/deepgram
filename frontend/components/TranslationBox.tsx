@@ -1000,69 +1000,69 @@ export default function TranslationBox() {
     )
   })
   const shellStyle = {
-    background: 'linear-gradient(145deg, #eef3f8 0%, #dde6f0 100%)',
-    boxShadow: '0 32px 72px rgba(122, 138, 163, 0.2)',
+    background: '#ffffff',
+    boxShadow: '0 4px 24px rgba(15,31,61,0.07)',
+    border: '1px solid #e4ddd2',
   } as const
   const panelStyle = {
-    background: 'rgba(244, 247, 251, 0.68)',
-    boxShadow: '18px 18px 36px rgba(122, 138, 163, 0.16), -16px -16px 32px rgba(255, 255, 255, 0.8)',
+    background: '#f7f4ef',
+    boxShadow: 'none',
   } as const
   const insetStyle = {
-    background: 'rgba(250, 252, 255, 0.78)',
-    boxShadow: 'inset 5px 5px 12px rgba(122, 138, 163, 0.12), inset -5px -5px 12px rgba(255, 255, 255, 0.9)',
+    background: '#ffffff',
+    boxShadow: 'none',
   } as const
   const accentPanelStyle = {
-    background: 'linear-gradient(145deg, rgba(248,250,253,0.8) 0%, rgba(223,233,244,0.92) 100%)',
-    boxShadow: '16px 16px 34px rgba(122, 138, 163, 0.16), -16px -16px 34px rgba(255, 255, 255, 0.82)',
+    background: 'rgba(184,154,94,0.06)',
+    boxShadow: 'none',
   } as const
   const pillStyle = {
-    background: 'rgba(248, 250, 253, 0.8)',
-    boxShadow: '8px 8px 18px rgba(122, 138, 163, 0.14), -8px -8px 18px rgba(255, 255, 255, 0.82)',
+    background: '#ffffff',
+    boxShadow: 'none',
   } as const
   const primaryActionStyle = {
-    background: 'linear-gradient(145deg, #7fa5db 0%, #4f73aa 100%)',
-    boxShadow: '0 18px 36px rgba(79, 115, 170, 0.28)',
+    background: '#b89a5e',
+    boxShadow: '0 4px 16px rgba(184,154,94,0.3)',
   } as const
   const stopActionStyle = {
-    background: 'linear-gradient(145deg, #e38888 0%, #bc5f6f 100%)',
-    boxShadow: '0 18px 36px rgba(188, 95, 111, 0.22)',
+    background: '#9f3650',
+    boxShadow: '0 4px 16px rgba(159,54,80,0.25)',
   } as const
 
   return (
     <section className="w-full space-y-8 text-slate-800">
-      <div className="relative overflow-hidden rounded-3xl border border-white/80 px-6 py-6 md:px-8 md:py-8" style={shellStyle}>
+      <div className="relative overflow-hidden px-6 py-6 md:px-8 md:py-8" style={{ ...shellStyle, borderRadius: 12 }}>
         <div
-          className="pointer-events-none absolute inset-0 opacity-70"
-          style={{ background: 'radial-gradient(circle at 18% 18%, rgba(159, 184, 214, 0.22), transparent 42%)' }}
+          className="pointer-events-none absolute inset-0 opacity-60"
+          style={{ background: 'radial-gradient(circle at 18% 18%, rgba(184,154,94,0.08), transparent 42%)' }}
         />
-        <div className="pointer-events-none absolute -right-24 top-10 h-64 w-64 rounded-full bg-slate-200/70 blur-3xl" />
+        <div className="pointer-events-none absolute -right-24 top-10 h-64 w-64 rounded-full blur-3xl" style={{ background: 'rgba(184,154,94,0.06)' }} />
         <div className="relative space-y-6">
-          <header className="flex flex-wrap items-center justify-between gap-6 border-b border-slate-200/80 pb-6">
+          <header className="flex flex-wrap items-center justify-between gap-6 border-b border-[#e4ddd2] pb-6">
             <div>
-              <p className="flex items-center gap-2 text-xs font-black uppercase tracking-[0.35em] text-[#5c7698]">
-                <span className={`inline-flex h-2 w-2 rounded-full ${isBroadcasting ? 'bg-[#6f87a6] animate-pulse' : 'bg-slate-400'}`} />
+              <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.28em] text-[#b89a5e]">
+                <span className={`inline-flex h-2 w-2 rounded-full ${isBroadcasting ? 'bg-[#b89a5e] animate-pulse' : 'bg-[#c8bfb0]'}`} />
                 Live
               </p>
-              <h2 className="mt-2 text-2xl font-black leading-tight text-slate-900 md:text-3xl">Real-Time Sermon Translation</h2>
-              <p className="text-sm text-slate-500">Monitor, refine, and broadcast translations without leaving this console.</p>
+              <h2 className="mt-2 font-semibold leading-tight text-[#0f1f3d]" style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: 'clamp(22px,2.6vw,30px)' }}>Real-Time Sermon Translation</h2>
+              <p className="text-sm text-[#5a5a52]">Monitor, refine, and broadcast translations without leaving this console.</p>
             </div>
             <div className="flex flex-col items-start gap-3 text-sm md:flex-row md:items-center md:gap-4">
-              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 ${socketStatusClasses}`} style={pillStyle}>
+              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${socketStatusClasses}`} style={pillStyle}>
                 <span className={`h-2 w-2 rounded-full ${socketDotClasses}`} />
                 Producer socket · {socketStatusLabel}
               </span>
               <span
-                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 ${
+                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${
                   status === 'streaming'
-                    ? 'border-sky-200 bg-sky-50/80 text-sky-700'
-                    : 'border-slate-200 bg-white/70 text-slate-500'
+                    ? 'border-emerald-200 bg-emerald-50/80 text-emerald-700'
+                    : 'border-[#e4ddd2] bg-white text-[#5a5a52]'
                 }`}
-                style={pillStyle}
               >
-                <span className={`h-2 w-2 rounded-full ${status === 'streaming' ? 'bg-sky-500 animate-pulse' : 'bg-slate-400'}`} />
+                <span className={`h-2 w-2 rounded-full ${status === 'streaming' ? 'bg-emerald-500 animate-pulse' : 'bg-[#c8bfb0]'}`} />
                 Deepgram · {status}
               </span>
-              <span className="inline-flex items-center gap-2 rounded-full border border-white/80 px-3 py-1.5 text-slate-600" style={pillStyle}>
+              <span className="inline-flex items-center gap-2 rounded-full border border-[#e4ddd2] bg-white px-3 py-1.5 text-xs font-semibold text-[#5a5a52]">
                 Latency · {latencyLabel}
               </span>
             </div>
@@ -1075,8 +1075,8 @@ export default function TranslationBox() {
           )}
 
           <div className="grid gap-6 md:grid-cols-2">
-            <div className="flex flex-col gap-2 rounded-[1.75rem] border border-white/80 px-4 py-4" style={panelStyle}>
-              <label className="text-xs font-black uppercase tracking-[0.28em] text-slate-400">Source Language</label>
+            <div className="flex flex-col gap-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
+              <label className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Source Language</label>
               <div className="mt-3 flex items-center gap-3">
                 <span className="text-lg leading-none" style={{ display: 'flex', alignItems: 'center', lineHeight: 1 }}>{languageFlag(sourceLang)}</span>
                 <select
@@ -1088,8 +1088,8 @@ export default function TranslationBox() {
                 </select>
               </div>
             </div>
-            <div className="flex flex-col gap-2 rounded-[1.75rem] border border-white/80 px-4 py-4" style={panelStyle}>
-              <label className="text-xs font-black uppercase tracking-[0.28em] text-slate-400">Target Language</label>
+            <div className="flex flex-col gap-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
+              <label className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Target Language</label>
               <div className="mt-3 flex items-center gap-3">
                 <span className="text-lg leading-none" style={{ display: 'flex', alignItems: 'center', lineHeight: 1 }}>{languageFlag(targetLang)}</span>
                 <select
@@ -1105,14 +1105,14 @@ export default function TranslationBox() {
 
           <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
             <div className="space-y-6">
-              <div className="rounded-3xl border border-white/80 p-5 lg:p-6" style={panelStyle}>
+              <div className="rounded-xl border border-[#e4ddd2] p-5 lg:p-6" style={panelStyle}>
                 <div className="grid gap-6 lg:grid-cols-2">
                   <div className="space-y-4">
-                    <div className="space-y-4 rounded-[1.75rem] border border-white/80 p-5" style={insetStyle}>
+                    <div className="space-y-4 rounded-xl border border-[#e4ddd2] p-5" style={insetStyle}>
                       <div className="flex items-center justify-between gap-4">
                         <div>
-                          <p className="text-xs font-black uppercase tracking-[0.34em] text-slate-400">Live Audio Stream</p>
-                          <p className="mt-1 flex items-center gap-1.5 text-lg font-black text-slate-800"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(sourceLang)}</span><span>{sourceLabel}</span></p>
+                          <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Live Audio Stream</p>
+                          <p className="mt-1 flex items-center gap-1.5 text-base font-semibold text-[#0f1f3d]"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(sourceLang)}</span><span>{sourceLabel}</span></p>
                         </div>
                         <div className="flex items-center gap-3 text-sm text-slate-500">
                           <span className={`relative inline-flex h-11 w-11 items-center justify-center rounded-full border ${micActive ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-white/80 bg-white/60 text-slate-400'}`}>
@@ -1126,7 +1126,7 @@ export default function TranslationBox() {
                         value={text}
                         onChange={e => setText(e.target.value)}
                         placeholder="Listening to the speaker in Korean..."
-                        className="min-h-[170px] w-full resize-none rounded-2xl border border-white/80 bg-white/70 px-4 py-3 text-base text-slate-700 placeholder:text-slate-400 focus:border-slate-300 focus:outline-none"
+                        className="min-h-[170px] w-full resize-none rounded-lg border border-[#e4ddd2] bg-white px-4 py-3 text-base text-[#1c1c1c] placeholder:text-[#c8bfb0] focus:border-[#b89a5e] focus:outline-none"
                       />
                     </div>
 
@@ -1139,57 +1139,57 @@ export default function TranslationBox() {
                     </button>
                   </div>
 
-                  <div className="space-y-4 rounded-[1.75rem] border border-white/80 p-5 text-slate-800" style={accentPanelStyle}>
+                  <div className="space-y-4 rounded-xl border border-[#e4ddd2] p-5 text-[#1c1c1c]" style={accentPanelStyle}>
                     <div className="flex items-center justify-between">
                       <div>
-                        <p className="text-xs font-black uppercase tracking-[0.35em] text-[#5c7698]">Translation Output</p>
-                        <p className="flex items-center gap-1.5 text-lg font-black text-slate-900"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(targetLang)}</span><span>{targetLabel}</span></p>
+                        <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Translation Output</p>
+                        <p className="flex items-center gap-1.5 text-base font-semibold text-[#0f1f3d]"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(targetLang)}</span><span>{targetLabel}</span></p>
                       </div>
-                      <span className="rounded-full border border-[#b9c8d9] bg-white/65 px-3 py-1 text-xs font-black uppercase tracking-[0.22em] text-[#5c7698]" style={pillStyle}>Broadcast Ready</span>
+                      <span className="rounded-full border border-[#e4ddd2] bg-white px-3 py-1 text-xs font-bold uppercase tracking-[0.18em] text-[#b89a5e]">Broadcast Ready</span>
                     </div>
                     {failOpenMeta && (
                       <div className="rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2 text-sm font-medium text-amber-700" style={insetStyle}>
                         Translation temporarily unavailable. {failReasonLabel}
                       </div>
                     )}
-                    <p className={`min-h-[100px] max-h-[220px] overflow-y-auto whitespace-pre-wrap font-semibold leading-relaxed text-slate-900 ${translated.length > 120 ? 'text-base' : translated.length > 60 ? 'text-lg' : 'text-xl'}`}>
+                    <p className={`min-h-[100px] max-h-[220px] overflow-y-auto whitespace-pre-wrap font-medium leading-relaxed text-[#0f1f3d] ${translated.length > 120 ? 'text-base' : translated.length > 60 ? 'text-lg' : 'text-xl'}`}>
                       {translated || 'Waiting for the next sentence...'}
                     </p>
                     {scriptureMeta && (
-                      <div className="rounded-2xl border border-white/80 px-4 py-4 text-slate-700" style={insetStyle}>
+                      <div className="rounded-xl border border-[#e4ddd2] px-4 py-4 text-[#1c1c1c]" style={insetStyle}>
                         <div className="flex flex-wrap items-center justify-between gap-3">
                           <div>
-                            <p className="text-xs font-black uppercase tracking-[0.3em] text-slate-400">Scripture Reference</p>
-                            <p className="text-lg font-black text-slate-900" title={scriptureMeta.versionFull || undefined}>
+                            <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Scripture Reference</p>
+                            <p className="text-base font-semibold text-[#0f1f3d]" title={scriptureMeta.versionFull || undefined}>
                               {scriptureMeta.header}
                             </p>
                           </div>
-                          <span className="rounded-full border border-[#b9c8d9] bg-white/65 px-3 py-1 text-xs font-black uppercase tracking-[0.22em] text-[#5c7698]" style={pillStyle}>
+                          <span className="rounded-full border border-[#e4ddd2] bg-white px-3 py-1 text-xs font-bold uppercase tracking-[0.18em] text-[#b89a5e]">
                             Exact Verse
                           </span>
                         </div>
                         {scriptureMeta.sourceText && (
-                          <div className="mt-3 rounded-2xl border border-white/80 bg-white/70 px-3 py-2 text-sm text-slate-600">
-                            <p className="text-xs font-black uppercase tracking-[0.25em] text-slate-400">
+                          <div className="mt-3 rounded-lg border border-[#e4ddd2] bg-[#f7f4ef] px-3 py-2 text-sm">
+                            <p className="text-xs font-bold uppercase tracking-[0.2em] text-[#b89a5e]">
                               {scriptureMeta.sourceLabel || 'Korean Source'}
                             </p>
-                            <p className="mt-1 text-base text-slate-800">{scriptureMeta.sourceText}</p>
+                            <p className="mt-1 text-base text-[#1c1c1c]">{scriptureMeta.sourceText}</p>
                           </div>
                         )}
                       </div>
                     )}
-                    <div className="rounded-2xl border border-white/80 px-4 py-3 text-sm text-slate-600" style={insetStyle}>
-                      <p className="text-xs font-black uppercase tracking-[0.3em] text-slate-400">Next Sentence Preview</p>
-                      <p className="mt-1 text-base text-slate-800">{previewSnippet || 'Listening for the next clause...'}</p>
+                    <div className="rounded-xl border border-[#e4ddd2] px-4 py-3 text-sm text-[#5a5a52]" style={insetStyle}>
+                      <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Next Sentence Preview</p>
+                      <p className="mt-1 text-base text-[#1c1c1c]">{previewSnippet || 'Listening for the next clause...'}</p>
                     </div>
                     {committedLines.length > 0 && (
-                      <div className="rounded-2xl border border-white/80 px-4 py-3" style={insetStyle}>
-                        <p className="mb-2 text-xs font-black uppercase tracking-[0.3em] text-slate-400">Recent Translations</p>
+                      <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={insetStyle}>
+                        <p className="mb-2 text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Recent Translations</p>
                         <div className="max-h-48 space-y-2 overflow-y-auto">
                           {[...committedLines].reverse().map(line => (
                             <div key={line.id} className="group flex items-start gap-2">
                               <div className="min-w-0 flex-1">
-                                <p className="truncate text-xs text-slate-400">{line.srcText}</p>
+                                <p className="truncate text-xs text-[#c8bfb0]">{line.srcText}</p>
                                 {correcting === line.id ? (
                                   <div className="mt-1 flex gap-1">
                                     <input
@@ -1201,7 +1201,8 @@ export default function TranslationBox() {
                                     />
                                     <button
                                       onClick={() => submitCorrection(line)}
-                                      className="rounded bg-blue-600 px-2 py-0.5 text-xs text-white hover:bg-blue-700"
+                                      className="rounded px-2 py-0.5 text-xs text-white"
+                                      style={{ background: '#b89a5e' }}
                                     >Save</button>
                                     <button
                                       onClick={() => setCorrecting(null)}
@@ -1232,25 +1233,25 @@ export default function TranslationBox() {
               </div>
             </div>
 
-            <aside className="space-y-6 rounded-3xl border border-white/80 p-5" style={panelStyle}>
-              <div className="space-y-4 rounded-[1.75rem] border border-white/80 p-4" style={insetStyle}>
+            <aside className="space-y-6 rounded-xl border border-[#e4ddd2] p-5" style={panelStyle}>
+              <div className="space-y-4 rounded-xl border border-[#e4ddd2] p-4" style={insetStyle}>
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <p className="text-sm font-black text-slate-800">Broadcast Output</p>
-                    <p className="text-xs text-slate-500">Enable or mute stage and display feeds.</p>
+                    <p className="text-sm font-semibold text-[#0f1f3d]">Broadcast Output</p>
+                    <p className="text-xs text-[#5a5a52]">Enable or mute stage and display feeds.</p>
                   </div>
                   <button
                     onClick={() => setIsBroadcasting(v => !v)}
-                    className={`relative inline-flex h-8 w-14 items-center rounded-full ${isBroadcasting ? 'bg-slate-900' : 'bg-slate-300'}`}
+                    className={`relative inline-flex h-8 w-14 items-center rounded-full ${isBroadcasting ? 'bg-[#0f1f3d]' : 'bg-[#d4ccc2]'}`}
                     aria-pressed={isBroadcasting}
                   >
                     <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${isBroadcasting ? 'translate-x-6' : 'translate-x-1'}`} />
                   </button>
                 </div>
-                <div className="flex items-center justify-between border-t border-slate-200/80 pt-3 text-sm text-slate-600">
+                <div className="flex items-center justify-between border-t border-[#e4ddd2] pt-3 text-sm text-[#5a5a52]">
                   <div className="flex flex-col">
                     <span>Display speed</span>
-                    <span className="text-xs text-slate-400">{displaySpeed.toFixed(2)}x</span>
+                    <span className="text-xs text-[#c8bfb0]">{displaySpeed.toFixed(2)}x</span>
                   </div>
                   <div className="flex items-center gap-2">
                     <button
@@ -1271,41 +1272,41 @@ export default function TranslationBox() {
                 </div>
               </div>
 
-              <div className="rounded-[1.75rem] border border-white/80 p-4 text-sm" style={insetStyle}>
-                <p className="mb-3 text-xs font-black uppercase tracking-[0.3em] text-slate-400">System Status</p>
-                <div className="space-y-2 text-slate-600">
+              <div className="rounded-xl border border-[#e4ddd2] p-4 text-sm" style={insetStyle}>
+                <p className="mb-3 text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">System Status</p>
+                <div className="space-y-2 text-[#5a5a52]">
                   <div className="flex items-center justify-between">
                     <span>Last heartbeat</span>
-                    <span className="font-black text-slate-800">{lastHeartbeatLabel}</span>
+                    <span className="font-semibold text-[#0f1f3d]">{lastHeartbeatLabel}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span>Reconnect attempt</span>
-                    <span className="font-black text-slate-800">{reconnectAttemptLabel}</span>
+                    <span className="font-semibold text-[#0f1f3d]">{reconnectAttemptLabel}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span>Socket downtime</span>
-                    <span className="font-black text-slate-800">{socketDowntimeLabel}</span>
+                    <span className="font-semibold text-[#0f1f3d]">{socketDowntimeLabel}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span>Deepgram engine</span>
-                    <span className="font-black text-slate-800">{status}</span>
+                    <span className="font-semibold text-[#0f1f3d]">{status}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span>Latency</span>
-                    <span className="font-black text-slate-800">{latencyLabel}</span>
+                    <span className="font-semibold text-[#0f1f3d]">{latencyLabel}</span>
                   </div>
                 </div>
               </div>
 
-              <details className="rounded-[1.75rem] border border-white/80 p-4 text-sm text-slate-600" style={insetStyle}>
-                <summary className="cursor-pointer text-xs font-black uppercase tracking-[0.3em] text-slate-400">
+              <details className="rounded-xl border border-[#e4ddd2] p-4 text-sm text-[#5a5a52]" style={insetStyle}>
+                <summary className="cursor-pointer text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">
                   Advanced Controls
                 </summary>
                 <div className="mt-4 space-y-4">
-                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-[1.1rem] border border-white/80 px-4 py-4" style={panelStyle}>
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
                     <div className="min-w-0">
                       <div className="flex min-w-0 items-center gap-2">
-                        <span className="text-sm font-semibold text-slate-800">Early Preview</span>
+                        <span className="text-sm font-semibold text-[#0f1f3d]">Early Preview</span>
                         <span
                           className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white/75 text-[10px] font-black text-slate-500"
                           title="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
@@ -1314,7 +1315,7 @@ export default function TranslationBox() {
                           ?
                         </span>
                       </div>
-                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                      <p className="mt-1 text-xs leading-5 text-[#5a5a52]">
                         Shows translation sooner, but the wording may shift before the final sentence is committed.
                       </p>
                     </div>
@@ -1322,33 +1323,33 @@ export default function TranslationBox() {
                       onClick={() => setEarlyCommitEnabled(v => !v)}
                       title="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
                       aria-label="Toggle early preview translation"
-                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${earlyCommitEnabled ? 'bg-slate-900' : 'bg-slate-300'}`}
+                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${earlyCommitEnabled ? 'bg-[#0f1f3d]' : 'bg-[#d4ccc2]'}`}
                       aria-pressed={earlyCommitEnabled}
                     >
                       <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${earlyCommitEnabled ? 'translate-x-7' : 'translate-x-1'}`} />
                     </button>
                   </div>
-                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-[1.1rem] border border-white/80 px-4 py-4" style={panelStyle}>
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
                     <div className="min-w-0">
-                      <span className="text-sm font-semibold text-slate-800">Audience TTS</span>
-                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                      <span className="text-sm font-semibold text-[#0f1f3d]">Audience TTS</span>
+                      <p className="mt-1 text-xs leading-5 text-[#5a5a52]">
                         Plays the translated sentence through the local monitor output as each final line is committed.
                       </p>
                     </div>
                     <button
                       onClick={() => setIsMuted(m => !m)}
-                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${ttsAudienceEnabled ? 'bg-slate-900' : 'bg-slate-300'}`}
+                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${ttsAudienceEnabled ? 'bg-[#0f1f3d]' : 'bg-[#d4ccc2]'}`}
                       aria-pressed={ttsAudienceEnabled}
                     >
                       <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${ttsAudienceEnabled ? 'translate-x-7' : 'translate-x-1'}`} />
                     </button>
                   </div>
-                  <div className="rounded-[1.1rem] border border-white/80 px-4 py-3" style={panelStyle}>
-                    <label className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-400">Voice engine</label>
+                  <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={panelStyle}>
+                    <label className="text-[10px] font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Voice engine</label>
                     <select
                       value={ttsProvider}
                       onChange={(e) => setTtsProvider(e.target.value as TTSProvider)}
-                      className="mt-2 w-full rounded-[1rem] border border-white/80 bg-white/65 px-3 py-2 text-sm font-medium text-slate-700 focus:border-slate-300 focus:outline-none"
+                      className="mt-2 w-full rounded-lg border border-[#e4ddd2] bg-white px-3 py-2 text-sm font-medium text-[#1c1c1c] focus:border-[#b89a5e] focus:outline-none"
                     >
                       {TTS_PROVIDER_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
@@ -1357,12 +1358,12 @@ export default function TranslationBox() {
                       ))}
                     </select>
                   </div>
-                  <div className="rounded-[1.1rem] border border-white/80 px-4 py-3" style={panelStyle}>
-                    <label className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-400">Voice preset</label>
+                  <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={panelStyle}>
+                    <label className="text-[10px] font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Voice preset</label>
                     <select
                       value={voicePreference}
                       onChange={(e) => setVoicePreference(e.target.value)}
-                      className="mt-2 w-full rounded-[1rem] border border-white/80 bg-white/65 px-3 py-2 text-sm font-medium text-slate-700 focus:border-slate-300 focus:outline-none"
+                      className="mt-2 w-full rounded-lg border border-[#e4ddd2] bg-white px-3 py-2 text-sm font-medium text-[#1c1c1c] focus:border-[#b89a5e] focus:outline-none"
                     >
                       <option value="auto">Auto · match language</option>
                       {voiceOptions.map((opt) => (
@@ -1372,10 +1373,10 @@ export default function TranslationBox() {
                       ))}
                     </select>
                   </div>
-                  <div className="rounded-[1.1rem] border border-white/80 px-4 py-3" style={panelStyle}>
+                  <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={panelStyle}>
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-[10px] font-black uppercase tracking-[0.24em] text-slate-400">Monitor volume</span>
-                      <span className="font-black text-slate-800">{Math.round(volume * 100)}%</span>
+                      <span className="text-[10px] font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Monitor volume</span>
+                      <span className="font-semibold text-[#0f1f3d]">{Math.round(volume * 100)}%</span>
                     </div>
                     <input
                       type="range"
@@ -1384,20 +1385,20 @@ export default function TranslationBox() {
                       step={0.05}
                       value={volume}
                       onChange={(e) => setVolume(parseFloat(e.target.value))}
-                      className="mt-3 w-full accent-slate-900"
+                      className="mt-3 w-full accent-[#b89a5e]"
                     />
                   </div>
                   <div className="grid gap-2">
                     <button
                       onClick={() => triggerFinalize('manual operator button')}
-                      className="w-full rounded-xl border border-white/80 px-4 py-2 text-xs font-semibold text-slate-700"
+                      className="w-full rounded-lg border border-[#e4ddd2] bg-white px-4 py-2 text-xs font-semibold text-[#5a5a52] hover:border-[#b89a5e]"
                       style={pillStyle}
                     >
                       Pulse finalize
                     </button>
                     <button
                       onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')}
-                      className="w-full rounded-xl border border-white/80 px-4 py-2 text-xs font-semibold text-slate-700"
+                      className="w-full rounded-lg border border-[#e4ddd2] bg-white px-4 py-2 text-xs font-semibold text-[#5a5a52] hover:border-[#b89a5e]"
                       style={pillStyle}
                     >
                       Test TTS
