@@ -1658,7 +1658,7 @@ export default function HostChurchPage() {
   const accentDangerGradient = "#c0392b";
   const accentDangerShadow = "0 4px 12px rgba(192,57,43,0.2)";
   const settingsShellStyle = {
-    padding: "28px 28px 0",
+    padding: "28px 28px 48px",
     display: "grid",
     gap: 24,
   } as const;
