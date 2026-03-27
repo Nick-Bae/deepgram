@@ -74,11 +74,6 @@ type PaidPlanKey = Exclude<BillingPlanKey, "trial">;
 type HostTab = "broadcast" | "settings" | "billing" | "team";
 const PAID_PLAN_KEYS: PaidPlanKey[] = ["starter", "growth", "premium"];
 
-const _PLAN_LABELS: Record<PaidPlanKey, string> = {
-  starter: "Starter (600 min / $20)",
-  growth: "Growth (1,800 min / $40)",
-  premium: "Premium (Unlimited / $60)",
-};
 
 const PLAN_SUMMARIES: Record<PaidPlanKey, { title: string; monthlyPrice: string; minuteLimit: string; description: string }> = {
   starter: {
@@ -1523,63 +1518,9 @@ export default function HostChurchPage() {
     minHeight: "100vh",
     background: DC.cream,
     color: DC.charcoal,
-    padding: "0 0 48px",
   } as const;
   const dashboardCardShadow = "0 1px 3px rgba(0,0,0,0.06)";
   const dashboardCompactShadow = "0 1px 2px rgba(0,0,0,0.04)";
-  const hostTopPanelStyle = {
-    background: DC.white,
-    border: `1px solid ${DC.border}`,
-    padding: "0 28px",
-    borderRadius: 8,
-    overflow: "hidden" as const,
-  } as const;
-  const hostTopIntroStyle = {
-    margin: "0 0 0",
-    width: "100%",
-    padding: "28px 0 20px",
-  } as const;
-  const hostTopIntroGlowStyle = { display: "none" } as const;
-  const hostTopIntroContentStyle = {
-    position: "relative" as const,
-    display: "grid",
-    gap: 10,
-  } as const;
-  const hostTopIntroBadgeStyle = {
-    display: "inline-flex",
-    alignItems: "center",
-    width: "fit-content",
-    padding: "3px 10px",
-    border: `1px solid rgba(184,154,94,0.3)`,
-    background: "rgba(184,154,94,0.08)",
-    color: DC.gold,
-    fontSize: 10,
-    lineHeight: 1,
-    fontWeight: 600,
-    letterSpacing: "0.18em",
-    textTransform: "uppercase" as const,
-  } as const;
-  const hostTopIntroHeadlineStyle = {
-    margin: 0,
-    color: DC.navy,
-    fontFamily: "'Cormorant Garamond', Georgia, serif",
-    fontSize: "clamp(22px, 2.8vw, 30px)",
-    lineHeight: 1.1,
-    fontWeight: 300,
-    letterSpacing: "-0.01em",
-  } as const;
-  const hostTopIntroAccentStyle = {
-    fontStyle: "italic" as const,
-    color: DC.gold,
-  } as const;
-  const hostTopIntroSubtextStyle = {
-    margin: 0,
-    maxWidth: 600,
-    color: DC.mid,
-    fontSize: "clamp(13px, 1.4vw, 14px)",
-    lineHeight: 1.65,
-    fontWeight: 400,
-  } as const;
   const hostFieldStyle = {
     border: `1px solid ${DC.border}`,
     background: DC.white,
@@ -1590,24 +1531,13 @@ export default function HostChurchPage() {
     outline: "none",
   } as const;
   const hostTabRailStyle = {
-    position: "sticky" as const,
-    top: 0,
-    zIndex: 5,
     display: "flex",
     flexWrap: "wrap" as const,
     gap: 0,
-    marginBottom: 0,
+    margin: "20px 0 0",
     padding: "0",
-    background: DC.white,
+    background: DC.cream,
     borderBottom: `1px solid ${DC.border}`,
-  } as const;
-  const studioHeaderStyle = {
-    position: "relative" as const,
-    overflow: "hidden",
-    background: DC.navy,
-    padding: "18px 28px",
-    color: DC.cream,
-    borderRadius: 8,
   } as const;
   const studioUserPanelStyle = {
     display: "flex",
@@ -1658,7 +1588,7 @@ export default function HostChurchPage() {
   const accentDangerGradient = "#c0392b";
   const accentDangerShadow = "0 4px 12px rgba(192,57,43,0.2)";
   const settingsShellStyle = {
-    padding: "28px 28px 48px",
+    padding: "28px 0 48px",
     display: "grid",
     gap: 24,
   } as const;
@@ -1738,13 +1668,11 @@ export default function HostChurchPage() {
     lineHeight: 1.7,
   } as const;
   const supportFooterStyle = {
-    padding: "24px 28px",
+    padding: "20px 0",
     borderTop: `1px solid ${DC.border}`,
     display: "flex",
-    flexWrap: "wrap",
     alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12,
+    gap: 16,
   } as const;
   const supportFooterLinkStyle = {
     border: "none",
@@ -1965,120 +1893,55 @@ export default function HostChurchPage() {
 
   return (
     <main style={hostPageStyle}>
-      <div style={{ maxWidth: 1240, margin: "0 auto", display: "grid", gap: 18 }}>
-        <section style={studioHeaderStyle}>
-          <div
-            aria-hidden="true"
-            style={{
-              position: "absolute",
-              inset: "-40% auto auto -8%",
-              height: 180,
-              width: 260,
-              borderRadius: 999,
-              background: "radial-gradient(circle, rgba(184,154,94,0.14) 0%, rgba(184,154,94,0) 72%)",
-              filter: "blur(8px)",
-            }}
-          />
-          <div
-            aria-hidden="true"
-            style={{
-              position: "absolute",
-              inset: "auto -6% -120px auto",
-              height: 220,
-              width: 280,
-              borderRadius: 999,
-              background: "radial-gradient(circle, rgba(212,184,122,0.10) 0%, rgba(212,184,122,0) 74%)",
-              filter: "blur(10px)",
-            }}
-          />
-          <div style={{ position: "relative", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 18 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
-              <div style={studioBrandTileStyle}>{currentChurchInitial}</div>
-              <div style={{ fontFamily: "'Cormorant Garamond', Georgia, serif" }}>
-                <h1
-                  style={{
-                    margin: 0,
-                    color: DC.cream,
-                    fontSize: "clamp(26px, 3.2vw, 34px)",
-                    lineHeight: 1,
-                    fontWeight: 600,
-                    letterSpacing: "-0.02em",
-                  }}
-                >
-                  {currentChurchLabel}
-                </h1>
-                <p
-                  style={{
-                    margin: "8px 0 0",
-                    color: DC.goldLight,
-                    fontSize: 11,
-                    letterSpacing: "0.26em",
-                    textTransform: "uppercase",
-                    fontFamily: "'DM Sans', system-ui, sans-serif",
-                  }}
-                >
-                  Translation Studio
-                </p>
+      {/* ── Full-width top navbar ── */}
+      <nav style={{ background: DC.navy, position: "relative", overflow: "hidden" }}>
+        <div aria-hidden="true" style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse at 10% 50%, rgba(184,154,94,0.1) 0%, transparent 60%)", pointerEvents: "none" }} />
+        <div style={{ maxWidth: 1240, margin: "0 auto", padding: "0 28px", position: "relative", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, minHeight: 60 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <div style={studioBrandTileStyle}>{currentChurchInitial}</div>
+            <div>
+              <div style={{ color: DC.cream, fontSize: 17, fontWeight: 600, letterSpacing: "-0.01em", fontFamily: "'Cormorant Garamond', Georgia, serif", lineHeight: 1.2 }}>
+                {currentChurchLabel}
               </div>
-            </div>
-
-            <div style={studioUserPanelStyle}>
-              <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
-                <span
-                  style={{
-                    color: "rgba(247,244,239,0.85)",
-                    fontSize: 14,
-                    fontWeight: 400,
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    maxWidth: 280,
-                  }}
-                >
-                  {currentUserName}
-                </span>
-              </div>
-              {isMasterUser && (
-                <Link href="/admin" style={studioAdminButtonStyle}>
-                  Admin
-                </Link>
-              )}
-              <button
-                onClick={async () => {
-                  clearStreamContext();
-                  clearHostToken();
-                  clearAuthToken();
-                  await logout();
-                }}
-                style={studioLogoutButtonStyle}
-              >
-                Logout
-              </button>
-            </div>
-          </div>
-        </section>
-
-        <section style={hostTopPanelStyle}>
-          <div style={hostTopIntroStyle}>
-            <div aria-hidden="true" style={hostTopIntroGlowStyle} />
-            <div style={hostTopIntroContentStyle}>
-              <span style={hostTopIntroBadgeStyle}>How to broadcast</span>
-              <h2 style={hostTopIntroHeadlineStyle}>
-                Launch Your <span style={hostTopIntroAccentStyle}>Broadcast</span>
-              </h2>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 4, alignItems: "center" }}>
-                {(["Select a service", "Open the Control Panel", "Start Translation"] as const).map((label, i) => (
-                  <div key={label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "6px 14px 6px 8px", borderRadius: 999, background: "rgba(184,154,94,0.08)" }}>
-                      <span style={{ width: 22, height: 22, borderRadius: "50%", background: DC.gold, color: "#fff", fontSize: 11, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: accentPrimaryShadow }}>{i + 1}</span>
-                      <span style={hostTopIntroSubtextStyle}>{label}</span>
-                    </div>
-                    {i < 2 && <span style={{ color: "rgba(184,154,94,0.5)", fontSize: 16, fontWeight: 300, lineHeight: 1 }}>→</span>}
-                  </div>
-                ))}
+              <div style={{ color: DC.goldLight, fontSize: 10, letterSpacing: "0.26em", textTransform: "uppercase", fontFamily: "'DM Sans', system-ui, sans-serif", marginTop: 2 }}>
+                Translation Studio
               </div>
             </div>
           </div>
+          <div style={studioUserPanelStyle}>
+            <span style={{ color: "rgba(247,244,239,0.7)", fontSize: 13, fontWeight: 400, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 220 }}>
+              {currentUserName}
+            </span>
+            {isMasterUser && <Link href="/admin" style={studioAdminButtonStyle}>Admin</Link>}
+            <button
+              onClick={async () => { clearStreamContext(); clearHostToken(); clearAuthToken(); await logout(); }}
+              style={studioLogoutButtonStyle}
+            >
+              Logout
+            </button>
+          </div>
+        </div>
+      </nav>
+
+      {/* ── Page content ── */}
+      <div style={{ maxWidth: 1240, margin: "0 auto", padding: "0 28px 64px" }}>
+        {/* Title + steps — broadcast tab only */}
+        {activeTab === "broadcast" && !activeRoomId && (
+          <div style={{ paddingTop: 28 }}>
+            <h1 style={{ margin: 0, fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: "clamp(26px, 3vw, 34px)", fontWeight: 600, color: DC.navy, letterSpacing: "-0.02em", lineHeight: 1.1 }}>
+              Launch Your Broadcast
+            </h1>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 10, alignItems: "center" }}>
+              {(["Select a service", "Open the Control Panel", "Start Translation"] as const).map((label, i) => (
+                <div key={label} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ width: 20, height: 20, borderRadius: "50%", background: DC.gold, color: "#fff", fontSize: 11, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{i + 1}</span>
+                  <span style={{ fontSize: 13, color: DC.mid }}>{label}</span>
+                  {i < 2 && <span style={{ color: DC.border, fontSize: 12, marginLeft: 4 }}>›</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
           {!backendReachable ? (
             <div style={{ marginBottom: 8, padding: "8px 12px", borderRadius: 10, background: "rgba(120,53,15,0.18)", border: "1px solid rgba(251,191,36,0.5)", color: "#92400e", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#f59e0b", flexShrink: 0, display: "inline-block" }} />
@@ -2143,7 +2006,7 @@ export default function HostChurchPage() {
             })}
           </div>
           {activeTab === "broadcast" ? (
-            <>
+            <div style={{ ...settingsCardStyle, marginTop: 20 }}>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 10 }}>
                 <label style={{ display: "grid", gap: 4 }}>
                   <span style={{ fontSize: 12, opacity: 0.75, color: DC.mid }}>Service</span>
@@ -2243,7 +2106,7 @@ export default function HostChurchPage() {
                 </div>
               ) : null}
               {displayUrl ? (
-                <div style={{ marginTop: 12, padding: "14px 16px", background: "rgba(184,154,94,0.06)", border: `1px solid ${DC.border}` }}>
+                <div style={{ marginTop: 12, padding: "14px 16px", background: "rgba(184,154,94,0.06)", border: `1px solid ${DC.border}`, borderRadius: 8 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
                     <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>Listener Access</span>
                     <a href={displayUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: DC.gold, textDecoration: "none", opacity: 0.75 }}>open ↗</a>
@@ -2288,7 +2151,7 @@ export default function HostChurchPage() {
               <p style={{ marginTop: 8, marginBottom: 0, fontSize: 12, opacity: 0.72 }}>
                 Signed-in hosts are authorized by account role. Manual host token entry is not required.
               </p>
-            </>
+            </div>
           ) : null}
           {activeTab === "settings" ? (
             canManageServices ? (
@@ -3108,66 +2971,28 @@ export default function HostChurchPage() {
               </div>
             )
           ) : null}
-        </section>
 
-        {activeTab === "broadcast" ? (
-          activeRoomId ? (
-            isTrialExpired ? (
-              <section style={{ border: "1px solid rgba(252,165,165,0.55)", borderRadius: 14, padding: 16, background: "rgba(127,29,29,0.18)", color: "#fecaca" }}>
-                Your trial has ended. Broadcasting is blocked until billing is added.
-              </section>
-            ) : (
-            <section>
-              <TranslationBox />
+        {activeTab === "broadcast" && activeRoomId ? (
+          isTrialExpired ? (
+            <section style={{ marginTop: 16, border: "1px solid rgba(252,165,165,0.55)", borderRadius: 14, padding: 16, background: "rgba(127,29,29,0.18)", color: "#fecaca" }}>
+              Your trial has ended. Broadcasting is blocked until billing is added.
             </section>
-            )
           ) : (
-            <section
-              style={{
-                background: DC.white,
-                border: `1px solid ${DC.border}`,
-                borderRadius: 8,
-                padding: "32px 24px",
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                gap: 12,
-                textAlign: "center",
-              }}
-            >
-              <div style={{ width: 48, height: 48, background: "rgba(184,154,94,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
-                  <circle cx="14" cy="18" r="2.5" fill={DC.gold} />
-                  <path d="M9.5 14.5 a6.5 6.5 0 0 1 9 0" stroke={DC.gold} strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.7" />
-                  <path d="M6 11 a11 11 0 0 1 16 0" stroke={DC.gold} strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.4" />
-                </svg>
-              </div>
-              <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy, letterSpacing: "-0.02em" }}>
-                Select a service and press <span style={{ color: DC.gold }}>Start Service</span> to open the controls
-              </p>
-              <p style={{ margin: 0, fontSize: 13, color: DC.mid, lineHeight: 1.55, maxWidth: 380 }}>
-                Translation, audio controls, and live monitoring will appear here once a room is active.
-              </p>
+            <section style={{ marginTop: 16 }}>
+              <TranslationBox />
             </section>
           )
         ) : null}
 
         <section style={supportFooterStyle}>
-          <div style={{ display: "grid", gap: 4 }}>
-            <p style={{ margin: 0, fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>
-              Support
-            </p>
-            <p style={{ margin: 0, fontSize: 13, color: DC.mid, lineHeight: 1.6 }}>
-              Need help with billing, setup, team access, or translation quality? Contact support from here.
-            </p>
-          </div>
+          <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>
+            Support
+          </span>
           <button
-            onClick={() => {
-              void router.push(dashboardContactHref);
-            }}
+            onClick={() => { void router.push(dashboardContactHref); }}
             style={supportFooterLinkStyle}
           >
-            Contact Us
+            Contact Us ↗
           </button>
         </section>
       </div>
