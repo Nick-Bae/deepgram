@@ -138,11 +138,12 @@ def _build_messages(ko: str, ctx: TranslationContext) -> list[dict[str, str]]:
         "Never output first-person pronouns (I, me, we, our, myself) unless the Korean clause explicitly contains first-person markers or implies speaker ownership via kinship terms.",
         "If a kinship term (아내/남편/부인/배우자/집사람/와이프) appears without an explicit possessor (그의/그녀의/그들의), assume it refers to the speaker (e.g., \"my wife\").",
         "Handle reflexives (스스로) as 'himself' / 'herself' / 'themselves' according to the subject.",
+        "NEVER use 'one', 'a person', 'someone', 'people', or other indefinite/generic terms as the subject unless the Korean explicitly introduces a new, unnamed entity. When Korean omits the subject, always carry the established subject forward.",
         "Output only the final English sentence.",
     ])
     user_text = "\n\n".join([
         f"Previous English sentence: {ctx.previous_line()}",
-        f"Subject hint: continue referring to {ctx.subject} as '{ctx.pronoun}'.",
+        f"IMPORTANT: The subject of this clause is \"{ctx.subject}\" ({ctx.pronoun}). Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms unless the Korean explicitly names a new entity.",
         f"Current Korean clause (finalized): {ko_clause}",
         "Return one polished English sentence that preserves tense and intent."
     ])

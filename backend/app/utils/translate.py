@@ -937,6 +937,9 @@ def _build_context_block(ctx: Optional[TranslationContext]) -> str:
         "- If a kinship term (아내/남편/부인/배우자/집사람/와이프) appears without an explicit possessor "
         "(그의/그녀의/그들의), assume it refers to the speaker (e.g., \"my wife\").\n"
         "- When translating 스스로 or similar reflexives, use himself/herself/themselves matching the subject.\n"
+        "- NEVER use 'one', 'a person', 'someone', 'people', or other indefinite/generic terms as the subject "
+        "unless the Korean explicitly introduces a new, unnamed entity. When Korean omits the subject, always "
+        "carry the established subject forward.\n"
     )
 
 def _mask_hard_glossary(text: str, source_lang: str) -> tuple[str, dict[str, str]]:
@@ -1341,11 +1344,18 @@ async def translate_text(
             user_content = (
                 recent_context_block +
                 f"Previous English sentence: {prev}\n"
-                f"Subject hint: continue referring to {subject_hint} ({pronoun_hint}).\n\n"
+                f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
+                f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
+                f"unless the Korean explicitly names a new entity.\n\n"
                 f"Current text:\n{masked_text}"
             )
         else:
-            user_content = f"Current text:\n{masked_text}"
+            user_content = (
+                f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
+                f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
+                f"unless the Korean explicitly names a new entity.\n\n"
+                f"Current text:\n{masked_text}"
+            )
 
     try:
         model_name = ENV.resolve_translation_model(model_override)
