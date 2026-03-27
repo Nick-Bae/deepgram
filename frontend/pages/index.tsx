@@ -415,10 +415,7 @@ export default function HomePage() {
       <Head>
         <title>Worship Translation — Live Church Translation</title>
         <meta name="description" content="Start the service once, share a QR code, and let translated captions reach listeners in real time. Built for multilingual church worship." />
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
-        <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet" />
-        <style>{`
+<style>{`
           *, *::before, *::after { box-sizing: border-box; }
           html { scroll-behavior: smooth; }
           body { margin: 0; padding: 0; font-family: 'DM Sans', 'Segoe UI', sans-serif; background: ${C.cream}; color: ${C.charcoal}; line-height: 1.6; overflow-x: hidden; }
