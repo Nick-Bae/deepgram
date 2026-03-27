@@ -9,7 +9,9 @@ from pydantic import BaseModel, Field
 
 from app import validators
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
+from app.auth.guards import require_org_role
 from app.services.multichurch_store import multichurch_store
+from app.services.script_store import script_store
 
 router = APIRouter()
 
@@ -98,6 +100,18 @@ def list_services(slug: str = Path(pattern=validators.CHURCH_SLUG)):
     if not data:
         raise HTTPException(status_code=404, detail="org_not_found")
     return data
+
+
+@router.get("/org/{org_id}/services")
+def list_services_by_org(
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    """List services for an org by orgId (requires auth). Used by sermon-prep UI."""
+    require_org_role(org_id=org_id, user=current_user, roles={"owner", "admin", "host", "viewer"}, store=multichurch_store)
+    services = multichurch_store.list_services_by_org_id(org_id)
+    return {"orgId": org_id, "services": services or []}
 
 
 @router.post("/org/{org_id}/services")
@@ -250,6 +264,10 @@ def end_room(
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # Free in-memory sermon script for this room
+    script_store.clear(room_id=room_id)
+
     return result
 
 

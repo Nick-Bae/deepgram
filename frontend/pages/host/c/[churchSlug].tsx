@@ -1501,41 +1501,43 @@ export default function HostChurchPage() {
     }
   };
 
+  // ─── design tokens ────────────────────────────────────────────────────────
+  const DC = {
+    cream:    "#f7f4ef",
+    navy:     "#0f1f3d",
+    gold:     "#b89a5e",
+    goldLight:"#d4b87a",
+    charcoal: "#1c1c1c",
+    mid:      "#5a5a52",
+    border:   "#e4ddd2",
+    white:    "#ffffff",
+    danger:   "#9f3650",
+    dangerBg: "#fdf2f4",
+    success:  "#2d6a4f",
+    successBg:"#f0faf5",
+    warn:     "#92400e",
+    warnBg:   "#fffbeb",
+  };
+
   const hostPageStyle = {
     minHeight: "100vh",
-    background: "linear-gradient(180deg, #e9edf4 0%, #dde4ee 56%, #d4dce8 100%)",
-    color: "#0f172a",
-    padding: "20px 14px 34px",
+    background: DC.cream,
+    color: DC.charcoal,
+    padding: "0 0 48px",
   } as const;
-  const _dashboardPanelShadow = "0 18px 38px rgba(122,138,163,0.12)";
-  const dashboardCardShadow = "0 14px 30px rgba(122,138,163,0.1)";
-  const dashboardCompactShadow = "0 10px 22px rgba(122,138,163,0.08)";
+  const dashboardCardShadow = "0 1px 3px rgba(0,0,0,0.06)";
+  const dashboardCompactShadow = "0 1px 2px rgba(0,0,0,0.04)";
   const hostTopPanelStyle = {
-    borderRadius: 24,
-    background: "linear-gradient(160deg, rgba(240,246,255,0.82) 0%, rgba(225,234,248,0.6) 100%)",
-    boxShadow: "0 8px 32px rgba(79,115,170,0.08)",
-    padding: 16,
+    background: DC.white,
+    borderBottom: `1px solid ${DC.border}`,
+    padding: "0 28px",
   } as const;
   const hostTopIntroStyle = {
-    margin: "0 0 18px",
+    margin: "0 0 0",
     width: "100%",
-    padding: "28px 28px 24px",
-    borderRadius: 18,
-    position: "relative" as const,
-    overflow: "hidden" as const,
-    background: "transparent",
+    padding: "28px 0 20px",
   } as const;
-  const hostTopIntroGlowStyle = {
-    position: "absolute" as const,
-    inset: "auto -40px -80px auto",
-    width: 320,
-    height: 220,
-    borderRadius: 999,
-    background: "radial-gradient(circle, rgba(127,165,219,0.18) 0%, rgba(79,115,170,0) 70%)",
-    filter: "blur(18px)",
-    pointerEvents: "none" as const,
-  } as const;
-  const _hostTopIntroRailStyle = { display: "none" } as const;
+  const hostTopIntroGlowStyle = { display: "none" } as const;
   const hostTopIntroContentStyle = {
     position: "relative" as const,
     display: "grid",
@@ -1545,156 +1547,145 @@ export default function HostChurchPage() {
     display: "inline-flex",
     alignItems: "center",
     width: "fit-content",
-    padding: "4px 10px",
-    borderRadius: 999,
-    background: "rgba(79,115,170,0.1)",
-    color: "#4f73aa",
-    fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
-    fontSize: 11,
+    padding: "3px 10px",
+    border: `1px solid rgba(184,154,94,0.3)`,
+    background: "rgba(184,154,94,0.08)",
+    color: DC.gold,
+    fontSize: 10,
     lineHeight: 1,
-    fontWeight: 800,
-    letterSpacing: "0.14em",
+    fontWeight: 600,
+    letterSpacing: "0.18em",
     textTransform: "uppercase" as const,
   } as const;
   const hostTopIntroHeadlineStyle = {
     margin: 0,
-    color: "#16324f",
-    fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
-    fontSize: "clamp(24px, 3.2vw, 34px)",
-    lineHeight: 1.05,
-    fontWeight: 900,
-    letterSpacing: "-0.05em",
+    color: DC.navy,
+    fontFamily: "'Cormorant Garamond', Georgia, serif",
+    fontSize: "clamp(22px, 2.8vw, 30px)",
+    lineHeight: 1.1,
+    fontWeight: 300,
+    letterSpacing: "-0.01em",
   } as const;
   const hostTopIntroAccentStyle = {
-    color: "#4f73aa",
-    background: "linear-gradient(135deg, #7fa5db, #4f73aa)",
-    backgroundClip: "text" as const,
-    WebkitBackgroundClip: "text" as const,
-    WebkitTextFillColor: "transparent",
+    fontStyle: "italic" as const,
+    color: DC.gold,
   } as const;
   const hostTopIntroSubtextStyle = {
     margin: 0,
-    maxWidth: 760,
-    color: "#45607d",
-    fontFamily: "Inter, 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif",
-    fontSize: "clamp(13px, 1.6vw, 15px)",
-    lineHeight: 1.55,
-    fontWeight: 500,
-    letterSpacing: "-0.01em",
+    maxWidth: 600,
+    color: DC.mid,
+    fontSize: "clamp(13px, 1.4vw, 14px)",
+    lineHeight: 1.65,
+    fontWeight: 400,
   } as const;
   const hostFieldStyle = {
-    borderRadius: 10,
-    border: "1px solid rgba(189,200,217,0.92)",
-    background: "rgba(247,250,253,0.9)",
-    color: "#20324a",
-    padding: "9px 10px",
-    boxShadow: "inset 2px 2px 6px rgba(122,138,163,0.1)",
+    border: `1px solid ${DC.border}`,
+    background: DC.white,
+    color: DC.charcoal,
+    padding: "9px 12px",
+    borderRadius: 3,
+    fontSize: 14,
+    outline: "none",
   } as const;
   const hostTabRailStyle = {
     position: "sticky" as const,
-    top: 8,
+    top: 0,
     zIndex: 5,
     display: "flex",
     flexWrap: "wrap" as const,
-    gap: 8,
-    marginBottom: 12,
-    padding: 6,
-    borderRadius: 14,
-    border: "1px solid rgba(255,255,255,0.88)",
-    background: "rgba(230,236,244,0.94)",
-    backdropFilter: "blur(8px)",
-    boxShadow: dashboardCompactShadow,
+    gap: 0,
+    marginBottom: 0,
+    padding: "0",
+    background: DC.white,
+    borderBottom: `1px solid ${DC.border}`,
   } as const;
   const studioHeaderStyle = {
-    borderRadius: 34,
     position: "relative" as const,
     overflow: "hidden",
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "linear-gradient(135deg, #4a5d79 0%, #2f3b4f 32%, #1d2430 68%, #161b24 100%)",
-    boxShadow: "0 24px 54px rgba(15,23,42,0.22), inset 0 1px 0 rgba(255,255,255,0.08)",
-    padding: "18px 20px",
-    color: "#f8fafc",
+    background: DC.navy,
+    padding: "18px 28px",
+    color: DC.cream,
   } as const;
   const studioUserPanelStyle = {
     display: "flex",
     alignItems: "center",
-    gap: 16,
+    gap: 12,
     padding: 0,
   } as const;
   const studioAdminButtonStyle = {
-    borderRadius: 18,
-    border: "1px solid rgba(99,102,241,0.5)",
-    background: "rgba(99,102,241,0.15)",
-    color: "#a5b4fc",
-    fontSize: 12,
-    fontWeight: 800,
-    letterSpacing: "0.16em",
+    border: `1px solid rgba(212,184,122,0.35)`,
+    background: "rgba(212,184,122,0.1)",
+    color: DC.goldLight,
+    fontSize: 11,
+    fontWeight: 600,
+    letterSpacing: "0.12em",
     textTransform: "uppercase" as const,
-    padding: "12px 22px",
+    padding: "8px 14px",
     cursor: "pointer",
     textDecoration: "none",
+    borderRadius: 3,
   } as const;
   const studioLogoutButtonStyle = {
-    borderRadius: 18,
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "rgba(13,20,32,0.2)",
-    color: "#f8fafc",
-    fontSize: 12,
-    fontWeight: 800,
-    letterSpacing: "0.16em",
+    border: "1px solid rgba(255,255,255,0.14)",
+    background: "transparent",
+    color: "rgba(255,255,255,0.55)",
+    fontSize: 11,
+    fontWeight: 500,
+    letterSpacing: "0.1em",
     textTransform: "uppercase" as const,
-    padding: "12px 22px",
+    padding: "8px 14px",
     cursor: "pointer",
+    borderRadius: 3,
   } as const;
   const studioBrandTileStyle = {
-    height: 72,
-    width: 72,
-    borderRadius: 22,
-    background: "linear-gradient(145deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02))",
-    boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.1), 0 12px 24px rgba(15,23,42,0.18)",
+    width: 48,
+    height: 48,
+    borderRadius: 10,
+    background: "rgba(255,255,255,0.06)",
+    border: "1px solid rgba(255,255,255,0.1)",
     display: "grid",
     placeItems: "center",
-    color: "#ffb703",
-    fontSize: 40,
-    fontWeight: 900,
+    color: DC.goldLight,
+    fontSize: 24,
+    fontWeight: 800,
     fontStyle: "italic",
+    flexShrink: 0,
   } as const;
-  const accentPrimaryGradient = "linear-gradient(145deg, #7fa5db, #4f73aa)";
-  const accentPrimaryShadow = "0 14px 30px rgba(79,115,170,0.28)";
-  const accentDangerGradient = "linear-gradient(145deg, #e38888, #bc5f6f)";
-  const accentDangerShadow = "0 14px 28px rgba(188,95,111,0.22)";
+  const accentPrimaryShadow = "0 4px 12px rgba(184,154,94,0.22)";
+  const accentDangerGradient = "#c0392b";
+  const accentDangerShadow = "0 4px 12px rgba(192,57,43,0.2)";
   const settingsShellStyle = {
-    marginTop: 12,
+    padding: "28px 28px 0",
     display: "grid",
-    gap: 16,
+    gap: 24,
   } as const;
   const settingsGridStyle = {
     display: "grid",
-    gap: 16,
+    gap: 24,
     gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 320px), 1fr))",
   } as const;
   const settingsCardStyle = {
-    border: "1px solid rgba(255,255,255,0.88)",
-    borderRadius: 22,
-    padding: 18,
-    background: "linear-gradient(145deg, rgba(248,250,253,0.96), rgba(230,236,244,0.92))",
-    boxShadow: dashboardCardShadow,
+    border: `1px solid ${DC.border}`,
+    background: DC.white,
+    padding: 24,
     display: "grid",
-    gap: 12,
+    gap: 16,
+    boxShadow: dashboardCardShadow,
   } as const;
   const settingsSubscriptionCardStyle = {
     ...settingsCardStyle,
-    background: "linear-gradient(145deg, rgba(237,243,251,0.98), rgba(216,227,243,0.94))",
+    borderTop: `3px solid ${DC.gold}`,
   } as const;
   const settingsBudgetCardStyle = {
     ...settingsCardStyle,
-    background: "linear-gradient(145deg, rgba(240,246,243,0.98), rgba(219,231,226,0.94))",
+    borderTop: `3px solid rgba(184,154,94,0.5)`,
   } as const;
   const billingHeroCardStyle = {
     ...settingsCardStyle,
-    padding: 22,
-    background: "linear-gradient(145deg, rgba(247,241,232,0.99), rgba(232,220,203,0.95))",
-    boxShadow: "0 18px 36px rgba(131,109,82,0.12)",
+    padding: 28,
+    background: DC.navy,
+    border: "none",
+    color: DC.cream,
   } as const;
   const billingDeckStyle = {
     display: "grid",
@@ -1702,46 +1693,47 @@ export default function HostChurchPage() {
     gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
   } as const;
   const billingPlanCardBaseStyle = {
-    borderRadius: 22,
-    padding: 18,
+    padding: 20,
     display: "grid",
     gap: 10,
-    minHeight: 220,
-    background: "rgba(252,249,246,0.95)",
+    minHeight: 200,
+    background: DC.white,
+    border: `1px solid ${DC.border}`,
     boxShadow: dashboardCompactShadow,
   } as const;
   const billingAlertStyle = {
-    borderRadius: 18,
-    border: "1px solid rgba(188,95,111,0.28)",
-    background: "linear-gradient(145deg, rgba(255,244,245,0.94), rgba(252,231,236,0.92))",
-    color: "#9f3650",
-    padding: "12px 14px",
+    border: "1px solid rgba(192,57,43,0.22)",
+    background: DC.dangerBg,
+    color: DC.danger,
+    padding: "12px 16px",
     fontSize: 13,
-    fontWeight: 700,
+    fontWeight: 600,
     lineHeight: 1.5,
   } as const;
   const settingsSectionLabelStyle = {
     margin: 0,
-    fontSize: 11,
-    fontWeight: 800,
-    letterSpacing: "0.22em",
+    fontSize: 10,
+    fontWeight: 600,
+    letterSpacing: "0.2em",
     textTransform: "uppercase" as const,
-    color: "#7c8ba3",
+    color: DC.gold,
   } as const;
   const settingsTitleStyle = {
     margin: 0,
     fontSize: 18,
-    fontWeight: 800,
-    color: "#20324a",
+    fontWeight: 700,
+    color: DC.navy,
+    letterSpacing: "-0.02em",
   } as const;
   const settingsBodyTextStyle = {
     margin: 0,
     fontSize: 13,
-    color: "#5f6f86",
-    lineHeight: 1.6,
+    color: DC.mid,
+    lineHeight: 1.7,
   } as const;
   const supportFooterStyle = {
-    padding: "4px 2px 0",
+    padding: "24px 28px",
+    borderTop: `1px solid ${DC.border}`,
     display: "flex",
     flexWrap: "wrap",
     alignItems: "center",
@@ -1752,9 +1744,9 @@ export default function HostChurchPage() {
     border: "none",
     background: "transparent",
     padding: 0,
-    color: "#4f73aa",
+    color: DC.gold,
     fontSize: 13,
-    fontWeight: 800,
+    fontWeight: 700,
     cursor: "pointer",
     textDecoration: "underline",
     textUnderlineOffset: "3px",
@@ -1763,39 +1755,42 @@ export default function HostChurchPage() {
   const settingsPillBaseStyle = {
     display: "inline-flex",
     alignItems: "center",
-    borderRadius: 999,
-    padding: "6px 10px",
-    fontSize: 12,
-    fontWeight: 700,
+    padding: "4px 10px",
+    fontSize: 11,
+    fontWeight: 600,
   } as const;
   const settingsButtonPrimaryStyle = {
-    borderRadius: 12,
-    border: "1px solid rgba(79,115,170,0.28)",
-    background: accentPrimaryGradient,
-    color: "#f8fafc",
-    fontWeight: 800,
-    padding: "10px 14px",
+    border: "none",
+    background: DC.gold,
+    color: DC.white,
+    fontWeight: 700,
+    fontSize: 13,
+    padding: "10px 18px",
     cursor: "pointer",
+    borderRadius: 3,
+    letterSpacing: "0.04em",
     boxShadow: accentPrimaryShadow,
   } as const;
   const settingsButtonNeutralStyle = {
-    borderRadius: 12,
-    border: "1px solid rgba(189,200,217,0.95)",
-    background: "rgba(247,250,253,0.82)",
-    color: "#42556f",
-    fontWeight: 700,
-    padding: "10px 14px",
+    border: `1px solid ${DC.border}`,
+    background: DC.white,
+    color: DC.charcoal,
+    fontWeight: 600,
+    fontSize: 13,
+    padding: "10px 18px",
     cursor: "pointer",
-    boxShadow: "0 8px 16px rgba(122,138,163,0.08)",
+    borderRadius: 3,
+    boxShadow: dashboardCompactShadow,
   } as const;
   const settingsButtonDangerStyle = {
-    borderRadius: 12,
-    border: "1px solid rgba(188,95,111,0.3)",
+    border: "none",
     background: accentDangerGradient,
-    color: "#f8fafc",
-    fontWeight: 800,
-    padding: "10px 14px",
+    color: DC.white,
+    fontWeight: 700,
+    fontSize: 13,
+    padding: "10px 18px",
     cursor: "pointer",
+    borderRadius: 3,
     boxShadow: accentDangerShadow,
   } as const;
   const settingsInlineFieldStyle = {
@@ -1808,10 +1803,9 @@ export default function HostChurchPage() {
     justifyContent: "space-between",
     gap: 12,
     alignItems: "center",
-    border: "1px solid rgba(215,223,235,0.9)",
-    borderRadius: 16,
-    padding: "14px 16px",
-    background: "rgba(255,255,255,0.72)",
+    border: `1px solid ${DC.border}`,
+    padding: "16px 20px",
+    background: DC.cream,
   } as const;
   const currentUserName = (
     user?.displayName ||
@@ -1872,48 +1866,46 @@ export default function HostChurchPage() {
           style={{
             width: "100%",
             maxWidth: 480,
-            borderRadius: 24,
-            border: "1px solid rgba(255,255,255,0.72)",
-            background: "linear-gradient(180deg, rgba(248,251,255,0.92) 0%, rgba(228,237,250,0.78) 100%)",
-            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.6), 0 24px 48px rgba(88,106,137,0.14)",
+            border: `1px solid ${DC.border}`,
+            background: DC.white,
+            boxShadow: "0 8px 32px rgba(15,31,61,0.08)",
             padding: "36px 32px",
             display: "grid",
             gap: 20,
-            color: "#10213a",
+            color: DC.charcoal,
           }}
         >
           <div style={{ display: "grid", gap: 6 }}>
-            <p style={{ margin: 0, fontSize: 11, fontWeight: 800, letterSpacing: "0.14em", textTransform: "uppercase", color: "#6b82a0" }}>
+            <p style={{ margin: 0, fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>
               Account Setup
             </p>
-            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: "#10213a", lineHeight: 1.2 }}>
+            <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: DC.navy, lineHeight: 1.2 }}>
               Verify your email address
             </h2>
           </div>
 
           <div
             style={{
-              borderRadius: 14,
-              border: "1px solid rgba(79,115,170,0.18)",
-              background: "rgba(79,115,170,0.06)",
+              border: `1px solid rgba(184,154,94,0.25)`,
+              background: "rgba(184,154,94,0.06)",
               padding: "14px 16px",
               display: "grid",
               gap: 4,
             }}
           >
-            <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: "#4f73aa", letterSpacing: "0.06em", textTransform: "uppercase" }}>
+            <p style={{ margin: 0, fontSize: 12, fontWeight: 700, color: DC.gold, letterSpacing: "0.06em", textTransform: "uppercase" }}>
               Verification email sent to
             </p>
-            <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#10213a" }}>{user.email}</p>
+            <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy }}>{user.email}</p>
           </div>
 
-          <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "#4a5f7a" }}>
-            Check your inbox and click the <strong style={{ color: "#10213a" }}>Verify email address</strong> link.
-            Once verified, return here and click <strong style={{ color: "#10213a" }}>I&apos;ve Verified</strong> below.
+          <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: DC.mid }}>
+            Check your inbox and click the <strong style={{ color: DC.charcoal }}>Verify email address</strong> link.
+            Once verified, return here and click <strong style={{ color: DC.charcoal }}>I&apos;ve Verified</strong> below.
           </p>
 
           {verificationError ? (
-            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.6, borderRadius: 12, padding: "10px 14px", background: "rgba(188,95,111,0.1)", color: "#a33d51" }}>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.6, padding: "10px 14px", background: DC.dangerBg, color: DC.danger }}>
               {verificationError}
             </p>
           ) : null}
@@ -1924,15 +1916,15 @@ export default function HostChurchPage() {
               disabled={verificationSending}
               style={{
                 padding: "12px 18px",
-                borderRadius: 999,
-                border: "1px solid rgba(79,115,170,0.28)",
-                background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                color: "#f8fafc",
+                border: "none",
+                background: DC.navy,
+                color: DC.cream,
                 fontSize: 14,
-                fontWeight: 800,
+                fontWeight: 700,
+                borderRadius: 3,
                 cursor: verificationSending ? "not-allowed" : "pointer",
                 opacity: verificationSending ? 0.6 : 1,
-                boxShadow: "0 10px 24px rgba(79,115,170,0.22)",
+                boxShadow: "0 4px 16px rgba(15,31,61,0.18)",
               }}
             >
               {verificationSending ? "Checking..." : "I've Verified — Open Dashboard"}
@@ -1942,22 +1934,21 @@ export default function HostChurchPage() {
               disabled={verificationSending}
               style={{
                 padding: "11px 18px",
-                borderRadius: 999,
-                border: "1px solid rgba(189,200,217,0.92)",
-                background: "rgba(247,250,253,0.82)",
-                color: "#42556f",
+                border: `1px solid ${DC.border}`,
+                background: DC.white,
+                color: DC.mid,
                 fontSize: 13,
-                fontWeight: 700,
+                fontWeight: 600,
+                borderRadius: 3,
                 cursor: verificationSending ? "not-allowed" : "pointer",
                 opacity: verificationSending ? 0.6 : 1,
-                boxShadow: "0 6px 16px rgba(122,138,163,0.08)",
               }}
             >
               {verificationSending ? "Sending..." : "Resend Verification Email"}
             </button>
           </div>
 
-          <p style={{ margin: 0, fontSize: 12, color: "#7a8fa8", lineHeight: 1.6 }}>
+          <p style={{ margin: 0, fontSize: 12, color: DC.mid, lineHeight: 1.6 }}>
             Can&apos;t find the email? Check your spam folder. The link expires after 24 hours.
           </p>
         </div>
@@ -1977,7 +1968,7 @@ export default function HostChurchPage() {
               height: 180,
               width: 260,
               borderRadius: 999,
-              background: "radial-gradient(circle, rgba(145, 177, 220, 0.34) 0%, rgba(145, 177, 220, 0) 72%)",
+              background: "radial-gradient(circle, rgba(184,154,94,0.14) 0%, rgba(184,154,94,0) 72%)",
               filter: "blur(8px)",
             }}
           />
@@ -1989,22 +1980,22 @@ export default function HostChurchPage() {
               height: 220,
               width: 280,
               borderRadius: 999,
-              background: "radial-gradient(circle, rgba(226, 234, 246, 0.18) 0%, rgba(226, 234, 246, 0) 74%)",
+              background: "radial-gradient(circle, rgba(212,184,122,0.10) 0%, rgba(212,184,122,0) 74%)",
               filter: "blur(10px)",
             }}
           />
           <div style={{ position: "relative", display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 18 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
               <div style={studioBrandTileStyle}>{currentChurchInitial}</div>
-              <div style={{ fontFamily: "Inter, 'Segoe UI', system-ui, sans-serif" }}>
+              <div style={{ fontFamily: "'Cormorant Garamond', Georgia, serif" }}>
                 <h1
                   style={{
                     margin: 0,
-                    color: "#f8fafc",
-                    fontSize: "clamp(30px, 3.8vw, 35px)",
+                    color: DC.cream,
+                    fontSize: "clamp(26px, 3.2vw, 34px)",
                     lineHeight: 1,
-                    fontWeight: 800,
-                    letterSpacing: "-0.05em",
+                    fontWeight: 600,
+                    letterSpacing: "-0.02em",
                   }}
                 >
                   {currentChurchLabel}
@@ -2012,10 +2003,11 @@ export default function HostChurchPage() {
                 <p
                   style={{
                     margin: "8px 0 0",
-                    color: "#b8c4da",
-                    fontSize: 12,
-                    letterSpacing: "0.34em",
+                    color: DC.goldLight,
+                    fontSize: 11,
+                    letterSpacing: "0.26em",
                     textTransform: "uppercase",
+                    fontFamily: "'DM Sans', system-ui, sans-serif",
                   }}
                 >
                   Translation Studio
@@ -2027,9 +2019,9 @@ export default function HostChurchPage() {
               <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
                 <span
                   style={{
-                    color: "#e1e8f4",
-                    fontSize: 20,
-                    fontWeight: 500,
+                    color: "rgba(247,244,239,0.85)",
+                    fontSize: 14,
+                    fontWeight: 400,
                     whiteSpace: "nowrap",
                     overflow: "hidden",
                     textOverflow: "ellipsis",
@@ -2070,11 +2062,11 @@ export default function HostChurchPage() {
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 4, alignItems: "center" }}>
                 {(["Select a service", "Open the Control Panel", "Start Translation"] as const).map((label, i) => (
                   <div key={label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "6px 14px 6px 8px", borderRadius: 999, background: "rgba(79,115,170,0.08)" }}>
-                      <span style={{ width: 22, height: 22, borderRadius: "50%", background: accentPrimaryGradient, color: "#fff", fontSize: 11, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: "0 2px 8px rgba(79,115,170,0.28)" }}>{i + 1}</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "6px 14px 6px 8px", borderRadius: 999, background: "rgba(184,154,94,0.08)" }}>
+                      <span style={{ width: 22, height: 22, borderRadius: "50%", background: DC.gold, color: "#fff", fontSize: 11, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: accentPrimaryShadow }}>{i + 1}</span>
                       <span style={hostTopIntroSubtextStyle}>{label}</span>
                     </div>
-                    {i < 2 && <span style={{ color: "rgba(79,115,170,0.4)", fontSize: 16, fontWeight: 300, lineHeight: 1 }}>→</span>}
+                    {i < 2 && <span style={{ color: "rgba(184,154,94,0.5)", fontSize: 16, fontWeight: 300, lineHeight: 1 }}>→</span>}
                   </div>
                 ))}
               </div>
@@ -2098,7 +2090,7 @@ export default function HostChurchPage() {
           {errorMsg ? <p style={{ color: "#b91c1c", marginTop: 0 }}>Error: {errorMsg}</p> : null}
           {memberships.length > 1 ? (
             <div style={{ marginBottom: 12, display: "grid", gap: 4, maxWidth: 380 }}>
-              <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Current Church</span>
+              <span style={{ fontSize: 12, opacity: 0.75, color: DC.mid }}>Current Church</span>
               <select
                 value={selectedOrgId || resolvedOrgId}
                 onChange={(e) => {
@@ -2117,94 +2109,37 @@ export default function HostChurchPage() {
             </div>
           ) : null}
           <div style={hostTabRailStyle}>
-            <button
-              onClick={() => navigateToTab("broadcast")}
-              style={{
-                borderRadius: 10,
-                border: activeTab === "broadcast" ? "1px solid rgba(79,115,170,0.38)" : "1px solid rgba(189,200,217,0.92)",
-                background: activeTab === "broadcast" ? accentPrimaryGradient : "rgba(247,250,253,0.78)",
-                color: activeTab === "broadcast" ? "#f8fafc" : "#42556f",
-                fontSize: 13,
-                fontWeight: 800,
-                padding: "8px 12px",
-                cursor: "pointer",
-                boxShadow: activeTab === "broadcast"
-                  ? accentPrimaryShadow
-                  : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
-              }}
-            >
-              Live Broadcast
-            </button>
-            <button
-              onClick={() => navigateToTab("settings")}
-              style={{
-                borderRadius: 10,
-                border: activeTab === "settings" ? "1px solid rgba(79,115,170,0.38)" : "1px solid rgba(189,200,217,0.92)",
-                background: activeTab === "settings" ? accentPrimaryGradient : "rgba(247,250,253,0.78)",
-                color: activeTab === "settings" ? "#f8fafc" : "#42556f",
-                fontSize: 13,
-                fontWeight: 800,
-                padding: "8px 12px",
-                cursor: "pointer",
-                boxShadow: activeTab === "settings"
-                  ? accentPrimaryShadow
-                  : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
-              }}
-            >
-              Church Settings
-            </button>
-            <button
-              onClick={() => navigateToTab("billing")}
-              style={{
-                borderRadius: 10,
-                border: activeTab === "billing"
-                  ? "1px solid rgba(79,115,170,0.38)"
-                  : billingNeedsAttention
-                    ? "1px solid rgba(188,95,111,0.34)"
-                    : "1px solid rgba(189,200,217,0.92)",
-                background: activeTab === "billing"
-                  ? accentPrimaryGradient
-                  : billingNeedsAttention
-                    ? "linear-gradient(145deg, rgba(255,245,245,0.92), rgba(252,229,229,0.9))"
-                    : "rgba(247,250,253,0.78)",
-                color: activeTab === "billing" ? "#f8fafc" : billingNeedsAttention ? "#a94457" : "#42556f",
-                fontSize: 13,
-                fontWeight: 800,
-                padding: "8px 12px",
-                cursor: "pointer",
-                boxShadow: activeTab === "billing"
-                  ? accentPrimaryShadow
-                  : billingNeedsAttention
-                    ? "0 12px 24px rgba(188,95,111,0.14)"
-                    : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
-              }}
-            >
-              Billing & Subscription
-            </button>
-            <button
-              onClick={() => navigateToTab("team")}
-              style={{
-                borderRadius: 10,
-                border: activeTab === "team" ? "1px solid rgba(79,115,170,0.38)" : "1px solid rgba(189,200,217,0.92)",
-                background: activeTab === "team" ? accentPrimaryGradient : "rgba(247,250,253,0.78)",
-                color: activeTab === "team" ? "#f8fafc" : "#42556f",
-                fontSize: 13,
-                fontWeight: 800,
-                padding: "8px 12px",
-                cursor: "pointer",
-                boxShadow: activeTab === "team"
-                  ? accentPrimaryShadow
-                  : "8px 8px 18px rgba(122,138,163,0.12), -8px -8px 18px rgba(255,255,255,0.78)",
-              }}
-            >
-              Team
-            </button>
+            {(["broadcast", "settings", "billing", "team"] as const).map((tab) => {
+              const labels: Record<string, string> = { broadcast: "Live Broadcast", settings: "Church Settings", billing: "Billing & Subscription", team: "Team" };
+              const isActive = activeTab === tab;
+              const isBillingAlert = tab === "billing" && billingNeedsAttention && !isActive;
+              return (
+                <button
+                  key={tab}
+                  onClick={() => navigateToTab(tab)}
+                  style={{
+                    border: "none",
+                    borderBottom: isActive ? `2px solid ${DC.gold}` : "2px solid transparent",
+                    background: "transparent",
+                    color: isActive ? DC.navy : isBillingAlert ? DC.danger : DC.mid,
+                    fontSize: 13,
+                    fontWeight: isActive ? 700 : 500,
+                    padding: "14px 18px 12px",
+                    cursor: "pointer",
+                    letterSpacing: "0.02em",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {labels[tab]}
+                </button>
+              );
+            })}
           </div>
           {activeTab === "broadcast" ? (
             <>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 10 }}>
                 <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75, color: "#475569" }}>Service</span>
+                  <span style={{ fontSize: 12, opacity: 0.75, color: DC.mid }}>Service</span>
                   {orgData?.services?.length ? (
                     <select
                       value={serviceKey}
@@ -2247,15 +2182,9 @@ export default function HostChurchPage() {
                   onClick={startService}
                   disabled={startServiceDisabled}
                   style={{
-                    borderRadius: 10,
-                    border: "1px solid rgba(79,115,170,0.3)",
-                    background: accentPrimaryGradient,
-                    color: "#f8fafc",
-                    fontWeight: 700,
-                    padding: "9px 14px",
+                    ...settingsButtonPrimaryStyle,
                     cursor: startServiceDisabled ? "not-allowed" : "pointer",
                     opacity: startServiceDisabled ? 0.6 : 1,
-                    boxShadow: accentPrimaryShadow,
                   }}
                 >
                   {activeRoomId ? "Restart / Rejoin Room" : "Start Service"}
@@ -2264,15 +2193,9 @@ export default function HostChurchPage() {
                   onClick={endService}
                   disabled={busy || !orgData?.orgId || (!activeRoomId && !queryRoomId)}
                   style={{
-                    borderRadius: 10,
-                    border: "1px solid rgba(188,95,111,0.3)",
-                    background: accentDangerGradient,
-                    color: "#f8fafc",
-                    fontWeight: 700,
-                    padding: "9px 14px",
+                    ...settingsButtonDangerStyle,
                     cursor: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? "not-allowed" : "pointer",
                     opacity: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? 0.6 : 1,
-                    boxShadow: accentDangerShadow,
                   }}
                 >
                   End Service
@@ -2313,10 +2236,10 @@ export default function HostChurchPage() {
                 </div>
               ) : null}
               {displayUrl ? (
-                <div style={{ marginTop: 12, padding: "14px 16px", borderRadius: 12, background: "rgba(79,115,170,0.07)", border: "1px solid rgba(79,115,170,0.15)" }}>
+                <div style={{ marginTop: 12, padding: "14px 16px", background: "rgba(184,154,94,0.06)", border: `1px solid ${DC.border}` }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                    <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase", color: "#4f73aa" }}>Listener Access</span>
-                    <a href={displayUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "#2563eb", textDecoration: "none", opacity: 0.75 }}>open ↗</a>
+                    <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>Listener Access</span>
+                    <a href={displayUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: DC.gold, textDecoration: "none", opacity: 0.75 }}>open ↗</a>
                   </div>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 16, alignItems: "flex-start" }}>
                     {qrDataUrl ? (
@@ -2326,19 +2249,19 @@ export default function HostChurchPage() {
                         alt="Listener QR code"
                         width={120}
                         height={120}
-                        style={{ borderRadius: 8, border: "1px solid rgba(0,0,0,0.08)", flexShrink: 0 }}
+                        style={{ border: `1px solid ${DC.border}`, flexShrink: 0 }}
                       />
                     ) : (
-                      <div style={{ width: 120, height: 120, borderRadius: 8, background: "rgba(0,0,0,0.05)", flexShrink: 0 }} />
+                      <div style={{ width: 120, height: 120, background: "rgba(0,0,0,0.04)", flexShrink: 0 }} />
                     )}
                     <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minWidth: 160 }}>
-                      <p style={{ margin: 0, fontSize: 12, color: "#374151", wordBreak: "break-all", lineHeight: 1.5 }}>{displayUrl}</p>
+                      <p style={{ margin: 0, fontSize: 12, color: DC.mid, wordBreak: "break-all", lineHeight: 1.5 }}>{displayUrl}</p>
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                         <button
                           type="button"
                           onClick={() => { void copyListenerUrl(); }}
                           disabled={copyUrlBusy}
-                          style={{ fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 8, border: "1px solid rgba(79,115,170,0.4)", background: "white", color: "#4f73aa", cursor: copyUrlBusy ? "not-allowed" : "pointer", opacity: copyUrlBusy ? 0.6 : 1 }}
+                          style={{ ...settingsButtonNeutralStyle, fontSize: 12, padding: "6px 12px", cursor: copyUrlBusy ? "not-allowed" : "pointer", opacity: copyUrlBusy ? 0.6 : 1 }}
                         >
                           {copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}
                         </button>
@@ -2346,7 +2269,7 @@ export default function HostChurchPage() {
                           type="button"
                           onClick={() => { void shareListenerUrl(); }}
                           disabled={shareUrlBusy}
-                          style={{ fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 8, border: "none", background: "#4f73aa", color: "white", cursor: shareUrlBusy ? "not-allowed" : "pointer", opacity: shareUrlBusy ? 0.6 : 1 }}
+                          style={{ ...settingsButtonPrimaryStyle, fontSize: 12, padding: "6px 12px", cursor: shareUrlBusy ? "not-allowed" : "pointer", opacity: shareUrlBusy ? 0.6 : 1 }}
                         >
                           {shareUrlBusy ? "Sharing…" : "Share via…"}
                         </button>
@@ -2371,7 +2294,7 @@ export default function HostChurchPage() {
                       Update the name shown in the host console and team-facing flows.
                     </p>
                     <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Display name</span>
+                      <span style={{ fontSize: 12, color: DC.mid }}>Display name</span>
                       <input
                         value={accountDisplayNameInput}
                         onChange={(e) => {
@@ -2411,7 +2334,7 @@ export default function HostChurchPage() {
                       The church name can be updated later. The church slug is public-facing and stays fixed after creation.
                     </p>
                     <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Church name</span>
+                      <span style={{ fontSize: 12, color: DC.mid }}>Church name</span>
                       <input
                         value={churchNameInput}
                         onChange={(e) => {
@@ -2428,7 +2351,7 @@ export default function HostChurchPage() {
                       />
                     </label>
                     <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Church URL slug</span>
+                      <span style={{ fontSize: 12, color: DC.mid }}>Church URL slug</span>
                       <input
                         readOnly
                         value={slug}
@@ -2436,7 +2359,7 @@ export default function HostChurchPage() {
                           ...settingsInlineFieldStyle,
                           width: "100%",
                           background: "rgba(239,244,250,0.92)",
-                          color: "#5f6f86",
+                          color: DC.mid,
                         }}
                       />
                     </label>
@@ -2446,7 +2369,7 @@ export default function HostChurchPage() {
                       </p>
                     ) : null}
                     {!canManagePaidBilling ? (
-                      <p style={{ margin: 0, fontSize: 13, color: "#5f6f86" }}>
+                      <p style={{ margin: 0, fontSize: 13, color: DC.mid }}>
                         Owner or admin role is required to rename the church. The slug remains locked for all roles.
                       </p>
                     ) : null}
@@ -2477,7 +2400,7 @@ export default function HostChurchPage() {
                     </p>
 
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                      <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(79,115,170,0.18)", background: "rgba(127,165,219,0.16)", color: "#3e5d8d" }}>
+                      <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.3)`, background: "rgba(184,154,94,0.1)", color: DC.gold }}>
                         Plan · {formatPlanLabel(billingPlanToken)}
                       </span>
                       <span
@@ -2489,26 +2412,26 @@ export default function HostChurchPage() {
                               ? "1px solid rgba(224,163,86,0.26)"
                               : billingNeedsAttention
                                 ? "1px solid rgba(188,95,111,0.26)"
-                                : "1px solid rgba(189,200,217,0.9)",
+                                : `1px solid ${DC.border}`,
                           background: billingStatusToken === "active"
                             ? "rgba(91,179,130,0.14)"
                             : billingStatusToken === "past_due"
                               ? "rgba(224,163,86,0.16)"
                               : billingNeedsAttention
                                 ? "rgba(188,95,111,0.12)"
-                                : "rgba(247,250,253,0.8)",
+                                : DC.white,
                           color: billingStatusToken === "active"
-                            ? "#3b7d5c"
+                            ? DC.success
                             : billingStatusToken === "past_due"
-                              ? "#9a6433"
+                              ? DC.warn
                               : billingNeedsAttention
-                                ? "#a94457"
-                                : "#55657d",
+                                ? DC.danger
+                                : DC.mid,
                         }}
                       >
                         Status · {formatBillingStatus(billingStatusToken)}
                       </span>
-                      <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(189,200,217,0.95)", background: "rgba(247,250,253,0.8)", color: "#55657d" }}>
+                      <span style={{ ...settingsPillBaseStyle, border: `1px solid ${DC.border}`, background: DC.white, color: DC.mid }}>
                         {billingMonthlyMinutesLimit !== null
                           ? `${billingMonthlyMinutesLimit === 0 ? "Unlimited" : `${billingMonthlyMinutesLimit} min/mo`}${billingMonthlyMinutesUsed !== null ? ` · ${billingMonthlyMinutesUsed} used` : ""}`
                           : `Minutes · ${billingMaxServiceKeys > 0 ? "limited" : "unlimited"}`}
@@ -2520,9 +2443,9 @@ export default function HostChurchPage() {
                     {billingProfile ? (
                       <div style={{ display: "grid", gap: 8 }}>
                         {hasSubscriptionPeriod ? (
-                          <div style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.8)", background: "rgba(255,255,255,0.7)", padding: "12px 14px" }}>
+                          <div style={{ border: `1px solid ${DC.border}`, background: DC.white, padding: "12px 14px" }}>
                             <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Subscription Period</p>
-                            <p style={{ margin: "6px 0 0", fontSize: 13, color: "#334155" }}>
+                            <p style={{ margin: "6px 0 0", fontSize: 13, color: DC.charcoal }}>
                               <strong>{formatDateTime(billingProfile.currentPeriodStart, subscriptionPeriodDateTimeOptions)}</strong>
                               {" → "}
                               <strong>{formatDateTime(billingProfile.currentPeriodEnd, subscriptionPeriodDateTimeOptions)}</strong>
@@ -2635,11 +2558,11 @@ export default function HostChurchPage() {
                       return (
                         <div key={row.serviceKey} style={settingsServiceRowStyle}>
                           <div style={{ minWidth: 0 }}>
-                            <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#23354d" }}>{row.title}</p>
-                            <p style={{ margin: "4px 0 0", fontSize: 13, color: "#5f6f86" }}>{row.serviceKey}</p>
+                            <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy }}>{row.title}</p>
+                            <p style={{ margin: "4px 0 0", fontSize: 13, color: DC.mid }}>{row.serviceKey}</p>
                             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
                               {isSelected ? (
-                                <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(79,115,170,0.18)", background: "rgba(127,165,219,0.16)", color: "#3e5d8d" }}>
+                                <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.3)`, background: "rgba(184,154,94,0.1)", color: DC.gold }}>
                                   Selected
                                 </span>
                               ) : null}
@@ -2699,7 +2622,7 @@ export default function HostChurchPage() {
                 </section>
               </div>
             ) : (
-              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: "#5f6f86" }}>
+              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: DC.mid }}>
                 You do not have permission to manage service schedules for this church.
               </div>
             )
@@ -2709,59 +2632,59 @@ export default function HostChurchPage() {
               <div style={settingsShellStyle}>
                 <section style={billingHeroCardStyle}>
                   <div style={{ display: "grid", gap: 8 }}>
-                    <p style={{ ...settingsSectionLabelStyle, color: "#8a6441" }}>Billing & Subscription</p>
-                    <h3 style={{ ...settingsTitleStyle, fontSize: 28, lineHeight: 1.05 }}>Review plan, renewal, and subscriptions</h3>
-                    <p style={{ ...settingsBodyTextStyle, maxWidth: 760, color: "#6f5a43" }}>
+                    <p style={{ ...settingsSectionLabelStyle, color: DC.goldLight }}>Billing & Subscription</p>
+                    <h3 style={{ ...settingsTitleStyle, fontSize: 28, lineHeight: 1.05, color: DC.cream }}>Review plan, renewal, and subscriptions</h3>
+                    <p style={{ ...settingsBodyTextStyle, maxWidth: 760, color: "rgba(247,244,239,0.7)" }}>
                       Review subscription status, renewal timing, plan options, billing limits, and Sermon Prep budget in one place.
                     </p>
                   </div>
 
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                    <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(138,100,65,0.18)", background: "rgba(170,128,91,0.12)", color: "#845f3d" }}>
+                    <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(212,184,122,0.3)`, background: "rgba(212,184,122,0.1)", color: DC.goldLight }}>
                       Plan · {formatPlanLabel(billingPlanToken)}
                     </span>
                     <span
                       style={{
                         ...settingsPillBaseStyle,
                         border: billingStatusToken === "active"
-                          ? "1px solid rgba(91,179,130,0.22)"
+                          ? "1px solid rgba(91,179,130,0.35)"
                           : billingStatusToken === "past_due"
-                            ? "1px solid rgba(224,163,86,0.26)"
+                            ? "1px solid rgba(224,163,86,0.35)"
                             : billingNeedsAttention
-                              ? "1px solid rgba(188,95,111,0.26)"
-                              : "1px solid rgba(189,200,217,0.9)",
+                              ? "1px solid rgba(188,95,111,0.35)"
+                              : "1px solid rgba(247,244,239,0.2)",
                         background: billingStatusToken === "active"
-                          ? "rgba(91,179,130,0.14)"
+                          ? "rgba(91,179,130,0.18)"
                           : billingStatusToken === "past_due"
-                            ? "rgba(224,163,86,0.16)"
+                            ? "rgba(224,163,86,0.18)"
                             : billingNeedsAttention
-                              ? "rgba(188,95,111,0.12)"
-                              : "rgba(247,250,253,0.8)",
+                              ? "rgba(188,95,111,0.18)"
+                              : "rgba(247,244,239,0.08)",
                         color: billingStatusToken === "active"
-                          ? "#3b7d5c"
+                          ? "#7dd4a8"
                           : billingStatusToken === "past_due"
-                            ? "#9a6433"
+                            ? "#f0c070"
                             : billingNeedsAttention
-                              ? "#a94457"
-                              : "#55657d",
+                              ? "#f09090"
+                              : "rgba(247,244,239,0.7)",
                       }}
                     >
                       Status · {formatBillingStatus(billingStatusToken)}
                     </span>
-                    <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(189,200,217,0.95)", background: "rgba(247,250,253,0.8)", color: "#55657d" }}>
+                    <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(247,244,239,0.2)", background: "rgba(247,244,239,0.08)", color: "rgba(247,244,239,0.7)" }}>
                       Service keys · {billingMaxServiceKeys > 0 ? `up to ${billingMaxServiceKeys}` : "unlimited"}
                     </span>
                   </div>
 
                   {billingAlertMessage ? <div style={billingAlertStyle}>{billingAlertMessage}</div> : null}
-                  {billingError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {billingError}</p> : null}
-                  {billingNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{billingNotice}</p> : null}
+                  {billingError ? <p style={{ margin: 0, color: "#f09090", fontSize: 13 }}>Error: {billingError}</p> : null}
+                  {billingNotice ? <p style={{ margin: 0, color: "#7dd4a8", fontSize: 13 }}>{billingNotice}</p> : null}
 
                   {billingProfile ? (
                     <div style={settingsGridStyle}>
-                      <div style={{ borderRadius: 18, border: "1px solid rgba(189,200,217,0.8)", background: "rgba(255,255,255,0.68)", padding: "14px 16px" }}>
-                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Current Term</p>
-                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "#334155", lineHeight: 1.6 }}>
+                      <div style={{ border: "1px solid rgba(247,244,239,0.15)", background: "rgba(247,244,239,0.06)", padding: "14px 16px" }}>
+                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10, color: DC.goldLight }}>Current Term</p>
+                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "rgba(247,244,239,0.85)", lineHeight: 1.6 }}>
                           {hasSubscriptionPeriod ? (
                             <>
                               <strong>{formatDateTime(billingProfile.currentPeriodStart, subscriptionPeriodDateTimeOptions)}</strong>
@@ -2780,9 +2703,9 @@ export default function HostChurchPage() {
                           )}
                         </p>
                       </div>
-                      <div style={{ borderRadius: 18, border: "1px solid rgba(189,200,217,0.8)", background: "rgba(255,255,255,0.68)", padding: "14px 16px" }}>
-                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Usage Snapshot</p>
-                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "#334155", lineHeight: 1.6 }}>
+                      <div style={{ border: "1px solid rgba(247,244,239,0.15)", background: "rgba(247,244,239,0.06)", padding: "14px 16px" }}>
+                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10, color: DC.goldLight }}>Usage Snapshot</p>
+                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "rgba(247,244,239,0.85)", lineHeight: 1.6 }}>
                           {isTrialPlan ? (
                             <>
                               Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
@@ -2826,17 +2749,17 @@ export default function HostChurchPage() {
                             ...billingPlanCardBaseStyle,
                             textAlign: "left",
                             border: isCurrentPlan
-                              ? "2px solid rgba(99,102,241,0.7)"
+                              ? `2px solid ${DC.navy}`
                               : isSelectedPlan
-                                ? "2px solid rgba(79,115,170,0.5)"
-                                : "1px solid rgba(214,220,229,0.92)",
+                                ? `2px solid ${DC.gold}`
+                                : `1px solid ${DC.border}`,
                             cursor: canManagePaidBilling ? "pointer" : "default",
                             opacity: canManagePaidBilling ? 1 : 0.82,
                             background: isCurrentPlan
-                              ? "linear-gradient(135deg, rgba(238,242,255,0.8) 0%, rgba(255,255,255,1) 60%)"
+                              ? "rgba(15,31,61,0.04)"
                               : billingPlanCardBaseStyle.background,
                             boxShadow: isCurrentPlan
-                              ? "0 8px 24px rgba(99,102,241,0.2), 0 2px 8px rgba(99,102,241,0.1)"
+                              ? "0 4px 16px rgba(15,31,61,0.1)"
                               : isSelectedPlan
                                 ? accentPrimaryShadow
                                 : billingPlanCardBaseStyle.boxShadow,
@@ -2845,25 +2768,25 @@ export default function HostChurchPage() {
                           {isCurrentPlan && (
                             <div style={{
                               display: "flex", alignItems: "center", gap: 6,
-                              background: "linear-gradient(90deg, #4f46e5, #6366f1)",
-                              color: "#fff", fontWeight: 700, fontSize: 12,
-                              letterSpacing: "0.04em", textTransform: "uppercase",
-                              padding: "5px 12px", borderRadius: 6,
+                              background: DC.navy,
+                              color: DC.cream, fontWeight: 700, fontSize: 11,
+                              letterSpacing: "0.1em", textTransform: "uppercase",
+                              padding: "4px 10px", borderRadius: 3,
                               marginBottom: 10, alignSelf: "flex-start",
                             }}>
-                              <span style={{ fontSize: 14 }}>✓</span> Current Plan
+                              ✓ Current Plan
                             </div>
                           )}
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "start" }}>
                             <div style={{ display: "grid", gap: 4 }}>
-                              <strong style={{ fontSize: 22, color: "#20324a" }}>{PLAN_SUMMARIES[plan].title}</strong>
-                              <span style={{ fontSize: 13, color: "#5f6f86", fontWeight: 600 }}>{PLAN_SUMMARIES[plan].minuteLimit}</span>
-                              <span style={{ fontSize: 12, color: "#7a8fa8" }}>{PLAN_SUMMARIES[plan].description}</span>
+                              <strong style={{ fontSize: 22, color: DC.navy }}>{PLAN_SUMMARIES[plan].title}</strong>
+                              <span style={{ fontSize: 13, color: DC.mid, fontWeight: 600 }}>{PLAN_SUMMARIES[plan].minuteLimit}</span>
+                              <span style={{ fontSize: 12, color: DC.mid }}>{PLAN_SUMMARIES[plan].description}</span>
                             </div>
                           </div>
                           <div style={{ display: "grid", gap: 2 }}>
-                            <span style={{ fontSize: 30, fontWeight: 900, letterSpacing: "-0.05em", color: "#20324a" }}>{PLAN_SUMMARIES[plan].monthlyPrice}</span>
-                            <span style={{ fontSize: 12, color: "#6a7a91" }}>
+                            <span style={{ fontSize: 30, fontWeight: 900, letterSpacing: "-0.05em", color: DC.navy }}>{PLAN_SUMMARIES[plan].monthlyPrice}</span>
+                            <span style={{ fontSize: 12, color: DC.mid }}>
                               {isCurrentPlan ? "Your active plan" : isSelectedPlan ? "Selected for checkout" : "Click to select this plan"}
                             </span>
                           </div>
@@ -2926,14 +2849,14 @@ export default function HostChurchPage() {
                     </p>
                     {canManageBilling ? (
                       <>
-                        <div style={{ borderRadius: 16, border: "1px solid rgba(189,200,217,0.84)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
-                          <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
+                        <div style={{ border: `1px solid ${DC.border}`, background: DC.white, padding: "12px 14px", display: "grid", gap: 6 }}>
+                          <p style={{ margin: 0, fontSize: 13, color: DC.mid }}>
                             Status:{" "}
                             <strong>{billingState ? (billingState.billingLimitsEnabled ? "Enabled" : "Disabled") : "Loading..."}</strong>
                             {billingState && !billingState.globalBillingLimitsEnabled ? " · Global override currently disables all billing checks" : ""}
                           </p>
                           {billingState ? (
-                            <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
+                            <p style={{ margin: 0, fontSize: 12, color: DC.mid }}>
                               Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
                               {" · "}
                               Hard cap: {billingState.hardCapReached ? "reached" : "not reached"}
@@ -2970,8 +2893,8 @@ export default function HostChurchPage() {
                       Track OpenAI token usage by sermon and cap monthly Sermon Prep spend for this church.
                     </p>
                     {sermonUsageState ? (
-                      <div style={{ borderRadius: 16, border: "1px solid rgba(184,204,194,0.88)", background: "rgba(255,255,255,0.68)", padding: "12px 14px", display: "grid", gap: 6 }}>
-                        <p style={{ margin: 0, fontSize: 13, color: "#42556f" }}>
+                      <div style={{ border: `1px solid ${DC.border}`, background: DC.white, padding: "12px 14px", display: "grid", gap: 6 }}>
+                        <p style={{ margin: 0, fontSize: 13, color: DC.mid }}>
                           Month {sermonUsageState.currentMonthKey}: <strong>${sermonUsageState.currentMonthEstimatedUsd.toFixed(4)}</strong>
                           {sermonUsageState.effectiveBudgetEnabled ? ` / $${sermonUsageState.budgetUsd.toFixed(2)}` : " (budget disabled)"}
                           {" · "}
@@ -2982,13 +2905,13 @@ export default function HostChurchPage() {
                         {sermonUsageState.sermons.length ? (
                           <div style={{ display: "grid", gap: 4 }}>
                             {sermonUsageState.sermons.slice(0, 4).map((row) => (
-                              <p key={row.sermonId} style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>
+                              <p key={row.sermonId} style={{ margin: 0, fontSize: 12, color: DC.mid }}>
                                 {row.sermonId}: ${row.estimatedUsd.toFixed(4)} · {row.totalTokens.toLocaleString()} tokens
                               </p>
                             ))}
                           </div>
                         ) : (
-                          <p style={{ margin: 0, fontSize: 12, color: "#5f6f86" }}>No Sermon Prep usage recorded this month yet.</p>
+                          <p style={{ margin: 0, fontSize: 12, color: DC.mid }}>No Sermon Prep usage recorded this month yet.</p>
                         )}
                       </div>
                     ) : (
@@ -2998,7 +2921,7 @@ export default function HostChurchPage() {
                       <>
                         <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "end" }}>
                           <label style={{ display: "grid", gap: 6 }}>
-                            <span style={{ fontSize: 12, color: "#5f6f86" }}>Monthly budget (USD)</span>
+                            <span style={{ fontSize: 12, color: DC.mid }}>Monthly budget (USD)</span>
                             <input
                               type="number"
                               min={0}
@@ -3041,7 +2964,7 @@ export default function HostChurchPage() {
                 </div>
               </div>
             ) : (
-              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: "#5f6f86" }}>
+              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: DC.mid }}>
                 You do not have permission to view billing for this church.
               </div>
             )
@@ -3060,7 +2983,7 @@ export default function HostChurchPage() {
 
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "end" }}>
                     <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: "#5f6f86" }}>Role</span>
+                      <span style={{ fontSize: 12, color: DC.mid }}>Role</span>
                       <select
                         value={inviteRole}
                         onChange={(e) => setInviteRole(e.target.value as InviteRoleChoice)}
@@ -3089,16 +3012,15 @@ export default function HostChurchPage() {
                   {inviteLink ? (
                     <div
                       style={{
-                        borderRadius: 16,
-                        border: "1px solid rgba(189,200,217,0.84)",
-                        background: "rgba(255,255,255,0.68)",
+                        border: `1px solid ${DC.border}`,
+                        background: DC.white,
                         padding: "12px 14px",
                         display: "grid",
                         gap: 10,
                       }}
                     >
                       <label style={{ display: "grid", gap: 6 }}>
-                        <span style={{ fontSize: 13, color: "#42556f", fontWeight: 700 }}>Invite URL</span>
+                        <span style={{ fontSize: 13, color: DC.mid, fontWeight: 700 }}>Invite URL</span>
                         <input readOnly value={inviteLink} style={{ ...settingsInlineFieldStyle, width: "100%" }} />
                       </label>
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -3145,12 +3067,12 @@ export default function HostChurchPage() {
                       {inviteRows.map((row) => (
                         <div key={row.inviteId} style={settingsServiceRowStyle}>
                           <div style={{ minWidth: 0 }}>
-                            <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#23354d" }}>Role: {row.role}</p>
+                            <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy }}>Role: {row.role}</p>
                             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-                              <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(79,115,170,0.18)", background: "rgba(127,165,219,0.16)", color: "#3e5d8d" }}>
+                              <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.3)`, background: "rgba(184,154,94,0.1)", color: DC.gold }}>
                                 Expires {formatDateTime(row.expiresAt || null)}
                               </span>
-                              <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(189,200,217,0.66)", background: "rgba(247,250,253,0.74)", color: "#5f6f86" }}>
+                              <span style={{ ...settingsPillBaseStyle, border: `1px solid ${DC.border}`, background: DC.white, color: DC.mid }}>
                                 Created {formatDateTime(row.createdAt || null)}
                               </span>
                             </div>
@@ -3174,7 +3096,7 @@ export default function HostChurchPage() {
                 </section>
               </div>
             ) : (
-              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: "#5f6f86" }}>
+              <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: DC.mid }}>
                 You do not have permission to manage team invites for this church.
               </div>
             )
@@ -3195,8 +3117,8 @@ export default function HostChurchPage() {
           ) : (
             <section
               style={{
-                borderRadius: 16,
-                background: "linear-gradient(160deg, rgba(240,246,255,0.7) 0%, rgba(225,234,248,0.45) 100%)",
+                background: DC.white,
+                border: `1px solid ${DC.border}`,
                 padding: "32px 24px",
                 display: "flex",
                 flexDirection: "column",
@@ -3205,18 +3127,17 @@ export default function HostChurchPage() {
                 textAlign: "center",
               }}
             >
-              <div style={{ width: 48, height: 48, borderRadius: 14, background: "rgba(79,115,170,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <div style={{ width: 48, height: 48, background: "rgba(184,154,94,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
-                  {/* broadcast signal arcs */}
-                  <circle cx="14" cy="18" r="2.5" fill="#4f73aa" />
-                  <path d="M9.5 14.5 a6.5 6.5 0 0 1 9 0" stroke="#4f73aa" strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.7" />
-                  <path d="M6 11 a11 11 0 0 1 16 0" stroke="#4f73aa" strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.4" />
+                  <circle cx="14" cy="18" r="2.5" fill={DC.gold} />
+                  <path d="M9.5 14.5 a6.5 6.5 0 0 1 9 0" stroke={DC.gold} strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.7" />
+                  <path d="M6 11 a11 11 0 0 1 16 0" stroke={DC.gold} strokeWidth="2" strokeLinecap="round" fill="none" opacity="0.4" />
                 </svg>
               </div>
-              <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#2c3e5a", letterSpacing: "-0.02em" }}>
-                Select a service and press <span style={{ color: "#4f73aa" }}>Start Service</span> to open the controls
+              <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy, letterSpacing: "-0.02em" }}>
+                Select a service and press <span style={{ color: DC.gold }}>Start Service</span> to open the controls
               </p>
-              <p style={{ margin: 0, fontSize: 13, color: "#7a8da8", lineHeight: 1.55, maxWidth: 380 }}>
+              <p style={{ margin: 0, fontSize: 13, color: DC.mid, lineHeight: 1.55, maxWidth: 380 }}>
                 Translation, audio controls, and live monitoring will appear here once a room is active.
               </p>
             </section>
@@ -3225,10 +3146,10 @@ export default function HostChurchPage() {
 
         <section style={supportFooterStyle}>
           <div style={{ display: "grid", gap: 4 }}>
-            <p style={{ margin: 0, fontSize: 16, fontWeight: 800, letterSpacing: "0.16em", textTransform: "uppercase", color: "#7c8ba3" }}>
+            <p style={{ margin: 0, fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>
               Support
             </p>
-            <p style={{ margin: 0, fontSize: 13, color: "#5f6f86", lineHeight: 1.6 }}>
+            <p style={{ margin: 0, fontSize: 13, color: DC.mid, lineHeight: 1.6 }}>
               Need help with billing, setup, team access, or translation quality? Contact support from here.
             </p>
           </div>

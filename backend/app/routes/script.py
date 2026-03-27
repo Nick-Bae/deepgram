@@ -78,6 +78,25 @@ class SermonBudgetRequest(BaseModel):
     budget_usd: float = Field(..., ge=0.0, le=1_000_000.0)
 
 
+# Service-scoped sermon request models (sermon-service-isolation)
+_SERVICE_DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
+_SERVICE_KEY_RE = r"^[a-zA-Z0-9_\-]{1,80}$"
+
+
+class ServiceSermonDraftRequest(BaseModel):
+    service_date: str = Field(..., pattern=_SERVICE_DATE_RE, description="YYYY-MM-DD")
+    korean: str = Field(..., min_length=1)
+    auto_split: bool = True
+    threshold: float = Field(default=0.84, ge=0.0, le=1.0)
+    lang_src: str = Field(default="ko", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    lang_tgt: str = Field(default="en", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+
+
+class ServiceSermonSaveRequest(BaseModel):
+    segments: list[SermonSegment] = Field(default_factory=list)
+    threshold: float = Field(default=0.84, ge=0.0, le=1.0)
+
+
 def _split_korean_text(raw: str, auto_split: bool) -> list[str]:
     text = (raw or "").strip()
     if not text:
@@ -443,3 +462,196 @@ def set_sermon_budget_default_org(
 ):
     org_id = resolve_default_org_id_for_roles(user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
     return set_sermon_budget(org_id=org_id, body=body, user=user)
+
+
+# ---------------------------------------------------------------------------
+# Service-scoped sermon endpoints (sermon-service-isolation)
+# Path: /org/{orgId}/services/{serviceKey}/sermon/*
+# ---------------------------------------------------------------------------
+
+@router.post("/org/{org_id}/services/{service_key}/sermon/draft")
+async def draft_service_sermon(
+    org_id: str,
+    service_key: str,
+    body: ServiceSermonDraftRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    """Generate an AI translation draft for a specific service slot + date."""
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+
+    service_date = body.service_date.strip()
+    source_lang = body.lang_src.strip().lower() or "ko"
+    target_lang = body.lang_tgt.strip().lower() or "en"
+
+    raw_segments = _split_korean_text(body.korean, body.auto_split)
+    if not raw_segments:
+        raise HTTPException(status_code=400, detail="korean text produced no segments")
+
+    translated_rows, usage = await _translate_segments(
+        segments=raw_segments,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        org_id=org_id,
+    )
+
+    # Persist as draft immediately (so user can resume editing)
+    pairs = [{"source": r["ko"], "target": r["en"]} for r in translated_rows]
+    multichurch_store.save_sermon_draft(
+        org_id, service_key, service_date,
+        pairs=pairs,
+        threshold=body.threshold,
+        lang_src=source_lang,
+        lang_tgt=target_lang,
+        created_by=user.uid,
+    )
+
+    return {
+        "serviceKey": service_key,
+        "serviceDate": service_date,
+        "status": "draft",
+        "segments": translated_rows,
+        "usage": usage,
+    }
+
+
+@router.get("/org/{org_id}/services/{service_key}/sermon/{service_date}")
+def get_service_sermon(
+    org_id: str,
+    service_key: str,
+    service_date: str,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    """Return a sermon draft or published doc for a service slot + date."""
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+    doc = multichurch_store.get_sermon_draft(org_id, service_key, service_date)
+    if not doc:
+        raise HTTPException(status_code=404, detail="sermon_not_found")
+    return doc
+
+
+@router.put("/org/{org_id}/services/{service_key}/sermon/{service_date}")
+def save_service_sermon(
+    org_id: str,
+    service_key: str,
+    service_date: str,
+    body: ServiceSermonSaveRequest,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    """Save edited segments to a draft sermon (does not publish)."""
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+
+    if not body.segments:
+        raise HTTPException(status_code=400, detail="segments must be a non-empty list")
+
+    pairs: list[dict] = []
+    for idx, seg in enumerate(body.segments):
+        ko = seg.ko.strip()
+        en = seg.en.strip()
+        if not ko or not en:
+            raise HTTPException(status_code=400, detail=f"segments[{idx}] must include both ko and en")
+        pairs.append({"source": ko, "target": en})
+
+    multichurch_store.save_sermon_draft(
+        org_id, service_key, service_date,
+        pairs=pairs,
+        threshold=body.threshold,
+        created_by=user.uid,
+    )
+    return {
+        "status": "draft",
+        "serviceKey": service_key,
+        "serviceDate": service_date,
+        "segmentCount": len(pairs),
+    }
+
+
+@router.post("/org/{org_id}/services/{service_key}/sermon/{service_date}/publish")
+def publish_service_sermon(
+    org_id: str,
+    service_key: str,
+    service_date: str,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    """
+    Freeze a draft sermon as published for a service slot + date.
+    Pre-warms the in-memory script store with the service+date key.
+    """
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+
+    doc = multichurch_store.get_sermon_draft(org_id, service_key, service_date)
+    if not doc:
+        raise HTTPException(status_code=404, detail="sermon_not_found")
+    if doc.get("status") == "published":
+        raise HTTPException(status_code=409, detail="already_published")
+    pairs = doc.get("pairs") or []
+    if not pairs:
+        raise HTTPException(status_code=400, detail="sermon_has_no_segments")
+
+    result = multichurch_store.publish_sermon(org_id, service_key, service_date)
+    if not result:
+        raise HTTPException(status_code=500, detail="publish_failed")
+
+    # Pre-warm in-memory store for instant room start
+    script_store.load(
+        pairs,
+        doc.get("threshold"),
+        service_key=service_key,
+        service_date=service_date,
+        org_id=org_id,
+    )
+
+    return {
+        "status": "published",
+        "serviceKey": service_key,
+        "serviceDate": service_date,
+        "segmentCount": len(pairs),
+        "preWarmed": True,
+    }
+
+
+@router.delete("/org/{org_id}/services/{service_key}/sermon/{service_date}/publish")
+def unpublish_service_sermon(
+    org_id: str,
+    service_key: str,
+    service_date: str,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    """Revert a published sermon to draft status (only if no live room is using it)."""
+    require_org_role(org_id=org_id, user=user, roles={"owner", "admin"}, store=multichurch_store)
+
+    doc = multichurch_store.get_sermon_draft(org_id, service_key, service_date)
+    if not doc:
+        raise HTTPException(status_code=404, detail="sermon_not_found")
+    if doc.get("status") != "published":
+        raise HTTPException(status_code=409, detail="not_published")
+
+    try:
+        sermon_ref = (
+            multichurch_store._db  # type: ignore[attr-defined]
+            .collection("organizations").document(org_id)
+            .collection("services").document(service_key)
+            .collection("sermons").document(service_date)
+        )
+        from google.cloud import firestore as gcf_fs  # type: ignore[import]
+        sermon_ref.update({
+            "status": "draft",
+            "publishedAt": None,
+            "updatedAt": gcf_fs.SERVER_TIMESTAMP,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="unpublish_failed") from exc
+
+    return {"status": "draft", "serviceKey": service_key, "serviceDate": service_date}
+
+
+@router.get("/org/{org_id}/services/{service_key}/sermons")
+def list_service_sermons(
+    org_id: str,
+    service_key: str,
+    limit: int = 10,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    """List sermon docs for a service slot, most recent first."""
+    require_org_role(org_id=org_id, user=user, roles=SCRIPT_EDITOR_ROLES, store=multichurch_store)
+    docs = multichurch_store.list_sermon_drafts(org_id, service_key, limit=min(limit, 50))
+    return {"serviceKey": service_key, "sermons": docs, "count": len(docs)}

@@ -4,10 +4,18 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/router";
 
 import { useAuth } from "../lib/authContext";
-import { draftOrgSermon, finalizeOrgSermon, type SermonDraftSegment } from "../lib/backendAuth";
+import {
+  draftOrgSermon,
+  finalizeOrgSermon,
+  draftServiceSermon,
+  saveServiceSermon,
+  publishServiceSermon,
+  type SermonDraftSegment,
+} from "../lib/backendAuth";
 
 type Props = {
   orgId: string;
+  serviceKey?: string;
 };
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
@@ -21,18 +29,31 @@ function buildDefaultSermonId(): string {
   return `${yyyy}-${mm}-${dd}-am`;
 }
 
-export default function SermonPrep({ orgId }: Props) {
+function buildDefaultServiceDate(): string {
+  const now = new Date();
+  // Default to next Sunday
+  const dayOfWeek = now.getDay(); // 0=Sun
+  const daysUntilSunday = dayOfWeek === 0 ? 7 : 7 - dayOfWeek;
+  const nextSunday = new Date(now);
+  nextSunday.setDate(now.getDate() + daysUntilSunday);
+  return nextSunday.toISOString().slice(0, 10);
+}
+
+export default function SermonPrep({ orgId, serviceKey }: Props) {
   const router = useRouter();
   const { getIdToken, logout } = useAuth();
   const [sermonId, setSermonId] = useState(buildDefaultSermonId());
+  const [serviceDate, setServiceDate] = useState(buildDefaultServiceDate());
   const [korean, setKorean] = useState("");
-  const [threshold, setThreshold] = useState(0.8);
+  const [threshold, setThreshold] = useState(0.84);
   const [langSrc, setLangSrc] = useState("ko");
   const [langTgt, setLangTgt] = useState("en");
   const [autoSplit, setAutoSplit] = useState(true);
   const [segments, setSegments] = useState<SermonDraftSegment[]>([]);
   const [busyDraft, setBusyDraft] = useState(false);
   const [busySave, setBusySave] = useState(false);
+  const [busyPublish, setBusyPublish] = useState(false);
+  const [published, setPublished] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
@@ -126,36 +147,55 @@ export default function SermonPrep({ orgId }: Props) {
       setMessage("❌ Select a church first.");
       return;
     }
-    if (!sermonId.trim()) {
-      setMessage("❌ Enter sermon_id first.");
-      return;
-    }
     if (!korean.trim()) {
       setMessage("❌ Paste Korean sermon text first.");
       return;
     }
+    if (serviceKey && !serviceDate.trim()) {
+      setMessage("❌ Select a service date first.");
+      return;
+    }
+    if (!serviceKey && !sermonId.trim()) {
+      setMessage("❌ Enter sermon_id first.");
+      return;
+    }
 
     setBusyDraft(true);
+    setPublished(false);
     setMessage("⏳ Generating draft... Larger sermons can take a few minutes.");
     try {
       const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
 
-      const drafted = await draftOrgSermon(idToken, orgId, {
-        sermon_id: sermonId.trim(),
-        korean,
-        auto_split: autoSplit,
-        threshold,
-        lang_src: langSrc,
-        lang_tgt: langTgt,
-      });
-
-      setSermonId(drafted.sermon_id);
-      setThreshold(drafted.threshold);
-      setLangSrc(drafted.lang_src);
-      setLangTgt(drafted.lang_tgt);
-      setSegments(drafted.segments || []);
-      setMessage(`✅ Draft ready: ${drafted.segments.length} rows.`);
+      if (serviceKey) {
+        // Service-scoped draft
+        const drafted = await draftServiceSermon(idToken, orgId, serviceKey, {
+          service_date: serviceDate.trim(),
+          korean,
+          auto_split: autoSplit,
+          threshold,
+          lang_src: langSrc,
+          lang_tgt: langTgt,
+        });
+        setSegments(drafted.segments || []);
+        setMessage(`✅ Draft ready: ${drafted.segments.length} rows for ${serviceKey} on ${serviceDate}.`);
+      } else {
+        // Legacy org-level draft
+        const drafted = await draftOrgSermon(idToken, orgId, {
+          sermon_id: sermonId.trim(),
+          korean,
+          auto_split: autoSplit,
+          threshold,
+          lang_src: langSrc,
+          lang_tgt: langTgt,
+        });
+        setSermonId(drafted.sermon_id);
+        setThreshold(drafted.threshold);
+        setLangSrc(drafted.lang_src);
+        setLangTgt(drafted.lang_tgt);
+        setSegments(drafted.segments || []);
+        setMessage(`✅ Draft ready: ${drafted.segments.length} rows.`);
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSessionExpiredError(msg)) {
@@ -192,6 +232,52 @@ export default function SermonPrep({ orgId }: Props) {
 
   const rangeLabel =
     segments.length > 0 ? `Rows ${currentPageStart + 1}-${currentPageEnd} of ${segments.length}` : "No rows yet";
+
+  const onSaveDraft = async () => {
+    if (!orgId || !serviceKey || !serviceDate.trim() || !segments.length) return;
+    setBusySave(true);
+    setMessage("⏳ Saving draft...");
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      await saveServiceSermon(idToken, orgId, serviceKey, serviceDate.trim(), { segments, threshold });
+      setMessage(`✅ Draft saved (${segments.length} rows).`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setMessage(`❌ ${msg}`);
+    } finally {
+      setBusySave(false);
+    }
+  };
+
+  const onPublish = async () => {
+    if (!orgId || !serviceKey || !serviceDate.trim() || !segments.length) return;
+    if (segments.some((row) => !row.en.trim())) {
+      setMessage("❌ Every English row must be filled before publishing.");
+      return;
+    }
+    setBusyPublish(true);
+    setMessage("⏳ Saving and publishing sermon...");
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      // Save latest edits first, then publish
+      await saveServiceSermon(idToken, orgId, serviceKey, serviceDate.trim(), { segments, threshold });
+      await publishServiceSermon(idToken, orgId, serviceKey, serviceDate.trim());
+      setPublished(true);
+      setMessage(`✅ Published for ${serviceKey} on ${serviceDate}. Sermon is now active for this service.`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isSessionExpiredError(msg)) {
+        setMessage("❌ Session expired. Redirecting to login...");
+        await redirectToLogin();
+        return;
+      }
+      setMessage(`❌ ${msg}`);
+    } finally {
+      setBusyPublish(false);
+    }
+  };
 
   const onSaveFinal = async () => {
     if (!orgId) {
@@ -252,15 +338,28 @@ export default function SermonPrep({ orgId }: Props) {
       </div>
 
       <div className="mt-5 grid gap-4 md:grid-cols-2">
-        <label className="space-y-1 text-sm text-slate-700">
-          <span className="font-medium text-slate-700">Step 1: Sermon ID</span>
-          <input
-            value={sermonId}
-            onChange={(e) => setSermonId(e.target.value)}
-            className="w-full rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white placeholder-white/35 focus:border-[#22d3ee] focus:outline-none"
-            placeholder="2026-03-08-am"
-          />
-        </label>
+        {serviceKey ? (
+          <label className="space-y-1 text-sm text-slate-700">
+            <span className="font-medium text-slate-700">Step 1: Service Date</span>
+            <input
+              type="date"
+              value={serviceDate}
+              onChange={(e) => { setServiceDate(e.target.value); setPublished(false); }}
+              className="w-full rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white focus:border-[#22d3ee] focus:outline-none"
+            />
+            <span className="text-xs text-slate-500">Sermon for: {serviceKey}</span>
+          </label>
+        ) : (
+          <label className="space-y-1 text-sm text-slate-700">
+            <span className="font-medium text-slate-700">Step 1: Sermon ID</span>
+            <input
+              value={sermonId}
+              onChange={(e) => setSermonId(e.target.value)}
+              className="w-full rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white placeholder-white/35 focus:border-[#22d3ee] focus:outline-none"
+              placeholder="2026-03-08-am"
+            />
+          </label>
+        )}
 
         <label className="space-y-1 text-sm text-slate-700">
           <span className="font-medium text-slate-700">Rows ready</span>
@@ -327,20 +426,46 @@ export default function SermonPrep({ orgId }: Props) {
         <button
           type="button"
           onClick={onGenerateDraft}
-          disabled={busyDraft || busySave}
+          disabled={busyDraft || busySave || busyPublish}
           className="inline-flex items-center justify-center gap-2 rounded-2xl bg-[#22d3ee] px-5 py-2.5 text-sm font-semibold text-[#041018] shadow-[0_15px_45px_rgba(34,211,238,0.35)] transition hover:bg-[#00ffff] disabled:cursor-not-allowed disabled:opacity-50"
         >
           {busyDraft ? "Generating..." : "Step 3: Generate draft"}
         </button>
 
-        <button
-          type="button"
-          onClick={onSaveFinal}
-          disabled={busyDraft || busySave || !segments.length || !allRowsReady}
-          className="inline-flex items-center justify-center gap-2 rounded-2xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-[#041018] shadow-[0_15px_45px_rgba(16,185,129,0.28)] transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {busySave ? "Saving..." : "Step 4: Save as final"}
-        </button>
+        {serviceKey ? (
+          <>
+            <button
+              type="button"
+              onClick={onSaveDraft}
+              disabled={busyDraft || busySave || busyPublish || !segments.length}
+              className="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-400 px-5 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-cyan-400 hover:text-cyan-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {busySave ? "Saving..." : "Step 4a: Save Draft"}
+            </button>
+            <button
+              type="button"
+              onClick={onPublish}
+              disabled={busyDraft || busySave || busyPublish || !segments.length || !allRowsReady || published}
+              className="inline-flex items-center justify-center gap-2 rounded-2xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-[#041018] shadow-[0_15px_45px_rgba(16,185,129,0.28)] transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {busyPublish ? "Publishing..." : published ? "✓ Published" : "Step 4b: Publish for Service"}
+            </button>
+            {published ? null : (
+              <span className="text-xs text-amber-600">
+                Publishing freezes this sermon for {serviceKey} on {serviceDate}.
+              </span>
+            )}
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={onSaveFinal}
+            disabled={busyDraft || busySave || !segments.length || !allRowsReady}
+            className="inline-flex items-center justify-center gap-2 rounded-2xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-[#041018] shadow-[0_15px_45px_rgba(16,185,129,0.28)] transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busySave ? "Saving..." : "Step 4: Save as final"}
+          </button>
+        )}
 
         <button
           type="button"

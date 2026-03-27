@@ -29,6 +29,13 @@ service cloud.firestore {
       match /services/{serviceKey} {
         allow read: if true;
         allow create, update, delete: if false;
+
+        // Service-scoped sermon subcollection — backend writes only via Admin SDK.
+        // Org members may read to display prep status in the UI.
+        match /sermons/{serviceDate} {
+          allow read: if isOrgMember(orgId);
+          allow create, update, delete: if false;
+        }
       }
 
       match /rooms/{roomId} {

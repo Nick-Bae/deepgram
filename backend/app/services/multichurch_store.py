@@ -2511,6 +2511,45 @@ class InMemoryMultiChurchStore:
     def get_latest_sermon_pairs(self, org_id: str) -> Optional[dict]:
         return None  # no-op for in-memory store
 
+    # --- Service-scoped sermon subcollection (service isolation) ---
+
+    def save_sermon_draft(
+        self,
+        org_id: str,
+        service_key: str,
+        service_date: str,
+        pairs: List[dict],
+        *,
+        threshold: float = 0.84,
+        lang_src: str = "ko",
+        lang_tgt: str = "en",
+        created_by: str = "",
+    ) -> None:
+        pass  # no-op for in-memory store
+
+    def get_sermon_draft(
+        self, org_id: str, service_key: str, service_date: str
+    ) -> Optional[dict]:
+        return None  # no-op for in-memory store
+
+    def publish_sermon(
+        self, org_id: str, service_key: str, service_date: str
+    ) -> Optional[dict]:
+        return None  # no-op for in-memory store
+
+    def get_published_sermon(
+        self, org_id: str, service_key: str, service_date: str
+    ) -> Optional[dict]:
+        return None  # no-op for in-memory store
+
+    def list_sermon_drafts(
+        self, org_id: str, service_key: str, limit: int = 10
+    ) -> List[dict]:
+        return []  # no-op for in-memory store
+
+    def list_services_by_org_id(self, org_id: str) -> List[Dict[str, Any]]:
+        return []  # no-op for in-memory store
+
 
 class FirestoreMultiChurchStore:
     def __init__(self) -> None:
@@ -2825,6 +2864,23 @@ class FirestoreMultiChurchStore:
             )
         rows.sort(key=lambda r: r["serviceKey"])
         return {"orgId": org_id, "slug": slug, "name": (org or {}).get("name", slug), "services": rows}
+
+    def list_services_by_org_id(self, org_id: str) -> List[Dict[str, Any]]:
+        """List services for an org by orgId directly (no slug resolution needed)."""
+        rows: List[Dict[str, Any]] = []
+        try:
+            for snap in self._org_ref(org_id).collection("services").stream():
+                service = snap.to_dict() or {}
+                rows.append({
+                    "serviceKey": snap.id,
+                    "title": service.get("title") or snap.id,
+                    "publishedSermonDate": service.get("publishedSermonDate"),
+                    "defaultLanguagePair": service.get("defaultLanguagePair") or {"source": "ko", "target": "en"},
+                })
+            rows.sort(key=lambda r: r["serviceKey"])
+        except Exception:
+            pass
+        return rows
 
     def update_org_profile(
         self,
@@ -4823,6 +4879,127 @@ class FirestoreMultiChurchStore:
         except Exception:
             pass
         return None
+
+    # --- Service-scoped sermon subcollection (service isolation) ---
+
+    def _sermon_ref(self, org_id: str, service_key: str, service_date: str):
+        return (
+            self._db
+            .collection("organizations").document(org_id)
+            .collection("services").document(service_key)
+            .collection("sermons").document(service_date)
+        )
+
+    def save_sermon_draft(
+        self,
+        org_id: str,
+        service_key: str,
+        service_date: str,
+        pairs: List[dict],
+        *,
+        threshold: float = 0.84,
+        lang_src: str = "ko",
+        lang_tgt: str = "en",
+        created_by: str = "",
+    ) -> None:
+        """Create or overwrite a draft sermon for a specific service slot + date."""
+        try:
+            ref = self._sermon_ref(org_id, service_key, service_date)
+            existing = ref.get()
+            if existing.exists and existing.to_dict().get("status") == "published":
+                # Never silently overwrite a published sermon
+                return
+            data: dict = {
+                "serviceKey": service_key,
+                "serviceDate": service_date,
+                "status": "draft",
+                "pairs": pairs,
+                "threshold": threshold,
+                "langSrc": lang_src,
+                "langTgt": lang_tgt,
+                "segmentCount": len(pairs),
+                "publishedAt": None,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            }
+            if not existing.exists:
+                data["createdBy"] = created_by
+                data["createdAt"] = gcf_firestore.SERVER_TIMESTAMP
+                ref.set(data)
+            else:
+                ref.update(data)
+        except Exception:
+            pass
+
+    def get_sermon_draft(
+        self, org_id: str, service_key: str, service_date: str
+    ) -> Optional[dict]:
+        """Return a sermon doc (any status) for a service slot + date, or None."""
+        try:
+            doc = self._sermon_ref(org_id, service_key, service_date).get()
+            return doc.to_dict() if doc.exists else None
+        except Exception:
+            return None
+
+    def publish_sermon(
+        self, org_id: str, service_key: str, service_date: str
+    ) -> Optional[dict]:
+        """
+        Freeze a draft sermon as published.
+        Sets status=published, publishedAt=now, updates service.publishedSermonDate.
+        Returns the updated doc, or None on failure.
+        """
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            ref = self._sermon_ref(org_id, service_key, service_date)
+            ref.update({
+                "status": "published",
+                "publishedAt": gcf_firestore.SERVER_TIMESTAMP,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            })
+            # Update service pointer
+            svc_ref = (
+                self._db
+                .collection("organizations").document(org_id)
+                .collection("services").document(service_key)
+            )
+            svc_ref.update({
+                "publishedSermonDate": service_date,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            })
+            doc = ref.get()
+            return doc.to_dict() if doc.exists else None
+        except Exception:
+            return None
+
+    def get_published_sermon(
+        self, org_id: str, service_key: str, service_date: str
+    ) -> Optional[dict]:
+        """Return the published sermon for a service slot + date, or None."""
+        try:
+            doc = self._sermon_ref(org_id, service_key, service_date).get()
+            if not doc.exists:
+                return None
+            data = doc.to_dict()
+            return data if data.get("status") == "published" else None
+        except Exception:
+            return None
+
+    def list_sermon_drafts(
+        self, org_id: str, service_key: str, limit: int = 10
+    ) -> List[dict]:
+        """List sermon docs for a service slot, ordered by serviceDate descending."""
+        try:
+            col_ref = (
+                self._db
+                .collection("organizations").document(org_id)
+                .collection("services").document(service_key)
+                .collection("sermons")
+            )
+            docs = col_ref.order_by("serviceDate", direction="DESCENDING").limit(limit).get()
+            return [d.to_dict() for d in docs if d.exists]
+        except Exception:
+            return []
 
 
 def _build_store():
