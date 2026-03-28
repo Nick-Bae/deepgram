@@ -1538,8 +1538,9 @@ export default function HostChurchPage() {
 
   const hostPageStyle = {
     minHeight: "100vh",
-    background: "radial-gradient(circle at 18% 15%, rgba(198,192,245,0.48), transparent 18%), radial-gradient(circle at 78% 18%, rgba(255,255,255,0.75), transparent 12%), radial-gradient(circle at 75% 70%, rgba(232,214,219,0.34), transparent 18%), linear-gradient(180deg, #f5efe7 0%, #eee6da 100%)",
+    background: "#ede5d8",
     color: "#2e2a28",
+    position: "relative" as const,
   } as const;
   const dashboardCardShadow = "0 1px 3px rgba(0,0,0,0.06)";
   const dashboardCompactShadow = "0 1px 2px rgba(0,0,0,0.04)";
@@ -1915,16 +1916,31 @@ export default function HostChurchPage() {
 
   return (
     <main style={hostPageStyle}>
-      <div style={{ maxWidth: 1500, margin: "0 auto", padding: "0 24px 64px" }}>
+      {/* ── Fixed bokeh background — gives glass panels something rich to blur through ── */}
+      <div aria-hidden="true" style={{ position: "fixed", inset: 0, zIndex: 0, overflow: "hidden", pointerEvents: "none" }}>
+        {/* Amber/gold — top-left */}
+        <div style={{ position: "absolute", left: "-8%", top: "-6%", width: 700, height: 700, borderRadius: "50%", background: "radial-gradient(circle, rgba(214,172,88,0.72) 0%, transparent 68%)", filter: "blur(80px)" }} />
+        {/* Lavender — top-right */}
+        <div style={{ position: "absolute", right: "-6%", top: "4%", width: 620, height: 620, borderRadius: "50%", background: "radial-gradient(circle, rgba(170,158,248,0.62) 0%, transparent 68%)", filter: "blur(80px)" }} />
+        {/* Terracotta/peach — bottom-right */}
+        <div style={{ position: "absolute", right: "8%", bottom: "-8%", width: 680, height: 580, borderRadius: "50%", background: "radial-gradient(circle, rgba(224,158,112,0.58) 0%, transparent 68%)", filter: "blur(90px)" }} />
+        {/* Warm rose — bottom-left */}
+        <div style={{ position: "absolute", left: "5%", bottom: "10%", width: 540, height: 520, borderRadius: "50%", background: "radial-gradient(circle, rgba(210,168,178,0.50) 0%, transparent 68%)", filter: "blur(70px)" }} />
+        {/* Bright cream highlight — center */}
+        <div style={{ position: "absolute", left: "28%", top: "30%", width: 800, height: 600, borderRadius: "50%", background: "radial-gradient(circle, rgba(255,250,238,0.88) 0%, transparent 68%)", filter: "blur(100px)" }} />
+        {/* Cool teal accent — mid-right */}
+        <div style={{ position: "absolute", right: "22%", top: "52%", width: 440, height: 400, borderRadius: "50%", background: "radial-gradient(circle, rgba(130,190,200,0.38) 0%, transparent 68%)", filter: "blur(70px)" }} />
+      </div>
+      <div style={{ position: "relative", zIndex: 1, maxWidth: 1500, margin: "0 auto", padding: "0 24px 64px" }}>
         {/* ── Glass header (logo + nav + user — all one line) ── */}
         <header style={{
           position: "relative",
           overflow: "hidden",
-          background: "linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.26))",
-          border: "1px solid rgba(255,255,255,0.52)",
-          boxShadow: "0 22px 55px rgba(122,101,79,0.10), inset 0 1px 0 rgba(255,255,255,0.75)",
-          backdropFilter: "blur(22px)",
-          WebkitBackdropFilter: "blur(22px)",
+          background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))",
+          border: "1px solid rgba(255,255,255,0.68)",
+          boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)",
+          backdropFilter: "blur(40px)",
+          WebkitBackdropFilter: "blur(40px)",
           borderRadius: 34,
           padding: "12px 24px",
           marginTop: 16,
@@ -1941,7 +1957,7 @@ export default function HostChurchPage() {
               </div>
             </div>
             {/* Center: nav pills */}
-            <nav style={{ display: "flex", alignItems: "center", borderRadius: 999, background: "rgba(255,255,255,0.35)", padding: "8px", boxShadow: "0 18px 40px rgba(110,93,74,0.10)", flexShrink: 0 }}>
+            <nav style={{ display: "flex", alignItems: "center", borderRadius: 999, background: "rgba(255,255,255,0.20)", padding: "8px", boxShadow: "0 18px 40px rgba(110,93,74,0.14), inset 0 1px 0 rgba(255,255,255,0.80)", border: "1px solid rgba(255,255,255,0.55)", flexShrink: 0 }}>
               {(["broadcast", "settings", "billing", "team"] as const).map((tab) => {
                 const labels: Record<string, string> = { broadcast: "Live Broadcast", settings: "Church Settings", billing: "Billing & Subscription", team: "Team" };
                 const isActive = activeTab === tab;
@@ -1991,7 +2007,7 @@ export default function HostChurchPage() {
           {activeTab === "broadcast" ? (
             <>
               {/* ── Control bar ── */}
-              <section style={{ marginTop: 20, background: "linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.26))", border: "1px solid rgba(255,255,255,0.52)", boxShadow: "0 22px 55px rgba(122,101,79,0.10), inset 0 1px 0 rgba(255,255,255,0.75)", backdropFilter: "blur(22px)", WebkitBackdropFilter: "blur(22px)", borderRadius: 30, padding: "20px 24px" }}>
+              <section style={{ marginTop: 20, background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)", borderRadius: 30, padding: "20px 24px" }}>
                 {!activeRoomId && (
                   <div style={{ marginBottom: 18 }}>
                     <h1 style={{ margin: "0 0 12px", fontSize: "clamp(22px, 2vw, 28px)", fontWeight: 600, letterSpacing: "-0.02em", color: "#1d1917" }}>Launch Your Broadcast</h1>
@@ -2050,7 +2066,7 @@ export default function HostChurchPage() {
                     Your trial has ended. Broadcasting is blocked until billing is added.
                   </section>
                 ) : (
-                  <section ref={controlPanelRef} style={{ marginTop: 20, position: "relative", overflow: "hidden", background: "linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.26))", border: "1px solid rgba(255,255,255,0.52)", boxShadow: "0 22px 55px rgba(122,101,79,0.10), inset 0 1px 0 rgba(255,255,255,0.75)", backdropFilter: "blur(22px)", WebkitBackdropFilter: "blur(22px)", borderRadius: 34, padding: "24px 28px" }}>
+                  <section ref={controlPanelRef} style={{ marginTop: 20, position: "relative", overflow: "hidden", background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)", borderRadius: 34, padding: "24px 28px" }}>
                     {/* Halo decorations */}
                     <div aria-hidden="true" style={{ position: "absolute", left: "18%", top: "18%", width: 320, height: 220, borderRadius: "50%", background: "radial-gradient(circle, rgba(169,160,245,0.40) 0%, rgba(169,160,245,0.10) 50%, transparent 72%)", filter: "blur(28px)", pointerEvents: "none" }} />
                     <div aria-hidden="true" style={{ position: "absolute", right: "5%", bottom: "14%", width: 240, height: 180, borderRadius: "50%", background: "radial-gradient(circle, rgba(255,255,255,0.75) 0%, rgba(255,255,255,0.15) 54%, transparent 72%)", filter: "blur(24px)", pointerEvents: "none" }} />
