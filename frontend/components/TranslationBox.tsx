@@ -1103,12 +1103,12 @@ export default function TranslationBox() {
             </div>
           </div>
 
-          <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
-            <div className="space-y-6">
-              <div className="rounded-xl border border-[#e4ddd2] p-5 lg:p-6" style={panelStyle}>
-                <div className="grid gap-6 lg:grid-cols-2">
-                  <div className="space-y-4">
-                    <div className="space-y-4 rounded-xl border border-[#e4ddd2] p-5" style={insetStyle}>
+          <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px] lg:items-stretch">
+            <div className="space-y-6 h-full">
+              <div className="rounded-xl border border-[#e4ddd2] p-5 lg:p-6 h-full" style={panelStyle}>
+                <div className="grid gap-6 lg:grid-cols-2 h-full lg:items-stretch">
+                  <div className="flex flex-col gap-4">
+                    <div className="flex-1 space-y-4 rounded-xl border border-[#e4ddd2] p-5" style={insetStyle}>
                       <div className="flex items-center justify-between gap-4">
                         <div>
                           <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Live Audio Stream</p>
@@ -1139,7 +1139,7 @@ export default function TranslationBox() {
                     </button>
                   </div>
 
-                  <div className="space-y-4 rounded-xl border border-[#e4ddd2] p-5 text-[#1c1c1c]" style={accentPanelStyle}>
+                  <div className="flex flex-col gap-4 rounded-xl border border-[#e4ddd2] p-5 text-[#1c1c1c]" style={accentPanelStyle}>
                     <div className="flex items-center justify-between">
                       <div>
                         <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Translation Output</p>
