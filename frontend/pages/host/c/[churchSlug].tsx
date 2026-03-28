@@ -1538,8 +1538,8 @@ export default function HostChurchPage() {
 
   const hostPageStyle = {
     minHeight: "100vh",
-    background: DC.cream,
-    color: DC.charcoal,
+    background: "radial-gradient(circle at 20% 20%, rgba(83,134,255,0.18), transparent 25%), radial-gradient(circle at 85% 15%, rgba(208,162,81,0.18), transparent 23%), radial-gradient(circle at 60% 80%, rgba(103,205,190,0.13), transparent 20%), linear-gradient(180deg, #091225 0%, #0d1b35 38%, #102547 100%)",
+    color: "#ffffff",
   } as const;
   const dashboardCardShadow = "0 1px 3px rgba(0,0,0,0.06)";
   const dashboardCompactShadow = "0 1px 2px rgba(0,0,0,0.04)";
@@ -1558,8 +1558,8 @@ export default function HostChurchPage() {
     gap: 0,
     margin: "20px 0 0",
     padding: "0",
-    background: DC.cream,
-    borderBottom: `1px solid ${DC.border}`,
+    background: "transparent",
+    borderBottom: "1px solid rgba(255,255,255,0.10)",
   } as const;
   const studioUserPanelStyle = {
     display: "flex",
@@ -1691,7 +1691,7 @@ export default function HostChurchPage() {
   } as const;
   const supportFooterStyle = {
     padding: "20px 0",
-    borderTop: `1px solid ${DC.border}`,
+    borderTop: "1px solid rgba(255,255,255,0.10)",
     display: "flex",
     alignItems: "center",
     gap: 16,
@@ -1947,57 +1947,34 @@ export default function HostChurchPage() {
 
       {/* ── Page content ── */}
       <div style={{ maxWidth: 1240, margin: "0 auto", padding: "0 28px 64px" }}>
-        {/* Title + steps — broadcast tab only */}
-        {activeTab === "broadcast" && !activeRoomId && (
-          <div style={{ paddingTop: 28 }}>
-            <h1 style={{ margin: 0, fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: "clamp(26px, 3vw, 34px)", fontWeight: 600, color: DC.navy, letterSpacing: "-0.02em", lineHeight: 1.1 }}>
-              Launch Your Broadcast
-            </h1>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 10, alignItems: "center" }}>
-              {(["Select a service", "Open the Control Panel", "Start Translation"] as const).map((label, i) => (
-                <div key={label} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <span style={{ width: 20, height: 20, borderRadius: "50%", background: DC.gold, color: "#fff", fontSize: 11, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{i + 1}</span>
-                  <span style={{ fontSize: 13, color: DC.mid }}>{label}</span>
-                  {i < 2 && <span style={{ color: DC.border, fontSize: 12, marginLeft: 4 }}>›</span>}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
           {!backendReachable ? (
-            <div style={{ marginBottom: 8, padding: "8px 12px", borderRadius: 10, background: "rgba(120,53,15,0.18)", border: "1px solid rgba(251,191,36,0.5)", color: "#92400e", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ marginBottom: 8, padding: "10px 14px", borderRadius: 10, background: "rgba(120,53,15,0.35)", border: "1px solid rgba(251,191,36,0.55)", color: "#fde68a", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#f59e0b", flexShrink: 0, display: "inline-block" }} />
               <span style={{ flex: 1 }}>Server unreachable — reconnecting…</span>
               <button
                 type="button"
-                onClick={() => {
-                  void refreshServices().then(() => setBackendReachable(true)).catch(() => {});
-                }}
-                style={{ background: "rgba(245,158,11,0.18)", border: "1px solid rgba(245,158,11,0.45)", color: "#92400e", borderRadius: 6, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+                onClick={() => { void refreshServices().then(() => setBackendReachable(true)).catch(() => {}); }}
+                style={{ background: "rgba(245,158,11,0.18)", border: "1px solid rgba(245,158,11,0.45)", color: "#fde68a", borderRadius: 6, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
               >
                 Retry now
               </button>
             </div>
           ) : null}
-          {errorMsg ? <p style={{ color: "#b91c1c", marginTop: 0 }}>Error: {errorMsg}</p> : null}
-          {memberships.length > 1 ? (
+          {errorMsg && activeTab !== "broadcast" ? <p style={{ color: "#fca5a5", marginTop: 0, fontSize: 13 }}>Error: {errorMsg}</p> : null}
+          {memberships.length > 1 && activeTab !== "broadcast" ? (
             <div style={{ marginBottom: 12, display: "grid", gap: 4, maxWidth: 380 }}>
-              <span style={{ fontSize: 12, opacity: 0.75, color: DC.mid }}>Current Church</span>
+              <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(255,255,255,0.45)" }}>Current Church</span>
               <select
                 value={selectedOrgId || resolvedOrgId}
-                onChange={(e) => {
-                  void switchOrganization(e.target.value);
-                }}
+                onChange={(e) => { void switchOrganization(e.target.value); }}
                 disabled={switchingOrg || busy}
-                style={hostFieldStyle}
+                style={{ border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.08)", color: "#ffffff", padding: "9px 12px", borderRadius: 8, fontSize: 14, outline: "none" }}
               >
                 {memberships.map((row) => (
-                  <option key={row.orgId} value={row.orgId}>
-                    {row.name} ({row.role || "member"})
-                  </option>
+                  <option key={row.orgId} value={row.orgId} style={{ background: "#0d1b35" }}>{row.name} ({row.role || "member"})</option>
                 ))}
               </select>
-              {switchingOrg ? <span style={{ fontSize: 12, opacity: 0.75 }}>Switching church...</span> : null}
+              {switchingOrg && <span style={{ fontSize: 12, color: "rgba(255,255,255,0.50)" }}>Switching church...</span>}
             </div>
           ) : null}
           <div style={hostTabRailStyle}>
@@ -2013,7 +1990,7 @@ export default function HostChurchPage() {
                     border: "none",
                     borderBottom: isActive ? `2px solid ${DC.gold}` : "2px solid transparent",
                     background: "transparent",
-                    color: isActive ? DC.navy : isBillingAlert ? DC.danger : DC.mid,
+                    color: isActive ? "#ffffff" : isBillingAlert ? "#fca5a5" : "rgba(255,255,255,0.55)",
                     fontSize: 13,
                     fontWeight: isActive ? 700 : 500,
                     padding: "14px 18px 12px",
@@ -2028,109 +2005,207 @@ export default function HostChurchPage() {
             })}
           </div>
           {activeTab === "broadcast" ? (
-            <div style={{ ...settingsCardStyle, marginTop: 20 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 10 }}>
-                <label style={{ display: "grid", gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.75, color: DC.mid }}>Service</span>
-                  {orgData?.services?.length ? (
-                    <select
-                      value={serviceKey}
-                      onChange={(e) => {
-                        const nextKey = e.target.value;
-                        setServiceKey(nextKey);
-                        setActiveRoomId(null);
-                        persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
-                      }}
-                      disabled={loading}
-                      style={hostFieldStyle}
-                    >
-                      {orgData?.services?.map((row) => (
-                        <option key={row.serviceKey} value={row.serviceKey}>
-                          {row.title} ({row.serviceKey})
-                        </option>
+            <section style={{
+              marginTop: 24,
+              position: "relative",
+              overflow: "hidden",
+              borderRadius: 28,
+              border: "1px solid rgba(255,255,255,0.10)",
+              boxShadow: "0 20px 60px rgba(8,15,32,0.35)",
+              background: "linear-gradient(180deg, rgba(8,16,34,0.08), rgba(8,16,34,0.55)), radial-gradient(circle at 50% 15%, rgba(173,230,245,0.30), transparent 24%), radial-gradient(circle at 50% 58%, rgba(248,224,150,0.22), transparent 18%), linear-gradient(180deg, rgba(50,91,122,1) 0%, rgba(22,55,79,1) 38%, rgba(17,40,49,1) 58%, rgba(60,81,38,1) 80%, rgba(31,49,20,1) 100%)",
+            }}>
+              <div aria-hidden="true" style={{ position: "absolute", inset: 0, background: "linear-gradient(to top right, rgba(15,27,53,0.50), transparent, rgba(255,255,255,0.05))", pointerEvents: "none" }} />
+              {!activeRoomId ? (
+                /* ── Pre-broadcast hero ── */
+                <div style={{ position: "relative", display: "grid", minHeight: 660, gap: 24, padding: "28px", gridTemplateColumns: "1.35fr 0.82fr" }}>
+                  {/* Left column */}
+                  <div style={{ display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+                    <div style={{ display: "grid", gap: 20 }}>
+                      <div style={{ display: "inline-flex", alignItems: "center", gap: 8, borderRadius: 999, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.10)", padding: "8px 16px", fontSize: 11, fontWeight: 700, letterSpacing: "0.28em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.70)", width: "fit-content" }}>
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#6ee7b7", display: "block" }} />
+                        Live multilingual worship
+                      </div>
+                      <div style={{ maxWidth: 640 }}>
+                        <p style={{ margin: "0 0 12px", fontSize: 14, color: "rgba(255,255,255,0.70)" }}>Welcome back · {currentChurchLabel}</p>
+                        <h1 style={{ margin: 0, fontSize: "clamp(30px, 3.2vw, 58px)", fontWeight: 600, lineHeight: 1.05, letterSpacing: "-0.02em", color: "#ffffff", fontFamily: "'Cormorant Garamond', Georgia, serif" }}>
+                          Keep the service calm while translation moves live.
+                        </h1>
+                        <p style={{ margin: "18px 0 0", fontSize: 15, lineHeight: 1.75, color: "rgba(255,255,255,0.75)", maxWidth: 500 }}>
+                          Start the room once, share listener access by QR, and monitor the live translated output in a single worship-focused console.
+                        </p>
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap" as const, alignItems: "flex-end", gap: 12 }}>
+                        <label style={{ display: "grid", gap: 6 }}>
+                          <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.50)" }}>Service</span>
+                          {orgData?.services?.length ? (
+                            <select
+                              value={serviceKey}
+                              onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }}
+                              disabled={loading}
+                              style={{ border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.08)", color: "#ffffff", padding: "10px 14px", borderRadius: 10, fontSize: 14, outline: "none" }}
+                            >
+                              {orgData.services.map((row) => (
+                                <option key={row.serviceKey} value={row.serviceKey} style={{ background: "#0d1b35" }}>{row.title} ({row.serviceKey})</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              value={serviceKey}
+                              onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }}
+                              placeholder={DEFAULT_SERVICE_KEY}
+                              style={{ border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.08)", color: "#ffffff", padding: "10px 14px", borderRadius: 10, fontSize: 14, outline: "none" }}
+                            />
+                          )}
+                        </label>
+                        <button
+                          onClick={startService}
+                          disabled={startServiceDisabled}
+                          style={{ border: "none", background: "#ffffff", color: "#0f172a", fontWeight: 700, fontSize: 14, padding: "12px 26px", borderRadius: 999, cursor: startServiceDisabled ? "not-allowed" : "pointer", opacity: startServiceDisabled ? 0.6 : 1, boxShadow: "0 20px 30px rgba(0,0,0,0.20)", whiteSpace: "nowrap" as const }}
+                        >
+                          Open Broadcast Console
+                        </button>
+                      </div>
+                      {!loading && orgData && !orgData.services?.length && (
+                        <p style={{ margin: 0, fontSize: 12, color: "rgba(255,255,255,0.55)" }}>No services found. Create a service in Church Settings first, then start it here.</p>
+                      )}
+                      {trialBroadcastNotice && (
+                        <div style={{ borderRadius: 10, border: isTrialExpired ? "1px solid rgba(252,165,165,0.7)" : "1px solid rgba(251,191,36,0.65)", background: isTrialExpired ? "rgba(127,29,29,0.28)" : "rgba(120,53,15,0.28)", color: isTrialExpired ? "#fecaca" : "#fde68a", fontSize: 13, fontWeight: 600, padding: "10px 14px" }}>
+                          {trialBroadcastNotice}
+                        </div>
+                      )}
+                      {errorMsg && <p style={{ margin: 0, color: "#fca5a5", fontSize: 13 }}>Error: {errorMsg}</p>}
+                    </div>
+                    {/* Stat panels */}
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginTop: 32 }}>
+                      {([
+                        { label: "Service", value: selectedService?.title || serviceKey || "—", sub: selectedService?.serviceKey || "key" },
+                        { label: "Language", value: "KR → EN", sub: "live translation" },
+                        { label: "Plan", value: billingPlanToken ? (billingPlanToken.charAt(0).toUpperCase() + billingPlanToken.slice(1)) : "—", sub: "current plan" },
+                        billingPlanToken === "trial" && effectiveTrialCountdownSeconds !== null
+                          ? { label: "Trial left", value: formatCountdownSeconds(effectiveTrialCountdownSeconds), sub: isTrialExpired ? "expired" : "active" }
+                          : { label: "Status", value: "Ready", sub: "standing by" },
+                      ] as { label: string; value: string; sub: string }[]).map(({ label, value, sub }) => (
+                        <div key={label} style={{ borderRadius: 22, border: "1px solid rgba(255,255,255,0.10)", background: "linear-gradient(180deg, rgba(255,255,255,0.13), rgba(255,255,255,0.06))", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", padding: 18 }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.32em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.50)" }}>{label}</div>
+                          <div style={{ marginTop: 10, fontSize: 20, fontWeight: 600, color: "#ffffff", letterSpacing: "-0.02em" }}>{value}</div>
+                          <div style={{ marginTop: 3, fontSize: 12, color: "rgba(255,255,255,0.60)" }}>{sub}</div>
+                        </div>
                       ))}
-                    </select>
-                  ) : (
-                    <input
-                      value={serviceKey}
-                      onChange={(e) => {
-                        const nextKey = e.target.value;
-                        setServiceKey(nextKey);
-                        setActiveRoomId(null);
-                        persistStreamContext({ orgId: orgData?.orgId, serviceKey: nextKey, churchSlug: slug });
-                      }}
-                      placeholder={DEFAULT_SERVICE_KEY}
-                      style={hostFieldStyle}
-                    />
-                  )}
-                  {!loading && orgData && !orgData.services?.length ? (
-                    <span style={{ fontSize: 12, opacity: 0.75, color: "#64748b" }}>No services found. Create a service in Church Settings first, then start it here.</span>
-                  ) : null}
-                </label>
-
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 12, alignItems: "center" }}>
-                <button
-                  onClick={startService}
-                  disabled={startServiceDisabled}
-                  style={{
-                    ...settingsButtonPrimaryStyle,
-                    cursor: startServiceDisabled ? "not-allowed" : "pointer",
-                    opacity: startServiceDisabled ? 0.6 : 1,
-                  }}
-                >
-                  {activeRoomId ? "Restart / Rejoin Room" : "Start Service"}
-                </button>
-                <button
-                  onClick={endService}
-                  disabled={busy || !orgData?.orgId || (!activeRoomId && !queryRoomId)}
-                  style={{
-                    ...settingsButtonDangerStyle,
-                    cursor: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? "not-allowed" : "pointer",
-                    opacity: busy || !orgData?.orgId || (!activeRoomId && !queryRoomId) ? 0.6 : 1,
-                  }}
-                >
-                  End Service
-                </button>
-                <span style={{ opacity: 0.84, fontSize: 14 }}>
-                  {activeRoomId ? `Live room: ${activeRoomId}` : "No live room"}
-                </span>
-                {billingPlanToken === "trial" && effectiveTrialCountdownSeconds !== null ? (
-                  <span
-                    style={{
-                      borderRadius: 999,
-                      border: isTrialExpired ? "1px solid rgba(252,165,165,0.8)" : "1px solid rgba(251,191,36,0.7)",
-                      background: isTrialExpired ? "rgba(127,29,29,0.35)" : "rgba(120,53,15,0.35)",
-                      color: isTrialExpired ? "#fecaca" : "#fde68a",
-                      fontSize: 12,
-                      fontWeight: 700,
-                      padding: "6px 10px",
-                    }}
-                  >
-                    Trial remaining: {formatCountdownSeconds(effectiveTrialCountdownSeconds)}
-                  </span>
-                ) : null}
-              </div>
-              {trialBroadcastNotice ? (
-                <div
-                  style={{
-                    marginTop: 10,
-                    borderRadius: 10,
-                    border: isTrialExpired ? "1px solid rgba(252,165,165,0.7)" : "1px solid rgba(251,191,36,0.65)",
-                    background: isTrialExpired ? "rgba(127,29,29,0.28)" : "rgba(120,53,15,0.28)",
-                    color: isTrialExpired ? "#fecaca" : "#fde68a",
-                    fontSize: 13,
-                    fontWeight: 600,
-                    padding: "9px 11px",
-                  }}
-                >
-                  {trialBroadcastNotice}
+                    </div>
+                  </div>
+                  {/* Right column */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 14, paddingTop: 12 }}>
+                    {/* Current Service card */}
+                    <div style={{ borderRadius: 26, border: "1px solid rgba(255,255,255,0.10)", background: "linear-gradient(180deg, rgba(255,255,255,0.13), rgba(255,255,255,0.06))", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", padding: 20 }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
+                        <div>
+                          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.30em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.50)" }}>Current Service</div>
+                          <div style={{ marginTop: 10, fontSize: 16, fontWeight: 600, color: "#ffffff" }}>{selectedService?.title || serviceKey || "Select a service"}</div>
+                          <div style={{ marginTop: 4, fontSize: 13, color: "rgba(255,255,255,0.60)" }}>{orgData?.name || slug} · English output</div>
+                        </div>
+                        <div style={{ borderRadius: 999, background: "rgba(255,255,255,0.08)", padding: "5px 11px", fontSize: 12, fontWeight: 500, color: "rgba(255,255,255,0.55)" }}>Ready</div>
+                      </div>
+                      <div style={{ marginTop: 16, borderRadius: 20, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.08)", padding: 14 }}>
+                        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.24em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.45)", marginBottom: 10 }}>3 steps to go live</div>
+                        {(["Select a service", "Click Open Broadcast Console", "Press Start Translation"] as const).map((step, i) => (
+                          <div key={step} style={{ display: "flex", alignItems: "center", gap: 10, marginTop: i > 0 ? 10 : 0 }}>
+                            <span style={{ width: 22, height: 22, borderRadius: "50%", background: "#ffffff", color: "#0f172a", fontSize: 11, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{i + 1}</span>
+                            <span style={{ fontSize: 13, color: "rgba(255,255,255,0.70)" }}>{step}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    {/* Multi-org switcher */}
+                    {memberships.length > 1 && (
+                      <div style={{ borderRadius: 20, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.06)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", padding: "14px 16px", display: "grid", gap: 6 }}>
+                        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.45)" }}>Switch Church</span>
+                        <select
+                          value={selectedOrgId || resolvedOrgId}
+                          onChange={(e) => { void switchOrganization(e.target.value); }}
+                          disabled={switchingOrg || busy}
+                          style={{ border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.08)", color: "#ffffff", padding: "8px 12px", borderRadius: 8, fontSize: 13, outline: "none" }}
+                        >
+                          {memberships.map((row) => (
+                            <option key={row.orgId} value={row.orgId} style={{ background: "#0d1b35" }}>{row.name} ({row.role || "member"})</option>
+                          ))}
+                        </select>
+                        {switchingOrg && <span style={{ fontSize: 12, color: "rgba(255,255,255,0.50)" }}>Switching church...</span>}
+                      </div>
+                    )}
+                    {/* Trial countdown */}
+                    {billingPlanToken === "trial" && effectiveTrialCountdownSeconds !== null && (
+                      <div style={{ borderRadius: 12, border: isTrialExpired ? "1px solid rgba(252,165,165,0.8)" : "1px solid rgba(251,191,36,0.7)", background: isTrialExpired ? "rgba(127,29,29,0.35)" : "rgba(120,53,15,0.35)", color: isTrialExpired ? "#fecaca" : "#fde68a", fontSize: 13, fontWeight: 700, padding: "10px 14px", textAlign: "center" as const }}>
+                        Trial remaining: {formatCountdownSeconds(effectiveTrialCountdownSeconds)}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              ) : null}
-              <p style={{ marginTop: 8, marginBottom: 0, fontSize: 12, opacity: 0.72 }}>
-                Signed-in hosts are authorized by account role. Manual host token entry is not required.
-              </p>
-            </div>
+              ) : isTrialExpired ? (
+                /* ── Trial expired ── */
+                <div style={{ padding: 28, position: "relative" }}>
+                  <div style={{ borderRadius: 16, border: "1px solid rgba(252,165,165,0.55)", padding: 20, background: "rgba(127,29,29,0.18)", color: "#fecaca" }}>
+                    Your trial has ended. Broadcasting is blocked until billing is added.
+                  </div>
+                </div>
+              ) : (
+                /* ── Live broadcast: TranslationBox + right panel ── */
+                <div ref={controlPanelRef} style={{ position: "relative", display: "grid", gap: 16, padding: 20, gridTemplateColumns: "1fr 280px" }}>
+                  <div style={{ borderRadius: 18, overflow: "hidden" }}>
+                    <TranslationBox />
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    {/* Live status */}
+                    <div style={{ borderRadius: 20, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.08)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", padding: 16 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", display: "block", boxShadow: "0 0 6px rgba(34,197,94,0.7)" }} />
+                        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: "#22c55e" }}>Live</span>
+                      </div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: "#ffffff" }}>{selectedService?.title || serviceKey}</div>
+                      <div style={{ marginTop: 4, fontSize: 12, color: "rgba(255,255,255,0.50)" }}>{formatCountdownSeconds(elapsedSec)} elapsed</div>
+                      <div style={{ marginTop: 2, fontSize: 11, color: "rgba(255,255,255,0.35)", wordBreak: "break-all" as const }}>{activeRoomId}</div>
+                    </div>
+                    {/* Listener access */}
+                    {displayUrl && (
+                      <div style={{ borderRadius: 20, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.08)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", padding: 16, display: "grid", gap: 10 }}>
+                        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: DC.goldLight }}>Listener Link</span>
+                        <p style={{ margin: 0, fontSize: 11, color: "rgba(255,255,255,0.50)", wordBreak: "break-all" as const, lineHeight: 1.5 }}>{displayUrl}</p>
+                        {qrDataUrl && (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={qrDataUrl} alt="Listener QR" width={80} height={80} style={{ borderRadius: 6 }} />
+                        )}
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" as const }}>
+                          <button
+                            type="button"
+                            onClick={() => { void copyListenerUrl(); }}
+                            disabled={copyUrlBusy}
+                            style={{ border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.80)", fontSize: 12, fontWeight: 600, padding: "7px 12px", borderRadius: 8, cursor: copyUrlBusy ? "not-allowed" : "pointer" }}
+                          >
+                            {copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}
+                          </button>
+                          <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", border: "none", background: DC.gold, color: "#ffffff", fontSize: 12, fontWeight: 700, padding: "7px 12px", borderRadius: 8, textDecoration: "none" }}>Open ↗</a>
+                        </div>
+                      </div>
+                    )}
+                    {/* End service */}
+                    <button
+                      onClick={endService}
+                      disabled={busy}
+                      style={{ border: "1px solid rgba(252,165,165,0.35)", background: "rgba(127,29,29,0.22)", color: "#fecaca", fontWeight: 700, fontSize: 13, padding: "12px 16px", borderRadius: 12, cursor: busy ? "not-allowed" : "pointer", opacity: busy ? 0.6 : 1, letterSpacing: "0.04em" }}
+                    >
+                      End Service
+                    </button>
+                    {/* Restart / rejoin */}
+                    <button
+                      onClick={startService}
+                      disabled={startServiceDisabled}
+                      style={{ border: "1px solid rgba(255,255,255,0.12)", background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.70)", fontWeight: 600, fontSize: 12, padding: "10px 16px", borderRadius: 12, cursor: startServiceDisabled ? "not-allowed" : "pointer", opacity: startServiceDisabled ? 0.5 : 1 }}
+                    >
+                      Restart / Rejoin Room
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
           ) : null}
           {activeTab === "settings" ? (
             canManageServices ? (
@@ -2950,20 +3025,6 @@ export default function HostChurchPage() {
               </div>
             )
           ) : null}
-
-        {activeTab === "broadcast" && activeRoomId ? (
-          isTrialExpired ? (
-            <section style={{ marginTop: 16, border: "1px solid rgba(252,165,165,0.55)", borderRadius: 14, padding: 16, background: "rgba(127,29,29,0.18)", color: "#fecaca" }}>
-              Your trial has ended. Broadcasting is blocked until billing is added.
-            </section>
-          ) : (
-            <section ref={controlPanelRef} style={{ marginTop: 20, borderRadius: 12, overflow: "hidden", boxShadow: "0 8px 32px rgba(15,31,61,0.2)" }}>
-              <div style={{ color: DC.cream }}>
-                <TranslationBox />
-              </div>
-            </section>
-          )
-        ) : null}
 
         <section style={supportFooterStyle}>
           <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase", color: DC.gold }}>
