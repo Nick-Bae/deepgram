@@ -1926,18 +1926,18 @@ export default function HostChurchPage() {
           backdropFilter: "blur(22px)",
           WebkitBackdropFilter: "blur(22px)",
           borderRadius: 34,
-          padding: "20px 32px",
-          marginTop: 24,
+          padding: "12px 24px",
+          marginTop: 16,
         }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
             {/* Left: church logo + name */}
             <div style={{ display: "flex", alignItems: "center", gap: 20, flexShrink: 0 }}>
-              <div style={{ width: 64, height: 64, borderRadius: 22, background: "#2d3650", color: "#f1d35c", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontWeight: 600, flexShrink: 0 }}>
+              <div style={{ width: 48, height: 48, borderRadius: 16, background: "#2d3650", color: "#f1d35c", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 600, flexShrink: 0 }}>
                 {currentChurchInitial}
               </div>
               <div>
-                <div style={{ fontSize: 26, fontWeight: 600, letterSpacing: "-0.02em", color: "#151515", lineHeight: 1.1 }}>{currentChurchLabel}</div>
-                <div style={{ marginTop: 3, fontSize: 11, letterSpacing: "0.38em", textTransform: "uppercase" as const, color: "#6f655c" }}>Translation Studio</div>
+                <div style={{ fontSize: 20, fontWeight: 600, letterSpacing: "-0.02em", color: "#151515", lineHeight: 1.1 }}>{currentChurchLabel}</div>
+                <div style={{ marginTop: 2, fontSize: 10, letterSpacing: "0.38em", textTransform: "uppercase" as const, color: "#6f655c" }}>Translation Studio</div>
               </div>
             </div>
             {/* Center: nav pills */}
@@ -1947,7 +1947,7 @@ export default function HostChurchPage() {
                 const isActive = activeTab === tab;
                 const isBillingAlert = tab === "billing" && billingNeedsAttention && !isActive;
                 return (
-                  <button key={tab} onClick={() => navigateToTab(tab)} style={{ border: "none", background: isActive ? "#ffffff" : "transparent", color: isActive ? "#27211d" : isBillingAlert ? "#c0392b" : "#5f5852", fontSize: 15, fontWeight: isActive ? 600 : 500, padding: "14px 24px", borderRadius: 999, cursor: "pointer", boxShadow: isActive ? "0 2px 8px rgba(0,0,0,0.08)" : "none", whiteSpace: "nowrap" as const, letterSpacing: "-0.01em" }}>
+                  <button key={tab} onClick={() => navigateToTab(tab)} style={{ border: "none", background: isActive ? "#ffffff" : "transparent", color: isActive ? "#27211d" : isBillingAlert ? "#c0392b" : "#5f5852", fontSize: 13, fontWeight: isActive ? 600 : 500, padding: "9px 18px", borderRadius: 999, cursor: "pointer", boxShadow: isActive ? "0 2px 8px rgba(0,0,0,0.08)" : "none", whiteSpace: "nowrap" as const, letterSpacing: "-0.01em" }}>
                     {labels[tab]}
                   </button>
                 );
@@ -1961,7 +1961,7 @@ export default function HostChurchPage() {
               </div>
               <button
                 onClick={async () => { clearStreamContext(); clearHostToken(); clearAuthToken(); await logout(); }}
-                style={{ border: "none", background: "rgba(41,35,33,0.90)", color: "#ffffff", fontWeight: 600, fontSize: 15, padding: "14px 26px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap" as const }}
+                style={{ border: "none", background: "rgba(41,35,33,0.90)", color: "#ffffff", fontWeight: 600, fontSize: 13, padding: "9px 20px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap" as const }}
               >
                 Logout
               </button>
@@ -2006,19 +2006,17 @@ export default function HostChurchPage() {
                     </div>
                   </div>
                 )}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 12, alignItems: "end" }}>
-                  {/* Service selector */}
-                  <div style={{ background: "linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.28))", boxShadow: "0 10px 24px rgba(126,104,81,0.06), inset 0 1px 0 rgba(255,255,255,0.72)", backdropFilter: "blur(14px)", borderRadius: 24, padding: "14px 18px" }}>
-                    <div style={{ fontSize: 13, color: "#746c64", marginBottom: 10 }}>Service</div>
-                    {orgData?.services?.length ? (
-                      <select value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} disabled={loading || !!activeRoomId} style={{ width: "100%", border: "1px solid rgba(120,98,78,0.08)", background: "rgba(255,255,255,0.42)", color: "#26211f", padding: "10px 14px", borderRadius: 16, fontSize: 14, fontWeight: 500, outline: "none", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.75)" }}>
-                        {orgData.services.map((row) => (<option key={row.serviceKey} value={row.serviceKey}>{row.title} ({row.serviceKey})</option>))}
-                      </select>
-                    ) : (
-                      <input value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} placeholder={DEFAULT_SERVICE_KEY} style={{ width: "100%", border: "1px solid rgba(120,98,78,0.08)", background: "rgba(255,255,255,0.42)", color: "#26211f", padding: "10px 14px", borderRadius: 16, fontSize: 14, outline: "none" }} />
-                    )}
-                    {!loading && orgData && !orgData.services?.length && <div style={{ marginTop: 8, fontSize: 12, color: "#7d746c" }}>No services found. Create one in Church Settings.</div>}
-                  </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" as const }}>
+                  {/* Service label + selector inline */}
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "#746c64", flexShrink: 0 }}>Service</span>
+                  {orgData?.services?.length ? (
+                    <select value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} disabled={loading || !!activeRoomId} style={{ flex: 1, minWidth: 200, border: "1px solid rgba(120,98,78,0.12)", background: "rgba(255,255,255,0.60)", color: "#26211f", padding: "10px 14px", borderRadius: 16, fontSize: 14, fontWeight: 500, outline: "none" }}>
+                      {orgData.services.map((row) => (<option key={row.serviceKey} value={row.serviceKey}>{row.title} ({row.serviceKey})</option>))}
+                    </select>
+                  ) : (
+                    <input value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} placeholder={DEFAULT_SERVICE_KEY} style={{ flex: 1, minWidth: 200, border: "1px solid rgba(120,98,78,0.12)", background: "rgba(255,255,255,0.60)", color: "#26211f", padding: "10px 14px", borderRadius: 16, fontSize: 14, outline: "none" }} />
+                  )}
+                  {!loading && orgData && !orgData.services?.length && <div style={{ fontSize: 12, color: "#7d746c" }}>No services found. Create one in Church Settings.</div>}
                   {/* Action buttons */}
                   <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" as const }}>
                     {activeRoomId ? (
@@ -2057,26 +2055,19 @@ export default function HostChurchPage() {
                     <div aria-hidden="true" style={{ position: "absolute", left: "18%", top: "18%", width: 320, height: 220, borderRadius: "50%", background: "radial-gradient(circle, rgba(169,160,245,0.40) 0%, rgba(169,160,245,0.10) 50%, transparent 72%)", filter: "blur(28px)", pointerEvents: "none" }} />
                     <div aria-hidden="true" style={{ position: "absolute", right: "5%", bottom: "14%", width: 240, height: 180, borderRadius: "50%", background: "radial-gradient(circle, rgba(255,255,255,0.75) 0%, rgba(255,255,255,0.15) 54%, transparent 72%)", filter: "blur(24px)", pointerEvents: "none" }} />
                     <div style={{ position: "relative" }}>
-                      {/* Header row */}
-                      <div style={{ display: "flex", flexWrap: "wrap" as const, alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 24 }}>
-                        <div>
-                          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 700, letterSpacing: "0.34em", textTransform: "uppercase" as const, color: "#b08b4f" }}>
-                            <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#c6a56d", display: "block" }} />
-                            Live
-                          </div>
-                          <h2 style={{ margin: "10px 0 6px", fontSize: "clamp(26px, 2.6vw, 38px)", fontWeight: 600, letterSpacing: "-0.02em", color: "#1d1917", lineHeight: 1.1 }}>Real-Time Sermon Translation</h2>
-                          <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, color: "#6d645c" }}>Monitor, refine, and broadcast translations without leaving this console.</p>
+                      {/* Status pills row */}
+                      <div style={{ display: "flex", flexWrap: "wrap" as const, alignItems: "center", gap: 8, marginBottom: 16 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, borderRadius: 999, background: "rgba(255,255,255,0.44)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#30a173", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>
+                          <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#c6a56d", display: "block" }} />
+                          Live · Connected
                         </div>
-                        <div style={{ display: "flex", flexWrap: "wrap" as const, gap: 8 }}>
-                          <div style={{ borderRadius: 999, background: "rgba(255,255,255,0.44)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#30a173", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>● Producer socket · Connected</div>
-                          <div style={{ borderRadius: 999, background: "rgba(255,255,255,0.38)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>{formatCountdownSeconds(elapsedSec)} elapsed</div>
-                          {displayUrl && (
-                            <>
-                              <button type="button" onClick={() => { void copyListenerUrl(); }} disabled={copyUrlBusy} style={{ borderRadius: 999, background: "rgba(255,255,255,0.38)", border: "none", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", cursor: copyUrlBusy ? "default" : "pointer", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>{copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}</button>
-                              <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", borderRadius: 999, background: "rgba(255,255,255,0.38)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", textDecoration: "none", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>Listener Page ↗</a>
-                            </>
-                          )}
-                        </div>
+                        <div style={{ borderRadius: 999, background: "rgba(255,255,255,0.38)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>{formatCountdownSeconds(elapsedSec)} elapsed</div>
+                        {displayUrl && (
+                          <>
+                            <button type="button" onClick={() => { void copyListenerUrl(); }} disabled={copyUrlBusy} style={{ borderRadius: 999, background: "rgba(255,255,255,0.38)", border: "none", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", cursor: copyUrlBusy ? "default" : "pointer", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>{copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}</button>
+                            <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", borderRadius: 999, background: "rgba(255,255,255,0.38)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", textDecoration: "none", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>Listener Page ↗</a>
+                          </>
+                        )}
                       </div>
                       {/* TranslationBox */}
                       <div style={{ borderRadius: 24, overflow: "hidden" }}>
