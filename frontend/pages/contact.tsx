@@ -243,21 +243,32 @@ export default function ContactPage() {
       <main
         style={{
           minHeight: "100vh",
-          background: "linear-gradient(180deg, #edf1f6 0%, #dfe6ef 54%, #d3dce7 100%)",
-          color: "#10213a",
+          background: "#ede5d8",
+          color: "#2e2a28",
           padding: "28px 16px 40px",
           fontFamily: "'Avenir Next', 'Segoe UI', sans-serif",
+          position: "relative",
         }}
       >
-        <section style={{ maxWidth: 1120, margin: "0 auto", display: "grid", gap: 22 }}>
+        {/* Bokeh background */}
+        <div aria-hidden="true" style={{ position: "fixed", inset: 0, zIndex: 0, overflow: "hidden", pointerEvents: "none" }}>
+          <div style={{ position: "absolute", left: "-8%", top: "-6%", width: 700, height: 700, borderRadius: "50%", background: "radial-gradient(circle, rgba(214,172,88,0.72) 0%, transparent 68%)", filter: "blur(80px)" }} />
+          <div style={{ position: "absolute", right: "-6%", top: "4%", width: 620, height: 620, borderRadius: "50%", background: "radial-gradient(circle, rgba(170,158,248,0.62) 0%, transparent 68%)", filter: "blur(80px)" }} />
+          <div style={{ position: "absolute", right: "8%", bottom: "-8%", width: 680, height: 580, borderRadius: "50%", background: "radial-gradient(circle, rgba(224,158,112,0.58) 0%, transparent 68%)", filter: "blur(90px)" }} />
+          <div style={{ position: "absolute", left: "5%", bottom: "10%", width: 540, height: 520, borderRadius: "50%", background: "radial-gradient(circle, rgba(210,168,178,0.50) 0%, transparent 68%)", filter: "blur(70px)" }} />
+          <div style={{ position: "absolute", left: "28%", top: "30%", width: 800, height: 600, borderRadius: "50%", background: "radial-gradient(circle, rgba(255,250,238,0.88) 0%, transparent 68%)", filter: "blur(100px)" }} />
+          <div style={{ position: "absolute", right: "22%", top: "52%", width: 440, height: 400, borderRadius: "50%", background: "radial-gradient(circle, rgba(130,190,200,0.38) 0%, transparent 68%)", filter: "blur(70px)" }} />
+        </div>
+        <section style={{ position: "relative", zIndex: 1, maxWidth: 1120, margin: "0 auto", display: "grid", gap: 22 }}>
           <header
             style={{
               borderRadius: 30,
-              border: "1px solid rgba(255,255,255,0.14)",
-              background: "linear-gradient(135deg, #566983 0%, #323d50 38%, #171d27 100%)",
-              boxShadow: "0 28px 56px rgba(32,42,58,0.24), inset 0 1px 0 rgba(255,255,255,0.08)",
-              padding: "20px 22px",
-              color: "#f8fafc",
+              border: "1px solid rgba(255,255,255,0.68)",
+              background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))",
+              boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)",
+              backdropFilter: "blur(40px)",
+              WebkitBackdropFilter: "blur(40px)",
+              padding: "14px 22px",
               display: "flex",
               flexWrap: "wrap",
               justifyContent: "space-between",
@@ -265,29 +276,29 @@ export default function ContactPage() {
               gap: 16,
             }}
           >
-            <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
               <div
                 style={{
-                  width: 56,
-                  height: 56,
-                  borderRadius: 18,
-                  background: "linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04))",
-                  border: "1px solid rgba(255,255,255,0.1)",
-                  color: "#ffb703",
+                  width: 46,
+                  height: 46,
+                  borderRadius: 14,
+                  background: "#2d3650",
+                  color: "#f1d35c",
                   display: "grid",
                   placeItems: "center",
-                  fontSize: 20,
+                  fontSize: 18,
                   fontWeight: 900,
                   fontStyle: "italic",
+                  flexShrink: 0,
                 }}
               >
                 W
               </div>
               <div>
-                <p style={{ margin: 0, fontSize: 11, letterSpacing: "0.34em", textTransform: "uppercase", color: "#b9c6da" }}>
+                <p style={{ margin: 0, fontSize: 10, letterSpacing: "0.38em", textTransform: "uppercase", color: "#7d746c" }}>
                   Worship Support
                 </p>
-                <h1 style={{ margin: "8px 0 0", fontSize: "clamp(28px, 4vw, 36px)", lineHeight: 1, letterSpacing: "-0.05em" }}>
+                <h1 style={{ margin: "3px 0 0", fontSize: 17, fontWeight: 600, letterSpacing: "-0.02em", color: "#1d1917", lineHeight: 1 }}>
                   Contact Us
                 </h1>
               </div>
@@ -298,11 +309,12 @@ export default function ContactPage() {
                 href="/"
                 style={{
                   borderRadius: 999,
-                  padding: "12px 18px",
-                  background: "rgba(255,255,255,0.08)",
-                  border: "1px solid rgba(255,255,255,0.14)",
-                  color: "#d9e3f2",
+                  padding: "9px 18px",
+                  background: "rgba(255,255,255,0.50)",
+                  border: "1px solid rgba(120,98,78,0.16)",
+                  color: "#4a4038",
                   fontWeight: 700,
+                  fontSize: 13,
                 }}
               >
                 Back Home
@@ -321,11 +333,12 @@ export default function ContactPage() {
                   style={{
                     borderRadius: 999,
                     border: "none",
-                    padding: "12px 18px",
-                    background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                    color: "#f8fafc",
-                    fontWeight: 800,
-                    boxShadow: "0 14px 30px rgba(79,115,170,0.28)",
+                    padding: "9px 18px",
+                    background: "#c5a263",
+                    color: "#ffffff",
+                    fontWeight: 700,
+                    fontSize: 13,
+                    boxShadow: "0 10px 24px rgba(110,93,74,0.20)",
                     cursor: "pointer",
                   }}
                 >
@@ -336,11 +349,12 @@ export default function ContactPage() {
                   href="/login"
                   style={{
                     borderRadius: 999,
-                    padding: "12px 18px",
-                    background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                    color: "#f8fafc",
-                    fontWeight: 800,
-                    boxShadow: "0 14px 30px rgba(79,115,170,0.28)",
+                    padding: "9px 18px",
+                    background: "#c5a263",
+                    color: "#ffffff",
+                    fontWeight: 700,
+                    fontSize: 13,
+                    boxShadow: "0 10px 24px rgba(110,93,74,0.20)",
                   }}
                 >
                   Host Login
@@ -360,9 +374,11 @@ export default function ContactPage() {
             <aside
               style={{
                 borderRadius: 30,
-                border: "1px solid rgba(255,255,255,0.82)",
-                background: "linear-gradient(145deg, rgba(248,251,254,0.96), rgba(228,235,244,0.9))",
-                boxShadow: "0 18px 36px rgba(122,138,163,0.12)",
+                border: "1px solid rgba(255,255,255,0.68)",
+                background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))",
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.90), 0 28px 64px rgba(122,101,79,0.18)",
+                backdropFilter: "blur(40px)",
+                WebkitBackdropFilter: "blur(40px)",
                 padding: 22,
                 display: "grid",
                 gap: 16,
@@ -374,19 +390,22 @@ export default function ContactPage() {
                 style={{
                   borderRadius: 22,
                   padding: "16px 18px",
-                  background: "linear-gradient(145deg, rgba(225,236,250,0.96), rgba(212,225,243,0.9))",
-                  border: "1px solid rgba(204,218,238,0.92)",
+                  background: "rgba(255,255,255,0.38)",
+                  border: "1px solid rgba(255,255,255,0.55)",
+                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.75)",
+                  backdropFilter: "blur(14px)",
+                  WebkitBackdropFilter: "blur(14px)",
                 }}
               >
-                <p style={{ margin: 0, fontSize: 11, color: "#7386a2", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
+                <p style={{ margin: 0, fontSize: 11, color: "#b08b4f", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
                   Support Topics
                 </p>
-                <h2 style={{ margin: "10px 0 0", fontSize: 30, lineHeight: 1.05, letterSpacing: "-0.05em" }}>
+                <h2 style={{ margin: "10px 0 0", fontSize: 28, lineHeight: 1.05, letterSpacing: "-0.03em", color: "#1d1917" }}>
                   Billing, setup, and bugs.
                 </h2>
               </div>
 
-              <p style={{ margin: 0, fontSize: 15, lineHeight: 1.8, color: "#50627c" }}>
+              <p style={{ margin: 0, fontSize: 15, lineHeight: 1.8, color: "#6d645c" }}>
                 Use this form for billing, access, setup, or translation issues.
               </p>
 
@@ -396,12 +415,15 @@ export default function ContactPage() {
                     key={entry.value}
                     style={{
                       borderRadius: 18,
-                      background: "rgba(255,255,255,0.56)",
-                      border: "1px solid rgba(219,227,238,0.9)",
+                      background: "rgba(255,255,255,0.38)",
+                      border: "1px solid rgba(255,255,255,0.55)",
+                      boxShadow: "inset 0 1px 0 rgba(255,255,255,0.75)",
+                      backdropFilter: "blur(14px)",
+                      WebkitBackdropFilter: "blur(14px)",
                       padding: "14px 16px",
                     }}
                   >
-                    <p style={{ margin: 0, fontSize: 15, fontWeight: 800, color: "#22344c" }}>{entry.label}</p>
+                    <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#1d1917" }}>{entry.label}</p>
                   </div>
                 ))}
               </div>
@@ -410,8 +432,11 @@ export default function ContactPage() {
                 style={{
                   borderRadius: 22,
                   padding: "16px 18px",
-                  background: "rgba(255,255,255,0.58)",
-                  border: "1px solid rgba(219,227,238,0.9)",
+                  background: "rgba(255,255,255,0.38)",
+                  border: "1px solid rgba(255,255,255,0.55)",
+                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.75)",
+                  backdropFilter: "blur(14px)",
+                  WebkitBackdropFilter: "blur(14px)",
                   display: "grid",
                   gap: 8,
                 }}
@@ -493,9 +518,11 @@ export default function ContactPage() {
             <article
               style={{
                 borderRadius: 30,
-                border: "1px solid rgba(255,255,255,0.82)",
-                background: "linear-gradient(145deg, rgba(248,251,254,0.96), rgba(228,235,244,0.9))",
-                boxShadow: "0 18px 36px rgba(122,138,163,0.12)",
+                border: "1px solid rgba(255,255,255,0.68)",
+                background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))",
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.90), 0 28px 64px rgba(122,101,79,0.18)",
+                backdropFilter: "blur(40px)",
+                WebkitBackdropFilter: "blur(40px)",
                 padding: 22,
                 display: "grid",
                 gap: 16,
@@ -507,14 +534,17 @@ export default function ContactPage() {
                 style={{
                   borderRadius: 22,
                   padding: "16px 18px",
-                  background: "linear-gradient(145deg, rgba(246,239,227,0.96), rgba(236,227,209,0.9))",
-                  border: "1px solid rgba(225,214,191,0.92)",
+                  background: "rgba(255,255,255,0.38)",
+                  border: "1px solid rgba(255,255,255,0.55)",
+                  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.75)",
+                  backdropFilter: "blur(14px)",
+                  WebkitBackdropFilter: "blur(14px)",
                 }}
               >
-                <p style={{ margin: 0, fontSize: 11, color: "#7386a2", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
+                <p style={{ margin: 0, fontSize: 11, color: "#b08b4f", letterSpacing: "0.24em", textTransform: "uppercase", fontWeight: 800 }}>
                   Submit Request
                 </p>
-                <h2 style={{ margin: "10px 0 0", fontSize: 30, lineHeight: 1.05, letterSpacing: "-0.05em" }}>
+                <h2 style={{ margin: "10px 0 0", fontSize: 28, lineHeight: 1.05, letterSpacing: "-0.03em", color: "#1d1917" }}>
                   Describe the issue.
                 </h2>
               </div>
@@ -658,14 +688,14 @@ export default function ContactPage() {
                     disabled={busy}
                     style={{
                       borderRadius: 999,
-                      border: "1px solid rgba(79,115,170,0.28)",
-                      background: "linear-gradient(145deg, #7fa5db, #4f73aa)",
-                      color: "#f8fafc",
-                      fontWeight: 800,
+                      border: "none",
+                      background: "#c5a263",
+                      color: "#ffffff",
+                      fontWeight: 700,
                       padding: "13px 22px",
                       cursor: busy ? "not-allowed" : "pointer",
                       opacity: busy ? 0.7 : 1,
-                      boxShadow: "0 14px 30px rgba(79,115,170,0.22)",
+                      boxShadow: "0 14px 30px rgba(110,93,74,0.22)",
                     }}
                   >
                     {busy ? "Sending..." : "Send Message"}
