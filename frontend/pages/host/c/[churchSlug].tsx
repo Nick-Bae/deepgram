@@ -1992,6 +1992,20 @@ export default function HostChurchPage() {
             <>
               {/* ── Control bar ── */}
               <section style={{ marginTop: 20, background: "linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.26))", border: "1px solid rgba(255,255,255,0.52)", boxShadow: "0 22px 55px rgba(122,101,79,0.10), inset 0 1px 0 rgba(255,255,255,0.75)", backdropFilter: "blur(22px)", WebkitBackdropFilter: "blur(22px)", borderRadius: 30, padding: "20px 24px" }}>
+                {!activeRoomId && (
+                  <div style={{ marginBottom: 18 }}>
+                    <h1 style={{ margin: "0 0 12px", fontSize: "clamp(22px, 2vw, 28px)", fontWeight: 600, letterSpacing: "-0.02em", color: "#1d1917" }}>Launch Your Broadcast</h1>
+                    <div style={{ display: "flex", flexWrap: "wrap" as const, alignItems: "center", gap: 6 }}>
+                      {(["Select a service", "Open the Control Panel", "Start Translation"] as const).map((label, i) => (
+                        <div key={label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ width: 22, height: 22, borderRadius: "50%", background: "#c6a56d", color: "#ffffff", fontSize: 11, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{i + 1}</span>
+                          <span style={{ fontSize: 13, color: "#7d746c" }}>{label}</span>
+                          {i < 2 && <span style={{ color: "#c4b8ac", fontSize: 13, marginLeft: 2 }}>›</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 12, alignItems: "end" }}>
                   {/* Service selector */}
                   <div style={{ background: "linear-gradient(180deg, rgba(255,255,255,0.42), rgba(255,255,255,0.28))", boxShadow: "0 10px 24px rgba(126,104,81,0.06), inset 0 1px 0 rgba(255,255,255,0.72)", backdropFilter: "blur(14px)", borderRadius: 24, padding: "14px 18px" }}>
