@@ -235,12 +235,13 @@ export type OrgSermonUsageResponse = {
   sermons: SermonUsageRow[];
 };
 
-const AUTH_FETCH_TIMEOUT_MS = 15000;
+const AUTH_FETCH_TIMEOUT_MS = 30000;
 const SLUG_FETCH_TIMEOUT_MS = 8000;
 const PROMPT_FETCH_TIMEOUT_MS = 30000;
 const SERMON_DRAFT_FETCH_TIMEOUT_MS = 300000;
 const SERMON_FINALIZE_FETCH_TIMEOUT_MS = 120000;
 const AUTH_ME_CACHE_TTL_MS = 10000;
+const AUTH_FETCH_RETRY_DELAY_MS = 450;
 
 type AuthRequestInit = RequestInit & {
   timeoutMs?: number;
@@ -322,34 +323,49 @@ async function authFetch<T>(path: string, idToken: string, init?: AuthRequestIni
   if ("timeoutMs" in requestInit) {
     delete (requestInit as AuthRequestInit).timeoutMs;
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  if (requestInit?.signal) {
-    if (requestInit.signal.aborted) controller.abort();
-    requestInit.signal.addEventListener("abort", () => controller.abort(), { once: true });
-  }
-  try {
-    const res = await fetch(`${API_URL}${path}`, {
-      ...requestInit,
-      signal: controller.signal,
-      headers: {
-        ...(requestInit.headers || {}),
-        Authorization: `Bearer ${idToken}`,
-      },
-    });
-    if (!res.ok) throw await parseError(res);
-    return res.json() as Promise<T>;
-  } catch (err: unknown) {
-    if (isAbortError(err)) {
-      throw new Error(`Request timed out after ${Math.floor(timeoutMs / 1000)}s. Check backend API at ${API_URL}.`);
+  const method = String(requestInit.method || "GET").trim().toUpperCase();
+  const canRetry = method === "GET" || method === "HEAD";
+
+  for (let attempt = 0; attempt < (canRetry ? 2 : 1); attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const upstreamSignal = requestInit.signal;
+    const abortFromUpstream = () => controller.abort();
+    if (upstreamSignal) {
+      if (upstreamSignal.aborted) controller.abort();
+      upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
     }
-    if (err instanceof TypeError) {
-      throw new Error(`Cannot reach backend API at ${API_URL}.`);
+    try {
+      const res = await fetch(`${API_URL}${path}`, {
+        ...requestInit,
+        signal: controller.signal,
+        headers: {
+          ...(requestInit.headers || {}),
+          Authorization: `Bearer ${idToken}`,
+        },
+      });
+      if (!res.ok) throw await parseError(res);
+      return res.json() as Promise<T>;
+    } catch (err: unknown) {
+      const retriable = (isAbortError(err) || err instanceof TypeError) && canRetry && attempt === 0;
+      if (retriable) {
+        await new Promise((resolve) => setTimeout(resolve, AUTH_FETCH_RETRY_DELAY_MS));
+        continue;
+      }
+      if (isAbortError(err)) {
+        throw new Error(`Request timed out after ${Math.floor(timeoutMs / 1000)}s. Check backend API at ${API_URL}.`);
+      }
+      if (err instanceof TypeError) {
+        throw new Error(`Cannot reach backend API at ${API_URL}.`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
     }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw new Error(`Request timed out after ${Math.floor(timeoutMs / 1000)}s. Check backend API at ${API_URL}.`);
 }
 
 export function fetchAuthMe(idToken: string): Promise<AuthMeResponse> {

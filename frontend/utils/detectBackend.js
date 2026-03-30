@@ -2,6 +2,15 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+function isWslEnvironment() {
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+  try {
+    return fs.readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft');
+  } catch {
+    return false;
+  }
+}
+
 function getPreferredNetworkIP() {
   try {
     const interfaces = os.networkInterfaces();
@@ -39,8 +48,9 @@ function getPreferredNetworkIP() {
 
 const explicitHost = (process.env.BACKEND_HOST || '').trim();
 const autoDetect = /^(1|true|yes)$/i.test((process.env.AUTO_DETECT_BACKEND_IP || '').trim());
+const runningInWsl = isWslEnvironment();
 const detectedIp = autoDetect ? getPreferredNetworkIP() : null;
-const ip = explicitHost || detectedIp || 'localhost';
+const ip = explicitHost || (runningInWsl ? 'localhost' : (detectedIp || 'localhost'));
 const envPath = path.join(__dirname, '../.env.local');
 
 function upsertEnvVars(envFilePath, updates) {
@@ -84,7 +94,10 @@ if (ip === 'localhost') {
   const hint = autoDetect
     ? '\nTip: pass BACKEND_HOST=<LAN_IP> if you are opening frontend from another device.'
     : '';
-  console.log(`⚠️ .env.local updated with localhost default:\n${envContent}${hint}`);
+  const wslHint = runningInWsl && !explicitHost
+    ? '\nWSL detected: using localhost avoids unstable WSL private IPs like 172.x.x.x.'
+    : '';
+  console.log(`⚠️ .env.local updated with localhost default:\n${envContent}${wslHint}${hint}`);
 } else {
   console.log(`✅ .env.local updated with detected IP (${ip}):\n${envContent}`);
 }

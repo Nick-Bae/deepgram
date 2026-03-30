@@ -315,6 +315,7 @@ export default function HostChurchPage() {
   const [sermonBudgetBusy, setSermonBudgetBusy] = useState(false);
   const [sermonBudgetError, setSermonBudgetError] = useState<string | null>(null);
   const [sermonBudgetNotice, setSermonBudgetNotice] = useState<string | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [verificationRequired, setVerificationRequired] = useState(false);
   const [verificationSending, setVerificationSending] = useState(false);
   const [verificationError, setVerificationError] = useState<string | null>(null);
@@ -372,7 +373,6 @@ export default function HostChurchPage() {
     return trialSecondsRemaining;
   }, [isTrialPlan, trialCountdownSeconds, trialSecondsRemaining]);
   const isTrialExpired = isTrialPlan && effectiveTrialCountdownSeconds !== null && effectiveTrialCountdownSeconds <= 0;
-  const startServiceDisabled = busy || isTrialExpired;
   const trialNoticeCheckpointRef = useRef<"" | "warn5" | "warn1" | "expired">("");
   const hasPaidPlan = PAID_PLAN_KEYS.includes(billingPlanToken as PaidPlanKey);
   const hasActiveLikeSubscription = billingStatusToken === "active" || billingStatusToken === "trialing" || billingStatusToken === "past_due";
@@ -551,7 +551,7 @@ export default function HostChurchPage() {
     if (authLoading || !user) return;
     let cancelled = false;
     const cacheAuthToken = async () => {
-      const idToken = await getIdToken();
+      const idToken = await getIdToken(true);
       if (cancelled) return;
       persistAuthToken(idToken || undefined);
     };
@@ -634,7 +634,9 @@ export default function HostChurchPage() {
       const selectedKey = (selected?.serviceKey || preferredKey || "").trim();
       if (selectedKey && selectedKey !== serviceKey) setServiceKey(selectedKey);
 
-      const rowRoomId = selected?.activeRoomId || null;
+      // Preserve a room that was just started locally until the services payload
+      // catches up, otherwise the console can disappear right after launch.
+      const rowRoomId = selected?.activeRoomId || activeRoomId || null;
       setActiveRoomId(rowRoomId);
       persistStreamContext({
         orgId: data.orgId,
@@ -645,7 +647,7 @@ export default function HostChurchPage() {
       if (!rowRoomId) clearRoomInSession();
       setErrorMsg(null);
     },
-    [normalizedServiceKey, queryServiceKey, serviceKey, slug],
+    [activeRoomId, normalizedServiceKey, queryServiceKey, serviceKey, slug],
   );
 
   useEffect(() => {
@@ -685,6 +687,15 @@ export default function HostChurchPage() {
     if (!orgData) return null;
     return orgData.services.find((s) => s.serviceKey === serviceKey) || null;
   }, [orgData, serviceKey]);
+
+  const liveService = useMemo(() => {
+    if (!orgData?.services?.length) return null;
+    return orgData.services.find((row) => Boolean((row.activeRoomId || "").trim())) || null;
+  }, [orgData]);
+
+  const liveServiceRoomId = (liveService?.activeRoomId || "").trim();
+  const hasLiveService = Boolean(liveServiceRoomId);
+  const startServiceDisabled = busy || (isTrialExpired && !Boolean(activeRoomId || liveServiceRoomId));
 
   useEffect(() => {
     if (!orgData?.services?.length) return;
@@ -858,6 +869,24 @@ export default function HostChurchPage() {
     void router.replace(href, undefined, { shallow: true });
   };
 
+  const openExistingLiveService = (row: ServiceRow): boolean => {
+    const liveKey = (row.serviceKey || "").trim();
+    const roomId = (row.activeRoomId || "").trim();
+    if (!liveKey || !roomId) return false;
+    scrollToPanelRef.current = true;
+    setActiveRoomId(roomId);
+    if (liveKey !== serviceKey) setServiceKey(liveKey);
+    persistStreamContext({
+      orgId: resolvedOrgId || undefined,
+      roomId,
+      serviceKey: liveKey,
+      churchSlug: slug,
+    });
+    syncHostUrl(roomId, liveKey);
+    setErrorMsg(null);
+    return true;
+  };
+
   const switchOrganization = useCallback(
     async (nextOrgId: string) => {
       const cleanOrgId = (nextOrgId || "").trim();
@@ -932,7 +961,7 @@ export default function HostChurchPage() {
       setBillingNotice(null);
     }
     try {
-      const idToken = await getIdToken();
+      const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
       const payload = await fetchOrgBillingStatus(idToken, resolvedOrgId, { refresh: forceRefresh });
@@ -1401,7 +1430,7 @@ export default function HostChurchPage() {
       setErrorMsg("Church slug is missing. Refresh the page.");
       return;
     }
-    if (isTrialExpired && !activeRoomId) {
+    if (isTrialExpired && !activeRoomId && !liveServiceRoomId) {
       setErrorMsg(ERROR_DETAIL_MESSAGES.trial_expired);
       return;
     }
@@ -1413,7 +1442,7 @@ export default function HostChurchPage() {
     busyRef.current = true;
     setBusy(true);
     try {
-      const idToken = await getIdToken();
+      const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
       const path = resolvedOrgId
@@ -1431,6 +1460,10 @@ export default function HostChurchPage() {
         }),
       });
       if (!res.ok) {
+        if (res.status === 429 && liveService) {
+          openExistingLiveService(liveService);
+          return;
+        }
         const msg = await readErrorMessage(res, "start_service");
         if (res.status === 402 && resolvedOrgId) {
           void loadBillingProfile({ refresh: true });
@@ -1481,7 +1514,7 @@ export default function HostChurchPage() {
     busyRef.current = true;
     setBusy(true);
     try {
-      const idToken = await getIdToken();
+      const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
       persistAuthToken(idToken);
       const res = await fetch(`${API_URL}/api/org/${encodeURIComponent(resolvedOrgId)}/room/${encodeURIComponent(roomToEnd)}/end`, {
@@ -1535,12 +1568,29 @@ export default function HostChurchPage() {
     warn:     "#92400e",
     warnBg:   "#fffbeb",
   };
+  const isBroadcastTab = activeTab === "broadcast";
+  const BC = {
+    cloud: "#24324a",
+    sand: "#d7c8bb",
+    rose: "#b48a6b",
+    blush: "#b88a52",
+    plum: "#7d6757",
+    navy: "#425775",
+    deep: "#2d3650",
+    surface: "#ede5d8",
+    low: "#f4ede4",
+    high: "#fffaf4",
+    bright: "#ead9ca",
+    ink: "#24324a",
+    mist: "rgba(82,72,64,0.68)",
+  } as const;
 
   const hostPageStyle = {
     minHeight: "100vh",
     background: "#ede5d8",
     color: "#2e2a28",
     position: "relative" as const,
+    fontFamily: "'Manrope', 'Segoe UI', sans-serif",
   } as const;
   const dashboardCardShadow = "0 1px 3px rgba(0,0,0,0.06)";
   const dashboardCompactShadow = "0 1px 2px rgba(0,0,0,0.04)";
@@ -1552,60 +1602,6 @@ export default function HostChurchPage() {
     borderRadius: 3,
     fontSize: 14,
     outline: "none",
-  } as const;
-  const hostTabRailStyle = {
-    display: "flex",
-    flexWrap: "wrap" as const,
-    gap: 0,
-    margin: "20px 0 0",
-    padding: "0",
-    background: "transparent",
-    borderBottom: "1px solid rgba(255,255,255,0.10)",
-  } as const;
-  const studioUserPanelStyle = {
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    padding: 0,
-  } as const;
-  const studioAdminButtonStyle = {
-    border: `1px solid rgba(212,184,122,0.35)`,
-    background: "rgba(212,184,122,0.1)",
-    color: DC.goldLight,
-    fontSize: 11,
-    fontWeight: 600,
-    letterSpacing: "0.12em",
-    textTransform: "uppercase" as const,
-    padding: "8px 14px",
-    cursor: "pointer",
-    textDecoration: "none",
-    borderRadius: 3,
-  } as const;
-  const studioLogoutButtonStyle = {
-    border: "1px solid rgba(255,255,255,0.14)",
-    background: "transparent",
-    color: "rgba(255,255,255,0.55)",
-    fontSize: 11,
-    fontWeight: 500,
-    letterSpacing: "0.1em",
-    textTransform: "uppercase" as const,
-    padding: "8px 14px",
-    cursor: "pointer",
-    borderRadius: 3,
-  } as const;
-  const studioBrandTileStyle = {
-    width: 48,
-    height: 48,
-    borderRadius: 10,
-    background: "rgba(255,255,255,0.06)",
-    border: "1px solid rgba(255,255,255,0.1)",
-    display: "grid",
-    placeItems: "center",
-    color: DC.goldLight,
-    fontSize: 24,
-    fontWeight: 800,
-    fontStyle: "italic",
-    flexShrink: 0,
   } as const;
   const accentPrimaryShadow = "0 4px 12px rgba(184,154,94,0.22)";
   const accentDangerGradient = "#c0392b";
@@ -1631,7 +1627,6 @@ export default function HostChurchPage() {
   } as const;
   const settingsSubscriptionCardStyle = {
     ...settingsCardStyle,
-    borderTop: `3px solid ${DC.gold}`,
   } as const;
   const settingsBudgetCardStyle = {
     ...settingsCardStyle,
@@ -1640,24 +1635,34 @@ export default function HostChurchPage() {
   const billingHeroCardStyle = {
     ...settingsCardStyle,
     padding: 28,
-    background: DC.navy,
-    border: "none",
-    color: DC.cream,
+    background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))",
+    border: "1px solid rgba(255,255,255,0.68)",
+    borderRadius: 30,
+    boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)",
+    backdropFilter: "blur(40px)",
+    WebkitBackdropFilter: "blur(40px)",
+    color: DC.charcoal,
+  } as const;
+  const billingHeroInsetCardStyle = {
+    border: "1px solid rgba(120,98,78,0.12)",
+    background: "rgba(255,255,255,0.36)",
+    padding: "14px 16px",
+    borderRadius: 16,
+    boxShadow: "0 14px 30px rgba(126,104,81,0.08)",
   } as const;
   const billingDeckStyle = {
     display: "grid",
     gap: 16,
-    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%), 1fr))",
   } as const;
   const billingPlanCardBaseStyle = {
     padding: 20,
     display: "grid",
     gap: 10,
     minHeight: 200,
-    background: DC.white,
-    border: `1px solid ${DC.border}`,
-    borderRadius: 8,
-    boxShadow: dashboardCompactShadow,
+    background: "rgba(255,255,255,0.82)",
+    border: "1px solid rgba(120,98,78,0.12)",
+    borderRadius: 18,
+    boxShadow: "0 18px 40px rgba(110,93,74,0.10)",
   } as const;
   const billingAlertStyle = {
     border: "1px solid rgba(192,57,43,0.22)",
@@ -1764,6 +1769,47 @@ export default function HostChurchPage() {
     padding: "16px 20px",
     background: DC.cream,
     borderRadius: 6,
+  } as const;
+  const broadcastGlassPanelStyle = {
+    background: "linear-gradient(180deg, rgba(255,255,255,0.26), rgba(255,255,255,0.14))",
+    border: "1px solid rgba(255,255,255,0.62)",
+    boxShadow: "0 28px 64px rgba(122,101,79,0.16), inset 0 1px 0 rgba(255,255,255,0.86)",
+    backdropFilter: "blur(40px)",
+    WebkitBackdropFilter: "blur(40px)",
+  } as const;
+  const broadcastMutedChipStyle = {
+    background: "linear-gradient(180deg, rgba(255,255,255,0.58), rgba(255,255,255,0.32))",
+    boxShadow: "0 12px 24px rgba(126,104,81,0.08), inset 0 1px 0 rgba(255,255,255,0.82), inset 0 0 0 1px rgba(120,98,78,0.10)",
+    color: "#5f5750",
+  } as const;
+  const broadcastFieldStyle = {
+    border: "1px solid rgba(120,98,78,0.12)",
+    background: "linear-gradient(180deg, rgba(255,255,255,0.58), rgba(255,255,255,0.34))",
+    color: "#26211f",
+    boxShadow: "0 12px 24px rgba(126,104,81,0.06), inset 0 1px 0 rgba(255,255,255,0.74)",
+  } as const;
+  const broadcastPrimaryButtonStyle = {
+    background: "linear-gradient(145deg, #d4b87a, #b88a52)",
+    color: "#ffffff",
+    boxShadow: "0 16px 32px rgba(184,154,94,0.24)",
+  } as const;
+  const broadcastSecondaryButtonStyle = {
+    background: "linear-gradient(180deg, rgba(255,255,255,0.64), rgba(255,255,255,0.36))",
+    color: BC.deep,
+    boxShadow: "0 12px 24px rgba(126,104,81,0.08), inset 0 1px 0 rgba(255,255,255,0.84), inset 0 0 0 1px rgba(120,98,78,0.12)",
+  } as const;
+  const broadcastDarkButtonStyle = {
+    background: "linear-gradient(180deg, #3b4960 0%, #2d3650 100%)",
+    color: "#ffffff",
+    boxShadow: "0 16px 30px rgba(45,54,80,0.22)",
+  } as const;
+  const broadcastInsetCardStyle = {
+    background: "linear-gradient(180deg, rgba(255,255,255,0.44), rgba(255,255,255,0.24))",
+    boxShadow: "0 18px 38px rgba(126,104,81,0.08), inset 0 1px 0 rgba(255,255,255,0.84), inset 0 0 0 1px rgba(120,98,78,0.10)",
+  } as const;
+  const broadcastAccentCardStyle = {
+    background: "linear-gradient(180deg, rgba(255,250,244,0.54), rgba(245,236,226,0.28))",
+    boxShadow: "0 18px 38px rgba(126,104,81,0.10), inset 0 1px 0 rgba(255,255,255,0.88), inset 0 0 0 1px rgba(120,98,78,0.10)",
   } as const;
   const currentUserName = (
     user?.displayName ||
@@ -1916,68 +1962,246 @@ export default function HostChurchPage() {
 
   return (
     <main style={hostPageStyle}>
-      {/* ── Fixed bokeh background — gives glass panels something rich to blur through ── */}
-      <div aria-hidden="true" style={{ position: "fixed", inset: 0, zIndex: 0, overflow: "hidden", pointerEvents: "none" }}>
-        {/* Amber/gold — top-left */}
-        <div style={{ position: "absolute", left: "-8%", top: "-6%", width: 700, height: 700, borderRadius: "50%", background: "radial-gradient(circle, rgba(214,172,88,0.72) 0%, transparent 68%)", filter: "blur(80px)" }} />
-        {/* Lavender — top-right */}
-        <div style={{ position: "absolute", right: "-6%", top: "4%", width: 620, height: 620, borderRadius: "50%", background: "radial-gradient(circle, rgba(170,158,248,0.62) 0%, transparent 68%)", filter: "blur(80px)" }} />
-        {/* Terracotta/peach — bottom-right */}
-        <div style={{ position: "absolute", right: "8%", bottom: "-8%", width: 680, height: 580, borderRadius: "50%", background: "radial-gradient(circle, rgba(224,158,112,0.58) 0%, transparent 68%)", filter: "blur(90px)" }} />
-        {/* Warm rose — bottom-left */}
-        <div style={{ position: "absolute", left: "5%", bottom: "10%", width: 540, height: 520, borderRadius: "50%", background: "radial-gradient(circle, rgba(210,168,178,0.50) 0%, transparent 68%)", filter: "blur(70px)" }} />
-        {/* Bright cream highlight — center */}
-        <div style={{ position: "absolute", left: "28%", top: "30%", width: 800, height: 600, borderRadius: "50%", background: "radial-gradient(circle, rgba(255,250,238,0.88) 0%, transparent 68%)", filter: "blur(100px)" }} />
-        {/* Cool teal accent — mid-right */}
-        <div style={{ position: "absolute", right: "22%", top: "52%", width: 440, height: 400, borderRadius: "50%", background: "radial-gradient(circle, rgba(130,190,200,0.38) 0%, transparent 68%)", filter: "blur(70px)" }} />
+      <style>{`
+        .broadcast-editorial-grid {
+          display: grid;
+          gap: 20px;
+          grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
+          align-items: start;
+        }
+        .broadcast-shell-main {
+          display: grid;
+          gap: 18px;
+          grid-template-columns: minmax(280px, 0.78fr) minmax(0, 1.22fr);
+          align-items: stretch;
+        }
+        .broadcast-summary-grid {
+          display: grid;
+          gap: 14px;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .broadcast-monitor-header {
+          display: grid;
+          gap: 16px;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: center;
+        }
+        .broadcast-live-utilities {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 10px;
+        }
+        .broadcast-control-grid {
+          display: grid;
+          gap: 18px;
+        }
+        .broadcast-session-header {
+          display: grid;
+          gap: 12px 16px;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: start;
+        }
+        .broadcast-session-status {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+          min-width: 0;
+        }
+        .broadcast-session-title {
+          flex: 1 1 320px;
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .broadcast-session-actions {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+          justify-content: flex-end;
+          flex-wrap: wrap;
+        }
+        .broadcast-setup-grid {
+          display: flex;
+          gap: 12px;
+          flex-wrap: wrap;
+          align-items: end;
+        }
+        .broadcast-setup-field {
+          display: grid;
+          gap: 7px;
+          min-width: 0;
+        }
+        .broadcast-service-field {
+          flex: 0 1 460px;
+          width: 100%;
+          max-width: 460px;
+        }
+        .broadcast-church-field {
+          width: 100%;
+          flex: 0 1 280px;
+          max-width: 280px;
+        }
+        .broadcast-info-strip {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .broadcast-diagnostics-toggle {
+          margin-left: auto;
+        }
+        @media (max-width: 768px) {
+          .host-page-wrap { padding: 0 12px 48px !important; }
+          .host-header-row { flex-wrap: wrap !important; gap: 8px !important; }
+          .host-brand { flex: 1 1 auto !important; min-width: 0 !important; }
+          .host-brand-name { font-size: 16px !important; }
+          .host-tab-nav { order: 3 !important; width: 100% !important; flex-shrink: 1 !important; justify-content: flex-start !important; flex-wrap: wrap !important; border-radius: 14px !important; }
+          .host-tab-nav .tab-full { display: none !important; }
+          .host-tab-nav .tab-short { display: inline !important; }
+          .host-user-section { flex-shrink: 1 !important; }
+          .host-user-name { display: none !important; }
+          .billing-plan-deck { grid-template-columns: 1fr !important; }
+          .broadcast-editorial-grid,
+          .broadcast-shell-main,
+          .broadcast-summary-grid,
+          .broadcast-monitor-header {
+            grid-template-columns: 1fr !important;
+          }
+          .broadcast-live-utilities {
+            width: 100% !important;
+            justify-content: flex-start !important;
+          }
+          .broadcast-session-header,
+          .broadcast-setup-grid {
+            display: grid !important;
+            grid-template-columns: 1fr !important;
+          }
+          .broadcast-session-actions {
+            justify-content: flex-start !important;
+          }
+          .broadcast-session-title {
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+          }
+          .broadcast-church-field {
+            flex-basis: auto !important;
+            max-width: none !important;
+          }
+          .broadcast-service-field {
+            flex-basis: auto !important;
+            max-width: none !important;
+          }
+          .broadcast-diagnostics-toggle {
+            margin-left: 0 !important;
+          }
+        }
+        @media (min-width: 769px) and (max-width: 1100px) {
+          .broadcast-session-header {
+            grid-template-columns: 1fr !important;
+          }
+          .broadcast-session-actions {
+            justify-content: flex-start !important;
+          }
+          .broadcast-diagnostics-toggle {
+            margin-left: 0 !important;
+          }
+        }
+        @media (min-width: 769px) {
+          .host-tab-nav .tab-short { display: none !important; }
+          .host-tab-nav .tab-full { display: inline !important; }
+        }
+        @media (min-width: 769px) and (max-width: 1180px) {
+          .broadcast-shell-main {
+            grid-template-columns: 1fr !important;
+          }
+        }
+        @media (min-width: 769px) and (max-width: 1024px) {
+          .broadcast-summary-grid {
+            grid-template-columns: 1fr !important;
+          }
+        }
+        @media (min-width: 769px) and (max-width: 1079px) {
+          .billing-plan-deck { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+        }
+        @media (min-width: 1080px) {
+          .billing-plan-deck { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
+        }
+      `}</style>
+      {/* ── Fixed atmospheric background ── */}
+      <div aria-hidden="true" style={{ position: "fixed", inset: 0, zIndex: 0, overflow: "hidden", pointerEvents: "none", background: isBroadcastTab ? "linear-gradient(145deg, #f0dcc8 0%, #e9e2db 40%, #ddd5cc 100%)" : "linear-gradient(180deg, #f3ecdf 0%, #ede5d8 40%, #efe7de 100%)" }}>
+        <div style={{ position: "absolute", left: "-10%", top: "-8%", width: 760, height: 760, borderRadius: "50%", background: isBroadcastTab ? "radial-gradient(circle, rgba(229,177,120,0.56) 0%, transparent 66%)" : "radial-gradient(circle, rgba(214,172,88,0.72) 0%, transparent 68%)", filter: "blur(90px)" }} />
+        <div style={{ position: "absolute", right: "-6%", top: "2%", width: 640, height: 640, borderRadius: "50%", background: isBroadcastTab ? "radial-gradient(circle, rgba(173,180,196,0.48) 0%, transparent 66%)" : "radial-gradient(circle, rgba(170,158,248,0.62) 0%, transparent 68%)", filter: "blur(84px)" }} />
+        <div style={{ position: "absolute", right: "4%", bottom: "-12%", width: 760, height: 620, borderRadius: "50%", background: isBroadcastTab ? "radial-gradient(circle, rgba(255,246,236,0.74) 0%, transparent 58%)" : "radial-gradient(circle, rgba(224,158,112,0.58) 0%, transparent 68%)", filter: "blur(96px)" }} />
+        <div style={{ position: "absolute", left: "8%", bottom: "8%", width: 520, height: 500, borderRadius: "50%", background: isBroadcastTab ? "radial-gradient(circle, rgba(206,167,145,0.34) 0%, transparent 62%)" : "radial-gradient(circle, rgba(210,168,178,0.50) 0%, transparent 68%)", filter: "blur(74px)" }} />
+        <div style={{ position: "absolute", left: "32%", top: "34%", width: 780, height: 560, borderRadius: "50%", background: isBroadcastTab ? "radial-gradient(circle, rgba(255,250,242,0.88) 0%, transparent 68%)" : "radial-gradient(circle, rgba(255,250,238,0.88) 0%, transparent 68%)", filter: "blur(110px)" }} />
+        <div style={{ position: "absolute", right: "18%", top: "56%", width: 460, height: 420, borderRadius: "50%", background: isBroadcastTab ? "radial-gradient(circle, rgba(152,186,198,0.28) 0%, transparent 68%)" : "radial-gradient(circle, rgba(130,190,200,0.38) 0%, transparent 68%)", filter: "blur(72px)" }} />
       </div>
-      <div style={{ position: "relative", zIndex: 1, maxWidth: 1500, margin: "0 auto", padding: "0 24px 64px" }}>
+      <div className="host-page-wrap" style={{ position: "relative", zIndex: 1, maxWidth: 1500, margin: "0 auto", padding: "0 24px 64px" }}>
         {/* ── Glass header (logo + nav + user — all one line) ── */}
         <header style={{
           position: "relative",
           overflow: "hidden",
-          background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))",
-          border: "1px solid rgba(255,255,255,0.68)",
-          boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)",
-          backdropFilter: "blur(40px)",
-          WebkitBackdropFilter: "blur(40px)",
+          ...(isBroadcastTab ? broadcastGlassPanelStyle : {
+            background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))",
+            border: "1px solid rgba(255,255,255,0.68)",
+            boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)",
+            backdropFilter: "blur(40px)",
+            WebkitBackdropFilter: "blur(40px)",
+          }),
           borderRadius: 34,
-          padding: "12px 24px",
-          marginTop: 16,
+          padding: "18px 24px",
+          marginTop: 28,
         }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
+          {isBroadcastTab ? (
+            <>
+              <div aria-hidden="true" style={{ position: "absolute", left: "10%", top: "-40%", width: 320, height: 240, borderRadius: "50%", background: "radial-gradient(circle, rgba(228,182,128,0.22) 0%, transparent 70%)", filter: "blur(24px)" }} />
+              <div aria-hidden="true" style={{ position: "absolute", right: "-4%", bottom: "-70%", width: 380, height: 300, borderRadius: "50%", background: "radial-gradient(circle, rgba(172,185,200,0.28) 0%, transparent 72%)", filter: "blur(20px)" }} />
+            </>
+          ) : null}
+          <div className="host-header-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
             {/* Left: church logo + name */}
-            <div style={{ display: "flex", alignItems: "center", gap: 20, flexShrink: 0 }}>
-              <div style={{ width: 48, height: 48, borderRadius: 16, background: "#2d3650", color: "#f1d35c", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 600, flexShrink: 0 }}>
+            <div className="host-brand" style={{ display: "flex", alignItems: "center", gap: 14, flexShrink: 0 }}>
+              <div style={{ width: 44, height: 44, borderRadius: 14, background: isBroadcastTab ? "linear-gradient(145deg, #d4b87a, #b88a52)" : "#2d3650", color: isBroadcastTab ? "#ffffff" : "#f1d35c", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 700, flexShrink: 0, boxShadow: isBroadcastTab ? "0 16px 30px rgba(184,154,94,0.24)" : "none" }}>
                 {currentChurchInitial}
               </div>
-              <div>
-                <div style={{ fontSize: 20, fontWeight: 600, letterSpacing: "-0.02em", color: "#151515", lineHeight: 1.1 }}>{currentChurchLabel}</div>
-                <div style={{ marginTop: 2, fontSize: 10, letterSpacing: "0.38em", textTransform: "uppercase" as const, color: "#6f655c" }}>Translation Studio</div>
+              <div style={{ minWidth: 0 }}>
+                <div className="host-brand-name" style={{ fontSize: 18, fontWeight: 600, letterSpacing: "-0.03em", color: isBroadcastTab ? BC.cloud : "#151515", lineHeight: 1.1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const }}>{currentChurchLabel}</div>
+                <div style={{ marginTop: 4, fontSize: 10, letterSpacing: "0.34em", textTransform: "uppercase" as const, color: isBroadcastTab ? "rgba(242,243,244,0.52)" : "#6f655c" }}>
+                  {isBroadcastTab ? "Silent Studio" : "Translation Studio"}
+                </div>
               </div>
             </div>
             {/* Center: nav pills */}
-            <nav style={{ display: "flex", alignItems: "center", borderRadius: 999, background: "rgba(255,255,255,0.20)", padding: "8px", boxShadow: "0 18px 40px rgba(110,93,74,0.14), inset 0 1px 0 rgba(255,255,255,0.80)", border: "1px solid rgba(255,255,255,0.55)", flexShrink: 0 }}>
+            <nav className="host-tab-nav" style={{ display: "flex", alignItems: "center", borderRadius: 999, background: isBroadcastTab ? "rgba(255,255,255,0.26)" : "rgba(255,255,255,0.20)", padding: "6px", boxShadow: isBroadcastTab ? "0 18px 40px rgba(110,93,74,0.12), inset 0 1px 0 rgba(255,255,255,0.82), inset 0 0 0 1px rgba(120,98,78,0.08)" : "0 18px 40px rgba(110,93,74,0.14), inset 0 1px 0 rgba(255,255,255,0.80)", flexShrink: 0 }}>
               {(["broadcast", "settings", "billing", "team"] as const).map((tab) => {
                 const labels: Record<string, string> = { broadcast: "Live Broadcast", settings: "Church Settings", billing: "Billing & Subscription", team: "Team" };
+                const shortLabels: Record<string, string> = { broadcast: "Live", settings: "Settings", billing: "Billing", team: "Team" };
                 const isActive = activeTab === tab;
                 const isBillingAlert = tab === "billing" && billingNeedsAttention && !isActive;
                 return (
-                  <button key={tab} onClick={() => navigateToTab(tab)} style={{ border: "none", background: isActive ? "#ffffff" : "transparent", color: isActive ? "#27211d" : isBillingAlert ? "#c0392b" : "#5f5852", fontSize: 13, fontWeight: isActive ? 600 : 500, padding: "9px 18px", borderRadius: 999, cursor: "pointer", boxShadow: isActive ? "0 2px 8px rgba(0,0,0,0.08)" : "none", whiteSpace: "nowrap" as const, letterSpacing: "-0.01em" }}>
-                    {labels[tab]}
+                  <button key={tab} onClick={() => navigateToTab(tab)} style={{ border: "none", background: isBroadcastTab ? (isActive ? "rgba(255,255,255,0.74)" : "transparent") : (isActive ? "#ffffff" : "transparent"), color: isBroadcastTab ? (isActive ? BC.deep : isBillingAlert ? "#b95567" : BC.mist) : (isActive ? "#27211d" : isBillingAlert ? "#c0392b" : "#5f5852"), fontSize: 13, fontWeight: isActive ? 700 : 500, padding: "10px 16px", borderRadius: 999, cursor: "pointer", boxShadow: isActive ? (isBroadcastTab ? "0 10px 22px rgba(126,104,81,0.10), inset 0 1px 0 rgba(255,255,255,0.86)" : "0 2px 8px rgba(0,0,0,0.08)") : "none", whiteSpace: "nowrap" as const, letterSpacing: isBroadcastTab ? "0.04em" : "-0.01em", textTransform: isBroadcastTab ? "uppercase" as const : "none" }}>
+                    <span className="tab-full">{labels[tab]}</span>
+                    <span className="tab-short">{shortLabels[tab]}</span>
                   </button>
                 );
               })}
             </nav>
             {/* Right: user + logout */}
-            <div style={{ display: "flex", alignItems: "center", gap: 16, flexShrink: 0 }}>
-              <div style={{ textAlign: "right" as const }}>
-                <div style={{ fontSize: 15, fontWeight: 500, color: "#2f2b28" }}>{currentUserName}</div>
-                {isMasterUser && <Link href="/admin" style={{ fontSize: 12, color: DC.gold, textDecoration: "none", fontWeight: 600 }}>Admin</Link>}
+            <div className="host-user-section" style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
+              <div className="host-user-name" style={{ textAlign: "right" as const }}>
+                <div style={{ fontSize: 14, fontWeight: 500, color: isBroadcastTab ? BC.cloud : "#2f2b28" }}>{currentUserName}</div>
+                <div style={{ marginTop: 4, fontSize: 10, letterSpacing: "0.28em", textTransform: "uppercase" as const, color: isBroadcastTab ? BC.mist : "#6f655c" }}>
+                  {activeRoomId ? "Live session active" : "Studio operator"}
+                </div>
+                {isMasterUser && <Link href="/admin" style={{ display: "inline-block", marginTop: 6, fontSize: 11, color: isBroadcastTab ? BC.blush : DC.gold, textDecoration: "none", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase" }}>Admin</Link>}
               </div>
               <button
                 onClick={async () => { clearStreamContext(); clearHostToken(); clearAuthToken(); await logout(); }}
-                style={{ border: "none", background: "rgba(41,35,33,0.90)", color: "#ffffff", fontWeight: 600, fontSize: 13, padding: "9px 20px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap" as const }}
+                style={{ border: "none", background: isBroadcastTab ? "linear-gradient(180deg, #3b4960, #2d3650)" : "rgba(41,35,33,0.90)", color: "#ffffff", fontWeight: 700, fontSize: 12, letterSpacing: isBroadcastTab ? "0.12em" : "normal", textTransform: isBroadcastTab ? "uppercase" as const : "none", padding: "11px 18px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap" as const, boxShadow: isBroadcastTab ? "0 14px 28px rgba(45,54,80,0.18)" : "none" }}
               >
                 Logout
               </button>
@@ -1988,10 +2212,10 @@ export default function HostChurchPage() {
         {/* ── Page content ── */}
         <div style={{ marginTop: 20 }}>
           {!backendReachable ? (
-            <div style={{ marginBottom: 10, padding: "10px 14px", borderRadius: 12, background: "rgba(251,243,219,0.85)", border: "1px solid rgba(198,165,109,0.40)", color: "#7a5c20", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8, backdropFilter: "blur(12px)" }}>
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#c6a56d", flexShrink: 0, display: "inline-block" }} />
+            <div style={{ marginBottom: 10, padding: "10px 14px", borderRadius: 12, background: isBroadcastTab ? "rgba(251,191,36,0.10)" : "rgba(251,243,219,0.85)", border: isBroadcastTab ? "1px solid rgba(251,191,36,0.22)" : "1px solid rgba(198,165,109,0.40)", color: isBroadcastTab ? "#fde68a" : "#7a5c20", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8, backdropFilter: "blur(12px)" }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: isBroadcastTab ? "#fbbf24" : "#c6a56d", flexShrink: 0, display: "inline-block" }} />
               <span style={{ flex: 1 }}>Server unreachable — reconnecting…</span>
-              <button type="button" onClick={() => { void refreshServices().then(() => setBackendReachable(true)).catch(() => {}); }} style={{ background: "rgba(198,165,109,0.18)", border: "1px solid rgba(198,165,109,0.45)", color: "#7a5c20", borderRadius: 6, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Retry now</button>
+              <button type="button" onClick={() => { void refreshServices().then(() => setBackendReachable(true)).catch(() => {}); }} style={{ background: isBroadcastTab ? "rgba(255,255,255,0.42)" : "rgba(198,165,109,0.18)", border: isBroadcastTab ? "1px solid rgba(120,98,78,0.12)" : "1px solid rgba(198,165,109,0.45)", color: isBroadcastTab ? BC.deep : "#7a5c20", borderRadius: 6, padding: "3px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Retry now</button>
             </div>
           ) : null}
           {errorMsg && activeTab !== "broadcast" ? <p style={{ color: "#9f3650", marginTop: 0, fontSize: 13, fontWeight: 600 }}>Error: {errorMsg}</p> : null}
@@ -2006,100 +2230,158 @@ export default function HostChurchPage() {
           ) : null}
           {activeTab === "broadcast" ? (
             <>
-              {/* ── Control bar ── */}
-              <section style={{ marginTop: 20, background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)", borderRadius: 30, padding: "20px 24px" }}>
-                {!activeRoomId && (
-                  <div style={{ marginBottom: 18 }}>
-                    <h1 style={{ margin: "0 0 12px", fontSize: "clamp(22px, 2vw, 28px)", fontWeight: 600, letterSpacing: "-0.02em", color: "#1d1917" }}>Launch Your Broadcast</h1>
-                    <div style={{ display: "flex", flexWrap: "wrap" as const, alignItems: "center", gap: 6 }}>
-                      {(["Select a service", "Open the Control Panel", "Start Translation"] as const).map((label, i) => (
-                        <div key={label} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <span style={{ width: 22, height: 22, borderRadius: "50%", background: "#c6a56d", color: "#ffffff", fontSize: 11, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{i + 1}</span>
-                          <span style={{ fontSize: 13, color: "#7d746c" }}>{label}</span>
-                          {i < 2 && <span style={{ color: "#c4b8ac", fontSize: 13, marginLeft: 2 }}>›</span>}
-                        </div>
-                      ))}
+              {/* ── Broadcast control card ── */}
+              <section style={{ marginTop: 20, position: "relative", overflow: "hidden", ...(isBroadcastTab ? broadcastGlassPanelStyle : { background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)" }), borderRadius: 36, padding: "22px 24px" }}>
+                <div className="broadcast-control-grid">
+
+                  {/* ── Session header: status · service · lang · elapsed · actions ── */}
+                  <div className="broadcast-session-header">
+                    <div className="broadcast-session-status">
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 14px", borderRadius: 999, background: activeRoomId ? "linear-gradient(180deg, rgba(110,231,167,0.18), rgba(110,231,167,0.08))" : "linear-gradient(180deg, rgba(255,255,255,0.66), rgba(255,255,255,0.40))", boxShadow: "0 10px 22px rgba(126,104,81,0.08), inset 0 1px 0 rgba(255,255,255,0.84), inset 0 0 0 1px rgba(120,98,78,0.10)", color: activeRoomId ? "#2d7a52" : BC.blush, fontSize: 11, fontWeight: 800, letterSpacing: "0.16em", textTransform: "uppercase" as const, flexShrink: 0 }}>
+                        <span style={{ width: 7, height: 7, borderRadius: "50%", background: activeRoomId ? "#6ee7a7" : BC.blush, flexShrink: 0 }} />
+                        {activeRoomId ? "Live" : "Standby"}
+                      </span>
+                      <span className="broadcast-session-title" title={selectedService?.title || liveService?.title || "Choose a service"} style={{ fontSize: 17, fontWeight: 600, letterSpacing: "-0.02em", color: BC.cloud }}>
+                        {selectedService?.title || liveService?.title || "Choose a service"}
+                      </span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: BC.mist, letterSpacing: "0.08em", whiteSpace: "nowrap" as const }}>
+                        {(sourceLang || "ko").toUpperCase()} → {(targetLang || "en").toUpperCase()}
+                      </span>
+                      {activeRoomId ? (
+                        <span style={{ ...broadcastMutedChipStyle, padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, letterSpacing: "0.10em", whiteSpace: "nowrap" as const }}>
+                          {formatCountdownSeconds(elapsedSec)} elapsed
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="broadcast-session-actions">
+                      {activeRoomId ? (
+                        <>
+                          <button type="button" onClick={startService} disabled={startServiceDisabled} style={{ borderRadius: 16, ...broadcastSecondaryButtonStyle, border: "none", padding: "11px 16px", fontSize: 12, fontWeight: 800, letterSpacing: "0.10em", textTransform: "uppercase" as const, cursor: startServiceDisabled ? "not-allowed" : "pointer", opacity: startServiceDisabled ? 0.6 : 1, whiteSpace: "nowrap" as const }}>Restart</button>
+                          <button type="button" onClick={endService} disabled={busy} style={{ borderRadius: 16, ...broadcastDarkButtonStyle, border: "none", padding: "11px 16px", fontSize: 12, fontWeight: 800, letterSpacing: "0.10em", textTransform: "uppercase" as const, cursor: busy ? "not-allowed" : "pointer", opacity: busy ? 0.6 : 1, whiteSpace: "nowrap" as const }}>End Service</button>
+                        </>
+                      ) : (
+                        <button type="button" onClick={startService} disabled={startServiceDisabled} style={{ borderRadius: 16, ...broadcastPrimaryButtonStyle, border: "none", padding: "12px 22px", fontSize: 12, fontWeight: 800, letterSpacing: "0.14em", textTransform: "uppercase" as const, cursor: startServiceDisabled ? "not-allowed" : "pointer", opacity: startServiceDisabled ? 0.6 : 1, whiteSpace: "nowrap" as const }}>
+                          {hasLiveService ? "Rejoin" : "Start Broadcast"}
+                        </button>
+                      )}
                     </div>
                   </div>
-                )}
-                <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" as const }}>
-                  {/* Service label + selector inline */}
-                  <span style={{ fontSize: 13, fontWeight: 600, color: "#746c64", flexShrink: 0 }}>Service</span>
-                  {orgData?.services?.length ? (
-                    <select value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} disabled={loading || !!activeRoomId} style={{ flex: 1, minWidth: 200, border: "1px solid rgba(120,98,78,0.12)", background: "rgba(255,255,255,0.60)", color: "#26211f", padding: "10px 14px", borderRadius: 16, fontSize: 14, fontWeight: 500, outline: "none" }}>
-                      {orgData.services.map((row) => (<option key={row.serviceKey} value={row.serviceKey}>{row.title} ({row.serviceKey})</option>))}
-                    </select>
-                  ) : (
-                    <input value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} placeholder={DEFAULT_SERVICE_KEY} style={{ flex: 1, minWidth: 200, border: "1px solid rgba(120,98,78,0.12)", background: "rgba(255,255,255,0.60)", color: "#26211f", padding: "10px 14px", borderRadius: 16, fontSize: 14, outline: "none" }} />
-                  )}
-                  {!loading && orgData && !orgData.services?.length && <div style={{ fontSize: 12, color: "#7d746c" }}>No services found. Create one in Church Settings.</div>}
-                  {/* Action buttons */}
-                  <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" as const }}>
-                    {activeRoomId ? (
+
+                  {/* ── Setup row: service selector + church selector ── */}
+                  <div className="broadcast-setup-grid">
+                    <div className="broadcast-setup-field broadcast-service-field">
+                      <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: BC.blush }}>Service</span>
+                      {orgData?.services?.length ? (
+                        <select value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} title={selectedService ? `${selectedService.title} (${selectedService.serviceKey})` : serviceKey} disabled={loading || !!activeRoomId} style={{ width: "100%", ...broadcastFieldStyle, padding: "11px 14px", borderRadius: 16, fontSize: 14, fontWeight: 600, outline: "none" }}>
+                          {orgData.services.map((row) => (<option key={row.serviceKey} value={row.serviceKey}>{row.title} ({row.serviceKey})</option>))}
+                        </select>
+                      ) : (
+                        <input value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} placeholder={DEFAULT_SERVICE_KEY} style={{ width: "100%", ...broadcastFieldStyle, padding: "11px 14px", borderRadius: 16, fontSize: 14, outline: "none" }} />
+                      )}
+                      {!loading && orgData && !orgData.services?.length ? <div style={{ fontSize: 12, color: BC.mist }}>No services found. Create one in Church Settings.</div> : null}
+                    </div>
+                    {memberships.length > 1 ? (
+                      <div className="broadcast-setup-field broadcast-church-field">
+                        <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: BC.mist }}>Church</span>
+                        <select value={selectedOrgId || resolvedOrgId} onChange={(e) => { void switchOrganization(e.target.value); }} disabled={switchingOrg || busy} style={{ width: "100%", ...broadcastFieldStyle, padding: "11px 14px", borderRadius: 16, fontSize: 14, outline: "none" }}>
+                          {memberships.map((row) => (<option key={row.orgId} value={row.orgId}>{row.name} ({row.role || "member"})</option>))}
+                        </select>
+                        {switchingOrg ? <span style={{ fontSize: 12, color: BC.mist }}>Switching…</span> : null}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {/* ── Info strip: plan · share · diagnostics toggle ── */}
+                  <div className="broadcast-info-strip">
+                    <span style={{ ...broadcastMutedChipStyle, padding: "7px 13px", borderRadius: 999, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" as const }}>
+                      {formatPlanLabel(billingPlanToken)} plan
+                    </span>
+                    {billingAlertMessage ? (
+                      <span style={{ padding: "7px 13px", borderRadius: 999, background: "rgba(243,166,176,0.14)", boxShadow: "inset 0 0 0 1px rgba(243,166,176,0.32)", color: "#c05060", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" as const }}>
+                        {billingAlertMessage}
+                      </span>
+                    ) : effectiveTrialCountdownSeconds !== null ? (
+                      <span style={{ padding: "7px 13px", borderRadius: 999, background: "rgba(247,197,107,0.14)", boxShadow: "inset 0 0 0 1px rgba(247,197,107,0.32)", color: "#a07820", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" as const }}>
+                        {formatCountdownSeconds(effectiveTrialCountdownSeconds)} trial remaining
+                      </span>
+                    ) : null}
+                    {displayUrl ? (
                       <>
-                        <button onClick={startService} disabled={startServiceDisabled} style={{ borderRadius: 22, background: "#efe7d6", border: "none", padding: "16px 20px", fontSize: 13, fontWeight: 600, color: "#51463b", cursor: startServiceDisabled ? "not-allowed" : "pointer", opacity: startServiceDisabled ? 0.6 : 1, boxShadow: "0 18px 40px rgba(110,93,74,0.10)", whiteSpace: "nowrap" as const }}>Restart / Rejoin Room</button>
-                        <button onClick={endService} disabled={busy} style={{ borderRadius: 22, background: "#d96f67", border: "none", padding: "16px 20px", fontSize: 13, fontWeight: 600, color: "#ffffff", cursor: busy ? "not-allowed" : "pointer", opacity: busy ? 0.6 : 1, boxShadow: "0 18px 40px rgba(110,93,74,0.10)", whiteSpace: "nowrap" as const }}>End Service</button>
-                        <div style={{ borderRadius: 22, background: "rgba(255,255,255,0.26)", boxShadow: "0 18px 40px rgba(110,93,74,0.10)", border: "1px solid rgba(120,98,78,0.05)", padding: "16px 20px", fontSize: 13, color: "#726961", whiteSpace: "nowrap" as const }}>Live room: {activeRoomId}</div>
+                        <button type="button" onClick={() => { void copyListenerUrl(); }} disabled={copyUrlBusy} style={{ ...broadcastMutedChipStyle, borderRadius: 999, border: "none", padding: "7px 13px", fontSize: 12, fontWeight: 700, letterSpacing: "0.08em", cursor: copyUrlBusy ? "default" : "pointer", whiteSpace: "nowrap" as const }}>
+                          {copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}
+                        </button>
+                        <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", ...broadcastMutedChipStyle, borderRadius: 999, padding: "7px 13px", fontSize: 12, fontWeight: 700, textDecoration: "none", whiteSpace: "nowrap" as const }}>
+                          Listener ↗
+                        </a>
+                        <button type="button" onClick={() => { void shareListenerUrl(); }} disabled={shareUrlBusy} style={{ ...broadcastMutedChipStyle, borderRadius: 999, border: "none", padding: "7px 13px", fontSize: 12, fontWeight: 700, cursor: shareUrlBusy ? "default" : "pointer", whiteSpace: "nowrap" as const }}>
+                          {shareUrlBusy ? "Sharing…" : "Share"}
+                        </button>
                       </>
-                    ) : (
-                      <button onClick={startService} disabled={startServiceDisabled} style={{ borderRadius: 22, background: "#c5a263", border: "none", padding: "16px 24px", fontSize: 13, fontWeight: 600, color: "#ffffff", cursor: startServiceDisabled ? "not-allowed" : "pointer", opacity: startServiceDisabled ? 0.6 : 1, boxShadow: "0 18px 40px rgba(110,93,74,0.10)", whiteSpace: "nowrap" as const, letterSpacing: "0.04em" }}>Open Broadcast Console</button>
-                    )}
+                    ) : null}
+                    <button type="button" onClick={() => { setShowDiagnostics((v) => !v); }} className="broadcast-diagnostics-toggle" style={{ ...broadcastMutedChipStyle, borderRadius: 999, border: "none", padding: "7px 13px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" as const }}>
+                      {showDiagnostics ? "Hide Details ▴" : "System Details ▾"}
+                    </button>
                   </div>
+
+                  {/* ── Collapsible system diagnostics ── */}
+                  {showDiagnostics ? (
+                    <div style={{ ...broadcastInsetCardStyle, padding: "14px 18px", borderRadius: 18, display: "flex", flexWrap: "wrap" as const, gap: "6px 20px" }}>
+                      <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: BC.blush, width: "100%", marginBottom: 4 }}>System Details</span>
+                      {activeRoomId ? <span style={{ fontSize: 12, color: BC.mist }}>Room · <strong style={{ color: BC.cloud }}>{activeRoomId}</strong></span> : null}
+                      <span style={{ fontSize: 12, color: BC.mist }}>Plan · <strong style={{ color: BC.cloud }}>{formatPlanLabel(billingPlanToken)}</strong></span>
+                      <span style={{ fontSize: 12, color: BC.mist }}>Billing · <strong style={{ color: BC.cloud }}>{formatBillingStatus(billingStatusToken)}</strong></span>
+                      {displayUrl ? <span style={{ fontSize: 12, color: BC.mist, wordBreak: "break-all" as const }}>URL · <strong style={{ color: BC.cloud }}>{displayUrl}</strong></span> : null}
+                    </div>
+                  ) : null}
+
+                  {/* ── Notices ── */}
+                  {!activeRoomId && hasLiveService && liveService ? (
+                    <div style={{ ...broadcastMutedChipStyle, borderRadius: 16, padding: "10px 14px", fontSize: 12, color: BC.mist }}>
+                      Existing live room: {liveService.title || liveService.serviceKey}
+                    </div>
+                  ) : null}
+                  {trialBroadcastNotice ? <div style={{ borderRadius: 16, background: isTrialExpired ? "rgba(243,166,176,0.12)" : "rgba(247,197,107,0.12)", boxShadow: `inset 0 0 0 1px ${isTrialExpired ? "rgba(243,166,176,0.26)" : "rgba(247,197,107,0.24)"}`, color: isTrialExpired ? "#fecdd3" : "#946010", fontSize: 13, fontWeight: 600, padding: "11px 16px" }}>{trialBroadcastNotice}</div> : null}
+                  {errorMsg ? <p style={{ margin: 0, color: isBroadcastTab ? "#fecdd3" : "#9f3650", fontSize: 13, fontWeight: 600 }}>Error: {errorMsg}</p> : null}
                 </div>
-                {trialBroadcastNotice && <div style={{ marginTop: 12, borderRadius: 10, border: isTrialExpired ? "1px solid rgba(217,111,103,0.4)" : "1px solid rgba(198,165,109,0.40)", background: isTrialExpired ? "rgba(240,220,218,0.85)" : "rgba(251,243,219,0.85)", color: isTrialExpired ? "#8a2720" : "#7a5c20", fontSize: 13, fontWeight: 600, padding: "10px 14px" }}>{trialBroadcastNotice}</div>}
-                {errorMsg && <p style={{ margin: "10px 0 0", color: "#9f3650", fontSize: 13, fontWeight: 600 }}>Error: {errorMsg}</p>}
-                {memberships.length > 1 && (
-                  <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10 }}>
-                    <span style={{ fontSize: 12, color: "#7d746c" }}>Church:</span>
-                    <select value={selectedOrgId || resolvedOrgId} onChange={(e) => { void switchOrganization(e.target.value); }} disabled={switchingOrg || busy} style={{ border: "1px solid rgba(120,98,78,0.12)", background: "rgba(255,255,255,0.6)", color: "#2e2a28", padding: "6px 10px", borderRadius: 8, fontSize: 13, outline: "none" }}>
-                      {memberships.map((row) => (<option key={row.orgId} value={row.orgId}>{row.name} ({row.role || "member"})</option>))}
-                    </select>
-                    {switchingOrg && <span style={{ fontSize: 12, color: "#7d746c" }}>Switching…</span>}
-                  </div>
-                )}
-                <div style={{ marginTop: 12, fontSize: 12, color: "#7d746c" }}>Signed-in hosts are authorized by account role. Manual host token entry is not required.</div>
               </section>
-              {/* ── Live broadcast section (only when active) ── */}
+
+              {/* ── Translation feed (hero) ── */}
               {activeRoomId ? (
                 isTrialExpired ? (
-                  <section style={{ marginTop: 16, borderRadius: 16, border: "1px solid rgba(217,111,103,0.40)", padding: 20, background: "rgba(240,220,218,0.85)", color: "#8a2720", fontSize: 13, fontWeight: 600 }}>
+                  <section style={{ marginTop: 14, borderRadius: 20, background: "rgba(243,166,176,0.12)", boxShadow: "inset 0 0 0 1px rgba(243,166,176,0.28)", padding: 20, color: "#fecdd3", fontSize: 13, fontWeight: 600 }}>
                     Your trial has ended. Broadcasting is blocked until billing is added.
                   </section>
                 ) : (
-                  <section ref={controlPanelRef} style={{ marginTop: 20, position: "relative", overflow: "hidden", background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)", borderRadius: 34, padding: "24px 28px" }}>
-                    {/* Halo decorations */}
-                    <div aria-hidden="true" style={{ position: "absolute", left: "18%", top: "18%", width: 320, height: 220, borderRadius: "50%", background: "radial-gradient(circle, rgba(169,160,245,0.40) 0%, rgba(169,160,245,0.10) 50%, transparent 72%)", filter: "blur(28px)", pointerEvents: "none" }} />
-                    <div aria-hidden="true" style={{ position: "absolute", right: "5%", bottom: "14%", width: 240, height: 180, borderRadius: "50%", background: "radial-gradient(circle, rgba(255,255,255,0.75) 0%, rgba(255,255,255,0.15) 54%, transparent 72%)", filter: "blur(24px)", pointerEvents: "none" }} />
-                    <div style={{ position: "relative" }}>
-                      {/* Status pills row */}
-                      <div style={{ display: "flex", flexWrap: "wrap" as const, alignItems: "center", gap: 8, marginBottom: 16 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6, borderRadius: 999, background: "rgba(255,255,255,0.44)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#30a173", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>
-                          <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#c6a56d", display: "block" }} />
-                          Live · Connected
+                  <section ref={controlPanelRef} style={{ marginTop: 14, position: "relative", overflow: "hidden", ...(isBroadcastTab ? broadcastGlassPanelStyle : { background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)" }), borderRadius: 36, padding: "20px 24px 24px" }}>
+                    <div style={{ display: "grid", gap: 16 }}>
+                      {/* Feed header: label + QR */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" as const }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: BC.blush }}>Translation Feed</span>
+                          <span style={{ fontSize: 12, color: BC.mist }}>· {(sourceLang || "ko").toUpperCase()} → {(targetLang || "en").toUpperCase()} · {selectedService?.title || ""}</span>
                         </div>
-                        <div style={{ borderRadius: 999, background: "rgba(255,255,255,0.38)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>{formatCountdownSeconds(elapsedSec)} elapsed</div>
-                        {displayUrl && (
-                          <>
-                            <button type="button" onClick={() => { void copyListenerUrl(); }} disabled={copyUrlBusy} style={{ borderRadius: 999, background: "rgba(255,255,255,0.38)", border: "none", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", cursor: copyUrlBusy ? "default" : "pointer", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>{copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}</button>
-                            <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", borderRadius: 999, background: "rgba(255,255,255,0.38)", padding: "8px 14px", fontSize: 13, fontWeight: 500, color: "#7e746c", textDecoration: "none", boxShadow: "0 14px 30px rgba(126,104,81,0.08)" }}>Listener Page ↗</a>
-                          </>
-                        )}
+                        {qrDataUrl && displayUrl ? (
+                          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 18, ...broadcastAccentCardStyle }}>
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={qrDataUrl} alt="Listener QR code" width={60} height={60} style={{ borderRadius: 10, background: "#ffffff", padding: 6, flexShrink: 0 }} />
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.16em", textTransform: "uppercase" as const, color: BC.blush }}>Listener QR</div>
+                              <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" as const }}>
+                                <button type="button" onClick={() => { void copyListenerUrl(); }} disabled={copyUrlBusy} style={{ ...broadcastMutedChipStyle, borderRadius: 999, border: "none", padding: "5px 11px", fontSize: 11, fontWeight: 700, cursor: copyUrlBusy ? "default" : "pointer", whiteSpace: "nowrap" as const }}>
+                                  {copyUrlBusy ? "Copied" : "Copy URL"}
+                                </button>
+                                <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", ...broadcastMutedChipStyle, borderRadius: 999, padding: "5px 11px", fontSize: 11, fontWeight: 700, textDecoration: "none", whiteSpace: "nowrap" as const }}>
+                                  Open ↗
+                                </a>
+                              </div>
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
-                      {/* TranslationBox */}
-                      <div style={{ borderRadius: 24, overflow: "hidden" }}>
+                      {/* TranslationBox hero */}
+                      <div style={{ borderRadius: 28, overflow: "hidden", boxShadow: "none" }}>
                         <TranslationBox />
                       </div>
-                      {/* QR code */}
-                      {qrDataUrl && displayUrl && (
-                        <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12 }}>
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img src={qrDataUrl} alt="Listener QR code" width={64} height={64} style={{ borderRadius: 8 }} />
-                          <div>
-                            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.22em", textTransform: "uppercase" as const, color: "#b08b4f", marginBottom: 4 }}>Listener QR</div>
-                            <div style={{ fontSize: 12, color: "#7d746c", wordBreak: "break-all" as const }}>{displayUrl}</div>
-                          </div>
-                        </div>
-                      )}
                     </div>
                   </section>
                 )
@@ -2455,15 +2737,15 @@ export default function HostChurchPage() {
               <div style={settingsShellStyle}>
                 <section style={billingHeroCardStyle}>
                   <div style={{ display: "grid", gap: 8 }}>
-                    <p style={{ ...settingsSectionLabelStyle, color: DC.goldLight }}>Billing & Subscription</p>
-                    <h3 style={{ ...settingsTitleStyle, fontSize: 28, lineHeight: 1.05, color: DC.cream }}>Review plan, renewal, and subscriptions</h3>
-                    <p style={{ ...settingsBodyTextStyle, maxWidth: 760, color: "rgba(247,244,239,0.7)" }}>
+                    <p style={settingsSectionLabelStyle}>Billing & Subscription</p>
+                    <h3 style={{ ...settingsTitleStyle, fontSize: 28, lineHeight: 1.05, color: DC.navy }}>Review plan, renewal, and subscriptions</h3>
+                    <p style={{ ...settingsBodyTextStyle, maxWidth: 760 }}>
                       Review subscription status, renewal timing, plan options, billing limits, and Sermon Prep budget in one place.
                     </p>
                   </div>
 
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                    <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(212,184,122,0.3)`, background: "rgba(212,184,122,0.1)", color: DC.goldLight }}>
+                    <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.28)`, background: "rgba(184,154,94,0.12)", color: DC.gold }}>
                       Plan · {formatPlanLabel(billingPlanToken)}
                     </span>
                     <span
@@ -2475,39 +2757,39 @@ export default function HostChurchPage() {
                             ? "1px solid rgba(224,163,86,0.35)"
                             : billingNeedsAttention
                               ? "1px solid rgba(188,95,111,0.35)"
-                              : "1px solid rgba(247,244,239,0.2)",
+                              : "1px solid rgba(120,98,78,0.12)",
                         background: billingStatusToken === "active"
                           ? "rgba(91,179,130,0.18)"
                           : billingStatusToken === "past_due"
                             ? "rgba(224,163,86,0.18)"
                             : billingNeedsAttention
                               ? "rgba(188,95,111,0.18)"
-                              : "rgba(247,244,239,0.08)",
+                              : "rgba(255,255,255,0.42)",
                         color: billingStatusToken === "active"
-                          ? "#7dd4a8"
+                          ? "#3b7d5c"
                           : billingStatusToken === "past_due"
-                            ? "#f0c070"
+                            ? "#9c6b1e"
                             : billingNeedsAttention
-                              ? "#f09090"
-                              : "rgba(247,244,239,0.7)",
+                              ? "#b95567"
+                              : DC.mid,
                       }}
                     >
                       Status · {formatBillingStatus(billingStatusToken)}
                     </span>
-                    <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(247,244,239,0.2)", background: "rgba(247,244,239,0.08)", color: "rgba(247,244,239,0.7)" }}>
+                    <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(120,98,78,0.12)", background: "rgba(255,255,255,0.42)", color: DC.mid }}>
                       Service keys · {billingMaxServiceKeys > 0 ? `up to ${billingMaxServiceKeys}` : "unlimited"}
                     </span>
                   </div>
 
                   {billingAlertMessage ? <div style={billingAlertStyle}>{billingAlertMessage}</div> : null}
-                  {billingError ? <p style={{ margin: 0, color: "#f09090", fontSize: 13 }}>Error: {billingError}</p> : null}
-                  {billingNotice ? <p style={{ margin: 0, color: "#7dd4a8", fontSize: 13 }}>{billingNotice}</p> : null}
+                  {billingError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {billingError}</p> : null}
+                  {billingNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{billingNotice}</p> : null}
 
                   {billingProfile ? (
                     <div style={settingsGridStyle}>
-                      <div style={{ border: "1px solid rgba(247,244,239,0.15)", background: "rgba(247,244,239,0.06)", padding: "14px 16px" }}>
-                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10, color: DC.goldLight }}>Current Term</p>
-                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "rgba(247,244,239,0.85)", lineHeight: 1.6 }}>
+                      <div style={billingHeroInsetCardStyle}>
+                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Current Term</p>
+                        <p style={{ margin: "8px 0 0", fontSize: 14, color: DC.charcoal, lineHeight: 1.6 }}>
                           {hasSubscriptionPeriod ? (
                             <>
                               <strong>{formatDateTime(billingProfile.currentPeriodStart, subscriptionPeriodDateTimeOptions)}</strong>
@@ -2526,9 +2808,9 @@ export default function HostChurchPage() {
                           )}
                         </p>
                       </div>
-                      <div style={{ border: "1px solid rgba(247,244,239,0.15)", background: "rgba(247,244,239,0.06)", padding: "14px 16px" }}>
-                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10, color: DC.goldLight }}>Usage Snapshot</p>
-                        <p style={{ margin: "8px 0 0", fontSize: 14, color: "rgba(247,244,239,0.85)", lineHeight: 1.6 }}>
+                      <div style={billingHeroInsetCardStyle}>
+                        <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Usage Snapshot</p>
+                        <p style={{ margin: "8px 0 0", fontSize: 14, color: DC.charcoal, lineHeight: 1.6 }}>
                           {isTrialPlan ? (
                             <>
                               Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
@@ -2555,7 +2837,7 @@ export default function HostChurchPage() {
                     </p>
                   </div>
 
-                  <div style={billingDeckStyle}>
+                  <div className="billing-plan-deck" style={billingDeckStyle}>
                     {PAID_PLAN_KEYS.map((plan) => {
                       const isSelectedPlan = selectedPlan === plan;
                       const isCurrentPlan = hasPaidPlan && billingPlanToken === plan && hasActiveLikeSubscription;
@@ -2572,17 +2854,17 @@ export default function HostChurchPage() {
                             ...billingPlanCardBaseStyle,
                             textAlign: "left",
                             border: isCurrentPlan
-                              ? `2px solid ${DC.navy}`
+                              ? "2px solid rgba(125,101,68,0.55)"
                               : isSelectedPlan
                                 ? `2px solid ${DC.gold}`
-                                : `1px solid ${DC.border}`,
+                                : billingPlanCardBaseStyle.border,
                             cursor: canManagePaidBilling ? "pointer" : "default",
                             opacity: canManagePaidBilling ? 1 : 0.82,
                             background: isCurrentPlan
-                              ? "rgba(15,31,61,0.04)"
+                              ? "rgba(239,231,214,0.94)"
                               : billingPlanCardBaseStyle.background,
                             boxShadow: isCurrentPlan
-                              ? "0 4px 16px rgba(15,31,61,0.1)"
+                              ? "0 22px 46px rgba(125,101,68,0.14)"
                               : isSelectedPlan
                                 ? accentPrimaryShadow
                                 : billingPlanCardBaseStyle.boxShadow,
@@ -2591,8 +2873,9 @@ export default function HostChurchPage() {
                           {isCurrentPlan && (
                             <div style={{
                               display: "flex", alignItems: "center", gap: 6,
-                              background: DC.navy,
-                              color: DC.cream, fontWeight: 700, fontSize: 11,
+                              background: "rgba(184,154,94,0.12)",
+                              border: "1px solid rgba(184,154,94,0.26)",
+                              color: "#8b6b34", fontWeight: 700, fontSize: 11,
                               letterSpacing: "0.1em", textTransform: "uppercase",
                               padding: "4px 10px", borderRadius: 3,
                               marginBottom: 10, alignSelf: "flex-start",

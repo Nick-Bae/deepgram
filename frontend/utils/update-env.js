@@ -2,28 +2,40 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+function isWslEnvironment() {
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+  try {
+    return fs.readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft');
+  } catch {
+    return false;
+  }
+}
+
 function getPreferredIP() {
   const interfaces = os.networkInterfaces();
-  let candidate = null;
+  let tenCandidate = null;
+  let homeLanCandidate = null;
+  let private172Candidate = null;
+  let fallback = null;
 
   for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]) {
+    if (/vEthernet|WSL|Hyper-V|Loopback|Docker/i.test(name)) continue;
+    for (const iface of interfaces[name] || []) {
       if (iface.family === 'IPv4' && !iface.internal) {
-        if (iface.address.startsWith('10.')) {
-          return iface.address; // Prefer 10.x.x.x (Wi-Fi LAN IP)
-        }
-        if (iface.address.startsWith('172.')) {
-          candidate = iface.address; // Fallback to 172.x.x.x (WSL)
-        }
+        if (iface.address.startsWith('10.')) tenCandidate ||= iface.address;
+        else if (iface.address.startsWith('192.168.')) homeLanCandidate ||= iface.address;
+        else if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(iface.address)) private172Candidate ||= iface.address;
+        else fallback ||= iface.address;
       }
     }
   }
-  return candidate || '127.0.0.1';
+  return tenCandidate || homeLanCandidate || private172Candidate || fallback || '127.0.0.1';
 }
 
 const explicitHost = (process.env.BACKEND_HOST || '').trim();
 const autoDetect = /^(1|true|yes)$/i.test((process.env.AUTO_DETECT_BACKEND_IP || '').trim());
-const ip = explicitHost || (autoDetect ? getPreferredIP() : 'localhost');
+const runningInWsl = isWslEnvironment();
+const ip = explicitHost || (runningInWsl ? 'localhost' : (autoDetect ? getPreferredIP() : 'localhost'));
 const envPath = path.join(__dirname, '../.env.local');
 function upsertEnvVars(envFilePath, updates) {
   const existing = fs.existsSync(envFilePath)
@@ -63,7 +75,10 @@ const content = upsertEnvVars(envPath, {
 });
 
 if (ip === 'localhost') {
-  console.log(`⚠️ .env.local updated with localhost default:\n${content}`);
+  const wslHint = runningInWsl && !explicitHost
+    ? '\nWSL detected: using localhost avoids unstable WSL private IPs like 172.x.x.x.'
+    : '';
+  console.log(`⚠️ .env.local updated with localhost default:\n${content}${wslHint}`);
 } else {
   console.log(`✅ .env.local updated with backend host (${ip}):\n${content}`);
 }

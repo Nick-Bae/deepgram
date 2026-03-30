@@ -141,168 +141,156 @@ function SectionTitle({ children, light }: { children: React.ReactNode; light?: 
   );
 }
 
+function QRPlaceholder({ size = 64 }: { size?: number }) {
+  return (
+    <div
+      style={{
+        width: size,
+        height: size,
+        background: C.white,
+        borderRadius: 6,
+        padding: 5,
+        display: "grid",
+        gridTemplateColumns: "repeat(5, 1fr)",
+        gap: 2,
+        flexShrink: 0,
+      }}
+    >
+      {Array.from({ length: 25 }).map((_, i) => {
+        const filled = [0,1,2,3,4,5,9,10,14,15,19,20,21,22,23,24,6,12].includes(i);
+        return <div key={i} style={{ borderRadius: 1, background: filled ? C.navy : "transparent" }} />;
+      })}
+    </div>
+  );
+}
+
 function ProductMockup({ isLoggedIn, dashboardHref, resolvingDashboard }: {
   isLoggedIn: boolean;
   dashboardHref: string;
   resolvingDashboard: boolean;
 }) {
+  const ctaHref = isLoggedIn ? dashboardHref : "/signup";
+  const ctaLabel = isLoggedIn ? (resolvingDashboard ? "Loading..." : "Open Dashboard") : "Start Free Trial";
+
   return (
     <div
       style={{
-        background: "rgba(255,255,255,0.04)",
-        border: "1px solid rgba(255,255,255,0.12)",
-        borderRadius: 20,
+        background: "rgba(10,18,36,0.72)",
+        border: "1px solid rgba(255,255,255,0.10)",
+        borderRadius: 18,
         overflow: "hidden",
-        boxShadow: "0 40px 80px rgba(0,0,0,0.4)",
+        boxShadow: "0 48px 96px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.06)",
+        backdropFilter: "blur(16px)",
       }}
     >
       {/* top bar */}
       <div
         style={{
-          background: "rgba(255,255,255,0.06)",
-          borderBottom: "1px solid rgba(255,255,255,0.08)",
-          padding: "12px 18px",
+          background: "rgba(255,255,255,0.04)",
+          borderBottom: "1px solid rgba(255,255,255,0.07)",
+          padding: "11px 16px",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          gap: 12,
         }}
       >
-        <div style={{ display: "flex", gap: 6 }}>
-          {["rgba(255,95,87,0.7)","rgba(255,188,46,0.7)","rgba(40,200,64,0.7)"].map((bg, i) => (
-            <div key={i} style={{ width: 10, height: 10, borderRadius: 999, background: bg }} />
+        <div style={{ display: "flex", gap: 5 }}>
+          {["rgba(255,95,87,0.65)","rgba(255,188,46,0.65)","rgba(40,200,64,0.65)"].map((bg, i) => (
+            <div key={i} style={{ width: 9, height: 9, borderRadius: 999, background: bg }} />
           ))}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 8, height: 8, borderRadius: 999, background: "#4ade80", boxShadow: "0 0 6px #4ade80" }} />
-          <span style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", letterSpacing: "0.1em", textTransform: "uppercase" }}>
-            Live
-          </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ width: 7, height: 7, borderRadius: 999, background: "#4ade80", boxShadow: "0 0 5px #4ade80" }} />
+          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.45)", letterSpacing: "0.12em", textTransform: "uppercase" }}>Live</span>
         </div>
-        <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Sunday 11 AM</span>
+        <span style={{ fontSize: 10, color: "rgba(255,255,255,0.32)", letterSpacing: "0.04em" }}>Sunday 11 AM</span>
       </div>
 
       {/* body */}
-      <div style={{ padding: "20px 18px", display: "grid", gap: 14 }}>
-        {/* listener count */}
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", letterSpacing: "0.14em", textTransform: "uppercase" }}>
-            Listeners
-          </span>
-          <span style={{ fontSize: 20, fontWeight: 700, color: C.goldLight, letterSpacing: "-0.04em" }}>24</span>
+      <div style={{ padding: "18px 16px", display: "grid", gap: 12 }}>
+
+        {/* listener count row */}
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", letterSpacing: "0.16em", textTransform: "uppercase" }}>Listeners</span>
+          <span style={{ fontSize: 26, fontWeight: 700, color: C.goldLight, letterSpacing: "-0.05em", lineHeight: 1 }}>24</span>
+        </div>
+
+        {/* scripture label */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ width: 2, height: 28, background: `linear-gradient(to bottom, ${C.gold}, transparent)`, borderRadius: 2, flexShrink: 0 }} />
+          <div>
+            <p style={{ margin: 0, fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.28)" }}>
+              Scripture reference
+            </p>
+            <p style={{ margin: "2px 0 0", fontSize: 10, color: "rgba(255,255,255,0.45)", letterSpacing: "0.04em" }}>
+              John 8:12
+            </p>
+          </div>
         </div>
 
         {/* transcript box */}
         <div
           style={{
-            background: "rgba(0,0,0,0.3)",
-            border: "1px solid rgba(255,255,255,0.06)",
-            borderRadius: 12,
-            padding: "14px 16px",
+            background: "rgba(0,0,0,0.28)",
+            border: "1px solid rgba(255,255,255,0.05)",
+            borderRadius: 10,
+            padding: "12px 14px",
           }}
         >
-          <p style={{ margin: "0 0 6px", fontSize: 10, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.3)" }}>
+          <p style={{ margin: "0 0 6px", fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "rgba(255,255,255,0.25)" }}>
             Korean → English
           </p>
-          <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, color: "rgba(255,255,255,0.85)", fontWeight: 300 }}>
+          <p style={{ margin: 0, fontSize: 13, lineHeight: 1.65, color: "rgba(255,255,255,0.82)", fontWeight: 300 }}>
             And he said, whoever believes in me will not walk in darkness, but will have the light of life.
           </p>
         </div>
 
-        {/* QR + controls row */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 12, alignItems: "end" }}>
-          <div style={{ display: "grid", gap: 8 }}>
-            <div
-              style={{
-                background: "rgba(184,154,94,0.12)",
-                border: "1px solid rgba(184,154,94,0.24)",
-                borderRadius: 10,
-                padding: "10px 14px",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-              }}
-            >
-              <span style={{ fontSize: 12, color: C.goldLight }}>Listener link ready</span>
-              <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>Share QR ›</span>
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {isLoggedIn ? (
-                <Link
-                  href={dashboardHref}
-                  style={{
-                    flex: 1,
-                    background: `linear-gradient(135deg, ${C.gold}, ${C.goldLight})`,
-                    color: C.navy,
-                    borderRadius: 8,
-                    padding: "10px 14px",
-                    fontSize: 12,
-                    fontWeight: 700,
-                    textAlign: "center",
-                    letterSpacing: "0.06em",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  {resolvingDashboard ? "Loading..." : "Open Dashboard"}
-                </Link>
-              ) : (
-                <Link
-                  href="/signup"
-                  style={{
-                    flex: 1,
-                    background: `linear-gradient(135deg, ${C.gold}, ${C.goldLight})`,
-                    color: C.navy,
-                    borderRadius: 8,
-                    padding: "10px 14px",
-                    fontSize: 12,
-                    fontWeight: 700,
-                    textAlign: "center",
-                    letterSpacing: "0.06em",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  Start Free Trial
-                </Link>
-              )}
-              <div
-                style={{
-                  background: "rgba(255,255,255,0.06)",
-                  border: "1px solid rgba(255,255,255,0.1)",
-                  borderRadius: 8,
-                  padding: "10px 14px",
-                  fontSize: 12,
-                  color: "rgba(255,255,255,0.5)",
-                  cursor: "default",
-                }}
-              >
-                ⏸
-              </div>
-            </div>
-          </div>
-
-          {/* QR placeholder */}
+        {/* copy link row */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div
             style={{
-              width: 68,
-              height: 68,
-              background: C.white,
-              borderRadius: 8,
-              padding: 6,
-              display: "grid",
-              gridTemplateColumns: "repeat(5, 1fr)",
-              gap: 2,
+              display: "flex",
+              alignItems: "center",
+              gap: 7,
+              background: "rgba(255,255,255,0.05)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: 7,
+              padding: "7px 12px",
+              cursor: "default",
             }}
           >
-            {Array.from({ length: 25 }).map((_, i) => {
-              const filled = [0,1,2,3,4,5,9,10,14,15,19,20,21,22,23,24,6,12].includes(i);
-              return (
-                <div
-                  key={i}
-                  style={{ borderRadius: 1, background: filled ? C.navy : "transparent" }}
-                />
-              );
-            })}
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
+              <path d="M5 2H3a1 1 0 00-1 1v6a1 1 0 001 1h6a1 1 0 001-1V7M8 1h3v3M11 1L5.5 6.5" stroke="rgba(255,255,255,0.4)" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>Copy link</span>
           </div>
+          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.28)", letterSpacing: "0.04em" }}>Next step ›</span>
+        </div>
+
+        {/* CTA + QR */}
+        <div style={{ display: "flex", gap: 10, alignItems: "stretch" }}>
+          <Link
+            href={ctaHref}
+            style={{
+              flex: 1,
+              background: `linear-gradient(135deg, ${C.gold} 0%, ${C.goldLight} 100%)`,
+              color: C.navy,
+              borderRadius: 9,
+              padding: "11px 0",
+              fontSize: 11,
+              fontWeight: 800,
+              textAlign: "center",
+              letterSpacing: "0.1em",
+              textTransform: "uppercase",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              boxShadow: "0 4px 20px rgba(184,154,94,0.35)",
+            }}
+          >
+            {ctaLabel}
+          </Link>
+          <QRPlaceholder size={42} />
         </div>
       </div>
     </div>
@@ -590,14 +578,23 @@ export default function HomePage() {
             </a>
           ))}
           <div style={{ marginTop: 24, display: "flex", gap: 12 }}>
-            <Link href="/login" onClick={() => setMobileNavOpen(false)}
-              style={{ padding: "13px 20px", border: `1px solid rgba(255,255,255,0.2)`, color: C.cream, borderRadius: 4, fontSize: "0.9rem" }}>
-              Sign In
-            </Link>
-            <Link href="/signup" onClick={() => setMobileNavOpen(false)}
-              style={{ padding: "13px 24px", background: C.gold, color: C.white, borderRadius: 4, fontSize: "0.9rem", fontWeight: 700 }}>
-              Free Trial
-            </Link>
+            {isLoggedIn ? (
+              <Link href={dashboardHref} onClick={() => setMobileNavOpen(false)}
+                style={{ padding: "13px 24px", background: C.gold, color: C.white, borderRadius: 4, fontSize: "0.9rem", fontWeight: 700 }}>
+                {resolvingDashboard ? "Loading..." : "Dashboard"}
+              </Link>
+            ) : (
+              <>
+                <Link href="/login" onClick={() => setMobileNavOpen(false)}
+                  style={{ padding: "13px 20px", border: `1px solid rgba(255,255,255,0.2)`, color: C.cream, borderRadius: 4, fontSize: "0.9rem" }}>
+                  Sign In
+                </Link>
+                <Link href="/signup" onClick={() => setMobileNavOpen(false)}
+                  style={{ padding: "13px 24px", background: C.gold, color: C.white, borderRadius: 4, fontSize: "0.9rem", fontWeight: 700 }}>
+                  Free Trial
+                </Link>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -607,7 +604,7 @@ export default function HomePage() {
         <section
           id="hero"
           style={{
-            background: `linear-gradient(160deg, #0a1628 0%, ${C.navy} 60%, #1a2f50 100%)`,
+            background: `linear-gradient(155deg, #060d1a 0%, #0d1e38 45%, #0f2040 100%)`,
             minHeight: "100vh",
             paddingTop: 68,
             display: "grid",
@@ -617,11 +614,12 @@ export default function HomePage() {
           }}
         >
           {/* background glow */}
-          <div aria-hidden style={{ position: "absolute", top: "15%", left: "5%", width: 500, height: 500, borderRadius: "50%", background: "radial-gradient(circle, rgba(184,154,94,0.08) 0%, transparent 70%)", pointerEvents: "none" }} />
-          <div aria-hidden style={{ position: "absolute", bottom: "10%", right: "5%", width: 400, height: 400, borderRadius: "50%", background: "radial-gradient(circle, rgba(100,140,200,0.12) 0%, transparent 70%)", pointerEvents: "none" }} />
+          <div aria-hidden style={{ position: "absolute", top: "10%", left: "-4%", width: 560, height: 560, borderRadius: "50%", background: "radial-gradient(circle, rgba(184,154,94,0.07) 0%, transparent 68%)", pointerEvents: "none" }} />
+          <div aria-hidden style={{ position: "absolute", bottom: "8%", right: "2%", width: 440, height: 440, borderRadius: "50%", background: "radial-gradient(circle, rgba(80,120,200,0.10) 0%, transparent 70%)", pointerEvents: "none" }} />
+          <div aria-hidden style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", width: 700, height: 300, borderRadius: "50%", background: "radial-gradient(ellipse, rgba(184,154,94,0.04) 0%, transparent 65%)", pointerEvents: "none" }} />
 
           <div style={{ ...container, padding: "80px 32px" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 64, alignItems: "center" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 72, alignItems: "center" }}>
 
               {/* left text */}
               <div>
@@ -631,68 +629,43 @@ export default function HomePage() {
                   style={{
                     margin: 0,
                     fontFamily: "'Cormorant Garamond', Georgia, serif",
-                    fontSize: "clamp(2.8rem, 5vw, 4.8rem)",
+                    fontSize: "clamp(3rem, 5.5vw, 5.2rem)",
                     fontWeight: 300,
-                    lineHeight: 1.06,
-                    letterSpacing: "-0.01em",
+                    lineHeight: 1.04,
+                    letterSpacing: "-0.02em",
                     color: C.white,
                   }}
                 >
                   Help every listener{" "}
-                  <em style={{ fontStyle: "italic", color: C.goldLight }}>follow the sermon live.</em>
+                  <em style={{ fontStyle: "italic", color: "rgba(255,255,255,0.72)", fontWeight: 300 }}>follow the sermon live.</em>
                 </h1>
-                <p style={{ margin: "28px 0 0", fontSize: "1.05rem", lineHeight: 1.75, color: "rgba(255,255,255,0.6)", maxWidth: 420, fontWeight: 300 }}>
+                <p style={{ margin: "24px 0 0", fontSize: "0.97rem", lineHeight: 1.75, color: "rgba(255,255,255,0.5)", maxWidth: 400, fontWeight: 300 }}>
                   Start the service once, share a QR code, and let translated captions reach listeners in real time.
                 </p>
 
-                <div style={{ marginTop: 40, display: "flex", gap: 14, flexWrap: "wrap" }}>
+                <div style={{ marginTop: 40 }}>
                   <Link
                     href={primaryCta.href}
                     style={{
-                      padding: "14px 30px",
+                      display: "inline-block",
+                      padding: "15px 36px",
                       background: C.gold,
                       color: C.white,
-                      fontSize: "0.82rem",
+                      fontSize: "0.78rem",
                       fontWeight: 700,
-                      letterSpacing: "0.1em",
+                      letterSpacing: "0.14em",
                       textTransform: "uppercase",
-                      borderRadius: 4,
-                      boxShadow: "0 8px 24px rgba(184,154,94,0.3)",
-                      transition: "background 0.2s",
+                      borderRadius: 6,
+                      boxShadow: "0 8px 32px rgba(184,154,94,0.28)",
                     }}
                   >
                     {primaryCta.label}
                   </Link>
-                  {!isLoggedIn && (
-                    <a
-                      href="#demo"
-                      style={{
-                        padding: "14px 30px",
-                        border: "1px solid rgba(255,255,255,0.2)",
-                        color: "rgba(255,255,255,0.8)",
-                        fontSize: "0.82rem",
-                        fontWeight: 500,
-                        letterSpacing: "0.1em",
-                        textTransform: "uppercase",
-                        borderRadius: 4,
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                      }}
-                    >
-                      Watch Demo
-                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6h8M6 2l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                    </a>
-                  )}
                 </div>
 
-                <div style={{ marginTop: 32, display: "flex", gap: 20, flexWrap: "wrap" }}>
-                  {["No listener login required", "Works on phones", "Built for church services"].map((s) => (
-                    <span key={s} style={{ fontSize: "0.78rem", color: "rgba(255,255,255,0.45)", letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ color: C.gold }}>·</span> {s}
-                    </span>
-                  ))}
-                </div>
+                <p style={{ marginTop: 28, fontSize: "0.74rem", color: "rgba(255,255,255,0.38)", letterSpacing: "0.06em" }}>
+                  No listener login required&nbsp;&nbsp;·&nbsp;&nbsp;Works on phones&nbsp;&nbsp;·&nbsp;&nbsp;Built for church services
+                </p>
               </div>
 
               {/* right mockup */}
@@ -713,7 +686,7 @@ export default function HomePage() {
               <SectionTitle>Three steps from setup to live service.</SectionTitle>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: 2 }}>
+            <div id="workflow-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: 2 }}>
               {workflowSteps.map((step, idx) => (
                 <div
                   key={step.id}
@@ -792,7 +765,7 @@ export default function HomePage() {
               <SectionTitle>Simple for the host. Clear for the listener.<br />Built for worship.</SectionTitle>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 300px), 1fr))", gap: 1, border: `1px solid ${C.border}` }}>
+            <div id="benefits-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 300px), 1fr))", gap: 1, border: `1px solid ${C.border}` }}>
               {benefits.map((b, idx) => (
                 <div
                   key={b.title}
@@ -1171,10 +1144,28 @@ export default function HomePage() {
           #churches > div > div > div:last-child { display: none; }
           #demo > div > div { grid-template-columns: 1fr !important; }
           footer > div > div:first-child { grid-template-columns: 1fr !important; }
+          footer > div > div:first-child > div:last-child { gap: 24px !important; }
         }
         @media (max-width: 768px) {
           .nav-desktop-links { display: none !important; }
           .nav-mobile-toggle { display: block !important; }
+          nav { padding-left: 20px !important; padding-right: 20px !important; }
+          section { padding-top: 64px !important; padding-bottom: 64px !important; }
+          footer { padding-top: 48px !important; padding-bottom: 32px !important; }
+          section > div, footer > div { padding-left: 20px !important; padding-right: 20px !important; }
+          #hero > div { padding: 56px 20px !important; }
+          #workflow-grid > div { border-left: none !important; border-top: 1px solid #e4ddd2; padding: 36px 24px !important; }
+          #workflow-grid > div:first-child { border-top: none !important; }
+          #benefits-grid > div { border-right: none !important; padding: 28px 24px !important; }
+        }
+        @media (max-width: 480px) {
+          nav { padding-left: 16px !important; padding-right: 16px !important; }
+          section { padding-top: 48px !important; padding-bottom: 48px !important; }
+          footer { padding-top: 40px !important; padding-bottom: 24px !important; }
+          section > div, footer > div { padding-left: 16px !important; padding-right: 16px !important; }
+          #hero > div { padding: 40px 16px !important; }
+          #workflow-grid > div { padding: 28px 16px !important; }
+          #benefits-grid > div { padding: 24px 16px !important; }
         }
         a:hover { opacity: 0.85; }
       `}</style>
