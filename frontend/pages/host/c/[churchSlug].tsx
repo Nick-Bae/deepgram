@@ -2158,11 +2158,11 @@ export default function HostChurchPage() {
         }}>
           {isBroadcastTab ? (
             <>
-              <div aria-hidden="true" style={{ position: "absolute", left: "10%", top: "-40%", width: 320, height: 240, borderRadius: "50%", background: "radial-gradient(circle, rgba(228,182,128,0.22) 0%, transparent 70%)", filter: "blur(24px)" }} />
-              <div aria-hidden="true" style={{ position: "absolute", right: "-4%", bottom: "-70%", width: 380, height: 300, borderRadius: "50%", background: "radial-gradient(circle, rgba(172,185,200,0.28) 0%, transparent 72%)", filter: "blur(20px)" }} />
+              <div aria-hidden="true" style={{ position: "absolute", left: "10%", top: "-40%", width: 320, height: 240, borderRadius: "50%", background: "radial-gradient(circle, rgba(228,182,128,0.22) 0%, transparent 70%)", filter: "blur(24px)", pointerEvents: "none" }} />
+              <div aria-hidden="true" style={{ position: "absolute", right: "-4%", bottom: "-70%", width: 380, height: 300, borderRadius: "50%", background: "radial-gradient(circle, rgba(172,185,200,0.28) 0%, transparent 72%)", filter: "blur(20px)", pointerEvents: "none" }} />
             </>
           ) : null}
-          <div className="host-header-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
+          <div className="host-header-row" style={{ position: "relative", zIndex: 1, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
             {/* Left: church logo + name */}
             <div className="host-brand" style={{ display: "flex", alignItems: "center", gap: 14, flexShrink: 0 }}>
               <div style={{ width: 44, height: 44, borderRadius: 14, background: isBroadcastTab ? "linear-gradient(145deg, #d4b87a, #b88a52)" : "#2d3650", color: isBroadcastTab ? "#ffffff" : "#f1d35c", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 700, flexShrink: 0, boxShadow: isBroadcastTab ? "0 16px 30px rgba(184,154,94,0.24)" : "none" }}>
@@ -2200,6 +2200,7 @@ export default function HostChurchPage() {
                 {isMasterUser && <Link href="/admin" style={{ display: "inline-block", marginTop: 6, fontSize: 11, color: isBroadcastTab ? BC.blush : DC.gold, textDecoration: "none", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase" }}>Admin</Link>}
               </div>
               <button
+                type="button"
                 onClick={async () => { clearStreamContext(); clearHostToken(); clearAuthToken(); await logout(); }}
                 style={{ border: "none", background: isBroadcastTab ? "linear-gradient(180deg, #3b4960, #2d3650)" : "rgba(41,35,33,0.90)", color: "#ffffff", fontWeight: 700, fontSize: 12, letterSpacing: isBroadcastTab ? "0.12em" : "normal", textTransform: isBroadcastTab ? "uppercase" as const : "none", padding: "11px 18px", borderRadius: 999, cursor: "pointer", whiteSpace: "nowrap" as const, boxShadow: isBroadcastTab ? "0 14px 28px rgba(45,54,80,0.18)" : "none" }}
               >
