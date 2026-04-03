@@ -1,9 +1,11 @@
 import {
+  GoogleAuthProvider,
   User,
   createUserWithEmailAndPassword,
   onAuthStateChanged,
   sendEmailVerification,
   signInWithEmailAndPassword,
+  signInWithPopup,
   signOut,
   updateProfile,
 } from "firebase/auth";
@@ -20,6 +22,7 @@ type AuthContextValue = {
   missingEnv: readonly string[];
   getIdToken: (forceRefresh?: boolean) => Promise<string | null>;
   login: (email: string, password: string) => Promise<User>;
+  loginWithGoogle: () => Promise<User>;
   signup: (email: string, password: string, displayName?: string) => Promise<User>;
   updateDisplayName: (displayName: string) => Promise<User>;
   sendPasswordReset: (email: string) => Promise<void>;
@@ -66,6 +69,16 @@ export function AuthProvider({ children }: Props) {
     const client = getFirebaseClient();
     if (!client) throw new Error("firebase_not_configured");
     const cred = await signInWithEmailAndPassword(client.auth, email, password);
+    setUser(cred.user);
+    return cred.user;
+  }, []);
+
+  const loginWithGoogle = useCallback(async (): Promise<User> => {
+    const client = getFirebaseClient();
+    if (!client) throw new Error("firebase_not_configured");
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: "select_account" });
+    const cred = await signInWithPopup(client.auth, provider);
     setUser(cred.user);
     return cred.user;
   }, []);
@@ -159,12 +172,13 @@ export function AuthProvider({ children }: Props) {
       missingEnv: missingFirebaseEnv,
       getIdToken,
       login,
+      loginWithGoogle,
       signup,
       updateDisplayName: updateDisplayNameValue,
       sendPasswordReset: sendPasswordResetValue,
       logout,
     }),
-    [getIdToken, loading, login, logout, sendPasswordResetValue, signup, updateDisplayNameValue, user],
+    [getIdToken, loading, login, loginWithGoogle, logout, sendPasswordResetValue, signup, updateDisplayNameValue, user],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
