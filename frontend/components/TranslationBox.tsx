@@ -76,6 +76,13 @@ const TTS_PROVIDER_OPTIONS = [
 ] as const
 
 type TTSProvider = (typeof TTS_PROVIDER_OPTIONS)[number]['value']
+type BroadcastIssueTone = 'warning' | 'critical'
+type BroadcastIssue = {
+  id: string
+  tone: BroadcastIssueTone
+  title: string
+  detail: string
+}
 
 function languageName(code: string) {
   const raw = (code || '').trim()
@@ -121,6 +128,7 @@ const DISPLAY_SPEED_MIN = 0.6
 const DISPLAY_SPEED_MAX = 1.6
 const DISPLAY_SPEED_STEP = 0.1
 const DISPLAY_SPEED_STORAGE_KEY = 'display_speed_factor'
+const DEEPGRAM_WARNING_DELAY_MS = 3000
 
 const clampDisplaySpeed = (value: number) =>
   Math.max(DISPLAY_SPEED_MIN, Math.min(DISPLAY_SPEED_MAX, value))
@@ -157,6 +165,7 @@ export default function TranslationBox() {
   const [displaySpeed, setDisplaySpeed] = useState(1)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const [socketClock, setSocketClock] = useState(() => Date.now())
+  const [deepgramStartingAt, setDeepgramStartingAt] = useState<number | null>(null)
 
   const [committedLines, setCommittedLines] = useState<{ id: number; srcText: string; translated: string }[]>([])
   const [correcting, setCorrecting] = useState<number | null>(null)
@@ -880,6 +889,14 @@ export default function TranslationBox() {
   }, [sendFinalNow, status])
 
   useEffect(() => {
+    if (status === 'starting') {
+      setDeepgramStartingAt(prev => prev ?? Date.now())
+      return
+    }
+    setDeepgramStartingAt(null)
+  }, [status])
+
+  useEffect(() => {
     if (status !== 'streaming') return
 
     const interval = setInterval(() => {
@@ -987,6 +1004,88 @@ export default function TranslationBox() {
     return `${ageSeconds}s`
   }, [connected, disconnectStartedAt, socketClock])
   const reconnectAttemptLabel = reconnectAttempt > 0 ? `#${reconnectAttempt}` : '0'
+  const deepgramDowntimeLabel = useMemo(() => {
+    if (!deepgramStartingAt || status !== 'starting') return '0s'
+    const ageSeconds = Math.max(1, Math.floor((socketClock - deepgramStartingAt) / 1000))
+    return `${ageSeconds}s`
+  }, [deepgramStartingAt, socketClock, status])
+  const deepgramRecovering =
+    status === 'starting' &&
+    !!deepgramStartingAt &&
+    socketClock - deepgramStartingAt >= DEEPGRAM_WARNING_DELAY_MS
+  const broadcastIssues = useMemo<BroadcastIssue[]>(() => {
+    const issues: BroadcastIssue[] = []
+
+    if (connectionState === 'disconnected') {
+      issues.push({
+        id: 'translation-socket-disconnected',
+        tone: 'critical',
+        title: 'Live feed disconnected',
+        detail: `The broadcast socket has been offline for ${socketDowntimeLabel}. Listeners may stop receiving live updates until the app reconnects.`,
+      })
+    } else if (connectionState === 'reconnecting') {
+      issues.push({
+        id: 'translation-socket-reconnecting',
+        tone: 'warning',
+        title: 'Reconnecting to the live feed',
+        detail: `The app is retrying the broadcast socket${disconnectStartedAt ? ` after ${socketDowntimeLabel} offline` : ''}${reconnectAttempt > 0 ? ` (attempt ${reconnectAttemptLabel})` : ''}.`,
+      })
+    }
+
+    if (status === 'error' && errorMsg) {
+      issues.push({
+        id: 'deepgram-error',
+        tone: 'critical',
+        title: 'Microphone or Deepgram connection failed',
+        detail: errorMsg,
+      })
+    } else if (deepgramRecovering) {
+      issues.push({
+        id: 'deepgram-reconnecting',
+        tone: 'warning',
+        title: 'Reconnecting microphone and speech engine',
+        detail: `Audio capture is still reconnecting after ${deepgramDowntimeLabel}.`,
+      })
+    }
+
+    if (failOpenMeta) {
+      issues.push({
+        id: 'translation-provider',
+        tone: 'warning',
+        title: 'Translation output is temporarily paused',
+        detail: failReasonLabel,
+      })
+    }
+
+    return issues
+  }, [
+    connectionState,
+    deepgramDowntimeLabel,
+    deepgramRecovering,
+    disconnectStartedAt,
+    errorMsg,
+    failOpenMeta,
+    failReasonLabel,
+    reconnectAttempt,
+    reconnectAttemptLabel,
+    socketDowntimeLabel,
+    status,
+  ])
+  const hasCriticalBroadcastIssue = broadcastIssues.some(issue => issue.tone === 'critical')
+  const broadcastAlertStyle = hasCriticalBroadcastIssue
+    ? {
+        background: 'linear-gradient(180deg, rgba(253,232,236,0.96), rgba(255,245,246,0.92))',
+        boxShadow: 'inset 0 0 0 1px rgba(188,95,111,0.22), 0 18px 34px rgba(159,54,80,0.08)',
+        color: '#7d1d32',
+      }
+    : {
+        background: 'linear-gradient(180deg, rgba(255,248,231,0.96), rgba(255,251,242,0.92))',
+        boxShadow: 'inset 0 0 0 1px rgba(198,165,109,0.24), 0 18px 34px rgba(122,92,32,0.08)',
+        color: '#7a5c20',
+      }
+  const broadcastAlertBadgeStyle = hasCriticalBroadcastIssue
+    ? { background: 'rgba(188,95,111,0.14)', color: '#8a2720' }
+    : { background: 'rgba(198,165,109,0.16)', color: '#7a5c20' }
   const micActive = isListening || inputLevel > 0.004
   const waveformActivity = micActive ? Math.min(1, Math.pow(inputLevel * 18, 0.8)) : 0
   const waveformBars = Array.from({ length: 5 }, (_, idx) => {
@@ -1119,21 +1218,78 @@ export default function TranslationBox() {
     <section className="w-full" style={{ color: palette.ink }}>
       <div className="relative overflow-hidden py-1">
         <div className="relative grid gap-6">
-          {/* Compact connection status bar — visible only when there is a problem */}
-          {connectionState !== 'connected' ? (
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold" style={socketStatusStyle}>
-                <span className={`h-2 w-2 rounded-full ${connectionState === 'reconnecting' ? 'animate-pulse' : ''}`} style={socketDotStyle} />
-                {socketStatusLabel}
-              </span>
-            </div>
-          ) : null}
+          {broadcastIssues.length > 0 ? (
+            <section
+              className="grid gap-3 rounded-[1.6rem] px-4 py-4 md:px-5"
+              style={broadcastAlertStyle}
+              role="alert"
+              aria-live={hasCriticalBroadcastIssue ? 'assertive' : 'polite'}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className="inline-flex items-center rounded-full px-3 py-1 text-[11px] font-bold uppercase tracking-[0.14em]"
+                      style={broadcastAlertBadgeStyle}
+                    >
+                      {hasCriticalBroadcastIssue ? 'Broadcast warning' : 'Broadcast notice'}
+                    </span>
+                    <span className="text-sm font-semibold" style={{ color: 'inherit' }}>
+                      {hasCriticalBroadcastIssue ? 'Live broadcast needs immediate attention.' : 'Live broadcast is degraded.'}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-sm" style={{ marginBottom: 0, color: 'inherit', opacity: 0.92, lineHeight: 1.7 }}>
+                    {hasCriticalBroadcastIssue
+                      ? 'Some listeners may stop receiving captions or translations until the connection recovers.'
+                      : 'The app is still running, but one or more broadcast services are recovering.'}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {connectionState !== 'connected' ? (
+                    <span className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold" style={socketStatusStyle}>
+                      <span className={`h-2 w-2 rounded-full ${connectionState === 'reconnecting' ? 'animate-pulse' : ''}`} style={socketDotStyle} />
+                      {socketStatusLabel}
+                    </span>
+                  ) : null}
+                  {status !== 'streaming' && status !== 'idle' && status !== 'stopped' ? (
+                    <span className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold" style={broadcastAlertBadgeStyle}>
+                      Deepgram {status}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
 
-          {errorMsg && (
-            <div className="rounded-[1.4rem] px-4 py-3 text-sm font-medium" style={{ background: 'rgba(243,166,176,0.10)', boxShadow: 'inset 0 0 0 1px rgba(243,166,176,0.24)', color: '#9f3650' }}>
-              {errorMsg}
-            </div>
-          )}
+              <div className="grid gap-2">
+                {broadcastIssues.map(issue => (
+                  <div
+                    key={issue.id}
+                    className="rounded-[1.1rem] px-4 py-3"
+                    style={{
+                      background: issue.tone === 'critical' ? 'rgba(255,255,255,0.72)' : 'rgba(255,255,255,0.62)',
+                      boxShadow: issue.tone === 'critical'
+                        ? 'inset 0 0 0 1px rgba(188,95,111,0.14)'
+                        : 'inset 0 0 0 1px rgba(198,165,109,0.14)',
+                    }}
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span
+                        className="inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em]"
+                        style={issue.tone === 'critical' ? { background: 'rgba(188,95,111,0.14)', color: '#8a2720' } : { background: 'rgba(198,165,109,0.16)', color: '#7a5c20' }}
+                      >
+                        {issue.tone === 'critical' ? 'Critical' : 'Recovering'}
+                      </span>
+                      <span className="text-sm font-semibold" style={{ color: issue.tone === 'critical' ? '#7d1d32' : '#7a5c20' }}>
+                        {issue.title}
+                      </span>
+                    </div>
+                    <p className="mt-2 text-sm" style={{ marginBottom: 0, color: issue.tone === 'critical' ? '#7d1d32' : '#7a5c20', lineHeight: 1.7, opacity: 0.92 }}>
+                      {issue.detail}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
 
           {/* Source + Target panels */}
           <div className="grid gap-4 xl:grid-cols-2 xl:items-stretch">
@@ -1189,12 +1345,6 @@ export default function TranslationBox() {
                     {availableLanguages.map(l => <option key={l.code} value={l.code} className="bg-white text-slate-900">{l.name}</option>)}
                   </select>
                 </div>
-
-                {failOpenMeta && (
-                  <div className="mb-3 rounded-[1.2rem] px-4 py-3 text-sm font-medium" style={{ background: 'rgba(247,197,107,0.14)', boxShadow: 'inset 0 0 0 1px rgba(247,197,107,0.22)', color: '#9a6700' }}>
-                    Translation temporarily unavailable. {failReasonLabel}
-                  </div>
-                )}
 
                 <div className="broadcast-scroll px-1 py-2" style={{ ...targetSurfaceStyle, minHeight: 280, maxHeight: 380, overflowY: 'auto' as const }}>
                   {[...committedLines].slice(-4).map(line => (
@@ -1321,6 +1471,7 @@ export default function TranslationBox() {
                       `Heartbeat · ${lastHeartbeatLabel}`,
                       `Reconnect · ${reconnectAttemptLabel}`,
                       `Downtime · ${socketDowntimeLabel}`,
+                      `Latency · ${latencyMs === null ? '—' : `${latencyMs}ms`}`,
                       `Deepgram · ${status}`,
                     ].map(label => (
                       <span key={label} className="rounded-full px-2.5 py-1 text-[10px] font-semibold" style={chipStyle}>{label}</span>
