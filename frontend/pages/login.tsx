@@ -36,6 +36,12 @@ function mapFirebaseError(err: unknown): string {
   if (code === "auth/user-not-found") return "Invalid email or password.";
   if (code === "auth/wrong-password") return "Invalid email or password.";
   if (code === "auth/too-many-requests") return "Too many attempts. Try again later.";
+  if (code === "auth/popup-closed-by-user") return "Google sign-in was cancelled.";
+  if (code === "auth/popup-blocked") return "Your browser blocked the Google sign-in popup. Please allow popups and try again.";
+  if (code === "auth/operation-not-allowed") return "Google sign-in is not enabled for this Firebase project yet.";
+  if (code === "auth/account-exists-with-different-credential") {
+    return "An account already exists for this email with another sign-in method. Sign in with email and password first.";
+  }
   if (err instanceof Error) return err.message;
   return "Login failed.";
 }
@@ -93,6 +99,17 @@ function FieldIcon({ kind }: { kind: "email" | "password" }) {
   );
 }
 
+function GoogleMarkIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.303C33.653 32.657 29.223 36 24 36c-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z" />
+      <path fill="#FF3D00" d="m6.306 14.691 6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z" />
+      <path fill="#4CAF50" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238C29.211 35.091 26.715 36 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z" />
+      <path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303a12.04 12.04 0 0 1-4.087 5.571l.003-.002 6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z" />
+    </svg>
+  );
+}
+
 function buildLoginNoticeStyle(tone: "error" | "info") {
   if (tone === "error") {
     return {
@@ -138,6 +155,10 @@ function buildLoginButtonStyle(options?: { tone?: "primary" | "secondary"; disab
       cursor: disabled ? "not-allowed" : "pointer",
       opacity: disabled ? 0.62 : 1,
       boxShadow: "10px 10px 20px rgba(163,177,198,0.20), -10px -10px 20px rgba(255,255,255,0.92), inset 1px 1px 0 rgba(255,255,255,0.9)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 10,
     } as const;
   }
 
@@ -154,12 +175,16 @@ function buildLoginButtonStyle(options?: { tone?: "primary" | "secondary"; disab
     cursor: disabled ? "not-allowed" : "pointer",
     opacity: disabled ? 0.62 : 1,
     boxShadow: "0 20px 26px rgba(75,185,221,0.26), inset 0 1px 0 rgba(255,255,255,0.42), inset 0 -2px 0 rgba(48,139,169,0.18)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
   } as const;
 }
 
 export default function LoginPage() {
   const router = useRouter();
-  const { login, logout, getIdToken, user, configured, missingEnv } = useAuth();
+  const { login, loginWithGoogle, logout, getIdToken, user, configured, missingEnv } = useAuth();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -261,6 +286,24 @@ export default function LoginPage() {
       if (code === "auth/too-many-requests" || code === "auth/wrong-password" || code === "auth/invalid-credential") {
         void reportLoginFailed(email.trim());
       }
+      if (isInvalidSessionError(err)) {
+        try {
+          await logout();
+        } catch {}
+      }
+      setErrorMsg(mapFirebaseError(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const signInWithGoogle = async () => {
+    setBusy(true);
+    setErrorMsg(null);
+    try {
+      await loginWithGoogle();
+      await redirectWithFreshSession();
+    } catch (err) {
       if (isInvalidSessionError(err)) {
         try {
           await logout();
@@ -467,6 +510,26 @@ export default function LoginPage() {
 
                   <button type="submit" disabled={!configured || busy} style={buildLoginButtonStyle({ disabled: !configured || busy })}>
                     {busy ? "Signing In..." : "Login"}
+                  </button>
+
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ flex: 1, height: 1, background: "rgba(123,134,151,0.22)" }} />
+                    <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase", color: "#8692a6" }}>
+                      or
+                    </span>
+                    <div style={{ flex: 1, height: 1, background: "rgba(123,134,151,0.22)" }} />
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void signInWithGoogle();
+                    }}
+                    disabled={!configured || busy}
+                    style={buildLoginButtonStyle({ tone: "secondary", disabled: !configured || busy })}
+                  >
+                    <GoogleMarkIcon />
+                    Continue with Google
                   </button>
                 </form>
               )}

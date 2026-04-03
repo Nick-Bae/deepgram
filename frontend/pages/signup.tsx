@@ -1,3 +1,4 @@
+import type { User } from "firebase/auth";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -29,13 +30,30 @@ function mapFirebaseError(err: unknown): string {
   if (code === "auth/email-already-in-use") return "This email is already in use.";
   if (code === "auth/invalid-email") return "Email format is invalid.";
   if (code === "auth/weak-password") return "Password must be at least 8 characters.";
+  if (code === "auth/popup-closed-by-user") return "Google sign-up was cancelled.";
+  if (code === "auth/popup-blocked") return "Your browser blocked the Google sign-up popup. Please allow popups and try again.";
+  if (code === "auth/operation-not-allowed") return "Google sign-up is not enabled for this Firebase project yet.";
+  if (code === "auth/account-exists-with-different-credential") {
+    return "An account already exists for this email with another sign-in method. Sign in with email and password first.";
+  }
   if (err instanceof Error) return err.message;
   return "Sign up failed.";
 }
 
+function GoogleMarkIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.303C33.653 32.657 29.223 36 24 36c-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z" />
+      <path fill="#FF3D00" d="m6.306 14.691 6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z" />
+      <path fill="#4CAF50" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238C29.211 35.091 26.715 36 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z" />
+      <path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303a12.04 12.04 0 0 1-4.087 5.571l.003-.002 6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z" />
+    </svg>
+  );
+}
+
 export default function SignupPage() {
   const router = useRouter();
-  const { signup, user, loading, configured, missingEnv } = useAuth();
+  const { loginWithGoogle, signup, user, loading, configured, missingEnv } = useAuth();
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -116,67 +134,79 @@ export default function SignupPage() {
     router.replace("/onboarding/create-church");
   }, [busy, configured, loading, nextPath, router, user]);
 
-  const onSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    setErrorMsg(null);
-    if (password !== confirmPassword) {
-      setErrorMsg("Passwords do not match.");
+  const validateChurchSetup = (): string | null => {
+    const safeSlug = normalizeChurchSlug(churchSlug);
+    if (inviteJoinFlow) return safeSlug;
+    if (!churchName.trim()) {
+      setErrorMsg("Church name is required.");
+      return null;
+    }
+    if (!safeSlug) {
+      setErrorMsg("Church slug is required.");
+      return null;
+    }
+    if (slugAvailable === false) {
+      setErrorMsg("That church URL slug is already in use. Choose one of the suggestions.");
+      return null;
+    }
+    return safeSlug;
+  };
+
+  const refreshSlugAvailability = async (safeSlug: string) => {
+    try {
+      const payload = await checkChurchSlugAvailability(safeSlug);
+      setSlugAvailable(Boolean(payload.available));
+      const suggestions = (payload.suggestions || [])
+        .map((value) => normalizeChurchSlug(value))
+        .filter((value, index, rows) => Boolean(value) && value !== safeSlug && rows.indexOf(value) === index)
+        .slice(0, 3);
+      setSlugSuggestions(suggestions);
+    } catch {
+      // no-op; keep original error message.
+    }
+  };
+
+  const completeSignup = async (authUser: User, safeSlug: string) => {
+    const token = await authUser.getIdToken(true);
+    persistAuthToken(token);
+    if (inviteJoinFlow && nextPath) {
+      await router.replace(nextPath);
       return;
     }
-    const safeSlug = normalizeChurchSlug(churchSlug);
-    if (!inviteJoinFlow) {
-      if (!safeSlug) {
-        setErrorMsg("Church slug is required.");
-        return;
-      }
-      if (slugAvailable === false) {
-        setErrorMsg("That church URL slug is already in use. Choose one of the suggestions.");
-        return;
-      }
-    }
+    const created = await bootstrapOwnerOrg(token, {
+      churchName: churchName.trim(),
+      churchSlug: safeSlug,
+      timezone: "America/Chicago",
+      source: "ko",
+      target: "en",
+    });
+
+    const serviceKey = created.services?.[0]?.serviceKey || "sun-11am";
+    const org = created.org;
+    clearHostToken();
+    persistStreamContext({
+      orgId: org.orgId,
+      serviceKey,
+      churchSlug: org.slug,
+    });
+
+    const params = new URLSearchParams();
+    params.set("orgId", org.orgId);
+    params.set("serviceKey", serviceKey);
+    await router.replace(`/host/c/${encodeURIComponent(org.slug)}/broadcast?${params.toString()}`);
+  };
+
+  const runSignupFlow = async (authAction: () => Promise<User>) => {
+    setErrorMsg(null);
+    const safeSlug = validateChurchSetup();
+    if (safeSlug === null) return;
     setBusy(true);
     try {
-      const authUser = await signup(email.trim(), password, name.trim());
-      const token = await authUser.getIdToken(true);
-      persistAuthToken(token);
-      if (inviteJoinFlow && nextPath) {
-        await router.replace(nextPath);
-        return;
-      }
-      const created = await bootstrapOwnerOrg(token, {
-        churchName: churchName.trim(),
-        churchSlug: safeSlug,
-        timezone: "America/Chicago",
-        source: "ko",
-        target: "en",
-      });
-
-      const serviceKey = created.services?.[0]?.serviceKey || "sun-11am";
-      const org = created.org;
-      clearHostToken();
-      persistStreamContext({
-        orgId: org.orgId,
-        serviceKey,
-        churchSlug: org.slug,
-      });
-
-      const params = new URLSearchParams();
-      params.set("orgId", org.orgId);
-      params.set("serviceKey", serviceKey);
-      await router.replace(`/host/c/${encodeURIComponent(org.slug)}/broadcast?${params.toString()}`);
+      const authUser = await authAction();
+      await completeSignup(authUser, safeSlug);
     } catch (err) {
       if (!inviteJoinFlow && err instanceof Error && err.message.toLowerCase().includes("slug")) {
-        try {
-          const payload = await checkChurchSlugAvailability(safeSlug);
-          setSlugAvailable(Boolean(payload.available));
-          const suggestions = (payload.suggestions || [])
-            .map((value) => normalizeChurchSlug(value))
-            .filter((value, index, rows) => Boolean(value) && value !== safeSlug && rows.indexOf(value) === index)
-            .slice(0, 3);
-          setSlugSuggestions(suggestions);
-        } catch {
-          // no-op; keep original error message.
-        }
+        await refreshSlugAvailability(safeSlug);
       }
       setErrorMsg(mapFirebaseError(err));
     } finally {
@@ -184,7 +214,21 @@ export default function SignupPage() {
     }
   };
 
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (password !== confirmPassword) {
+      setErrorMsg("Passwords do not match.");
+      return;
+    }
+    await runSignupFlow(() => signup(email.trim(), password, name.trim()));
+  };
+
+  const onGoogleSignup = async () => {
+    await runSignupFlow(() => loginWithGoogle());
+  };
+
   const slugBlocked = !inviteJoinFlow && (!normalizedSlug || slugAvailabilityBusy || slugAvailable === false);
+  const googleSignupDisabled = !configured || busy || (!inviteJoinFlow && (!churchName.trim() || slugBlocked));
 
   return (
     <StudioAccessLayout
@@ -390,6 +434,26 @@ export default function SignupPage() {
           style={buildStudioButtonStyle({ disabled: !configured || busy || passwordMismatch || slugBlocked })}
         >
           {busy ? "Creating Account..." : inviteJoinFlow ? "Sign Up and Continue" : "Sign Up and Create Church"}
+        </button>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "4px 0" }}>
+          <div style={{ flex: 1, height: 1, background: "rgba(120,98,78,0.16)" }} />
+          <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase", color: "#8f8378" }}>
+            or
+          </span>
+          <div style={{ flex: 1, height: 1, background: "rgba(120,98,78,0.16)" }} />
+        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            void onGoogleSignup();
+          }}
+          disabled={googleSignupDisabled}
+          style={{ ...buildStudioButtonStyle({ tone: "secondary", disabled: googleSignupDisabled }), gap: 10 }}
+        >
+          <GoogleMarkIcon />
+          {inviteJoinFlow ? "Continue with Google" : "Continue with Google and Create Church"}
         </button>
       </form>
 
