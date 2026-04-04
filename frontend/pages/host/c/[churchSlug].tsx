@@ -5,6 +5,7 @@ import { sendEmailVerification } from "firebase/auth";
 import QRCode from "qrcode";
 
 import TranslationBox from "../../../components/TranslationBox";
+import SttKeytermsEditor from "../../../components/SttKeytermsEditor";
 import { useAuth } from "../../../lib/authContext";
 import { getFirebaseClient } from "../../../lib/firebaseClient";
 import {
@@ -157,6 +158,15 @@ function isNetworkError(err: unknown): boolean {
   return err instanceof TypeError && /fetch|network|failed/i.test((err as TypeError).message);
 }
 
+function isStaleFirebaseUserError(err: unknown): boolean {
+  const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
+  if (code === "auth/user-not-found" || code === "auth/user-token-expired" || code === "auth/user-disabled") {
+    return true;
+  }
+  const message = err instanceof Error ? err.message.toLowerCase() : String(err || "").toLowerCase();
+  return message.includes("user-not-found") || message.includes("user-token-expired") || message.includes("user-disabled");
+}
+
 async function readErrorMessage(res: Response, action: HostAction): Promise<string> {
   try {
     const data = await res.clone().json();
@@ -249,6 +259,29 @@ async function copyTextToClipboard(value: string): Promise<void> {
   const copied = document.execCommand("copy");
   document.body.removeChild(textarea);
   if (!copied) throw new Error("clipboard_unavailable");
+}
+
+function SttKeytermsEditorLazy({
+  orgId,
+  getIdToken,
+}: {
+  orgId: string;
+  getIdToken: (forceRefresh?: boolean) => Promise<string>;
+}) {
+  const [idToken, setIdToken] = useState<string | null>(null);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getIdToken()
+      .then(setIdToken)
+      .catch((e: unknown) =>
+        setTokenError(e instanceof Error ? e.message : "Token error")
+      );
+  }, [getIdToken]);
+
+  if (tokenError) return <p style={{ color: "#bc5f6f", fontSize: 13 }}>{tokenError}</p>;
+  if (!idToken) return <p style={{ fontSize: 13, color: "#8a9ab4" }}>Loading...</p>;
+  return <SttKeytermsEditor orgId={orgId} idToken={idToken} />;
 }
 
 export default function HostChurchPage() {
@@ -539,11 +572,15 @@ export default function HostChurchPage() {
     try {
       await sendEmailVerification(user);
     } catch (err) {
+      if (isStaleFirebaseUserError(err)) {
+        await logout();
+        return;
+      }
       setVerificationError(err instanceof Error ? err.message : "Failed to send verification email.");
     } finally {
       setVerificationSending(false);
     }
-  }, [user]);
+  }, [logout, user]);
 
   const handleCheckVerification = useCallback(async () => {
     if (!user) return;
@@ -558,11 +595,15 @@ export default function HostChurchPage() {
         setVerificationError("Email not yet verified. Check your inbox and click the link.");
       }
     } catch (err) {
+      if (isStaleFirebaseUserError(err)) {
+        await logout();
+        return;
+      }
       setVerificationError(err instanceof Error ? err.message : "Failed to check verification status.");
     } finally {
       setVerificationSending(false);
     }
-  }, [user]);
+  }, [logout, user]);
 
   useEffect(() => {
     if (authLoading || !user) return;
@@ -2013,6 +2054,25 @@ export default function HostChurchPage() {
             >
               {verificationSending ? "Sending..." : "Resend Verification Email"}
             </button>
+            <button
+              onClick={logout}
+              disabled={verificationSending}
+              style={{
+                padding: "11px 18px",
+                border: "none",
+                background: "transparent",
+                color: DC.gold,
+                fontSize: 13,
+                fontWeight: 700,
+                borderRadius: 3,
+                cursor: verificationSending ? "not-allowed" : "pointer",
+                opacity: verificationSending ? 0.6 : 1,
+                textDecoration: "underline",
+                textUnderlineOffset: "4px",
+              }}
+            >
+              Use a Different Account
+            </button>
           </div>
 
           <p style={{ margin: 0, fontSize: 12, color: DC.mid, lineHeight: 1.6 }}>
@@ -2560,6 +2620,17 @@ export default function HostChurchPage() {
                       </button>
                     </div>
                   </section>
+
+                  {canManageInvites && resolvedOrgId ? (
+                    <section style={settingsCardStyle}>
+                      <p style={settingsSectionLabelStyle}>Translation</p>
+                      <h3 style={settingsTitleStyle}>STT Keywords</h3>
+                      <p style={settingsBodyTextStyle}>
+                        Add church-specific terms to help Deepgram recognize them accurately — pastor names, series titles, or theological vocabulary unique to your church. Changes take effect on the next session start.
+                      </p>
+                      <SttKeytermsEditorLazy orgId={resolvedOrgId} getIdToken={getIdToken} />
+                    </section>
+                  ) : null}
 
                   <section style={settingsSubscriptionCardStyle}>
                     <p style={settingsSectionLabelStyle}>Billing Snapshot</p>

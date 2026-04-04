@@ -51,6 +51,27 @@ def _clean_token(raw: Optional[str]) -> Optional[str]:
     return txt or None
 
 
+def _clean_replacements(
+    raw: List[Dict[str, str]], max_count: int
+) -> List[Dict[str, str]]:
+    """Validate and deduplicate replacement pairs. Dedup on 'find' key (lowercased)."""
+    seen: set = set()
+    result: List[Dict[str, str]] = []
+    for item in raw:
+        find = str(item.get("find") or "").strip()
+        replacement = str(item.get("replace") or "").strip()
+        if not find:
+            continue
+        key = find.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({"find": find, "replace": replacement})
+        if len(result) >= max_count:
+            break
+    return result
+
+
 def _tick_minutes(tick_seconds: int) -> int:
     return max(1, int(math.ceil(max(1, int(tick_seconds)) / 60)))
 
@@ -113,6 +134,9 @@ DEFAULT_SERVICE_SEEDS: tuple[tuple[str, str], ...] = (
 
 ALLOWED_MEMBER_ROLES: set[str] = {"owner", "admin", "host", "viewer"}
 PROMPT_EDITOR_ROLES: set[str] = {"owner", "admin", "host"}
+STT_KEYTERMS_ROLES: set[str] = {"owner", "admin"}
+STT_KEYTERMS_MAX: int = 50  # max org custom keyterms (Tier 1 budget)
+STT_REPLACEMENTS_MAX: int = 50  # max org custom replacement pairs
 ALLOWED_INVITE_ROLES: set[str] = {"admin", "host", "viewer"}
 INVITE_STATUS_ACTIVE = "active"
 INVITE_STATUS_CONSUMED = "consumed"
@@ -1745,6 +1769,117 @@ class InMemoryMultiChurchStore:
                 "service_prompt": str(org.get("servicePrompt") or ""),
                 "updatedAt": now,
             }
+
+    def get_org_stt_keyterms(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in STT_KEYTERMS_ROLES:
+                raise PermissionError("forbidden")
+            return {
+                "orgId": clean_org_id,
+                "keyterms": list(org.get("sttKeyterms") or []),
+            }
+
+    def set_org_stt_keyterms(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        keyterms: List[str],
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in STT_KEYTERMS_ROLES:
+                raise PermissionError("forbidden")
+            cleaned = [t.strip() for t in keyterms if t.strip()][:STT_KEYTERMS_MAX]
+            org["sttKeyterms"] = cleaned
+            org["updatedAt"] = _utcnow()
+            return {"orgId": clean_org_id, "keyterms": cleaned}
+
+    def get_org_stt_keyterms_for_session(self, org_id: Optional[str]) -> List[str]:
+        """Called at session start — no auth check, returns list directly."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return []
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                return []
+            return list(org.get("sttKeyterms") or [])
+
+    def get_org_stt_replacements(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in STT_KEYTERMS_ROLES:
+                raise PermissionError("forbidden")
+            return {
+                "orgId": clean_org_id,
+                "replacements": list(org.get("sttReplacements") or []),
+            }
+
+    def set_org_stt_replacements(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        replacements: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in STT_KEYTERMS_ROLES:
+                raise PermissionError("forbidden")
+            cleaned = _clean_replacements(replacements, STT_REPLACEMENTS_MAX)
+            org["sttReplacements"] = cleaned
+            org["updatedAt"] = _utcnow()
+            return {"orgId": clean_org_id, "replacements": cleaned}
+
+    def get_org_stt_replacements_for_session(self, org_id: Optional[str]) -> List[Tuple[str, str]]:
+        """Called at session start — no auth check, returns list of (find, replace) tuples."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return []
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                return []
+            return [(r["find"], r["replace"]) for r in (org.get("sttReplacements") or [])
+                    if r.get("find") and r.get("replace") is not None]
 
     def get_org_prompt_for_translation(self, org_id: Optional[str]) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -4445,6 +4580,121 @@ class FirestoreMultiChurchStore:
             "service_prompt": str(service_prompt or ""),
             "updatedAt": _utcnow(),
         }
+
+    def get_org_stt_keyterms(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in STT_KEYTERMS_ROLES:
+            raise PermissionError("forbidden")
+        org = org_snap.to_dict() or {}
+        return {
+            "orgId": clean_org_id,
+            "keyterms": list(org.get("sttKeyterms") or []),
+        }
+
+    def set_org_stt_keyterms(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        keyterms: List[str],
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in STT_KEYTERMS_ROLES:
+            raise PermissionError("forbidden")
+        cleaned = [t.strip() for t in keyterms if t.strip()][:STT_KEYTERMS_MAX]
+        org_ref.set(
+            {"sttKeyterms": cleaned, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+        return {"orgId": clean_org_id, "keyterms": cleaned}
+
+    def get_org_stt_keyterms_for_session(self, org_id: Optional[str]) -> List[str]:
+        """Called at session start — no auth check, returns list directly."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return []
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            return []
+        org = org_snap.to_dict() or {}
+        return list(org.get("sttKeyterms") or [])
+
+    def get_org_stt_replacements(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in STT_KEYTERMS_ROLES:
+            raise PermissionError("forbidden")
+        org = org_snap.to_dict() or {}
+        return {
+            "orgId": clean_org_id,
+            "replacements": list(org.get("sttReplacements") or []),
+        }
+
+    def set_org_stt_replacements(
+        self,
+        *,
+        org_id: str,
+        requested_by_uid: str,
+        replacements: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        org_ref = self._org_ref(clean_org_id)
+        org_snap = org_ref.get()
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in STT_KEYTERMS_ROLES:
+            raise PermissionError("forbidden")
+        cleaned = _clean_replacements(replacements, STT_REPLACEMENTS_MAX)
+        org_ref.set(
+            {"sttReplacements": cleaned, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+        return {"orgId": clean_org_id, "replacements": cleaned}
+
+    def get_org_stt_replacements_for_session(self, org_id: Optional[str]) -> List[Tuple[str, str]]:
+        """Called at session start — no auth check, returns list of (find, replace) tuples."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return []
+        org_snap = self._org_ref(clean_org_id).get()
+        if not org_snap.exists:
+            return []
+        org = org_snap.to_dict() or {}
+        return [(r["find"], r["replace"]) for r in (org.get("sttReplacements") or [])
+                if r.get("find") and r.get("replace") is not None]
 
     def get_org_prompt_for_translation(self, org_id: Optional[str]) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
