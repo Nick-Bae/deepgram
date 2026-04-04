@@ -83,6 +83,7 @@ class CheckoutSessionRequest(BaseModel):
     planKey: str = Field(..., min_length=3, max_length=32, pattern=validators.PLAN_KEY)
     successUrl: str = Field(..., min_length=8, max_length=2048)
     cancelUrl: str = Field(..., min_length=8, max_length=2048)
+    interval: str = Field(default="month", pattern=r"^(month|year)$")
 
     @field_validator("successUrl", "cancelUrl")
     @classmethod
@@ -586,7 +587,10 @@ def create_checkout_session(
     target_plan = plan_spec(body.planKey)
     if target_plan.key == "trial":
         raise HTTPException(status_code=400, detail="invalid_plan")
-    price_id = _clean_price_id(BILLING_CONFIG.stripe_price_ids.get(target_plan.key))
+    use_annual = body.interval == "year"
+    price_id = _clean_price_id(
+        (BILLING_CONFIG.stripe_price_ids_annual if use_annual else BILLING_CONFIG.stripe_price_ids).get(target_plan.key)
+    )
     if not price_id:
         raise HTTPException(status_code=503, detail="billing_not_configured")
     if not _is_valid_price_id(price_id):
@@ -624,7 +628,7 @@ def create_checkout_session(
             cancel_url=body.cancelUrl,
             trial_days=0,
             allow_no_payment_method=False,
-            metadata={"orgId": body.orgId, "planKey": target_plan.key, "requestedByUid": user.uid},
+            metadata={"orgId": body.orgId, "planKey": target_plan.key, "interval": body.interval, "requestedByUid": user.uid},
         )
     except StripeClientError as exc:
         # If the stored Stripe customer belongs to a different account/mode, recreate and retry once.
@@ -644,7 +648,7 @@ def create_checkout_session(
                     cancel_url=body.cancelUrl,
                     trial_days=0,
                     allow_no_payment_method=False,
-                    metadata={"orgId": body.orgId, "planKey": target_plan.key, "requestedByUid": user.uid},
+                    metadata={"orgId": body.orgId, "planKey": target_plan.key, "interval": body.interval, "requestedByUid": user.uid},
                 )
             except StripeClientError as retry_exc:
                 logger.warning("stripe_checkout_failed (retry) org=%s: %s", body.orgId, retry_exc)

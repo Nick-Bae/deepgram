@@ -550,7 +550,7 @@ export function saveOrgBillingLimits(
 
 export function createBillingCheckoutSession(
   idToken: string,
-  payload: { orgId: string; planKey: Exclude<BillingPlanKey, "trial">; successUrl: string; cancelUrl: string },
+  payload: { orgId: string; planKey: Exclude<BillingPlanKey, "trial">; successUrl: string; cancelUrl: string; interval?: "month" | "year" },
 ): Promise<{ url: string; sessionId: string }> {
   return authFetch<{ url: string; sessionId: string }>("/api/billing/checkout-session", idToken, {
     method: "POST",
@@ -560,6 +560,7 @@ export function createBillingCheckoutSession(
       planKey: payload.planKey,
       successUrl: payload.successUrl,
       cancelUrl: payload.cancelUrl,
+      interval: payload.interval ?? "month",
     }),
   });
 }

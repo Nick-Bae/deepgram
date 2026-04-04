@@ -23,6 +23,7 @@ class BillingConfig:
     stripe_secret_key: str
     stripe_webhook_secret: str
     stripe_price_ids: Dict[str, str]
+    stripe_price_ids_annual: Dict[str, str]
     trial_days: int
     trial_minutes: int
     grace_days: int
@@ -41,10 +42,16 @@ def load_billing_config() -> BillingConfig:
         GROWTH_PLAN_KEY: (os.getenv("STRIPE_PRICE_GROWTH") or "").strip(),
         PREMIUM_PLAN_KEY: (os.getenv("STRIPE_PRICE_PREMIUM") or "").strip(),
     }
+    price_ids_annual = {
+        STARTER_PLAN_KEY: (os.getenv("STRIPE_PRICE_STARTER_ANNUAL") or "").strip(),
+        GROWTH_PLAN_KEY: (os.getenv("STRIPE_PRICE_GROWTH_ANNUAL") or "").strip(),
+        PREMIUM_PLAN_KEY: (os.getenv("STRIPE_PRICE_PREMIUM_ANNUAL") or "").strip(),
+    }
     return BillingConfig(
         stripe_secret_key=stripe_secret_key,
         stripe_webhook_secret=stripe_webhook_secret,
         stripe_price_ids=price_ids,
+        stripe_price_ids_annual=price_ids_annual,
         trial_days=trial_days,
         trial_minutes=trial_minutes,
         grace_days=grace_days,

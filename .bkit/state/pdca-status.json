@@ -1,6 +1,6 @@
 {
   "version": "3.0",
-  "lastUpdated": "2026-04-04T20:42:55.536Z",
+  "lastUpdated": "2026-04-04T21:30:53.312Z",
   "activeFeatures": [
     "billing",
     "admin",
@@ -44,9 +44,9 @@
       "designDoc": "docs/02-design/features/billing.design.md",
       "analysisDoc": "docs/03-analysis/billing.analysis.md",
       "phaseNumber": 3,
-      "lastFile": "/home/namju/project/real-time-translation/backend/app/billing/stripe_client.py",
+      "lastFile": "/home/namju/project/real-time-translation/backend/app/billing/config.py",
       "timestamps": {
-        "lastUpdated": "2026-03-23T05:49:42.201Z"
+        "lastUpdated": "2026-04-04T21:29:29.786Z"
       }
     },
     "admin": {
@@ -71,7 +71,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T20:38:50.121Z",
-        "lastUpdated": "2026-04-04T20:42:55.536Z"
+        "lastUpdated": "2026-04-04T21:29:57.179Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/backend/app/routes/billing.py"
     },
@@ -84,7 +84,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T21:11:56.820Z",
-        "lastUpdated": "2026-04-04T18:49:11.523Z"
+        "lastUpdated": "2026-04-04T21:30:04.526Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/frontend/lib/backendAuth.ts"
     },
@@ -97,7 +97,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T21:12:40.289Z",
-        "lastUpdated": "2026-04-04T18:50:10.338Z"
+        "lastUpdated": "2026-04-04T21:30:53.312Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/frontend/pages/host/c/[churchSlug].tsx"
     },
@@ -241,7 +241,7 @@
   "session": {
     "startedAt": "2026-03-20T20:05:09.411Z",
     "onboardingCompleted": false,
-    "lastActivity": "2026-04-04T20:42:55.536Z"
+    "lastActivity": "2026-04-04T21:30:53.312Z"
   },
   "history": [
     {
@@ -3079,6 +3079,72 @@
     {
       "timestamp": "2026-04-04T20:42:55.536Z",
       "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:29:25.139Z",
+      "feature": "billing",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:29:29.786Z",
+      "feature": "billing",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:29:38.656Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:29:44.832Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:29:57.179Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:30:04.526Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:30:20.548Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:30:24.944Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:30:29.884Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:30:46.689Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T21:30:53.312Z",
+      "feature": "c",
       "phase": "do",
       "action": "updated"
     }

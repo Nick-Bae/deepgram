@@ -77,22 +77,31 @@ type HostTab = "broadcast" | "settings" | "billing" | "team";
 const PAID_PLAN_KEYS: PaidPlanKey[] = ["starter", "growth", "premium"];
 
 
-const PLAN_SUMMARIES: Record<PaidPlanKey, { title: string; monthlyPrice: string; minuteLimit: string; description: string }> = {
+const PLAN_SUMMARIES: Record<PaidPlanKey, { title: string; monthlyPrice: string; annualPrice: string; annualMonthlyRate: string; annualSavings: string; minuteLimit: string; description: string }> = {
   starter: {
     title: "Starter",
     monthlyPrice: "$20 / month",
+    annualPrice: "$200 / year",
+    annualMonthlyRate: "$16.67 / month",
+    annualSavings: "Save $40/yr",
     minuteLimit: "600 min / month (~10 hrs)",
     description: "Great for one weekly service with room to spare.",
   },
   growth: {
     title: "Growth",
     monthlyPrice: "$40 / month",
+    annualPrice: "$400 / year",
+    annualMonthlyRate: "$33.33 / month",
+    annualSavings: "Save $80/yr",
     minuteLimit: "1,800 min / month (~30 hrs)",
     description: "Fits churches with 2–3 services per week.",
   },
   premium: {
     title: "Premium",
     monthlyPrice: "$60 / month",
+    annualPrice: "$600 / year",
+    annualMonthlyRate: "$50 / month",
+    annualSavings: "Save $120/yr",
     minuteLimit: "Unlimited",
     description: "No limits — ideal for large or multi-campus churches.",
   },
@@ -302,6 +311,7 @@ export default function HostChurchPage() {
   const [churchProfileError, setChurchProfileError] = useState<string | null>(null);
   const [churchProfileNotice, setChurchProfileNotice] = useState<string | null>(null);
   const [selectedPlan, setSelectedPlan] = useState<PaidPlanKey | null>(null);
+  const [billingInterval, setBillingInterval] = useState<"month" | "year">("month");
   const [billingBusy, setBillingBusy] = useState(false);
   const [billingCheckoutBusy, setBillingCheckoutBusy] = useState(false);
   const [billingPortalBusy, setBillingPortalBusy] = useState(false);
@@ -1288,6 +1298,7 @@ export default function HostChurchPage() {
         planKey: selectedPlan,
         successUrl: returnUrl,
         cancelUrl: returnUrl,
+        interval: billingInterval,
       });
       if (!checkout.url) throw new Error("Stripe checkout URL was not returned.");
       if (typeof window !== "undefined") {
@@ -2886,9 +2897,46 @@ export default function HostChurchPage() {
                     <p style={settingsSectionLabelStyle}>Plans</p>
                     <h3 style={settingsTitleStyle}>Choose the next plan</h3>
                     <p style={settingsBodyTextStyle}>
-                      Plans are billed monthly and measured in broadcast minutes — the time your congregation is actively receiving translation. Upgrades take effect immediately; downgrades apply at the end of your current billing period.
+                      Plans are billed in broadcast minutes — the time your congregation is actively receiving translation. Upgrades take effect immediately; downgrades apply at the end of your current billing period.
                     </p>
                   </div>
+
+                  {/* Billing interval toggle */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 0, alignSelf: "flex-start", border: `1px solid ${DC.border}`, borderRadius: 6, overflow: "hidden", background: DC.white }}>
+                    <button
+                      type="button"
+                      onClick={() => setBillingInterval("month")}
+                      style={{
+                        padding: "8px 20px", fontSize: 13, fontWeight: 600, border: "none", cursor: "pointer",
+                        background: billingInterval === "month" ? DC.navy : "transparent",
+                        color: billingInterval === "month" ? "#fff" : DC.mid,
+                        transition: "background 0.15s",
+                      }}
+                    >
+                      Monthly
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBillingInterval("year")}
+                      style={{
+                        padding: "8px 20px", fontSize: 13, fontWeight: 600, border: "none", cursor: "pointer",
+                        background: billingInterval === "year" ? DC.navy : "transparent",
+                        color: billingInterval === "year" ? "#fff" : DC.mid,
+                        transition: "background 0.15s",
+                        display: "flex", alignItems: "center", gap: 6,
+                      }}
+                    >
+                      Annual
+                      <span style={{ fontSize: 11, fontWeight: 700, background: "#3b7d5c", color: "#fff", padding: "2px 6px", borderRadius: 3 }}>
+                        2 months free
+                      </span>
+                    </button>
+                  </div>
+
+                  {/* Auto-renewal disclosure */}
+                  <p style={{ margin: 0, fontSize: 12, color: DC.mid, background: "rgba(120,98,78,0.06)", border: `1px solid ${DC.border}`, borderRadius: 4, padding: "8px 12px" }}>
+                    Subscriptions renew automatically {billingInterval === "year" ? "every year" : "every month"} until cancelled. You can cancel at any time from the Billing Portal — access continues until the end of the current period.
+                  </p>
 
                   <div className="billing-plan-deck" style={billingDeckStyle}>
                     {PAID_PLAN_KEYS.map((plan) => {
@@ -2944,7 +2992,14 @@ export default function HostChurchPage() {
                             </div>
                           </div>
                           <div style={{ display: "grid", gap: 2 }}>
-                            <span style={{ fontSize: 30, fontWeight: 900, letterSpacing: "-0.05em", color: DC.navy }}>{PLAN_SUMMARIES[plan].monthlyPrice}</span>
+                            <span style={{ fontSize: 30, fontWeight: 900, letterSpacing: "-0.05em", color: DC.navy }}>
+                              {billingInterval === "year" ? PLAN_SUMMARIES[plan].annualPrice : PLAN_SUMMARIES[plan].monthlyPrice}
+                            </span>
+                            {billingInterval === "year" && (
+                              <span style={{ fontSize: 12, color: "#3b7d5c", fontWeight: 600 }}>
+                                {PLAN_SUMMARIES[plan].annualMonthlyRate} · {PLAN_SUMMARIES[plan].annualSavings}
+                              </span>
+                            )}
                             <span style={{ fontSize: 12, color: DC.mid }}>
                               {isCurrentPlan ? "Your active plan" : isSelectedPlan ? "Selected for checkout" : "Click to select this plan"}
                             </span>
