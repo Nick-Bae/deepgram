@@ -180,6 +180,11 @@ class BillingRouteTests(unittest.TestCase):
         test_case = self
 
         class _SanitizedPortalStripeClient(_FakeStripeClient):
+            def retrieve_subscription(self, *, subscription_id: str) -> dict:
+                payload = super().retrieve_subscription(subscription_id=subscription_id)
+                payload["customer"] = "cus_test_portal"
+                return payload
+
             def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> dict:
                 test_case.assertEqual(customer_id, "cus_test_portal")
                 return super().create_billing_portal_session(customer_id=customer_id, return_url=return_url)
@@ -230,6 +235,49 @@ class BillingRouteTests(unittest.TestCase):
         updated = self.store.get_org_billing_profile(org_id=org_id)
         self.assertEqual(str(updated.get("stripeCustomerId") or ""), "cus_test_retry_portal")
         self.assertIsNone(updated.get("stripeSubscriptionId"))
+
+    def test_portal_session_refreshes_customer_from_subscription_before_opening(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-billing-2ab", slug="billing-route-b1b", name="Billing Route B1B")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["planKey"] = "starter"
+        billing["status"] = "active"
+        billing["stripeCustomerId"] = "cus_test_empty_portal"
+        billing["stripeSubscriptionId"] = "sub_test_real_portal"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        test_case = self
+
+        class _PortalHydrateStripeClient(_FakeStripeClient):
+            def retrieve_subscription(self, *, subscription_id: str) -> dict:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id,
+                    "customer": "cus_test_real_portal",
+                    "status": "active",
+                    "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"price": {"id": "price_starter"}}]},
+                }
+
+            def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> dict:
+                test_case.assertEqual(customer_id, "cus_test_empty_portal")
+                return {"data": []}
+
+            def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> dict:
+                test_case.assertEqual(customer_id, "cus_test_real_portal")
+                return super().create_billing_portal_session(customer_id=customer_id, return_url=return_url)
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _PortalHydrateStripeClient()):
+            result = billing_routes.create_portal_session(
+                billing_routes.PortalSessionRequest(orgId=org_id, returnUrl="https://example.com/settings"),
+                user=self._user("owner-billing-2ab"),
+            )
+
+        self.assertIn("cus_test_real_portal", str(result.get("url") or ""))
+        updated = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(str(updated.get("stripeCustomerId") or ""), "cus_test_real_portal")
+        self.assertEqual(str(updated.get("stripeSubscriptionId") or ""), "sub_test_real_portal")
 
     def test_checkout_session_recreates_customer_when_saved_customer_missing(self) -> None:
         class _MissingCustomerStripeClient(_FakeStripeClient):

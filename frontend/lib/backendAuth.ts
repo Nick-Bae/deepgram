@@ -578,6 +578,35 @@ export function createBillingPortalSession(
   });
 }
 
+export type ChangePlanResponse = {
+  ok: boolean;
+  effective: string;
+  pendingPlanKey: string | null;
+  pendingPlanDate: string | null;
+};
+
+export function changePlan(
+  idToken: string,
+  payload: { orgId: string; targetPlanKey: Exclude<BillingPlanKey, "trial"> },
+): Promise<ChangePlanResponse> {
+  return authFetch<ChangePlanResponse>("/api/billing/change-plan", idToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ orgId: payload.orgId, targetPlanKey: payload.targetPlanKey }),
+  });
+}
+
+export function cancelPendingDowngrade(
+  idToken: string,
+  payload: { orgId: string },
+): Promise<{ ok: boolean }> {
+  return authFetch<{ ok: boolean }>("/api/billing/cancel-pending-downgrade", idToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ orgId: payload.orgId }),
+  });
+}
+
 export function createOrgService(
   idToken: string,
   orgId: string,

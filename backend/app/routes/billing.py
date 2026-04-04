@@ -40,7 +40,7 @@ from app.services import email_service
 router = APIRouter(tags=["billing"])
 
 
-def _send_billing_email(event: str, *, org_id: str, plan_key: str = "") -> None:
+def _send_billing_email(event: str, *, org_id: str, plan_key: str = "", old_plan_key: str = "", effective: str = "immediate") -> None:
     """Fire-and-forget billing email dispatcher. Never raises."""
     try:
         admin_emails = multichurch_store.get_org_admin_emails(org_id=org_id)
@@ -60,6 +60,14 @@ def _send_billing_email(event: str, *, org_id: str, plan_key: str = "") -> None:
         elif event == "payment_recovered":
             email_service.send_payment_recovered_email(
                 admin_emails=admin_emails, org_name=org_name
+            )
+        elif event == "plan_changed":
+            email_service.send_plan_changed_email(
+                admin_emails=admin_emails,
+                org_name=org_name,
+                old_plan_key=old_plan_key,
+                new_plan_key=plan_key,
+                effective=effective,
             )
     except Exception:
         logger.exception("billing_email_dispatch_error event=%s org=%s", event, org_id)
@@ -615,7 +623,7 @@ def create_checkout_session(
             success_url=body.successUrl,
             cancel_url=body.cancelUrl,
             trial_days=0,
-            allow_no_payment_method=True,
+            allow_no_payment_method=False,
             metadata={"orgId": body.orgId, "planKey": target_plan.key, "requestedByUid": user.uid},
         )
     except StripeClientError as exc:
@@ -635,7 +643,7 @@ def create_checkout_session(
                     success_url=body.successUrl,
                     cancel_url=body.cancelUrl,
                     trial_days=0,
-                    allow_no_payment_method=True,
+                    allow_no_payment_method=False,
                     metadata={"orgId": body.orgId, "planKey": target_plan.key, "requestedByUid": user.uid},
                 )
             except StripeClientError as retry_exc:
@@ -672,6 +680,18 @@ def create_portal_session(
     billing, refs_changed = _normalize_billing_refs(billing=billing)
     if refs_changed:
         billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+
+    try:
+        billing = _hydrate_billing_from_stripe(
+            org_id=body.orgId,
+            billing=billing,
+            force_refresh=True,
+        )
+    except StripeClientError as exc:
+        logger.warning("stripe_portal_sync_failed org=%s: %s", body.orgId, exc)
+        raise HTTPException(status_code=502, detail="stripe_sync_failed") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "billing_status_sync_failed") from exc
 
     client = _stripe_client()
     customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
@@ -779,6 +799,7 @@ def change_plan(
         except StripeClientError as exc:
             logger.warning("change_plan_upgrade_failed org=%s: %s", body.orgId, exc)
             raise HTTPException(status_code=502, detail="stripe_update_failed") from exc
+        _send_billing_email("plan_changed", org_id=body.orgId, plan_key=target_plan.key, old_plan_key=current_plan_key, effective="immediate")
         return {"ok": True, "effective": "immediate", "pendingPlanKey": None, "pendingPlanDate": None}
 
     # Downgrade: create subscription schedule for period end
@@ -810,11 +831,13 @@ def change_plan(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
 
+    effective_iso = period_end_dt.isoformat()
+    _send_billing_email("plan_changed", org_id=body.orgId, plan_key=target_plan.key, old_plan_key=current_plan_key, effective=effective_iso)
     return {
         "ok": True,
-        "effective": period_end_dt.isoformat(),
+        "effective": effective_iso,
         "pendingPlanKey": target_plan.key,
-        "pendingPlanDate": period_end_dt.isoformat(),
+        "pendingPlanDate": effective_iso,
     }
 
 
@@ -959,6 +982,12 @@ async def stripe_webhook(
             next_billing["trialEndsAt"] = None
             stripe_status = "canceled"
             _send_billing_email("subscription_canceled", org_id=org_id)
+        elif event_type == "customer.subscription.updated":
+            # Send cancellation email immediately when user sets cancel_at_period_end=true
+            # (e.g. via Customer Portal). The subscription.deleted event fires much later.
+            just_set_cancel = bool(payload_obj.get("cancel_at_period_end")) and not bool(billing.get("cancelAtPeriodEnd"))
+            if just_set_cancel:
+                _send_billing_email("subscription_canceled", org_id=org_id)
         if stripe_status == "past_due":
             if not next_billing.get("graceEndsAt"):
                 next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))

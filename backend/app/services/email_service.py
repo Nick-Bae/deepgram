@@ -436,6 +436,62 @@ def send_soft_cap_reached_email(
     )
 
 
+def send_plan_changed_email(
+    *,
+    admin_emails: List[str],
+    org_name: str,
+    old_plan_key: str,
+    new_plan_key: str,
+    effective: str,  # "immediate" or ISO date string
+) -> None:
+    """Sent when a user upgrades or downgrades their plan."""
+    if not admin_emails:
+        return
+    brand = _brand()
+    old_label = old_plan_key.capitalize()
+    new_label = new_plan_key.capitalize()
+    upgrading = effective == "immediate"
+    dashboard_url = _app_url() + "/host" if _app_url() else ""
+
+    if upgrading:
+        heading = f"Plan upgraded to {new_label}"
+        body = (
+            f"<p>Your <strong>{brand}</strong> plan for <strong>{org_name}</strong> "
+            f"has been upgraded from <strong>{old_label}</strong> to <strong>{new_label}</strong>.</p>"
+            f"<p>The change is effective immediately and new features are available now.</p>"
+            + (_btn("Go to Dashboard", dashboard_url) if dashboard_url else "")
+        )
+        text_lines = [
+            f"Plan upgraded to {new_label} — {org_name}",
+            "",
+            f"Your {brand} plan for {org_name} has been upgraded from {old_label} to {new_label}.",
+            "The change is effective immediately.",
+        ]
+        subject = f"{org_name} — plan upgraded to {new_label}"
+        tag = "plan-upgraded"
+    else:
+        heading = f"Plan change scheduled: {new_label}"
+        body = (
+            f"<p>Your <strong>{brand}</strong> plan for <strong>{org_name}</strong> "
+            f"is scheduled to change from <strong>{old_label}</strong> to <strong>{new_label}</strong> "
+            f"at the end of your current billing period ({effective}).</p>"
+            f"<p>You can cancel this change from the Billing tab before it takes effect.</p>"
+            + (_btn("Manage Billing", dashboard_url) if dashboard_url else "")
+        )
+        text_lines = [
+            f"Plan change scheduled — {org_name}",
+            "",
+            f"Your {brand} plan for {org_name} will change from {old_label} to {new_label} on {effective}.",
+            "You can cancel this change from the Billing tab.",
+        ]
+        subject = f"{org_name} — plan change scheduled to {new_label}"
+        tag = "plan-downgraded"
+
+    html = _layout(heading=heading, body_html=body)
+    text = "\n".join(text_lines + ["", "Thanks,", brand])
+    _send(to=admin_emails, subject=subject, html=html, text=text, tag=tag)
+
+
 def send_payment_recovered_email(
     *,
     admin_emails: List[str],
