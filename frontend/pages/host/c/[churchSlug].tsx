@@ -8,6 +8,8 @@ import TranslationBox from "../../../components/TranslationBox";
 import { useAuth } from "../../../lib/authContext";
 import { getFirebaseClient } from "../../../lib/firebaseClient";
 import {
+  changePlan,
+  cancelPendingDowngrade,
   createBillingCheckoutSession,
   createBillingPortalSession,
   createOrgService,
@@ -304,6 +306,8 @@ export default function HostChurchPage() {
   const [billingCheckoutBusy, setBillingCheckoutBusy] = useState(false);
   const [billingPortalBusy, setBillingPortalBusy] = useState(false);
   const [billingRefreshBusy, setBillingRefreshBusy] = useState(false);
+  const [billingChangePlanBusy, setBillingChangePlanBusy] = useState(false);
+  const [billingCancelDowngradeBusy, setBillingCancelDowngradeBusy] = useState(false);
   const [billingError, setBillingError] = useState<string | null>(null);
   const [billingNotice, setBillingNotice] = useState<string | null>(null);
   const [trialBroadcastNotice, setTrialBroadcastNotice] = useState<string | null>(null);
@@ -376,6 +380,9 @@ export default function HostChurchPage() {
   const trialNoticeCheckpointRef = useRef<"" | "warn5" | "warn1" | "expired">("");
   const hasPaidPlan = PAID_PLAN_KEYS.includes(billingPlanToken as PaidPlanKey);
   const hasActiveLikeSubscription = billingStatusToken === "active" || billingStatusToken === "trialing" || billingStatusToken === "past_due";
+  const hasActiveSubscription = (billingStatusToken === "active" || billingStatusToken === "past_due") && hasPaidPlan && Boolean(billingProfile?.stripeSubscriptionId);
+  const pendingPlanKey = (billingProfile?.pendingPlanKey || "").trim().toLowerCase() as PaidPlanKey | "";
+  const pendingPlanDate = billingProfile?.pendingPlanDate || null;
   const billingNeedsAttention = isTrialExpired || ["past_due", "canceled", "unpaid", "incomplete"].includes(billingStatusToken);
   const billingAlertMessage = isTrialExpired
     ? "Trial access has ended. Review billing before the next broadcast."
@@ -1328,6 +1335,51 @@ export default function HostChurchPage() {
       setBillingError(message || "Failed to open Stripe billing portal.");
     } finally {
       setBillingPortalBusy(false);
+    }
+  };
+
+  const handleChangePlan = async () => {
+    if (!resolvedOrgId || !canManagePaidBilling || !selectedPlan) return;
+    setBillingChangePlanBusy(true);
+    setBillingError(null);
+    setBillingNotice(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const result = await changePlan(idToken, { orgId: resolvedOrgId, targetPlanKey: selectedPlan });
+      if (result.effective === "immediate") {
+        setBillingNotice(`Plan changed to ${PLAN_SUMMARIES[selectedPlan].title} immediately.`);
+      } else {
+        const dateStr = result.pendingPlanDate ? new Date(result.pendingPlanDate).toLocaleDateString() : "end of billing period";
+        setBillingNotice(`Downgrade to ${PLAN_SUMMARIES[selectedPlan].title} scheduled for ${dateStr}.`);
+      }
+      void loadBillingProfile({ refresh: true });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setBillingError(message || "Failed to change plan.");
+    } finally {
+      setBillingChangePlanBusy(false);
+    }
+  };
+
+  const handleCancelDowngrade = async () => {
+    if (!resolvedOrgId || !canManagePaidBilling) return;
+    setBillingCancelDowngradeBusy(true);
+    setBillingError(null);
+    setBillingNotice(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      await cancelPendingDowngrade(idToken, { orgId: resolvedOrgId });
+      setBillingNotice("Scheduled downgrade has been cancelled. Your current plan continues.");
+      void loadBillingProfile({ refresh: true });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setBillingError(message || "Failed to cancel downgrade.");
+    } finally {
+      setBillingCancelDowngradeBusy(false);
     }
   };
 
@@ -2902,21 +2954,72 @@ export default function HostChurchPage() {
                     })}
                   </div>
 
-                  {canManagePaidBilling ? (
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  {pendingPlanKey && canManagePaidBilling ? (
+                    <div style={{
+                      padding: "12px 16px",
+                      background: "rgba(224,163,86,0.12)",
+                      border: "1px solid rgba(224,163,86,0.35)",
+                      borderRadius: 6,
+                      display: "flex",
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                      gap: 12,
+                    }}>
+                      <span style={{ fontSize: 13, color: "#9c6b1e", flex: 1 }}>
+                        Downgrade to <strong>{PLAN_SUMMARIES[pendingPlanKey as PaidPlanKey]?.title ?? pendingPlanKey}</strong> scheduled
+                        {pendingPlanDate ? ` for ${new Date(pendingPlanDate).toLocaleDateString()}` : " at period end"}.
+                      </span>
                       <button
-                        onClick={openUpgradeCheckout}
-                        disabled={billingCheckoutBusy || !resolvedOrgId || !selectedPlan}
+                        onClick={() => { void handleCancelDowngrade(); }}
+                        disabled={billingCancelDowngradeBusy}
                         style={{
-                          ...settingsButtonPrimaryStyle,
-                          opacity: billingCheckoutBusy || !resolvedOrgId || !selectedPlan ? 0.6 : 1,
-                          cursor: billingCheckoutBusy || !resolvedOrgId || !selectedPlan ? "not-allowed" : "pointer",
+                          ...settingsButtonNeutralStyle,
+                          fontSize: 12,
+                          padding: "6px 12px",
+                          opacity: billingCancelDowngradeBusy ? 0.6 : 1,
+                          cursor: billingCancelDowngradeBusy ? "not-allowed" : "pointer",
                         }}
                       >
-                        {billingCheckoutBusy ? "Opening Checkout..." : selectedPlan ? `Open Checkout for ${PLAN_SUMMARIES[selectedPlan].title}` : "Select a plan above"}
+                        {billingCancelDowngradeBusy ? "Cancelling..." : "Cancel Downgrade"}
                       </button>
+                    </div>
+                  ) : null}
+
+                  {canManagePaidBilling ? (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                      {hasActiveSubscription ? (
+                        <button
+                          onClick={() => { void handleChangePlan(); }}
+                          disabled={billingChangePlanBusy || !resolvedOrgId || !selectedPlan || billingPlanToken === selectedPlan}
+                          style={{
+                            ...settingsButtonPrimaryStyle,
+                            opacity: billingChangePlanBusy || !resolvedOrgId || !selectedPlan || billingPlanToken === selectedPlan ? 0.6 : 1,
+                            cursor: billingChangePlanBusy || !resolvedOrgId || !selectedPlan || billingPlanToken === selectedPlan ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          {billingChangePlanBusy
+                            ? "Changing Plan..."
+                            : !selectedPlan
+                              ? "Select a plan above"
+                              : billingPlanToken === selectedPlan
+                                ? "Already on this plan"
+                                : `Switch to ${PLAN_SUMMARIES[selectedPlan].title}`}
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => { void openUpgradeCheckout(); }}
+                          disabled={billingCheckoutBusy || !resolvedOrgId || !selectedPlan}
+                          style={{
+                            ...settingsButtonPrimaryStyle,
+                            opacity: billingCheckoutBusy || !resolvedOrgId || !selectedPlan ? 0.6 : 1,
+                            cursor: billingCheckoutBusy || !resolvedOrgId || !selectedPlan ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          {billingCheckoutBusy ? "Opening Checkout..." : selectedPlan ? `Subscribe to ${PLAN_SUMMARIES[selectedPlan].title}` : "Select a plan above"}
+                        </button>
+                      )}
                       <button
-                        onClick={openBillingPortal}
+                        onClick={() => { void openBillingPortal(); }}
                         disabled={billingPortalBusy || !resolvedOrgId}
                         style={{
                           ...settingsButtonNeutralStyle,
@@ -2924,17 +3027,17 @@ export default function HostChurchPage() {
                           cursor: billingPortalBusy || !resolvedOrgId ? "not-allowed" : "pointer",
                         }}
                       >
-                        {billingPortalBusy ? "Opening Portal..." : "Open Stripe Billing Portal"}
+                        {billingPortalBusy ? "Opening Portal..." : "Manage Billing"}
                       </button>
                       <button
                         onClick={() => {
                           void loadBillingProfile({ refresh: true });
                         }}
-                        disabled={billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId}
+                        disabled={billingPortalBusy || billingCheckoutBusy || billingChangePlanBusy || billingRefreshBusy || !resolvedOrgId}
                         style={{
                           ...settingsButtonNeutralStyle,
-                          opacity: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? 0.6 : 1,
-                          cursor: billingPortalBusy || billingCheckoutBusy || billingRefreshBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                          opacity: billingPortalBusy || billingCheckoutBusy || billingChangePlanBusy || billingRefreshBusy || !resolvedOrgId ? 0.6 : 1,
+                          cursor: billingPortalBusy || billingCheckoutBusy || billingChangePlanBusy || billingRefreshBusy || !resolvedOrgId ? "not-allowed" : "pointer",
                         }}
                       >
                         {billingRefreshBusy ? "Refreshing..." : "Refresh Billing"}
