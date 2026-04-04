@@ -293,6 +293,40 @@ def _normalize_org_billing(org: Dict[str, Any], *, now: datetime) -> Dict[str, A
     )
 
 
+def _apply_bootstrap_org_defaults(
+    org: Dict[str, Any],
+    *,
+    slug: str,
+    name: str,
+    host_token: str,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Backfill a newly created or orphaned org document with required defaults."""
+    next_org = dict(org or {})
+    next_org["slug"] = slug
+    next_org["name"] = name
+    next_org["plan"] = _status_token(next_org.get("plan")) or "trial"
+    next_org["status"] = _status_token(next_org.get("status")) or "active"
+    next_org["billing"] = _normalize_billing_state(next_org.get("billing"), plan_key=str(next_org.get("plan") or "trial"), now=now)
+    next_org["maxMinutesPerMonth"] = _safe_int(next_org.get("maxMinutesPerMonth"), 500) or 500
+    next_org["currentMonthMinutes"] = _safe_int(next_org.get("currentMonthMinutes"), 0)
+    next_org["currentMonthKey"] = _clean_token(next_org.get("currentMonthKey")) or _yyyymm(now)
+    next_org["maxConcurrentRooms"] = _safe_int(next_org.get("maxConcurrentRooms"), 1) or 1
+    next_org["billingLimitsEnabled"] = bool(next_org.get("billingLimitsEnabled", True))
+    next_org["hardCapReached"] = bool(next_org.get("hardCapReached", False))
+    if not _clean_token(next_org.get("sermonPrepBudgetUsd")):
+        next_org["sermonPrepBudgetUsd"] = float(SERMON_PREP_DEFAULT_BUDGET_USD)
+    if not _clean_token(next_org.get("hostToken")):
+        next_org["hostToken"] = host_token
+    if not isinstance(next_org.get("customPrompt"), str):
+        next_org["customPrompt"] = ""
+    if not isinstance(next_org.get("servicePrompt"), str):
+        next_org["servicePrompt"] = ""
+    next_org.setdefault("createdAt", now)
+    next_org["updatedAt"] = now
+    return next_org
+
+
 def _billing_max_service_keys(billing: Dict[str, Any]) -> int:
     limits = billing.get("limits")
     if not isinstance(limits, dict):
@@ -2134,8 +2168,65 @@ class InMemoryMultiChurchStore:
                     "services": [],
                 }
 
-            if slug in self._slug_to_org:
-                raise ValueError("slug_taken")
+            now = _utcnow()
+            existing_org_id = self._slug_to_org.get(slug)
+            if existing_org_id:
+                has_members = any(org_id == existing_org_id for (org_id, _member_uid) in self._members.keys())
+                if has_members:
+                    raise ValueError("slug_taken")
+                org_id = existing_org_id
+                self._orgs[org_id] = _apply_bootstrap_org_defaults(
+                    self._orgs.get(org_id, {}),
+                    slug=slug,
+                    name=clean_name,
+                    host_token=host_token,
+                    now=now,
+                )
+                self._members[(org_id, clean_uid)] = {
+                    "role": "owner",
+                    "email": _clean_token(owner_email),
+                    "displayName": _clean_token(owner_display_name),
+                    "createdAt": now,
+                    "updatedAt": now,
+                }
+                self._users[clean_uid] = {
+                    "email": _clean_token(owner_email),
+                    "displayName": _clean_token(owner_display_name),
+                    "currentOrgId": org_id,
+                    "updatedAt": now,
+                }
+                service_rows: List[Dict[str, str]] = []
+                existing_service_rows = [
+                    {
+                        "serviceKey": service_key,
+                        "title": str((service or {}).get("title") or service_key),
+                    }
+                    for (service_org_id, service_key), service in self._services.items()
+                    if service_org_id == org_id
+                ]
+                if existing_service_rows:
+                    service_rows.extend(sorted(existing_service_rows, key=lambda row: row["serviceKey"]))
+                else:
+                    for service_key, title in DEFAULT_SERVICE_SEEDS:
+                        self._services[(org_id, service_key)] = {
+                            "title": title,
+                            "timezone": tz,
+                            "rrule": None,
+                            "defaultLanguagePair": {"source": src, "target": tgt},
+                            "activeRoomId": None,
+                            "lastRoomId": None,
+                            "updatedAt": now,
+                        }
+                        service_rows.append({"serviceKey": service_key, "title": title})
+                return {
+                    "created": True,
+                    "orgId": org_id,
+                    "slug": slug,
+                    "name": self._orgs[org_id]["name"],
+                    "role": "owner",
+                    "hostToken": self._orgs[org_id].get("hostToken"),
+                    "services": service_rows,
+                }
 
             org_id = slug
             if org_id in self._orgs:
@@ -2144,26 +2235,7 @@ class InMemoryMultiChurchStore:
                     suffix += 1
                 org_id = f"{slug}-{suffix}"
 
-            now = _utcnow()
-            self._orgs[org_id] = {
-                "slug": slug,
-                "name": clean_name,
-                "plan": "trial",
-                "status": "active",
-                "billing": _default_billing_state(now=now, plan_key="trial"),
-                "maxMinutesPerMonth": 500,
-                "currentMonthMinutes": 0,
-                "currentMonthKey": _yyyymm(now),
-                "maxConcurrentRooms": 1,
-                "billingLimitsEnabled": True,
-                "hardCapReached": False,
-                "sermonPrepBudgetUsd": float(SERMON_PREP_DEFAULT_BUDGET_USD),
-                "hostToken": host_token,
-                "customPrompt": "",
-                "servicePrompt": "",
-                "createdAt": now,
-                "updatedAt": now,
-            }
+            self._orgs[org_id] = _apply_bootstrap_org_defaults({}, slug=slug, name=clean_name, host_token=host_token, now=now)
             self._slug_to_org[slug] = org_id
             self._members[(org_id, clean_uid)] = {
                 "role": "owner",

@@ -224,30 +224,11 @@ export default function SignupPage() {
   };
 
   const onGoogleSignup = async () => {
-    // If church name is not filled in, do Google auth first then redirect to the
-    // dedicated church setup page (/onboarding/create-church) for a two-step flow.
-    if (!inviteJoinFlow && !churchName.trim()) {
-      setErrorMsg(null);
-      setBusy(true);
-      try {
-        const authUser = await loginWithGoogle();
-        const token = await authUser.getIdToken(true);
-        persistAuthToken(token);
-        await router.replace("/onboarding/create-church");
-      } catch (err) {
-        setErrorMsg(mapFirebaseError(err));
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
     await runSignupFlow(() => loginWithGoogle());
   };
 
   const slugBlocked = !inviteJoinFlow && (!normalizedSlug || slugAvailabilityBusy || slugAvailable === false);
-  // Google button is only blocked by slug issues when the user has already started filling in church name.
-  // If church name is empty, Google auth proceeds and redirects to /onboarding/create-church.
-  const googleSignupDisabled = !configured || busy || (!inviteJoinFlow && !!churchName.trim() && slugBlocked);
+  const googleSignupDisabled = !configured || busy || slugBlocked;
 
   return (
     <StudioAccessLayout
