@@ -31,7 +31,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 # --- local modules (single import each) ---
 from app.socket_manager import manager
-from app.deepgram_session import connect_to_deepgram
+from app.deepgram_session import connect_to_deepgram, _build_keyterm_list, _build_replace_list, DG_DEBUG
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
 from app.utils.translate import _preprocess_source_text, translate_text, TranslationContext  # async wrapper you already have
@@ -40,6 +40,7 @@ from app.routes import translate as translate_routes  # your existing REST route
 from app.routes import examples as examples_routes
 from app.routes import script as script_routes
 from app.routes import prompt as prompt_routes
+from app.routes import stt_keyterms as stt_keyterms_routes
 from app.routes import multichurch as multichurch_routes
 from app.routes import auth as auth_routes
 from app.routes import billing as billing_routes
@@ -287,6 +288,7 @@ app.include_router(translate_routes.router, prefix="/api")
 app.include_router(examples_routes.router, prefix="/api")
 app.include_router(script_routes.router, prefix="/api")
 app.include_router(prompt_routes.router, prefix="/api")
+app.include_router(stt_keyterms_routes.router, prefix="/api")
 app.include_router(multichurch_routes.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
 app.include_router(billing_routes.router, prefix="/api")
@@ -1358,7 +1360,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     host_token_claim = ctx.get("hostToken")
     early_commit = str(websocket.query_params.get("early") or websocket.query_params.get("early_commit") or "").lower() in {"1", "true", "yes", "on"}
     dg_language = _deepgram_language_preference(src_lang_full)
-    dg_keywords = None if src_lang.startswith("ko") else []
+    # dg_keywords is resolved after auth + websocket accept (needs org/room context)
 
     # Reject BEFORE accepting — prevents establishing Deepgram/OpenAI sessions
     # for unauthenticated callers and eliminates accept-then-close race.
@@ -1399,8 +1401,29 @@ async def ws_stt_deepgram(websocket: WebSocket):
         silence_commit_ms=ENV.SILENCE_COMMIT_MS,
         max_precommit_tokens=ENV.MAX_PRECOMMIT_TOKENS,
     ) if early_commit and src_lang.startswith("ko") else None
+    # Build merged keyterm list from all 3 tiers (Korean only)
+    if src_lang.startswith("ko"):
+        _org_keyterms = multichurch_store.get_org_stt_keyterms_for_session(org_id)
+        # Tier 2a: glossary terms first (curated recurring sermon vocab), then broader set
+        _glossary_ko  = [ko for ko, _ in script_store.get_keyword_glossary(room_id=room_id)] if room_id else []
+        _vocab_rest   = list(script_store.get_vocab_set(room_id=room_id)) if room_id else []
+        _sermon_vocab = _glossary_ko + [t for t in _vocab_rest if t not in set(_glossary_ko)]
+        dg_keywords = _build_keyterm_list(
+            org_custom=_org_keyterms,
+            sermon_vocab=_sermon_vocab,
+        )
+        if DG_DEBUG:
+            print(f"[DG] session keyterms: {len(dg_keywords)} total "
+                  f"(org_custom={len(_org_keyterms)}, glossary={len(_glossary_ko)}, sermon={len(_sermon_vocab)})")
+        # Replace: org corrections first, then built-in defaults
+        _org_replacements = multichurch_store.get_org_stt_replacements_for_session(org_id)
+        dg_replacements = _build_replace_list(org_custom=_org_replacements)
+    else:
+        dg_keywords = []
+        dg_replacements = []
+
     try:
-        dg = await connect_to_deepgram(language=dg_language, keywords=dg_keywords)  # <-- dg is created here
+        dg = await connect_to_deepgram(language=dg_language, keywords=dg_keywords, replacements=dg_replacements)
     except Exception as e:
         await websocket.send_json({"type": "error", "message": f"Deepgram connect failed: {e}"})
         await websocket.close()

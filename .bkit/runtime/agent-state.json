@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "enabled": true,
+  "teamName": "",
+  "feature": "frontend",
+  "pdcaPhase": "do",
+  "orchestrationPattern": "leader",
+  "ctoAgent": "opus",
+  "startedAt": "2026-04-04T23:57:15.725Z",
+  "lastUpdated": "2026-04-04T23:57:15.726Z",
+  "teammates": [
+    {
+      "name": "a26f220849275575e",
+      "role": "bkit:gap-detector",
+      "model": "sonnet",
+      "status": "spawning",
+      "currentTask": null,
+      "taskId": null,
+      "startedAt": "2026-04-04T23:57:15.726Z",
+      "lastActivityAt": "2026-04-04T23:57:15.726Z"
+    }
+  ],
+  "progress": {
+    "totalTasks": 0,
+    "completedTasks": 0,
+    "inProgressTasks": 0,
+    "failedTasks": 0,
+    "pendingTasks": 0
+  },
+  "recentMessages": [],
+  "sessionId": "99b4221d-1047-4c10-b159-300e90e42457"
+}

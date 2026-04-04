@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import websockets
 from websockets import legacy as ws_legacy  # fallback for websockets<=13
 
-from app.config.deepgram_keywords import DEFAULT_DEEPGRAM_KEYWORDS
+from app.config.deepgram_keywords import DEFAULT_DEEPGRAM_KEYWORDS, DEFAULT_DEEPGRAM_REPLACEMENTS
 
 load_dotenv()
 
@@ -34,7 +34,7 @@ DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 1500, min_value=200, max_value=6000)
 DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 1000, min_value=300, max_value=6000)
 _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
-DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 60, min_value=0, max_value=200)
+DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 100, min_value=0, max_value=200)
 DG_DEBUG    = os.getenv("DEEPGRAM_DEBUG", "0") not in ("0", "", "false", "False")
 
 _KEYWORD_FILE_ENV = os.getenv("DEEPGRAM_KEYWORDS_FILE")
@@ -118,6 +118,80 @@ def _current_keywords() -> List[str]:
     return items
 
 
+def _build_keyterm_list(
+    org_custom: Optional[List[str]] = None,
+    sermon_vocab: Optional[List[str]] = None,
+    limit: int = 100,
+) -> List[str]:
+    """
+    Merge keyterm tiers (priority: org_custom > sermon_vocab > defaults).
+    Returns a deduplicated list up to `limit` items.
+
+    Tier 1 — org_custom:   per-church terms (pastor name, series title, etc.)
+    Tier 2 — sermon_vocab: Korean tokens extracted from today's sermon script
+    Tier 3 — defaults:     _current_keywords() (worship terms + all 66 Bible books)
+    """
+    seen: set = set()
+    result: List[str] = []
+
+    def _add(terms: List[str]) -> None:
+        for t in terms:
+            t = (t or "").strip()
+            if not t:
+                continue
+            # Dedup on the bare term only (strip any :boost suffix)
+            bare = t.partition(":")[0].strip().lower()
+            if not bare:
+                continue
+            if bare not in seen and len(result) < limit:
+                seen.add(bare)
+                result.append(t)
+
+    _add(org_custom or [])
+    _add(sermon_vocab or [])
+    _add(_current_keywords())
+
+    if DG_DEBUG:
+        print(f"[DG] _build_keyterm_list: {len(result)} total "
+              f"(org={len(org_custom or [])}, sermon={len(sermon_vocab or [])}, "
+              f"defaults up to {limit - len(org_custom or []) - len(sermon_vocab or [])})")
+    return result
+
+
+def _build_replace_list(
+    org_custom: Optional[List[Tuple[str, str]]] = None,
+    limit: int = 200,
+) -> List[Tuple[str, str]]:
+    """
+    Merge replace tiers (priority: org_custom > defaults).
+    Dedup on the 'find' key (lowercased). Returns list of (find, replacement) tuples.
+
+    Tier 1 — org_custom:  per-church corrections (admin-defined)
+    Tier 2 — defaults:    DEFAULT_DEEPGRAM_REPLACEMENTS (known nova-3 patterns)
+    """
+    seen: set = set()
+    result: List[Tuple[str, str]] = []
+
+    def _add(pairs: List[Tuple[str, str]]) -> None:
+        for find, replacement in pairs:
+            find = (find or "").strip()
+            replacement = (replacement or "").strip()
+            if not find:
+                continue
+            key = find.lower()
+            if key not in seen and len(result) < limit:
+                seen.add(key)
+                result.append((find, replacement))
+
+    _add(org_custom or [])
+    _add(DEFAULT_DEEPGRAM_REPLACEMENTS)
+
+    if DG_DEBUG:
+        print(f"[DG] _build_replace_list: {len(result)} pairs "
+              f"(org={len(org_custom or [])}, defaults={len(DEFAULT_DEEPGRAM_REPLACEMENTS)})")
+    return result
+
+
 def _qs(
     model: str,
     language: str,
@@ -125,6 +199,7 @@ def _qs(
     keywords: Optional[List[str]],
     endpointing_ms: Optional[int],
     utter_end_ms: Optional[int],
+    replacements: Optional[List[Tuple[str, str]]] = None,
 ) -> str:
     params: List[Tuple[str, str]] = [
         ("model", model),
@@ -154,6 +229,11 @@ def _qs(
         for term, _ in normalized_keywords:
             params.append(("keyterm", term))
 
+    # Find-and-replace: post-processing corrections (nova-3, not Flux)
+    if replacements:
+        for find, replacement in replacements:
+            params.append(("replace", f"{find}:{replacement}"))
+
     return urlencode(params, doseq=True)
 
 async def connect_to_deepgram(
@@ -161,6 +241,7 @@ async def connect_to_deepgram(
     language: Optional[str] = None,
     keywords: Optional[List[str]] = None,
     sample_rate: int = 48000,
+    replacements: Optional[List[Tuple[str, str]]] = None,
 ):
     if not DG_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY not set")
@@ -173,7 +254,7 @@ async def connect_to_deepgram(
     if lg and not str(lg).lower().startswith("ko"):
         kw = []
 
-    url = f"{DG_ENDPOINT}?{_qs(m, lg, sample_rate, kw, DG_ENDPOINTING_MS, DG_UTTER_END_MS)}"
+    url = f"{DG_ENDPOINT}?{_qs(m, lg, sample_rate, kw, DG_ENDPOINTING_MS, DG_UTTER_END_MS, replacements)}"
 
     headers = {"Authorization": f"Token {DG_KEY}"}
     if DG_DEBUG:

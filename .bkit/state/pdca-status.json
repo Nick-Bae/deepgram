@@ -1,6 +1,6 @@
 {
   "version": "3.0",
-  "lastUpdated": "2026-04-04T21:30:53.312Z",
+  "lastUpdated": "2026-04-04T23:52:52.905Z",
   "activeFeatures": [
     "billing",
     "admin",
@@ -17,7 +17,9 @@
     "multichurch_store.py",
     "script_store.py",
     "sermon-service-isolation",
-    "translator"
+    "translator",
+    "config",
+    "deepgram-keyterms"
   ],
   "primaryFeature": "frontend",
   "features": {
@@ -71,9 +73,9 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T20:38:50.121Z",
-        "lastUpdated": "2026-04-04T21:29:57.179Z"
+        "lastUpdated": "2026-04-04T23:51:22.543Z"
       },
-      "lastFile": "/home/namju/project/real-time-translation/backend/app/routes/billing.py"
+      "lastFile": "/home/namju/project/real-time-translation/backend/app/routes/stt_keyterms.py"
     },
     "frontend": {
       "phase": "do",
@@ -84,9 +86,9 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T21:11:56.820Z",
-        "lastUpdated": "2026-04-04T21:30:04.526Z"
+        "lastUpdated": "2026-04-04T23:52:52.905Z"
       },
-      "lastFile": "/home/namju/project/real-time-translation/frontend/lib/backendAuth.ts"
+      "lastFile": "/home/namju/project/real-time-translation/frontend/components/SttKeytermsEditor.tsx"
     },
     "c": {
       "phase": "do",
@@ -97,7 +99,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T21:12:40.289Z",
-        "lastUpdated": "2026-04-04T21:30:53.312Z"
+        "lastUpdated": "2026-04-04T23:05:43.165Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/frontend/pages/host/c/[churchSlug].tsx"
     },
@@ -162,9 +164,9 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-21T01:30:50.279Z",
-        "lastUpdated": "2026-03-27T13:12:48.262Z"
+        "lastUpdated": "2026-04-04T23:51:38.208Z"
       },
-      "lastFile": "/home/namju/project/real-time-translation/backend/app/utils/translate.py"
+      "lastFile": "/home/namju/project/real-time-translation/backend/app/main.py"
     },
     "s": {
       "phase": "do",
@@ -188,7 +190,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-21T13:52:20.230Z",
-        "lastUpdated": "2026-03-27T05:31:12.884Z"
+        "lastUpdated": "2026-04-04T23:50:48.405Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/backend/app/services/multichurch_store.py"
     },
@@ -231,6 +233,33 @@
         "lastUpdated": "2026-03-27T13:13:00.559Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/backend/app/translator/openai_translator.py"
+    },
+    "config": {
+      "phase": "do",
+      "phaseNumber": 3,
+      "matchRate": null,
+      "iterationCount": 0,
+      "requirements": [],
+      "documents": {},
+      "timestamps": {
+        "started": "2026-04-04T23:01:35.366Z",
+        "lastUpdated": "2026-04-04T23:49:28.866Z"
+      },
+      "lastFile": "/home/namju/project/real-time-translation/backend/app/config/deepgram_keywords.py"
+    },
+    "deepgram-keyterms": {
+      "phase": "act",
+      "phaseNumber": 5,
+      "matchRate": null,
+      "iterationCount": 0,
+      "requirements": [],
+      "documents": {},
+      "timestamps": {
+        "started": "2026-04-04T23:14:54.463Z",
+        "lastUpdated": "2026-04-04T23:14:54.463Z"
+      },
+      "previousPhase": "check",
+      "autoAdvanced": true
     }
   },
   "pipeline": {
@@ -241,7 +270,7 @@
   "session": {
     "startedAt": "2026-03-20T20:05:09.411Z",
     "onboardingCompleted": false,
-    "lastActivity": "2026-04-04T21:30:53.312Z"
+    "lastActivity": "2026-04-04T23:52:52.905Z"
   },
   "history": [
     {
@@ -3145,6 +3174,258 @@
     {
       "timestamp": "2026-04-04T21:30:53.312Z",
       "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:01:35.366Z",
+      "feature": "config",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:01:39.128Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:01:49.452Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:02:05.702Z",
+      "feature": "multichurch_store.py",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:02:16.818Z",
+      "feature": "multichurch_store.py",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:02:33.566Z",
+      "feature": "multichurch_store.py",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:02:44.987Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:02:55.072Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:02:58.057Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:03:07.889Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:03:12.809Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:03:19.558Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:03:31.757Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:04:03.977Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:05:19.594Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:05:26.515Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:05:43.165Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:06:21.161Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:14:31.632Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:14:54.463Z",
+      "feature": "deepgram-keyterms",
+      "phase": "act",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:49:20.334Z",
+      "feature": "config",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:49:28.866Z",
+      "feature": "config",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:49:32.811Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:49:46.174Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:49:49.751Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:49:53.168Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:49:56.949Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:50:04.749Z",
+      "feature": "multichurch_store.py",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:50:12.125Z",
+      "feature": "multichurch_store.py",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:50:30.035Z",
+      "feature": "multichurch_store.py",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:50:48.405Z",
+      "feature": "multichurch_store.py",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:51:22.543Z",
+      "feature": "routes",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:51:27.339Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:51:38.208Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:51:42.773Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:52:00.773Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:52:05.840Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:52:11.841Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:52:16.286Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:52:24.793Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:52:33.698Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-04T23:52:52.905Z",
+      "feature": "frontend",
       "phase": "do",
       "action": "updated"
     }
