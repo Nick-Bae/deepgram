@@ -35,7 +35,14 @@ def _sign_stripe_payload(payload: bytes, secret: str, *, timestamp: int | None =
 
 
 class _FakeStripeClient:
-    def create_customer(self, *, email: str | None, name: str | None, metadata: dict | None = None) -> dict:
+    def create_customer(
+        self,
+        *,
+        email: str | None,
+        name: str | None,
+        metadata: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
         return {"id": "cus_test_123", "email": email, "name": name, "metadata": metadata or {}}
 
     def create_checkout_session(
@@ -153,15 +160,16 @@ class BillingRouteTests(unittest.TestCase):
         billing = self.store.get_org_billing_profile(org_id=org_id)
         self.assertEqual(str(billing.get("stripeCustomerId") or ""), "cus_test_123")
 
-    def test_portal_session_requires_customer(self) -> None:
+    def test_portal_session_creates_customer_when_missing(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-billing-2", slug="billing-route-b", name="Billing Route B")
-        with self.assertRaises(HTTPException) as ctx:
-            billing_routes.create_portal_session(
-                billing_routes.PortalSessionRequest(orgId=org_id, returnUrl="https://example.com/settings"),
-                user=self._user("owner-billing-2"),
-            )
-        self.assertEqual(ctx.exception.status_code, 404)
-        self.assertEqual(ctx.exception.detail, "billing_customer_not_found")
+        result = billing_routes.create_portal_session(
+            billing_routes.PortalSessionRequest(orgId=org_id, returnUrl="https://example.com/settings"),
+            user=self._user("owner-billing-2"),
+        )
+        self.assertIn("url", result)
+        self.assertIn("cus_test_123", str(result.get("url") or ""))
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(str(billing.get("stripeCustomerId") or ""), "cus_test_123")
 
     def test_portal_session_sanitizes_saved_customer_id(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-billing-2a", slug="billing-route-b1", name="Billing Route B1")
@@ -186,7 +194,7 @@ class BillingRouteTests(unittest.TestCase):
         updated = self.store.get_org_billing_profile(org_id=org_id)
         self.assertEqual(str(updated.get("stripeCustomerId") or ""), "cus_test_portal")
 
-    def test_portal_session_clears_stale_customer_refs_on_missing_customer(self) -> None:
+    def test_portal_session_recreates_stale_customer_and_returns_url(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-billing-2aa", slug="billing-route-b1a", name="Billing Route B1A")
         billing = self.store.get_org_billing_profile(org_id=org_id)
         billing["stripeCustomerId"] = "cus_test_mode_mismatch`"
@@ -194,22 +202,33 @@ class BillingRouteTests(unittest.TestCase):
         self.store.set_org_billing_profile(org_id=org_id, billing=billing)
 
         class _MissingPortalCustomerStripeClient(_FakeStripeClient):
+            def create_customer(
+                self,
+                *,
+                email: str | None,
+                name: str | None,
+                metadata: dict | None = None,
+                idempotency_key: str | None = None,
+            ) -> dict:
+                return {"id": "cus_test_retry_portal", "email": email, "name": name, "metadata": metadata or {}}
+
             def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> dict:
+                if customer_id == "cus_test_retry_portal":
+                    return super().create_billing_portal_session(customer_id=customer_id, return_url=return_url)
                 raise StripeClientError(
                     "stripe_http_400: No such customer 'cus_test_mode_mismatch' a similar object exists in test mode, but a live mode key was used"
                 )
 
         with patch.object(billing_routes, "_stripe_client", lambda: _MissingPortalCustomerStripeClient()):
-            with self.assertRaises(HTTPException) as ctx:
-                billing_routes.create_portal_session(
-                    billing_routes.PortalSessionRequest(orgId=org_id, returnUrl="https://example.com/settings"),
-                    user=self._user("owner-billing-2aa"),
-                )
+            result = billing_routes.create_portal_session(
+                billing_routes.PortalSessionRequest(orgId=org_id, returnUrl="https://example.com/settings"),
+                user=self._user("owner-billing-2aa"),
+            )
 
-        self.assertEqual(ctx.exception.status_code, 404)
-        self.assertEqual(ctx.exception.detail, "billing_customer_not_found")
+        self.assertIn("url", result)
+        self.assertIn("cus_test_retry_portal", str(result.get("url") or ""))
         updated = self.store.get_org_billing_profile(org_id=org_id)
-        self.assertIsNone(updated.get("stripeCustomerId"))
+        self.assertEqual(str(updated.get("stripeCustomerId") or ""), "cus_test_retry_portal")
         self.assertIsNone(updated.get("stripeSubscriptionId"))
 
     def test_checkout_session_recreates_customer_when_saved_customer_missing(self) -> None:
@@ -217,7 +236,14 @@ class BillingRouteTests(unittest.TestCase):
             def __init__(self) -> None:
                 self._customer_created_count = 0
 
-            def create_customer(self, *, email: str | None, name: str | None, metadata: dict | None = None) -> dict:
+            def create_customer(
+                self,
+                *,
+                email: str | None,
+                name: str | None,
+                metadata: dict | None = None,
+                idempotency_key: str | None = None,
+            ) -> dict:
                 self._customer_created_count += 1
                 return {"id": f"cus_test_retry_{self._customer_created_count}"}
 

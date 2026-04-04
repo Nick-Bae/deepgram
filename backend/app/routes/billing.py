@@ -246,6 +246,29 @@ def _clear_stale_stripe_refs(*, org_id: str, billing: Dict[str, Any]) -> Dict[st
     return multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
 
 
+def _create_missing_stripe_customer(
+    *,
+    client: StripeBillingClient,
+    org_id: str,
+    billing: Dict[str, Any],
+    user: AuthenticatedUser,
+    idempotency_suffix: str = "",
+) -> tuple[str, Dict[str, Any]]:
+    customer = client.create_customer(
+        email=user.email,
+        name=user.displayName,
+        metadata={"orgId": org_id, "createdByUid": user.uid},
+        idempotency_key=f"create-customer-{org_id}{idempotency_suffix}",
+    )
+    customer_id = _clean_customer_id((customer or {}).get("id"))
+    if not customer_id:
+        raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
+    next_billing = dict(billing or {})
+    next_billing["stripeCustomerId"] = customer_id
+    saved = multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
+    return customer_id, saved
+
+
 def _first_subscription_item(subscription: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     items = subscription.get("items")
     if not isinstance(items, dict):
@@ -579,17 +602,12 @@ def create_checkout_session(
     customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
     try:
         if not customer_id:
-            customer = client.create_customer(
-                email=user.email,
-                name=user.displayName,
-                metadata={"orgId": body.orgId, "createdByUid": user.uid},
-                idempotency_key=f"create-customer-{body.orgId}",
+            customer_id, billing = _create_missing_stripe_customer(
+                client=client,
+                org_id=body.orgId,
+                billing=billing,
+                user=user,
             )
-            customer_id = _clean_customer_id((customer or {}).get("id"))
-            if not customer_id:
-                raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
-            billing["stripeCustomerId"] = customer_id
-            multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
 
         session = client.create_checkout_session(
             customer_id=customer_id,
@@ -604,17 +622,13 @@ def create_checkout_session(
         # If the stored Stripe customer belongs to a different account/mode, recreate and retry once.
         if customer_id and _is_missing_customer_error(exc):
             try:
-                customer = client.create_customer(
-                    email=user.email,
-                    name=user.displayName,
-                    metadata={"orgId": body.orgId, "createdByUid": user.uid},
-                    idempotency_key=f"create-customer-retry-{body.orgId}",
+                customer_id, billing = _create_missing_stripe_customer(
+                    client=client,
+                    org_id=body.orgId,
+                    billing=billing,
+                    user=user,
+                    idempotency_suffix="-retry",
                 )
-                customer_id = _clean_customer_id((customer or {}).get("id"))
-                if not customer_id:
-                    raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
-                billing["stripeCustomerId"] = customer_id
-                multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
                 session = client.create_checkout_session(
                     customer_id=customer_id,
                     price_id=price_id,
@@ -659,18 +673,35 @@ def create_portal_session(
     if refs_changed:
         billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
 
+    client = _stripe_client()
     customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
-    if not customer_id:
-        raise HTTPException(status_code=404, detail="billing_customer_not_found")
-
     try:
-        session = _stripe_client().create_billing_portal_session(customer_id=customer_id, return_url=body.returnUrl)
+        if not customer_id:
+            customer_id, billing = _create_missing_stripe_customer(
+                client=client,
+                org_id=body.orgId,
+                billing=billing,
+                user=user,
+            )
+        session = client.create_billing_portal_session(customer_id=customer_id, return_url=body.returnUrl)
     except StripeClientError as exc:
         if _is_missing_customer_error(exc):
-            _clear_stale_stripe_refs(org_id=body.orgId, billing=billing)
-            raise HTTPException(status_code=404, detail="billing_customer_not_found") from exc
-        logger.warning("stripe_portal_failed org=%s: %s", body.orgId, exc)
-        raise HTTPException(status_code=502, detail="stripe_portal_failed") from exc
+            try:
+                refreshed_billing = _clear_stale_stripe_refs(org_id=body.orgId, billing=billing)
+                customer_id, billing = _create_missing_stripe_customer(
+                    client=client,
+                    org_id=body.orgId,
+                    billing=refreshed_billing,
+                    user=user,
+                    idempotency_suffix="-retry",
+                )
+                session = client.create_billing_portal_session(customer_id=customer_id, return_url=body.returnUrl)
+            except StripeClientError as retry_exc:
+                logger.warning("stripe_portal_failed (retry) org=%s: %s", body.orgId, retry_exc)
+                raise HTTPException(status_code=502, detail="stripe_portal_failed") from retry_exc
+        else:
+            logger.warning("stripe_portal_failed org=%s: %s", body.orgId, exc)
+            raise HTTPException(status_code=502, detail="stripe_portal_failed") from exc
 
     portal_url = _clean((session or {}).get("url"))
     if not portal_url:
@@ -860,18 +891,18 @@ async def stripe_webhook(
             raise HTTPException(status_code=400, detail=detail) from exc
         raise HTTPException(status_code=400, detail="invalid_webhook_event") from exc
     if not fresh:
-        return {"ok": True, "deduped": True}
+        return {"ok": True, "eventId": event_id, "deduped": True}
 
     org_id = _resolve_org_id_from_event(event_type, payload_obj)
     if not org_id:
-        return {"ok": True, "unmatched": True}
+        return {"ok": True, "eventId": event_id, "unmatched": True}
 
     try:
         billing = multichurch_store.get_org_billing_profile(org_id=org_id)
     except ValueError as exc:
         detail = str(exc)
         if detail == "org_not_found":
-            return {"ok": True, "unmatched": True}
+            return {"ok": True, "eventId": event_id, "unmatched": True}
         raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
 
     now = _utcnow()
@@ -963,4 +994,4 @@ async def stripe_webhook(
         multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
-    return {"ok": True}
+    return {"ok": True, "eventId": event_id}
