@@ -266,14 +266,20 @@ function SttKeytermsEditorLazy({
   getIdToken,
 }: {
   orgId: string;
-  getIdToken: (forceRefresh?: boolean) => Promise<string>;
+  getIdToken: (forceRefresh?: boolean) => Promise<string | null>;
 }) {
   const [idToken, setIdToken] = useState<string | null>(null);
   const [tokenError, setTokenError] = useState<string | null>(null);
 
   useEffect(() => {
     getIdToken()
-      .then(setIdToken)
+      .then((token) => {
+        if (!token) {
+          setTokenError("Authentication required.");
+          return;
+        }
+        setIdToken(token);
+      })
       .catch((e: unknown) =>
         setTokenError(e instanceof Error ? e.message : "Token error")
       );
