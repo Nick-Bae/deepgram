@@ -53,7 +53,7 @@ function GoogleMarkIcon() {
 
 export default function SignupPage() {
   const router = useRouter();
-  const { loginWithGoogle, signup, user, loading, configured, missingEnv } = useAuth();
+  const { signupWithGoogle, signup, user, loading, configured, missingEnv } = useAuth();
 
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -224,11 +224,23 @@ export default function SignupPage() {
   };
 
   const onGoogleSignup = async () => {
-    await runSignupFlow(() => loginWithGoogle());
+    if (!inviteJoinFlow && !churchName.trim() && !normalizedSlug) {
+      setBusy(true);
+      setErrorMsg(null);
+      try {
+        await signupWithGoogle();
+      } catch (err) {
+        setErrorMsg(mapFirebaseError(err));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+    await runSignupFlow(() => signupWithGoogle());
   };
 
   const slugBlocked = !inviteJoinFlow && (!normalizedSlug || slugAvailabilityBusy || slugAvailable === false);
-  const googleSignupDisabled = !configured || busy || slugBlocked;
+  const googleSignupDisabled = !configured || busy || (!inviteJoinFlow && Boolean(churchName.trim() || normalizedSlug) && slugBlocked);
 
   return (
     <StudioAccessLayout

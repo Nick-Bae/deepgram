@@ -112,8 +112,19 @@ python scripts/set_super_admin.py \
   --audit-log ./logs/god-mode-audit.jsonl \
   --yes
 
+# or resolve by email
+python scripts/set_super_admin.py \
+  --grant \
+  --email you@example.com \
+  --actor you@example.com \
+  --reason "on-call billing admin" \
+  --ticket SEC-123 \
+  --audit-log ./logs/god-mode-audit.jsonl \
+  --yes
+
 # check status
 python scripts/set_super_admin.py --status --uid your_firebase_uid
+python scripts/set_super_admin.py --status --email you@example.com
 
 # revoke
 python scripts/set_super_admin.py --revoke --uid your_firebase_uid --actor you@example.com --ticket SEC-123 --yes
@@ -134,7 +145,13 @@ NEXT_PUBLIC_FIREBASE_PROJECT_ID=...
 NEXT_PUBLIC_FIREBASE_APP_ID=...
 NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=...    # optional
 NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=...          # optional
+
+# Local-only convenience: bypass the host dashboard email verification gate.
+# Never set this in production.
+# NEXT_PUBLIC_SKIP_EMAIL_VERIFICATION=1
 ```
+
+When `NEXT_PUBLIC_SKIP_EMAIL_VERIFICATION=1`, local signup/login can access the host dashboard without clicking a verification link.
 
 ### Backend env for branded password reset emails
 

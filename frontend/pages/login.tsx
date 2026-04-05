@@ -39,6 +39,7 @@ function mapFirebaseError(err: unknown): string {
   if (code === "auth/popup-closed-by-user") return "Google sign-in was cancelled.";
   if (code === "auth/popup-blocked") return "Your browser blocked the Google sign-in popup. Please allow popups and try again.";
   if (code === "auth/operation-not-allowed") return "Google sign-in is not enabled for this Firebase project yet.";
+  if (code === "auth/google-signup-required") return "No Google account is registered here yet. Sign up first.";
   if (code === "auth/account-exists-with-different-credential") {
     return "An account already exists for this email with another sign-in method. Sign in with email and password first.";
   }
