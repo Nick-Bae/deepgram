@@ -7,7 +7,7 @@ import QRCode from "qrcode";
 import TranslationBox from "../../../components/TranslationBox";
 import SttKeytermsEditor from "../../../components/SttKeytermsEditor";
 import { useAuth } from "../../../lib/authContext";
-import { getFirebaseClient } from "../../../lib/firebaseClient";
+import { getFirebaseClient, skipEmailVerification } from "../../../lib/firebaseClient";
 import {
   changePlan,
   cancelPendingDowngrade,
@@ -568,7 +568,7 @@ export default function HostChurchPage() {
 
   useEffect(() => {
     if (authLoading || !user) return;
-    setVerificationRequired(!user.emailVerified);
+    setVerificationRequired(!skipEmailVerification && !user.emailVerified);
   }, [authLoading, user]);
 
   const handleResendVerification = useCallback(async () => {
@@ -2297,9 +2297,9 @@ export default function HostChurchPage() {
               <div style={{ width: 44, height: 44, borderRadius: 14, background: isBroadcastTab ? "linear-gradient(145deg, #d4b87a, #b88a52)" : "#2d3650", color: isBroadcastTab ? "#ffffff" : "#f1d35c", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 700, flexShrink: 0, boxShadow: isBroadcastTab ? "0 16px 30px rgba(184,154,94,0.24)" : "none" }}>
                 {currentChurchInitial}
               </div>
-              <div style={{ minWidth: 0 }}>
-                <div className="host-brand-name" style={{ fontSize: 18, fontWeight: 600, letterSpacing: "-0.03em", color: isBroadcastTab ? BC.cloud : "#151515", lineHeight: 1.1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const }}>{currentChurchLabel}</div>
-                <div style={{ marginTop: 4, fontSize: 10, letterSpacing: "0.34em", textTransform: "uppercase" as const, color: isBroadcastTab ? "rgba(242,243,244,0.52)" : "#6f655c" }}>
+              <div style={{ minWidth: 0, display: "flex", flexDirection: "column", justifyContent: "center", gap: 6 }}>
+                <div className="host-brand-name" style={{ fontSize: 18, fontWeight: 600, letterSpacing: "-0.03em", color: isBroadcastTab ? BC.cloud : "#151515", lineHeight: 1.22, paddingBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const }}>{currentChurchLabel}</div>
+                <div style={{ fontSize: 10, lineHeight: 1.15, letterSpacing: "0.34em", textTransform: "uppercase" as const, color: isBroadcastTab ? BC.mist : "#6f655c" }}>
                   {isBroadcastTab ? "Silent Studio" : "Translation Studio"}
                 </div>
               </div>

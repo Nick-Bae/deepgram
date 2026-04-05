@@ -2,6 +2,8 @@ import {
   GoogleAuthProvider,
   User,
   createUserWithEmailAndPassword,
+  deleteUser,
+  getAdditionalUserInfo,
   onAuthStateChanged,
   sendEmailVerification,
   signInWithEmailAndPassword,
@@ -11,7 +13,7 @@ import {
 } from "firebase/auth";
 import { ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
-import { firebaseConfigured, getFirebaseClient, missingFirebaseEnv } from "./firebaseClient";
+import { firebaseConfigured, getFirebaseClient, missingFirebaseEnv, skipEmailVerification } from "./firebaseClient";
 import { API_URL } from "../utils/urls";
 import { clearAuthToken, clearHostToken, clearStreamContext } from "../utils/streamContext";
 
@@ -23,6 +25,7 @@ type AuthContextValue = {
   getIdToken: (forceRefresh?: boolean) => Promise<string | null>;
   login: (email: string, password: string) => Promise<User>;
   loginWithGoogle: () => Promise<User>;
+  signupWithGoogle: () => Promise<User>;
   signup: (email: string, password: string, displayName?: string) => Promise<User>;
   updateDisplayName: (displayName: string) => Promise<User>;
   sendPasswordReset: (email: string) => Promise<void>;
@@ -32,6 +35,12 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 type Props = { children: ReactNode };
+
+function authError(code: string, message: string): Error & { code: string } {
+  const err = new Error(message) as Error & { code: string };
+  err.code = code;
+  return err;
+}
 
 export function AuthProvider({ children }: Props) {
   const [user, setUser] = useState<User | null>(null);
@@ -73,15 +82,34 @@ export function AuthProvider({ children }: Props) {
     return cred.user;
   }, []);
 
-  const loginWithGoogle = useCallback(async (): Promise<User> => {
+  const continueWithGoogle = useCallback(async (allowNewUser: boolean): Promise<User> => {
     const client = getFirebaseClient();
     if (!client) throw new Error("firebase_not_configured");
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: "select_account" });
     const cred = await signInWithPopup(client.auth, provider);
+    const isNewUser = Boolean(getAdditionalUserInfo(cred)?.isNewUser);
+    if (!allowNewUser && isNewUser) {
+      try {
+        await deleteUser(cred.user);
+      } catch {
+        // Best-effort cleanup; the user is still signed out below.
+      }
+      await signOut(client.auth);
+      setUser(null);
+      throw authError("auth/google-signup-required", "Please sign up before using Google sign-in.");
+    }
     setUser(cred.user);
     return cred.user;
   }, []);
+
+  const loginWithGoogle = useCallback(async (): Promise<User> => {
+    return continueWithGoogle(false);
+  }, [continueWithGoogle]);
+
+  const signupWithGoogle = useCallback(async (): Promise<User> => {
+    return continueWithGoogle(true);
+  }, [continueWithGoogle]);
 
   const signup = useCallback(async (email: string, password: string, displayName?: string): Promise<User> => {
     const client = getFirebaseClient();
@@ -91,11 +119,13 @@ export function AuthProvider({ children }: Props) {
       await updateProfile(cred.user, { displayName: displayName.trim() });
     }
     await cred.user.getIdToken(true);
-    // Send verification email immediately after account creation (best-effort, never blocks signup)
-    try {
-      await sendEmailVerification(cred.user);
-    } catch {
-      // Verification email failure is non-fatal
+    if (!skipEmailVerification) {
+      // Send verification email immediately after account creation (best-effort, never blocks signup)
+      try {
+        await sendEmailVerification(cred.user);
+      } catch {
+        // Verification email failure is non-fatal
+      }
     }
     setUser(cred.user);
     return cred.user;
@@ -173,12 +203,13 @@ export function AuthProvider({ children }: Props) {
       getIdToken,
       login,
       loginWithGoogle,
+      signupWithGoogle,
       signup,
       updateDisplayName: updateDisplayNameValue,
       sendPasswordReset: sendPasswordResetValue,
       logout,
     }),
-    [getIdToken, loading, login, loginWithGoogle, logout, sendPasswordResetValue, signup, updateDisplayNameValue, user],
+    [getIdToken, loading, login, loginWithGoogle, logout, sendPasswordResetValue, signup, signupWithGoogle, updateDisplayNameValue, user],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

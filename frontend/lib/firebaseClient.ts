@@ -30,6 +30,7 @@ export const missingFirebaseEnv = requiredKeys.filter((key) => {
 });
 
 export const firebaseConfigured = missingFirebaseEnv.length === 0;
+export const skipEmailVerification = (process.env.NEXT_PUBLIC_SKIP_EMAIL_VERIFICATION || "").trim() === "1";
 
 let cachedApp: FirebaseApp | null = null;
 let cachedAuth: Auth | null = null;

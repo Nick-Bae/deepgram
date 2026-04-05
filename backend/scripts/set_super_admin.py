@@ -47,30 +47,48 @@ def _project_id_from_env() -> str | None:
     return project_id or None
 
 
-def _split_uids(raw_values: list[str]) -> list[str]:
+def _split_values(raw_values: list[str], *, lowercase: bool = False) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for raw in raw_values:
         for token in re.split(r"[,\s]+", _clean(raw)):
-            uid = _clean(token)
-            if not uid or uid in seen:
+            value = _clean(token)
+            if lowercase:
+                value = value.lower()
+            if not value or value in seen:
                 continue
-            seen.add(uid)
-            out.append(uid)
+            seen.add(value)
+            out.append(value)
     return out
 
 
-def _load_uid_file(path: str) -> list[str]:
+def _split_uids(raw_values: list[str]) -> list[str]:
+    return _split_values(raw_values)
+
+
+def _split_emails(raw_values: list[str]) -> list[str]:
+    return _split_values(raw_values, lowercase=True)
+
+
+def _load_value_file(path: str, *, value_name: str) -> list[str]:
     file_path = Path(path).expanduser().resolve()
     if not file_path.exists():
-        raise FileNotFoundError(f"UID file not found: {file_path}")
+        raise FileNotFoundError(f"{value_name} file not found: {file_path}")
     values: list[str] = []
     for raw in file_path.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
         values.append(line)
-    return _split_uids(values)
+    return values
+
+
+def _load_uid_file(path: str) -> list[str]:
+    return _split_uids(_load_value_file(path, value_name="UID"))
+
+
+def _load_email_file(path: str) -> list[str]:
+    return _split_emails(_load_value_file(path, value_name="Email"))
 
 
 def _resolve_actor(raw_actor: str) -> str:
@@ -104,11 +122,18 @@ def _init_firebase(*, project_id: str | None, credentials_path: str | None) -> N
             raise RuntimeError(f"Credentials file not found: {resolved}")
         credential = firebase_credentials.Certificate(str(resolved))
     else:
-        env_credentials = _clean(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+        env_credentials_name = ""
+        env_credentials = _clean(os.getenv("FIREBASE_ADMIN_CREDENTIALS"))
+        if env_credentials:
+            env_credentials_name = "FIREBASE_ADMIN_CREDENTIALS"
+        else:
+            env_credentials = _clean(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+            if env_credentials:
+                env_credentials_name = "GOOGLE_APPLICATION_CREDENTIALS"
         if env_credentials:
             resolved = Path(env_credentials).expanduser().resolve()
             if not resolved.exists():
-                raise RuntimeError(f"GOOGLE_APPLICATION_CREDENTIALS does not exist: {resolved}")
+                raise RuntimeError(f"{env_credentials_name or 'credentials'} does not exist: {resolved}")
             credential = firebase_credentials.Certificate(str(resolved))
         else:
             credential = firebase_credentials.ApplicationDefault()
@@ -135,6 +160,19 @@ def _confirm_mutation(action: str, uids: list[str], claim_key: str) -> bool:
     return confirm == "YES"
 
 
+def _lookup_uid_by_email(email: str) -> str:
+    clean_email = _clean(email).lower()
+    if not clean_email:
+        raise ValueError("email is required")
+    if firebase_auth is None:
+        raise RuntimeError("firebase_admin auth client is not available")
+    user = firebase_auth.get_user_by_email(clean_email)  # type: ignore[union-attr]
+    uid = _clean(getattr(user, "uid", ""))
+    if not uid:
+        raise RuntimeError(f"Email lookup returned empty UID for {clean_email}")
+    return uid
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Grant/revoke Firebase custom claim for God Mode (super admin) with JSON audit output.",
@@ -146,6 +184,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--uid", action="append", default=[], help="Target UID (repeatable, also supports comma-separated values).")
     parser.add_argument("--uid-file", default="", help="Path to file with UIDs (newline or comma separated; # comments allowed).")
+    parser.add_argument("--email", action="append", default=[], help="Target email (repeatable, also supports comma-separated values).")
+    parser.add_argument("--email-file", default="", help="Path to file with emails (newline or comma separated; # comments allowed).")
     parser.add_argument("--claim-key", default="super_admin", help="Custom claim key to manage. Default: super_admin")
     parser.add_argument("--project-id", default="", help="Firebase project id override (optional).")
     parser.add_argument("--credentials", default="", help="Service account JSON file path override (optional).")
@@ -183,18 +223,19 @@ def main() -> int:
     uid_file = _clean(args.uid_file)
     if uid_file:
         uid_values.extend(_load_uid_file(uid_file))
-    uids = _split_uids(uid_values)
-    if not uids:
-        parser.error("Provide at least one UID via --uid or --uid-file.")
+    email_values: list[str] = list(args.email or [])
+    email_file = _clean(args.email_file)
+    if email_file:
+        email_values.extend(_load_email_file(email_file))
+
+    requested_uids = _split_uids(uid_values)
+    requested_emails = _split_emails(email_values)
+    if not requested_uids and not requested_emails:
+        parser.error("Provide at least one target via --uid/--uid-file or --email/--email-file.")
 
     actor = _resolve_actor(args.actor)
     if action in {"grant", "revoke"} and not actor:
         parser.error("--actor is required for claim mutations.")
-
-    if action in {"grant", "revoke"} and not args.dry_run and not args.yes:
-        if not _confirm_mutation(action, uids, claim_key):
-            print("Aborted.")
-            return 2
 
     project_id = _clean(args.project_id) or _project_id_from_env()
     try:
@@ -206,6 +247,45 @@ def main() -> int:
     run_started_at = datetime.now(timezone.utc).isoformat()
     script_name = Path(__file__).name
     any_error = False
+    uids = list(requested_uids)
+    seen_uids = set(requested_uids)
+
+    for email in requested_emails:
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            resolved_uid = _lookup_uid_by_email(email)
+            if resolved_uid not in seen_uids:
+                seen_uids.add(resolved_uid)
+                uids.append(resolved_uid)
+        except Exception as exc:
+            any_error = True
+            event = {
+                "timestamp": now,
+                "runStartedAt": run_started_at,
+                "script": script_name,
+                "action": action,
+                "success": False,
+                "dryRun": bool(args.dry_run),
+                "projectId": project_id,
+                "actor": actor or None,
+                "targetEmail": email,
+                "claimKey": claim_key,
+                "error": str(exc),
+                "reason": _clean(args.reason) or None,
+                "ticket": _clean(args.ticket) or None,
+            }
+            print(json.dumps(event, ensure_ascii=True, sort_keys=True), file=sys.stderr)
+            if _clean(args.audit_log):
+                _append_audit_log(_clean(args.audit_log), event)
+
+    if not uids:
+        return 1
+
+    if action in {"grant", "revoke"} and not args.dry_run and not args.yes:
+        if not _confirm_mutation(action, uids, claim_key):
+            print("Aborted.")
+            return 2
+
     for uid in uids:
         now = datetime.now(timezone.utc).isoformat()
         try:

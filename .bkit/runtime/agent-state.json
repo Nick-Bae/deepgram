@@ -1,25 +1,14 @@
 {
   "version": "1.0",
-  "enabled": true,
+  "enabled": false,
   "teamName": "",
   "feature": "frontend",
   "pdcaPhase": "do",
   "orchestrationPattern": "leader",
   "ctoAgent": "opus",
   "startedAt": "2026-04-04T23:57:15.725Z",
-  "lastUpdated": "2026-04-04T23:57:15.726Z",
-  "teammates": [
-    {
-      "name": "a26f220849275575e",
-      "role": "bkit:gap-detector",
-      "model": "sonnet",
-      "status": "spawning",
-      "currentTask": null,
-      "taskId": null,
-      "startedAt": "2026-04-04T23:57:15.726Z",
-      "lastActivityAt": "2026-04-04T23:57:15.726Z"
-    }
-  ],
+  "lastUpdated": "2026-04-05T13:41:53.442Z",
+  "teammates": [],
   "progress": {
     "totalTasks": 0,
     "completedTasks": 0,
