@@ -696,6 +696,17 @@ def _infer_subject_from_context_history(ctx: Optional[TranslationContext]) -> tu
     return default_subject, default_pronoun
 
 
+def _has_established_context(ctx: Optional[TranslationContext]) -> bool:
+    """Return True if ctx has at least one translated pair as evidence for subject.
+
+    When False (cold-start), we must NOT inject a default "we" subject —
+    there is no evidence yet and the default poisons the translation.
+    """
+    if not ctx:
+        return False
+    return bool(ctx.recent_pairs or ctx.last_english)
+
+
 _CONTEXTUAL_KO_PREFIXES = (
     "그리고",
     "그런데",
@@ -863,6 +874,10 @@ def _infer_subject_from_english(
         return "I", "i"
     if re.search(r"\bmy\b", low):
         return "I", "i"
+    # Handle adverb-first sentences: "Yesterday, I was tired" / "At that time, I..."
+    # Third-person checks below already use re.search; add the same for first-person.
+    if re.search(r"\bi\b", low) and not re.search(r"\b(we|our|us|ourselves)\b", low):
+        return "I", "i"
     if re.match(r"^(we|our|us|ourselves)\b", low):
         return default_subject or ENV.CONTEXT_SUBJECT, "we"
     if re.match(r"^(they|those|these)\b", low):
@@ -873,6 +888,14 @@ def _infer_subject_from_english(
         return head, "she"
     if re.match(r"^(jesus|christ|lord|god)\b", low):
         return head, "he"
+
+    # Singular masculine church/pastoral role (e.g., "The pastor was not feeling well")
+    pastoral_match = re.search(
+        r"\bthe\s+(pastor|senior\s+pastor|lead\s+pastor|minister|reverend|rev\.?|elder|deacon|bishop|priest|father|chaplain)\b",
+        low,
+    )
+    if pastoral_match:
+        return f"the {pastoral_match.group(1)}", "he"
 
     # Plural noun phrase (e.g., "the Levites", "the Pharisees") anywhere in the head
     plural_match = re.search(r"\b(the\s+[a-z][\w-]*s)\b", low)
@@ -909,6 +932,17 @@ def _normalize_english_pronoun_case(text: str) -> str:
     updated = re.sub(r"(?<![A-Za-z])i(?![A-Za-z])", "I", text)
     updated = re.sub(r"(?<![A-Za-z])i(['’](?:m|d|ll|ve))\b", lambda m: "I" + m.group(1), updated, flags=re.IGNORECASE)
     return updated
+
+def _has_ko_honorific_verb(text: str) -> bool:
+    """
+    Return True if the Korean text contains honorific verb infix forms (시/셨).
+    The honorific infix signals a respected third-person subject.
+    Plain verb forms (했/잤/됐 etc.) without honorific suggest first-person narration.
+    """
+    compact = re.sub(r"\s+", "", text or "")
+    # 셨 = honorific past (으셨/셨), 시겠 = honorific future, 세요/십시오 = honorific imperative
+    return any(p in compact for p in ("셨", "시겠", "세요", "십시오"))
+
 
 def _detect_third_person_pronoun(ko: str) -> str:
     compact = re.sub(r"\s+", "", ko)
@@ -1150,6 +1184,16 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
                 if inferred_subj:
                     ctx.subject = inferred_subj
 
+    # If we're about to enforce a third-person pronoun but the Korean clause
+    # has no honorific verb form and no explicit third-person marker, the speaker
+    # is likely talking about themselves. Skip substitution and let GPT's output stand.
+    if (
+        pronoun_key in ("he", "she")
+        and not explicit_pronoun
+        and not _has_ko_honorific_verb(source_text)
+    ):
+        return en
+
     if not pronoun_key:
         return en
     forms = PRONOUN_FORMS.get(pronoun_key)
@@ -1321,11 +1365,17 @@ async def translate_text(
             implicit_first_person=implicit_first_person,
         )
 
+    had_established_context = _has_established_context(ctx_for_prompt)
+    # For cold-start (no prior context), pass None to _build_system_prompt so that
+    # _build_context_block emits nothing instead of "the congregation (we)" default.
+    # Without this, the system prompt tells GPT "the subject is we" even for the
+    # first sentence, overriding our user-message fix.
+    ctx_for_system = ctx_for_prompt if had_established_context else None
     client = _get_client()
     system = _build_system_prompt(
         source,
         target,
-        ctx_for_prompt,
+        ctx_for_system,
         current_source_text=text,
         custom_prompt=custom_prompt,
         service_prompt=service_prompt,
@@ -1339,23 +1389,50 @@ async def translate_text(
         prev = ctx_for_prompt.last_english or "(none yet)"
         subject_hint = ctx_for_prompt.subject or ENV.CONTEXT_SUBJECT
         pronoun_hint = ctx_for_prompt.pronoun or ENV.CONTEXT_PRONOUN
+
+        # If context says third-person (he/she) but the Korean clause has no
+        # honorific verb form and no explicit third-person pronoun marker,
+        # the speaker is likely narrating in first person. Fall back to neutral
+        # default so GPT can infer the subject freely from the text.
+        if (
+            pronoun_hint in ("he", "she")
+            and not _has_ko_honorific_verb(text)
+            and not _detect_third_person_pronoun(text)
+        ):
+            subject_hint = ENV.CONTEXT_SUBJECT
+            pronoun_hint = ENV.CONTEXT_PRONOUN
+
         if _should_include_prompt_context(text, update_ctx=update_ctx):
             recent_context_block = _build_recent_context_block(ctx_for_prompt, current_source_text=text)
-            user_content = (
-                recent_context_block +
-                f"Previous English sentence: {prev}\n"
-                f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
-                f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
-                f"unless the Korean explicitly names a new entity.\n\n"
-                f"Current text:\n{masked_text}"
-            )
+            if had_established_context:
+                user_content = (
+                    recent_context_block +
+                    f"Previous English sentence: {prev}\n"
+                    f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
+                    f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
+                    f"unless the Korean explicitly names a new entity.\n\n"
+                    f"Current text:\n{masked_text}"
+                )
+            else:
+                # Cold-start: no prior evidence for any subject.
+                # Do not inject a default "we" — let GPT infer from the Korean.
+                user_content = (
+                    recent_context_block +
+                    "No prior context established. Translate naturally. "
+                    "Do NOT use \"we\" unless the Korean explicitly contains 우리 or 저희.\n\n"
+                    f"Current text:\n{masked_text}"
+                )
         else:
-            user_content = (
-                f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
-                f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
-                f"unless the Korean explicitly names a new entity.\n\n"
-                f"Current text:\n{masked_text}"
-            )
+            if had_established_context:
+                user_content = (
+                    f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
+                    f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
+                    f"unless the Korean explicitly names a new entity.\n\n"
+                    f"Current text:\n{masked_text}"
+                )
+            else:
+                # Cold-start, no context injection needed — translate directly.
+                user_content = masked_text
 
     try:
         model_name = ENV.resolve_translation_model(model_override)
@@ -1412,13 +1489,22 @@ async def translate_text(
             out = _normalize_english_pronoun_case(out)
 
         if ctx and update_ctx:
-            # Update context for the next clause so subject continuity follows
-            # the most recent English output instead of reverting to defaults.
-            ctx.subject, ctx.pronoun = _infer_subject_from_english(
-                out,
-                ctx.subject or ENV.CONTEXT_SUBJECT,
-                ctx.pronoun or ENV.CONTEXT_PRONOUN,
+            # Only propagate subject/pronoun from the English output when we had
+            # real prior evidence (had_established_context), or when the Korean
+            # itself contained an explicit subject marker.  Without this guard a
+            # cold-start default "we" gets locked into ctx and self-perpetuates
+            # across every subsequent subject-drop sentence.
+            explicit_ko_subject = (
+                _contains_first_person_markers(text)
+                or _contains_we_markers(text)
+                or bool(_detect_third_person_pronoun(text))
             )
+            if had_established_context or explicit_ko_subject:
+                ctx.subject, ctx.pronoun = _infer_subject_from_english(
+                    out,
+                    ctx.subject or ENV.CONTEXT_SUBJECT,
+                    ctx.pronoun or ENV.CONTEXT_PRONOUN,
+                )
             ctx.remember(text, out)
 
         # Defer the file write off the critical path so it never delays broadcast

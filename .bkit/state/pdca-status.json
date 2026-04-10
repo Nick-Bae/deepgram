@@ -1,6 +1,6 @@
 {
   "version": "3.0",
-  "lastUpdated": "2026-04-04T23:52:52.905Z",
+  "lastUpdated": "2026-04-10T23:07:04.760Z",
   "activeFeatures": [
     "billing",
     "admin",
@@ -86,9 +86,9 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T21:11:56.820Z",
-        "lastUpdated": "2026-04-04T23:52:52.905Z"
+        "lastUpdated": "2026-04-06T01:43:03.254Z"
       },
-      "lastFile": "/home/namju/project/real-time-translation/frontend/components/SttKeytermsEditor.tsx"
+      "lastFile": "/home/namju/project/real-time-translation/frontend/components/TranslationBox.tsx"
     },
     "c": {
       "phase": "do",
@@ -99,7 +99,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-20T21:12:40.289Z",
-        "lastUpdated": "2026-04-04T23:05:43.165Z"
+        "lastUpdated": "2026-04-10T23:07:04.760Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/frontend/pages/host/c/[churchSlug].tsx"
     },
@@ -164,9 +164,9 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-21T01:30:50.279Z",
-        "lastUpdated": "2026-04-04T23:51:38.208Z"
+        "lastUpdated": "2026-04-06T04:04:04.616Z"
       },
-      "lastFile": "/home/namju/project/real-time-translation/backend/app/main.py"
+      "lastFile": "/home/namju/project/real-time-translation/backend/app/utils/translate.py"
     },
     "s": {
       "phase": "do",
@@ -270,7 +270,7 @@
   "session": {
     "startedAt": "2026-03-20T20:05:09.411Z",
     "onboardingCompleted": false,
-    "lastActivity": "2026-04-04T23:52:52.905Z"
+    "lastActivity": "2026-04-10T23:07:04.760Z"
   },
   "history": [
     {
@@ -3426,6 +3426,120 @@
     {
       "timestamp": "2026-04-04T23:52:52.905Z",
       "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T01:35:36.596Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T01:43:03.254Z",
+      "feature": "frontend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T01:47:45.126Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T01:47:52.728Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T01:48:03.139Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T02:10:41.966Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T02:11:04.530Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T02:11:12.552Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T04:01:12.058Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-06T04:04:04.616Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-07T05:16:24.668Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-07T05:19:08.177Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-10T21:38:35.508Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-10T21:45:04.148Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-10T22:36:40.988Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-10T23:04:42.214Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-10T23:04:53.355Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-10T23:06:40.240Z",
+      "feature": "c",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-10T23:07:04.760Z",
+      "feature": "c",
       "phase": "do",
       "action": "updated"
     }

@@ -857,8 +857,8 @@ export default function TranslationBox() {
     }
 
     if (delta) {
-      console.log('[FE][clause][delta]', clip(delta));
       clauseRef.current += delta;
+      console.log('[FE][clause][delta]', clip(clauseRef.current));
 
       sendPreview(clauseRef.current);
 
