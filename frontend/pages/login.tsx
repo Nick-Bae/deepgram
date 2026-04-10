@@ -1,8 +1,16 @@
-import Head from "next/head";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import { FormEvent, useMemo, useState } from "react";
 
+import StudioAccessLayout, {
+  buildStudioButtonStyle,
+  buildStudioNoticeStyle,
+  studioFieldStyle,
+  studioHelperTextStyle,
+  studioLabelStyle,
+  studioLabelTextStyle,
+  studioReadOnlyCardStyle,
+} from "../components/StudioAccessLayout";
 import { fetchAuthMe, type OrgMembership } from "../lib/backendAuth";
 import { useAuth } from "../lib/authContext";
 import { buildDashboardHref, persistDashboardContext, pickPreferredMembership } from "../lib/dashboardRoute";
@@ -82,24 +90,6 @@ function membershipForTarget(target: NextRouteTarget, memberships: OrgMembership
   return undefined;
 }
 
-function FieldIcon({ kind }: { kind: "email" | "password" }) {
-  if (kind === "password") {
-    return (
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <rect x="5" y="11" width="14" height="9" rx="2.5" stroke="#617089" strokeWidth="1.6" />
-        <path d="M8.5 11V8.8a3.5 3.5 0 0 1 7 0V11" stroke="#617089" strokeWidth="1.6" strokeLinecap="round" />
-      </svg>
-    );
-  }
-
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M16.5 19v-1.1a3.4 3.4 0 0 0-3.4-3.4H10.9a3.4 3.4 0 0 0-3.4 3.4V19" stroke="#617089" strokeWidth="1.6" strokeLinecap="round" />
-      <circle cx="12" cy="8.2" r="3.1" stroke="#617089" strokeWidth="1.6" />
-    </svg>
-  );
-}
-
 function GoogleMarkIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
@@ -109,78 +99,6 @@ function GoogleMarkIcon() {
       <path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303a12.04 12.04 0 0 1-4.087 5.571l.003-.002 6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z" />
     </svg>
   );
-}
-
-function buildLoginNoticeStyle(tone: "error" | "info") {
-  if (tone === "error") {
-    return {
-      margin: 0,
-      padding: "12px 14px",
-      borderRadius: 18,
-      background: "linear-gradient(145deg, rgba(255,233,236,0.94), rgba(255,245,246,0.9))",
-      border: "1px solid rgba(208,110,131,0.18)",
-      color: "#aa4f65",
-      boxShadow: "inset 1px 1px 0 rgba(255,255,255,0.9), 0 12px 24px rgba(194,120,138,0.12)",
-      fontSize: 13,
-      lineHeight: 1.5,
-    } as const;
-  }
-
-  return {
-    margin: 0,
-    padding: "12px 14px",
-    borderRadius: 18,
-    background: "linear-gradient(145deg, rgba(236,245,255,0.94), rgba(244,249,255,0.9))",
-    border: "1px solid rgba(123,157,196,0.16)",
-    color: "#516b86",
-    boxShadow: "inset 1px 1px 0 rgba(255,255,255,0.9), 0 12px 24px rgba(160,177,198,0.12)",
-    fontSize: 13,
-    lineHeight: 1.5,
-  } as const;
-}
-
-function buildLoginButtonStyle(options?: { tone?: "primary" | "secondary"; disabled?: boolean }) {
-  const tone = options?.tone || "primary";
-  const disabled = Boolean(options?.disabled);
-
-  if (tone === "secondary") {
-    return {
-      width: "100%",
-      borderRadius: 999,
-      border: "1px solid rgba(255,255,255,0.9)",
-      background: "linear-gradient(145deg, #eef3f9, #ffffff)",
-      color: "#5d697d",
-      fontSize: 15,
-      fontWeight: 800,
-      padding: "15px 18px",
-      cursor: disabled ? "not-allowed" : "pointer",
-      opacity: disabled ? 0.62 : 1,
-      boxShadow: "10px 10px 20px rgba(163,177,198,0.20), -10px -10px 20px rgba(255,255,255,0.92), inset 1px 1px 0 rgba(255,255,255,0.9)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      gap: 10,
-    } as const;
-  }
-
-  return {
-    width: "100%",
-    borderRadius: 999,
-    border: "1px solid rgba(107,212,245,0.2)",
-    background: "linear-gradient(180deg, #67d1f4 0%, #4bb9dd 100%)",
-    color: "#ffffff",
-    fontSize: 17,
-    fontWeight: 900,
-    letterSpacing: "0.01em",
-    padding: "16px 18px",
-    cursor: disabled ? "not-allowed" : "pointer",
-    opacity: disabled ? 0.62 : 1,
-    boxShadow: "0 20px 26px rgba(75,185,221,0.26), inset 0 1px 0 rgba(255,255,255,0.42), inset 0 -2px 0 rgba(48,139,169,0.18)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-  } as const;
 }
 
 export default function LoginPage() {
@@ -198,6 +116,10 @@ export default function LoginPage() {
     if (!raw.startsWith("/") || raw.startsWith("//")) return "";
     return raw;
   }, [router.query.next]);
+  const signupHref = useMemo(
+    () => (nextPath ? `/signup?next=${encodeURIComponent(nextPath)}` : "/signup"),
+    [nextPath],
+  );
 
   const redirectFromMembership = async (idToken: string) => {
     const me = await fetchAuthMe(idToken);
@@ -316,249 +238,168 @@ export default function LoginPage() {
     }
   };
 
-  const cardShellStyle = {
-    position: "relative" as const,
-    width: "min(100%, 380px)",
-  };
-  const cardStyle = {
-    position: "relative" as const,
-    borderRadius: 34,
-    padding: "28px 24px 22px",
-    background: "linear-gradient(145deg, #e7edf5 0%, #d9e2ed 100%)",
-    border: "1px solid rgba(255,255,255,0.84)",
-    boxShadow: "22px 22px 44px rgba(162,176,198,0.28), -16px -16px 34px rgba(255,255,255,0.92), inset 1px 1px 0 rgba(255,255,255,0.88)",
-    overflow: "hidden" as const,
-  };
-  const fieldWrapStyle = {
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    minHeight: 56,
-    padding: "0 16px",
-    borderRadius: 999,
-    background: "linear-gradient(145deg, #dfe7f2, #ffffff)",
-    border: "1px solid rgba(255,255,255,0.95)",
-    boxShadow: "inset 8px 8px 16px rgba(176,190,208,0.22), inset -8px -8px 16px rgba(255,255,255,0.98), 0 12px 22px rgba(162,176,198,0.12)",
-  };
-  const inputStyle = {
-    width: "100%",
-    border: "none",
-    outline: "none",
-    background: "transparent",
-    color: "#2f3948",
-    fontSize: 15,
-    fontWeight: 700,
-  };
-  const footerLinkStyle = {
-    color: "#62708a",
-    fontWeight: 800,
-    textDecoration: "none",
-  };
-  const srOnlyStyle = {
-    position: "absolute" as const,
-    width: 1,
-    height: 1,
-    padding: 0,
-    margin: -1,
-    overflow: "hidden" as const,
-    clip: "rect(0, 0, 0, 0)",
-    whiteSpace: "nowrap" as const,
-    border: 0,
-  };
-
   return (
-    <>
-      <Head>
-        <title>Host Login | Worship</title>
-        <meta name="description" content="Sign in to manage church services, rooms, and team access." />
-      </Head>
-      <style>{`
-        @media (max-width: 480px) {
-          .login-card { padding: 24px 18px 20px !important; border-radius: 30px !important; }
-          .login-card h1 { font-size: 36px !important; }
-        }
-      `}</style>
-      <main
-        style={{
-          minHeight: "100vh",
-          display: "grid",
-          placeItems: "center",
-          padding: "28px 16px",
-          background: "radial-gradient(circle at top, rgba(255,255,255,0.95) 0%, rgba(228,236,247,0.92) 38%, #dce4ef 100%)",
-          position: "relative",
-          overflow: "hidden",
-          fontFamily: "'Avenir Next', 'Segoe UI', sans-serif",
-        }}
-      >
-        <div aria-hidden="true" style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-          <div style={{ position: "absolute", top: -160, left: -120, width: 320, height: 320, borderRadius: "50%", background: "radial-gradient(circle, rgba(255,255,255,0.96), transparent 72%)", filter: "blur(18px)" }} />
-          <div style={{ position: "absolute", right: -80, top: 80, width: 260, height: 260, borderRadius: "50%", background: "radial-gradient(circle, rgba(119,213,245,0.16), transparent 70%)", filter: "blur(10px)" }} />
-          <div style={{ position: "absolute", left: "18%", bottom: -80, width: 340, height: 280, borderRadius: "50%", background: "radial-gradient(circle, rgba(163,177,198,0.14), transparent 72%)", filter: "blur(20px)" }} />
+    <StudioAccessLayout
+      pageTitle="Host Login | Worship"
+      pageDescription="Sign in to manage church services, rooms, and team access."
+      panelEyebrow={user ? "Current Session" : "Host Access"}
+      panelTitle={user ? "Resume session" : "Sign In"}
+      panelDescription={
+        user
+          ? "Continue with the authenticated account below or switch to another account before entering the dashboard."
+          : "Use your host account to manage services, team access, and church broadcast settings."
+      }
+      infoEyebrow="Access Flow"
+      infoTitle={nextPath ? "Sign in and return to the page that sent you here." : "One host login can route into the right church workspace."}
+      infoDescription={
+        nextPath
+          ? "Protected routes can send you to the login page first. After a successful sign-in, the app restores the original destination automatically."
+          : "Email/password and Google sign-in both use the same account routing flow, so you land back in the correct church dashboard after authentication."
+      }
+      infoItems={[
+        {
+          title: "Redirect-safe sign-in",
+          description: nextPath
+            ? "This login keeps the original target so the session can continue exactly where it was interrupted."
+            : "When your account belongs to multiple churches, the app picks the preferred membership and routes there automatically.",
+        },
+        {
+          title: "Use the current session or switch",
+          description: "If this browser already has a valid session, you can continue immediately or sign out and use a different account.",
+        },
+        {
+          title: "Google or password",
+          description: "Google sign-in and email/password both feed the same host access flow and end at the same dashboard routing logic.",
+        },
+      ]}
+      headerActions={[
+        { href: "/", label: "Back Home" },
+        { href: "/contact", label: "Contact Us", accent: true },
+      ]}
+    >
+      {nextPath ? (
+        <p style={buildStudioNoticeStyle("info")}>
+          After sign-in, you&apos;ll be returned to <code>{nextPath}</code>.
+        </p>
+      ) : null}
+
+      {!configured ? (
+        <div style={buildStudioNoticeStyle("error")}>
+          Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
         </div>
+      ) : null}
 
-        <section style={cardShellStyle}>
-          <div aria-hidden="true" style={{ position: "absolute", inset: "12px 18px -12px", borderRadius: 34, background: "rgba(166,180,199,0.18)", filter: "blur(18px)" }} />
-          <article className="login-card" style={cardStyle}>
-            <div aria-hidden="true" style={{ position: "absolute", inset: 0, background: "linear-gradient(135deg, rgba(255,255,255,0.55), transparent 28%, transparent 72%, rgba(255,255,255,0.18) 100%)", pointerEvents: "none" }} />
+      {errorMsg ? <p style={buildStudioNoticeStyle("error")}>Error: {errorMsg}</p> : null}
 
-            <div style={{ position: "relative", display: "grid", gap: 18 }}>
-              <div style={{ display: "grid", placeItems: "center", gap: 12 }}>
-                <div
-                  style={{
-                    width: 84,
-                    height: 84,
-                    borderRadius: "50%",
-                    background: "linear-gradient(160deg, #0f1323, #2a3152 62%, #101522)",
-                    boxShadow: "0 18px 26px rgba(66,78,99,0.28), -8px -8px 20px rgba(255,255,255,0.86), inset 0 0 0 4px rgba(255,255,255,0.92), inset 0 10px 18px rgba(255,255,255,0.08)",
-                    display: "grid",
-                    placeItems: "center",
-                  }}
-                >
-                  <div style={{ display: "grid", placeItems: "center", gap: 3 }}>
-                    <div style={{ fontSize: 24, fontWeight: 900, lineHeight: 1, color: "#7c69ff", letterSpacing: "-0.08em" }}>W</div>
-                    <div style={{ fontSize: 8, fontWeight: 800, letterSpacing: "0.12em", textTransform: "uppercase", color: "#f3f6fb" }}>Host</div>
-                  </div>
-                </div>
+      {user ? (
+        <section style={{ display: "grid", gap: 14 }}>
+          <div style={studioReadOnlyCardStyle}>
+            <p style={{ margin: 0, fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase", color: "#8b6533" }}>
+              Active session
+            </p>
+            <p style={{ margin: "10px 0 0", fontSize: 16, fontWeight: 700, color: "#22344c", wordBreak: "break-word" }}>
+              {user.email || user.uid}
+            </p>
+            <p style={{ margin: "8px 0 0", fontSize: 14, lineHeight: 1.7, color: "#5d6d84" }}>
+              Continue with this session or switch accounts before entering the dashboard.
+            </p>
+          </div>
 
-                <div style={{ textAlign: "center" }}>
-                  <h1 style={{ margin: 0, fontSize: 40, lineHeight: 1.02, letterSpacing: "-0.06em", color: "#111827", fontWeight: 900 }}>
-                    Host Login
-                  </h1>
-                  <p style={{ margin: "8px 0 0", color: "#758198", fontSize: 15, fontWeight: 700, letterSpacing: "0.18em", textTransform: "uppercase" }}>
-                    Translation Studio
-                  </p>
-                  <p style={{ margin: "8px 0 0", color: "#7d8798", fontSize: 14, fontWeight: 600 }}>
-                    Smooth access. 3D card. Same auth flow.
-                  </p>
-                </div>
-              </div>
+          <button
+            type="button"
+            onClick={() => {
+              void continueExistingSession();
+            }}
+            disabled={!configured || sessionBusy}
+            style={{ ...buildStudioButtonStyle({ disabled: !configured || sessionBusy }), width: "100%" }}
+          >
+            {sessionBusy ? "Continuing..." : "Continue to Dashboard"}
+          </button>
 
-              {!configured ? (
-                <div style={buildLoginNoticeStyle("error")}>
-                  Firebase config is missing in <code>frontend/.env.local</code>: {missingEnv.join(", ")}
-                </div>
-              ) : null}
-
-              {errorMsg ? <p style={buildLoginNoticeStyle("error")}>Error: {errorMsg}</p> : null}
-
-              {user ? (
-                <section style={{ display: "grid", gap: 12 }}>
-                  <div style={{ ...fieldWrapStyle, minHeight: 74, borderRadius: 24, alignItems: "flex-start", paddingTop: 14, paddingBottom: 14 }}>
-                    <div style={{ marginTop: 2 }}>
-                      <FieldIcon kind="email" />
-                    </div>
-                    <div style={{ display: "grid", gap: 4 }}>
-                      <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.16em", textTransform: "uppercase", color: "#7e8aa0" }}>
-                        Active session
-                      </span>
-                      <span style={{ fontSize: 14, color: "#2f3948", fontWeight: 700 }}>{user.email || user.uid}</span>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void continueExistingSession();
-                    }}
-                    disabled={!configured || sessionBusy}
-                    style={buildLoginButtonStyle({ disabled: !configured || sessionBusy })}
-                  >
-                    {sessionBusy ? "Continuing..." : "Continue to Dashboard"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void switchAccount();
-                    }}
-                    disabled={sessionBusy}
-                    style={buildLoginButtonStyle({ tone: "secondary", disabled: sessionBusy })}
-                  >
-                    Use a Different Account
-                  </button>
-                </section>
-              ) : (
-                <form onSubmit={onSubmit} style={{ display: "grid", gap: 16 }}>
-                  <label style={{ display: "grid", gap: 0 }}>
-                    <span style={srOnlyStyle}>Email</span>
-                    <div style={fieldWrapStyle}>
-                      <FieldIcon kind="email" />
-                      <input
-                        type="email"
-                        autoComplete="email"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        required
-                        placeholder="Email address"
-                        style={inputStyle}
-                      />
-                    </div>
-                  </label>
-
-                  <label style={{ display: "grid", gap: 0 }}>
-                    <span style={srOnlyStyle}>Password</span>
-                    <div style={fieldWrapStyle}>
-                      <FieldIcon kind="password" />
-                      <input
-                        type="password"
-                        autoComplete="current-password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        required
-                        placeholder="Password"
-                        style={inputStyle}
-                      />
-                    </div>
-                  </label>
-
-                  <button type="submit" disabled={!configured || busy} style={buildLoginButtonStyle({ disabled: !configured || busy })}>
-                    {busy ? "Signing In..." : "Login"}
-                  </button>
-
-                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                    <div style={{ flex: 1, height: 1, background: "rgba(123,134,151,0.22)" }} />
-                    <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase", color: "#8692a6" }}>
-                      or
-                    </span>
-                    <div style={{ flex: 1, height: 1, background: "rgba(123,134,151,0.22)" }} />
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void signInWithGoogle();
-                    }}
-                    disabled={!configured || busy}
-                    style={buildLoginButtonStyle({ tone: "secondary", disabled: !configured || busy })}
-                  >
-                    <GoogleMarkIcon />
-                    Continue with Google
-                  </button>
-                </form>
-              )}
-
-              <div style={{ display: "grid", gap: 10, textAlign: "center" }}>
-                <p style={{ margin: 0, fontSize: 13, color: "#7b8697", fontWeight: 700 }}>
-                  <Link href="/recover-account" style={footerLinkStyle}>
-                    Forgot password?
-                  </Link>{" "}
-                  or{" "}
-                  <Link href={nextPath ? `/signup?next=${encodeURIComponent(nextPath)}` : "/signup"} style={footerLinkStyle}>
-                    Sign Up
-                  </Link>
-                </p>
-                <p style={{ margin: 0, fontSize: 12, color: "#8a93a3" }}>
-                  <Link href="/" style={footerLinkStyle}>
-                    Back Home
-                  </Link>{" "}
-                  |{" "}
-                  <Link href="/contact" style={footerLinkStyle}>
-                    Contact Us
-                  </Link>
-                </p>
-              </div>
-            </div>
-          </article>
+          <button
+            type="button"
+            onClick={() => {
+              void switchAccount();
+            }}
+            disabled={sessionBusy}
+            style={{ ...buildStudioButtonStyle({ tone: "secondary", disabled: sessionBusy }), width: "100%" }}
+          >
+            Use a Different Account
+          </button>
         </section>
-      </main>
-    </>
+      ) : (
+        <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
+          <label style={studioLabelStyle}>
+            <span style={studioLabelTextStyle}>Email</span>
+            <input
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              autoFocus
+              style={studioFieldStyle}
+            />
+          </label>
+
+          <label style={studioLabelStyle}>
+            <span style={studioLabelTextStyle}>Password</span>
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              style={studioFieldStyle}
+            />
+          </label>
+
+          <button
+            type="submit"
+            disabled={!configured || busy}
+            style={{ ...buildStudioButtonStyle({ disabled: !configured || busy }), width: "100%" }}
+          >
+            {busy ? "Signing In..." : "Sign In"}
+          </button>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "4px 0" }}>
+            <div style={{ flex: 1, height: 1, background: "rgba(120,98,78,0.16)" }} />
+            <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase", color: "#8f8378" }}>
+              or
+            </span>
+            <div style={{ flex: 1, height: 1, background: "rgba(120,98,78,0.16)" }} />
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              void signInWithGoogle();
+            }}
+            disabled={!configured || busy}
+            style={{ ...buildStudioButtonStyle({ tone: "secondary", disabled: !configured || busy }), width: "100%", gap: 10 }}
+          >
+            <GoogleMarkIcon />
+            Continue with Google
+          </button>
+        </form>
+      )}
+
+      {!user ? (
+        <div style={{ display: "grid", gap: 8 }}>
+          <p style={studioHelperTextStyle}>
+            Forgot your password or can&apos;t remember the login email?{" "}
+            <Link href="/recover-account" style={{ color: "#3f6093", fontWeight: 700 }}>
+              Recover account
+            </Link>
+          </p>
+          <p style={studioHelperTextStyle}>
+            Need a host account first?{" "}
+            <Link href={signupHref} style={{ color: "#3f6093", fontWeight: 700 }}>
+              Create one
+            </Link>
+          </p>
+        </div>
+      ) : null}
+    </StudioAccessLayout>
   );
 }

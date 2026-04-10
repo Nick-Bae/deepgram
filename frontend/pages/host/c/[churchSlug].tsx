@@ -319,6 +319,7 @@ export default function HostChurchPage() {
   const [switchingOrg, setSwitchingOrg] = useState(false);
   const [selectedOrgId, setSelectedOrgId] = useState("");
   const [membershipRole, setMembershipRole] = useState("");
+  const [settingsSection, setSettingsSection] = useState<"general" | "services" | "translation">("general");
   const [isMasterUser, setIsMasterUser] = useState(false);
   const [inviteRole, setInviteRole] = useState<InviteRoleChoice>("host");
   const [inviteBusy, setInviteBusy] = useState(false);
@@ -913,6 +914,10 @@ export default function HostChurchPage() {
     },
     [buildTabHref, router],
   );
+
+  useEffect(() => {
+    if (activeTab !== "settings") setSettingsSection("general");
+  }, [activeTab]);
 
   useEffect(() => {
     if (!router.isReady || !slug || querySection) return;
@@ -1735,9 +1740,7 @@ export default function HostChurchPage() {
     borderRadius: 8,
     boxShadow: dashboardCardShadow,
   } as const;
-  const settingsSubscriptionCardStyle = {
-    ...settingsCardStyle,
-  } as const;
+
   const settingsBudgetCardStyle = {
     ...settingsCardStyle,
     borderTop: `3px solid rgba(184,154,94,0.5)`,
@@ -2324,7 +2327,7 @@ export default function HostChurchPage() {
               <div className="host-user-name" style={{ textAlign: "right" as const }}>
                 <div style={{ fontSize: 14, fontWeight: 500, color: isBroadcastTab ? BC.cloud : "#2f2b28" }}>{currentUserName}</div>
                 <div style={{ marginTop: 4, fontSize: 10, letterSpacing: "0.28em", textTransform: "uppercase" as const, color: isBroadcastTab ? BC.mist : "#6f655c" }}>
-                  {activeRoomId ? "Live session active" : "Studio operator"}
+                  {activeRoomId ? "Live session active" : (membershipRole ? membershipRole.charAt(0).toUpperCase() + membershipRole.slice(1).toLowerCase() : "Studio operator")}
                 </div>
                 {isMasterUser && <Link href="/admin" style={{ display: "inline-block", marginTop: 6, fontSize: 11, color: isBroadcastTab ? BC.blush : DC.gold, textDecoration: "none", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase" }}>Admin</Link>}
               </div>
@@ -2475,6 +2478,27 @@ export default function HostChurchPage() {
                 </div>
               </section>
 
+              {/* ── Standby worship banner ── */}
+              {!activeRoomId ? (
+                <div style={{ marginTop: 16, borderRadius: 36, overflow: "hidden", position: "relative", ...broadcastGlassPanelStyle, background: "linear-gradient(135deg, #cfb58d 0%, #8e7248 48%, #cfb58d 100%)", padding: 0 }}>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src="/worship-banner.png?v=20260410-3"
+                    alt="Worship"
+                    style={{ width: "100%", display: "block", height: 420, objectFit: "cover", objectPosition: "center" }}
+                  />
+                  {/* bottom gradient overlay */}
+                  <div style={{ position: "absolute", inset: 0, background: "linear-gradient(to bottom, transparent 40%, rgba(26,22,18,0.62) 100%)", pointerEvents: "none" }} />
+                  {/* bottom-left label */}
+                  {/* <div style={{ position: "absolute", bottom: 20, left: 24, display: "flex", flexDirection: "column" as const, gap: 4 }}>
+                    <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.22em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.55)" }}>Ready to broadcast</span>
+                    <span style={{ fontSize: 14, fontWeight: 600, color: "rgba(255,255,255,0.92)", letterSpacing: "-0.01em" }}>Select a service and press Start Broadcast</span>
+                  </div> */}
+                  {/* subtle top-edge glass line */}
+                  <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 1, background: "rgba(255,255,255,0.38)", pointerEvents: "none" }} />
+                </div>
+              ) : null}
+
               {/* ── Translation feed (hero) ── */}
               {activeRoomId ? (
                 isTrialExpired ? (
@@ -2521,215 +2545,158 @@ export default function HostChurchPage() {
           {activeTab === "settings" ? (
             canManageServices ? (
               <div style={settingsShellStyle}>
-                <div style={settingsGridStyle}>
-                  <section style={settingsCardStyle}>
-                    <p style={settingsSectionLabelStyle}>Account</p>
-                    <h3 style={settingsTitleStyle}>Your Profile</h3>
-                    <p style={settingsBodyTextStyle}>
-                      Update the name shown in the host console and team-facing flows.
-                    </p>
-                    <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: DC.mid }}>Display name</span>
-                      <input
-                        value={accountDisplayNameInput}
-                        onChange={(e) => {
-                          setAccountDisplayNameInput(e.target.value);
-                          setAccountProfileError(null);
-                          setAccountProfileNotice(null);
-                        }}
-                        style={{ ...settingsInlineFieldStyle, width: "100%" }}
-                      />
-                    </label>
-                    <p style={{ margin: 0, fontSize: 12, color: "#6b7b92" }}>
-                      This can be changed later.
-                    </p>
-                    {accountProfileError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {accountProfileError}</p> : null}
-                    {accountProfileNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{accountProfileNotice}</p> : null}
-                    <div>
-                      <button
-                        onClick={() => {
-                          void saveAccountProfile();
-                        }}
-                        disabled={accountProfileBusy}
-                        style={{
-                          ...settingsButtonPrimaryStyle,
-                          opacity: accountProfileBusy ? 0.6 : 1,
-                          cursor: accountProfileBusy ? "not-allowed" : "pointer",
-                        }}
-                      >
-                        {accountProfileBusy ? "Saving..." : "Save Display Name"}
-                      </button>
-                    </div>
-                  </section>
-
-                  <section style={settingsCardStyle}>
-                    <p style={settingsSectionLabelStyle}>Church Identity</p>
-                    <h3 style={settingsTitleStyle}>Church Name & URL</h3>
-                    <p style={settingsBodyTextStyle}>
-                      The church name can be updated later. The church slug is public-facing and stays fixed after creation.
-                    </p>
-                    <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: DC.mid }}>Church name</span>
-                      <input
-                        value={churchNameInput}
-                        onChange={(e) => {
-                          setChurchNameInput(e.target.value);
-                          setChurchProfileError(null);
-                          setChurchProfileNotice(null);
-                        }}
-                        disabled={!canManagePaidBilling}
-                        style={{
-                          ...settingsInlineFieldStyle,
-                          width: "100%",
-                          opacity: canManagePaidBilling ? 1 : 0.7,
-                        }}
-                      />
-                    </label>
-                    <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: DC.mid }}>Church URL slug</span>
-                      <input
-                        readOnly
-                        value={slug}
-                        style={{
-                          ...settingsInlineFieldStyle,
-                          width: "100%",
-                          background: "rgba(239,244,250,0.92)",
-                          color: DC.mid,
-                        }}
-                      />
-                    </label>
-                    {churchPublicPath ? (
-                      <p style={{ margin: 0, fontSize: 12, color: "#4d607a", wordBreak: "break-all" }}>
-                        Public path: <strong>{churchPublicPath}</strong>
-                      </p>
-                    ) : null}
-                    {!canManagePaidBilling ? (
-                      <p style={{ margin: 0, fontSize: 13, color: DC.mid }}>
-                        Owner or admin role is required to rename the church. The slug remains locked for all roles.
-                      </p>
-                    ) : null}
-                    {churchProfileError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {churchProfileError}</p> : null}
-                    {churchProfileNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{churchProfileNotice}</p> : null}
-                    <div>
-                      <button
-                        onClick={() => {
-                          void saveChurchProfile();
-                        }}
-                        disabled={churchProfileBusy || !canManagePaidBilling || !resolvedOrgId}
-                        style={{
-                          ...settingsButtonPrimaryStyle,
-                          opacity: churchProfileBusy || !canManagePaidBilling || !resolvedOrgId ? 0.6 : 1,
-                          cursor: churchProfileBusy || !canManagePaidBilling || !resolvedOrgId ? "not-allowed" : "pointer",
-                        }}
-                      >
-                        {churchProfileBusy ? "Saving..." : "Save Church Name"}
-                      </button>
-                    </div>
-                  </section>
-
-                  {canManageInvites && resolvedOrgId ? (
-                    <section style={settingsCardStyle}>
-                      <p style={settingsSectionLabelStyle}>Translation</p>
-                      <h3 style={settingsTitleStyle}>STT Keywords</h3>
-                      <p style={settingsBodyTextStyle}>
-                        Add church-specific terms to help Deepgram recognize them accurately — pastor names, series titles, or theological vocabulary unique to your church. Changes take effect on the next session start.
-                      </p>
-                      <SttKeytermsEditorLazy orgId={resolvedOrgId} getIdToken={getIdToken} />
-                    </section>
-                  ) : null}
-
-                  <section style={settingsSubscriptionCardStyle}>
-                    <p style={settingsSectionLabelStyle}>Billing Snapshot</p>
-                    <h3 style={settingsTitleStyle}>Billing & Subscription</h3>
-                    <p style={settingsBodyTextStyle}>
-                      View the current plan and renewal timing here. Open Billing for plan changes, payment details, and billing controls.
-                    </p>
-
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                      <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.3)`, background: "rgba(184,154,94,0.1)", color: DC.gold }}>
-                        Plan · {formatPlanLabel(billingPlanToken)}
-                      </span>
-                      <span
-                        style={{
-                          ...settingsPillBaseStyle,
-                          border: billingStatusToken === "active"
-                            ? "1px solid rgba(91,179,130,0.22)"
-                            : billingStatusToken === "past_due"
-                              ? "1px solid rgba(224,163,86,0.26)"
-                              : billingNeedsAttention
-                                ? "1px solid rgba(188,95,111,0.26)"
-                                : `1px solid ${DC.border}`,
-                          background: billingStatusToken === "active"
-                            ? "rgba(91,179,130,0.14)"
-                            : billingStatusToken === "past_due"
-                              ? "rgba(224,163,86,0.16)"
-                              : billingNeedsAttention
-                                ? "rgba(188,95,111,0.12)"
-                                : DC.white,
-                          color: billingStatusToken === "active"
-                            ? DC.success
-                            : billingStatusToken === "past_due"
-                              ? DC.warn
-                              : billingNeedsAttention
-                                ? DC.danger
-                                : DC.mid,
-                        }}
-                      >
-                        Status · {formatBillingStatus(billingStatusToken)}
-                      </span>
-                      <span style={{ ...settingsPillBaseStyle, border: `1px solid ${DC.border}`, background: DC.white, color: DC.mid }}>
-                        {billingMonthlyMinutesLimit !== null
-                          ? `${billingMonthlyMinutesLimit === 0 ? "Unlimited" : `${billingMonthlyMinutesLimit} min/mo`}${billingMonthlyMinutesUsed !== null ? ` · ${billingMonthlyMinutesUsed} used` : ""}`
-                          : `Minutes · ${billingMaxServiceKeys > 0 ? "limited" : "unlimited"}`}
-                      </span>
-                    </div>
-
-                    {billingAlertMessage ? <div style={billingAlertStyle}>{billingAlertMessage}</div> : null}
-
-                    {billingProfile ? (
-                      <div style={{ display: "grid", gap: 8 }}>
-                        {hasSubscriptionPeriod ? (
-                          <div style={{ border: `1px solid ${DC.border}`, background: DC.white, padding: "12px 14px" }}>
-                            <p style={{ ...settingsSectionLabelStyle, fontSize: 10 }}>Subscription Period</p>
-                            <p style={{ margin: "6px 0 0", fontSize: 13, color: DC.charcoal }}>
-                              <strong>{formatDateTime(billingProfile.currentPeriodStart, subscriptionPeriodDateTimeOptions)}</strong>
-                              {" → "}
-                              <strong>{formatDateTime(billingProfile.currentPeriodEnd, subscriptionPeriodDateTimeOptions)}</strong>
-                              {billingProfile.cancelAtPeriodEnd ? " · Cancels at period end" : ""}
-                            </p>
-                          </div>
-                        ) : null}
-                        {isTrialPlan && !hasSubscriptionPeriod && effectiveTrialCountdownSeconds !== null ? (
-                          <p style={settingsBodyTextStyle}>
-                            Trial usage: <strong>{trialMinutesUsed}</strong> / <strong>{trialMinutesLimit}</strong> minutes
-                            {" · "}
-                            Remaining: <strong>{formatCountdownSeconds(effectiveTrialCountdownSeconds)}</strong>
-                          </p>
-                        ) : null}
-                        {isTrialPlan && !hasSubscriptionPeriod && effectiveTrialCountdownSeconds === null ? (
-                          <p style={settingsBodyTextStyle}>Trial usage details will appear after the next usage tick.</p>
-                        ) : null}
-                        {!isTrialPlan && !hasSubscriptionPeriod ? (
-                          <p style={settingsBodyTextStyle}>Subscription period is syncing from Stripe. Open billing to review the latest details.</p>
-                        ) : null}
-                      </div>
-                    ) : (
-                      <p style={settingsBodyTextStyle}>Loading billing summary…</p>
-                    )}
-
-                    <div>
-                      <button
-                        onClick={() => navigateToTab("billing")}
-                        style={settingsButtonPrimaryStyle}
-                      >
-                        Open Billing & Subscription
-                      </button>
-                    </div>
-                  </section>
+                {/* Settings sub-nav */}
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" as const }}>
+                  {(["general", "services", "translation"] as const)
+                    .filter((s) => s !== "translation" || canManageInvites)
+                    .map((s) => {
+                      const labels: Record<string, string> = { general: "General", services: "Services", translation: "Translation" };
+                      const isActive = settingsSection === s;
+                      return (
+                        <button
+                          key={s}
+                          type="button"
+                          onClick={() => setSettingsSection(s)}
+                          style={{
+                            border: isActive ? "none" : `1px solid ${DC.border}`,
+                            background: isActive ? DC.navy : DC.white,
+                            color: isActive ? "#ffffff" : DC.charcoal,
+                            fontWeight: isActive ? 700 : 500,
+                            fontSize: 13,
+                            padding: "8px 18px",
+                            borderRadius: 999,
+                            cursor: "pointer",
+                            letterSpacing: "-0.01em",
+                          }}
+                        >
+                          {labels[s]}
+                        </button>
+                      );
+                    })}
                 </div>
 
-                <section style={settingsCardStyle}>
-                  <div style={{ display: "flex", flexWrap: "wrap", alignItems: "start", justifyContent: "space-between", gap: 12 }}>
+                {/* General: Your Profile + Church Name & URL */}
+                {settingsSection === "general" ? (
+                  <div style={{ display: "grid", gap: 24 }}>
+                    <div style={settingsGridStyle}>
+                      <section style={settingsCardStyle}>
+                        <p style={settingsSectionLabelStyle}>Account</p>
+                        <h3 style={settingsTitleStyle}>Your Profile</h3>
+                        <p style={settingsBodyTextStyle}>
+                          Update the name shown in the host console and team-facing flows.
+                        </p>
+                        <label style={{ display: "grid", gap: 6 }}>
+                          <span style={{ fontSize: 12, color: DC.mid }}>Display name</span>
+                          <input
+                            value={accountDisplayNameInput}
+                            onChange={(e) => {
+                              setAccountDisplayNameInput(e.target.value);
+                              setAccountProfileError(null);
+                              setAccountProfileNotice(null);
+                            }}
+                            style={{ ...settingsInlineFieldStyle, width: "100%" }}
+                          />
+                        </label>
+                        <p style={{ margin: 0, fontSize: 12, color: "#6b7b92" }}>
+                          This can be changed later.
+                        </p>
+                        {accountProfileError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {accountProfileError}</p> : null}
+                        {accountProfileNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{accountProfileNotice}</p> : null}
+                        <div>
+                          <button
+                            onClick={() => { void saveAccountProfile(); }}
+                            disabled={accountProfileBusy}
+                            style={{
+                              ...settingsButtonPrimaryStyle,
+                              opacity: accountProfileBusy ? 0.6 : 1,
+                              cursor: accountProfileBusy ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {accountProfileBusy ? "Saving..." : "Save Display Name"}
+                          </button>
+                        </div>
+                      </section>
+
+                      <section style={settingsCardStyle}>
+                        <p style={settingsSectionLabelStyle}>Church Identity</p>
+                        <h3 style={settingsTitleStyle}>Church Name & URL</h3>
+                        <p style={settingsBodyTextStyle}>
+                          The church name can be updated later. The church slug is public-facing and stays fixed after creation.
+                        </p>
+                        <label style={{ display: "grid", gap: 6 }}>
+                          <span style={{ fontSize: 12, color: DC.mid }}>Church name</span>
+                          <input
+                            value={churchNameInput}
+                            onChange={(e) => {
+                              setChurchNameInput(e.target.value);
+                              setChurchProfileError(null);
+                              setChurchProfileNotice(null);
+                            }}
+                            disabled={!canManagePaidBilling}
+                            style={{
+                              ...settingsInlineFieldStyle,
+                              width: "100%",
+                              opacity: canManagePaidBilling ? 1 : 0.7,
+                            }}
+                          />
+                        </label>
+                        <label style={{ display: "grid", gap: 6 }}>
+                          <span style={{ fontSize: 12, color: DC.mid }}>Church URL slug</span>
+                          <input
+                            readOnly
+                            value={slug}
+                            style={{
+                              ...settingsInlineFieldStyle,
+                              width: "100%",
+                              background: "rgba(239,244,250,0.92)",
+                              color: DC.mid,
+                            }}
+                          />
+                        </label>
+                        {churchPublicPath ? (
+                          <p style={{ margin: 0, fontSize: 12, color: "#4d607a", wordBreak: "break-all" }}>
+                            Public path: <strong>{churchPublicPath}</strong>
+                          </p>
+                        ) : null}
+                        {!canManagePaidBilling ? (
+                          <p style={{ margin: 0, fontSize: 13, color: DC.mid }}>
+                            Owner or admin role is required to rename the church. The slug remains locked for all roles.
+                          </p>
+                        ) : null}
+                        {churchProfileError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {churchProfileError}</p> : null}
+                        {churchProfileNotice ? <p style={{ margin: 0, color: "#3b7d5c", fontSize: 13 }}>{churchProfileNotice}</p> : null}
+                        <div>
+                          <button
+                            onClick={() => { void saveChurchProfile(); }}
+                            disabled={churchProfileBusy || !canManagePaidBilling || !resolvedOrgId}
+                            style={{
+                              ...settingsButtonPrimaryStyle,
+                              opacity: churchProfileBusy || !canManagePaidBilling || !resolvedOrgId ? 0.6 : 1,
+                              cursor: churchProfileBusy || !canManagePaidBilling || !resolvedOrgId ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {churchProfileBusy ? "Saving..." : "Save Church Name"}
+                          </button>
+                        </div>
+                      </section>
+                    </div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ fontSize: 13, color: DC.mid }}>Need to change your plan or review subscription?</span>
+                      <button
+                        type="button"
+                        onClick={() => navigateToTab("billing")}
+                        style={{ ...settingsButtonNeutralStyle, padding: "7px 14px", fontSize: 12 }}
+                      >
+                        Go to Billing →
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {/* Services: Service Schedule */}
+                {settingsSection === "services" ? (
+                  <section style={settingsCardStyle}>
                     <div style={{ display: "grid", gap: 8 }}>
                       <p style={settingsSectionLabelStyle}>Operations</p>
                       <h3 style={settingsTitleStyle}>Service Schedule</h3>
@@ -2737,12 +2704,133 @@ export default function HostChurchPage() {
                         Add service times for this church. Added services appear in the dropdown for all members.
                       </p>
                     </div>
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                      <input
+                        value={newServiceKey}
+                        onChange={(e) => setNewServiceKey(e.target.value)}
+                        placeholder="service key (example: sun-9am)"
+                        style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
+                      />
+                      <input
+                        value={newServiceTitle}
+                        onChange={(e) => setNewServiceTitle(e.target.value)}
+                        placeholder="title (optional)"
+                        style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
+                      />
+                      <button
+                        onClick={addService}
+                        disabled={serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId}
+                        style={{
+                          ...settingsButtonPrimaryStyle,
+                          opacity: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? 0.6 : 1,
+                          cursor: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {serviceManageBusy ? "Adding..." : "Add Service"}
+                      </button>
+                    </div>
+                    {serviceManageError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {serviceManageError}</p> : null}
+
+                    <div style={{ display: "grid", gap: 10 }}>
+                      {(orgData?.services || []).map((row) => {
+                        const isSelected = row.serviceKey === serviceKey;
+                        const isLive = Boolean(row.activeRoomId);
+                        const deleting = deletingServiceKey === row.serviceKey;
+                        const downloadRoomId = !isLive ? (row.lastRoomId || null) : null;
+                        const isDownloading = downloadingRoom === downloadRoomId;
+                        return (
+                          <div key={row.serviceKey} style={settingsServiceRowStyle}>
+                            <div style={{ minWidth: 0 }}>
+                              <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy }}>{row.title}</p>
+                              <p style={{ margin: "4px 0 0", fontSize: 13, color: DC.mid }}>{row.serviceKey}</p>
+                              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                                {isSelected ? (
+                                  <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.3)`, background: "rgba(184,154,94,0.1)", color: DC.gold }}>
+                                    Selected
+                                  </span>
+                                ) : null}
+                                {isLive ? (
+                                  <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(91,179,130,0.24)", background: "rgba(91,179,130,0.14)", color: "#3b7d5c" }}>
+                                    Live
+                                  </span>
+                                ) : null}
+                              </div>
+                            </div>
+                            <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
+                              {downloadRoomId ? (
+                                <button
+                                  onClick={async () => {
+                                    if (!resolvedOrgId || !downloadRoomId) return;
+                                    setDownloadingRoom(downloadRoomId);
+                                    setDownloadError(null);
+                                    try {
+                                      await downloadTranslationLog(resolvedOrgId, downloadRoomId, async () => (await getIdToken()) ?? "");
+                                    } catch (err) {
+                                      setDownloadError(err instanceof Error ? err.message : "Download failed");
+                                    } finally {
+                                      setDownloadingRoom(null);
+                                    }
+                                  }}
+                                  disabled={isDownloading}
+                                  style={{
+                                    ...settingsButtonNeutralStyle,
+                                    padding: "9px 12px",
+                                    opacity: isDownloading ? 0.55 : 1,
+                                    cursor: isDownloading ? "not-allowed" : "pointer",
+                                  }}
+                                >
+                                  {isDownloading ? "Downloading..." : "Download Log"}
+                                </button>
+                              ) : null}
+                              <button
+                                onClick={() => removeService(row.serviceKey)}
+                                disabled={serviceManageBusy || deletingServiceKey.length > 0 || isLive}
+                                style={{
+                                  ...settingsButtonDangerStyle,
+                                  padding: "9px 12px",
+                                  opacity: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? 0.55 : 1,
+                                  cursor: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? "not-allowed" : "pointer",
+                                }}
+                              >
+                                {deleting ? "Deleting..." : "Delete"}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {downloadError ? (
+                        <p style={{ margin: "8px 0 0", fontSize: 12, color: "#bc5f6f" }}>{downloadError}</p>
+                      ) : null}
+                    </div>
+                  </section>
+                ) : null}
+
+                {/* Translation: STT Keywords + Prompt Settings + Sermon Prep */}
+                {settingsSection === "translation" && canManageInvites ? (
+                  <div style={settingsGridStyle}>
                     {resolvedOrgId ? (
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                      <section style={settingsCardStyle}>
+                        <p style={settingsSectionLabelStyle}>Translation</p>
+                        <h3 style={settingsTitleStyle}>STT Keywords</h3>
+                        <p style={settingsBodyTextStyle}>
+                          Add church-specific terms to help Deepgram recognize them accurately — pastor names, series titles, or theological vocabulary unique to your church. Changes take effect on the next session start.
+                        </p>
+                        <SttKeytermsEditorLazy orgId={resolvedOrgId} getIdToken={getIdToken} />
+                      </section>
+                    ) : null}
+
+                    <section style={settingsCardStyle}>
+                      <p style={settingsSectionLabelStyle}>Translation</p>
+                      <h3 style={settingsTitleStyle}>Prompt Settings</h3>
+                      <p style={settingsBodyTextStyle}>
+                        Customize the translation instructions sent to the AI model — tone, formality, theological terms, and more.
+                      </p>
+                      <div>
                         <button
                           onClick={() => {
                             const qs = new URLSearchParams();
-                            qs.set("orgId", resolvedOrgId);
+                            if (resolvedOrgId) qs.set("orgId", resolvedOrgId);
                             if (slug) qs.set("churchSlug", slug);
                             void router.push(`/admin/prompt?${qs.toString()}`);
                           }}
@@ -2750,10 +2838,20 @@ export default function HostChurchPage() {
                         >
                           Open Prompt Settings
                         </button>
+                      </div>
+                    </section>
+
+                    <section style={settingsCardStyle}>
+                      <p style={settingsSectionLabelStyle}>Translation</p>
+                      <h3 style={settingsTitleStyle}>Sermon Prep</h3>
+                      <p style={settingsBodyTextStyle}>
+                        Pre-load sermon scripts and vocabulary before the service to improve real-time translation accuracy.
+                      </p>
+                      <div>
                         <button
                           onClick={() => {
                             const qs = new URLSearchParams();
-                            qs.set("orgId", resolvedOrgId);
+                            if (resolvedOrgId) qs.set("orgId", resolvedOrgId);
                             if (slug) qs.set("churchSlug", slug);
                             const returnTo = (router.asPath || "").trim();
                             if (returnTo.startsWith("/") && !returnTo.startsWith("//")) qs.set("returnTo", returnTo);
@@ -2764,108 +2862,9 @@ export default function HostChurchPage() {
                           Open Sermon Prep
                         </button>
                       </div>
-                    ) : null}
+                    </section>
                   </div>
-
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-                    <input
-                      value={newServiceKey}
-                      onChange={(e) => setNewServiceKey(e.target.value)}
-                      placeholder="service key (example: sun-9am)"
-                      style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
-                    />
-                    <input
-                      value={newServiceTitle}
-                      onChange={(e) => setNewServiceTitle(e.target.value)}
-                      placeholder="title (optional)"
-                      style={{ ...settingsInlineFieldStyle, flex: "1 1 240px" }}
-                    />
-                    <button
-                      onClick={addService}
-                      disabled={serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId}
-                      style={{
-                        ...settingsButtonPrimaryStyle,
-                        opacity: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? 0.6 : 1,
-                        cursor: serviceManageBusy || deletingServiceKey.length > 0 || !resolvedOrgId ? "not-allowed" : "pointer",
-                      }}
-                    >
-                      {serviceManageBusy ? "Adding..." : "Add Service"}
-                    </button>
-                  </div>
-                  {serviceManageError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {serviceManageError}</p> : null}
-
-                  <div style={{ display: "grid", gap: 10 }}>
-                    {(orgData?.services || []).map((row) => {
-                      const isSelected = row.serviceKey === serviceKey;
-                      const isLive = Boolean(row.activeRoomId);
-                      const deleting = deletingServiceKey === row.serviceKey;
-                      const downloadRoomId = !isLive ? (row.lastRoomId || null) : null;
-                      const isDownloading = downloadingRoom === downloadRoomId;
-                      return (
-                        <div key={row.serviceKey} style={settingsServiceRowStyle}>
-                          <div style={{ minWidth: 0 }}>
-                            <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy }}>{row.title}</p>
-                            <p style={{ margin: "4px 0 0", fontSize: 13, color: DC.mid }}>{row.serviceKey}</p>
-                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-                              {isSelected ? (
-                                <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.3)`, background: "rgba(184,154,94,0.1)", color: DC.gold }}>
-                                  Selected
-                                </span>
-                              ) : null}
-                              {isLive ? (
-                                <span style={{ ...settingsPillBaseStyle, border: "1px solid rgba(91,179,130,0.24)", background: "rgba(91,179,130,0.14)", color: "#3b7d5c" }}>
-                                  Live
-                                </span>
-                              ) : null}
-                            </div>
-                          </div>
-                          <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
-                            {downloadRoomId ? (
-                              <button
-                                onClick={async () => {
-                                  if (!resolvedOrgId || !downloadRoomId) return;
-                                  setDownloadingRoom(downloadRoomId);
-                                  setDownloadError(null);
-                                  try {
-                                    await downloadTranslationLog(resolvedOrgId, downloadRoomId, async () => (await getIdToken()) ?? "");
-                                  } catch (err) {
-                                    setDownloadError(err instanceof Error ? err.message : "Download failed");
-                                  } finally {
-                                    setDownloadingRoom(null);
-                                  }
-                                }}
-                                disabled={isDownloading}
-                                style={{
-                                  ...settingsButtonNeutralStyle,
-                                  padding: "9px 12px",
-                                  opacity: isDownloading ? 0.55 : 1,
-                                  cursor: isDownloading ? "not-allowed" : "pointer",
-                                }}
-                              >
-                                {isDownloading ? "Downloading..." : "Download Log"}
-                              </button>
-                            ) : null}
-                            <button
-                              onClick={() => removeService(row.serviceKey)}
-                              disabled={serviceManageBusy || deletingServiceKey.length > 0 || isLive}
-                              style={{
-                                ...settingsButtonDangerStyle,
-                                padding: "9px 12px",
-                                opacity: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? 0.55 : 1,
-                                cursor: serviceManageBusy || deletingServiceKey.length > 0 || isLive ? "not-allowed" : "pointer",
-                              }}
-                            >
-                              {deleting ? "Deleting..." : "Delete"}
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                    {downloadError ? (
-                      <p style={{ margin: "8px 0 0", fontSize: 12, color: "#bc5f6f" }}>{downloadError}</p>
-                    ) : null}
-                  </div>
-                </section>
+                ) : null}
               </div>
             ) : (
               <div style={{ ...settingsCardStyle, marginTop: 12, fontSize: 13, color: DC.mid }}>
