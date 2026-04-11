@@ -686,7 +686,7 @@ export default function TranslationBox({
   }, [ensureAudioElement, isMuted]);
 
   const enqueueFinalTTS = useCallback((s: string) => {
-    const t = s.trim();
+    const t = s.trim().replace(/\[\[T\d+\]\]/g, '').replace(/  +/g, ' ').trim();
     if (!t || isMuted) return;
 
     if (currentSpokenRef.current === t) {

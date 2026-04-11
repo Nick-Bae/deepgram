@@ -800,7 +800,10 @@ async def _room_sweeper_loop() -> None:
                 for room in candidate_rooms
             }
             if ROOM_HOST_PRESENCE_GRACE_SEC > 0:
-                for room in multichurch_store.live_rooms():
+                live = await asyncio.get_running_loop().run_in_executor(
+                    None, multichurch_store.live_rooms
+                )
+                for room in live:
                     org_id = _clean_token(room.get("orgId"))
                     room_id = _clean_token(room.get("roomId"))
                     if not org_id or not room_id:
@@ -1612,6 +1615,13 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     # your AudioWorklet streams raw 16-bit PCM @ 48k
                     total_audio_bytes += len(b)
                     await dg.send(b)
+                    if org_id and room_id:
+                        now_ts = time.time()
+                        if (now_ts - last_audio_touch_ts) >= 20:
+                            last_audio_touch_ts = now_ts
+                            asyncio.get_running_loop().run_in_executor(
+                                None, multichurch_store.touch_audio, org_id, room_id
+                            )
                 elif (t := msg.get("text")):
                     # allow client-side finalize
                     try:
@@ -2056,18 +2066,9 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 is_final = bool(evt.get("is_final"))
                 speech_final = bool(evt.get("speech_final") or False)
 
-                # Update idle clock only when Deepgram detects actual speech,
-                # not on silent PCM bytes which the AudioWorklet streams continuously.
+                # Update idle clock only when Deepgram detects actual speech.
                 if transcript:
                     last_speech_activity_ts = time.monotonic()
-                    if org_id and room_id:
-                        now_ts = time.time()
-                        if (now_ts - last_audio_touch_ts) >= 20:
-                            last_audio_touch_ts = now_ts
-                            try:
-                                multichurch_store.touch_audio(org_id, room_id)
-                            except Exception:
-                                pass
 
                 # show partial text in the UI; optionally emit early preview translations
                 if transcript and not is_final:
