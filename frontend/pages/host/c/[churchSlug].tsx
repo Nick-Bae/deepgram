@@ -299,7 +299,6 @@ export default function HostChurchPage() {
   const queryServiceKey = typeof router.query.serviceKey === "string" ? router.query.serviceKey : "";
   const queryHostToken = typeof router.query.hostToken === "string" ? router.query.hostToken : "";
   const queryOrgId = typeof router.query.orgId === "string" ? router.query.orgId : "";
-  const queryRoomId = typeof router.query.roomId === "string" ? router.query.roomId : "";
 
   const [origin, setOrigin] = useState("");
   const [loading, setLoading] = useState(true);
@@ -650,11 +649,10 @@ export default function HostChurchPage() {
 
       if (!preferredMembership) return;
       const cleanSlug = (slug || "").trim();
-      const cleanQueryOrgId = (queryOrgId || "").trim();
       const preferredSlug = (preferredMembership.slug || "").trim();
       const preferredOrg = (preferredMembership.orgId || "").trim();
       if (!preferredSlug || !preferredOrg) return;
-      if (cleanSlug === preferredSlug && cleanQueryOrgId === preferredOrg) return;
+      if (cleanSlug === preferredSlug) return;
 
       persistStreamContext({
         orgId: preferredOrg,
@@ -663,7 +661,6 @@ export default function HostChurchPage() {
         roomId: undefined,
       });
       const params = new URLSearchParams();
-      params.set("orgId", preferredOrg);
       if (queryServiceKey) params.set("serviceKey", queryServiceKey);
       const query = params.toString();
       await router.replace(
@@ -674,7 +671,7 @@ export default function HostChurchPage() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, authLoading, getIdToken, queryOrgId, queryServiceKey, resolvedOrgId, router, slug, user]);
+  }, [activeTab, authLoading, getIdToken, queryServiceKey, resolvedOrgId, router, slug, user]);
 
   useEffect(() => {
     if (typeof window !== "undefined") setOrigin(window.location.origin);
@@ -916,19 +913,13 @@ export default function HostChurchPage() {
       const churchSlug = (options?.churchSlug || slug || "").trim();
       if (!churchSlug) return "";
       const serviceToken = (options?.serviceKey || normalizedServiceKey || queryServiceKey || "").trim();
-      const orgToken = (options?.orgId || orgData?.orgId || queryOrgId || "").trim();
-      const hasExplicitRoom = Boolean(options && Object.prototype.hasOwnProperty.call(options, "roomId"));
-      const roomCandidate = hasExplicitRoom ? options?.roomId : activeRoomId || queryRoomId || "";
-      const roomToken = typeof roomCandidate === "string" ? roomCandidate.trim() : "";
       const params = new URLSearchParams();
       if (serviceToken) params.set("serviceKey", serviceToken);
-      if (orgToken) params.set("orgId", orgToken);
-      if (roomToken) params.set("roomId", roomToken);
       const query = params.toString();
       const base = `/host/c/${encodeURIComponent(churchSlug)}/${tab}`;
       return query ? `${base}?${query}` : base;
     },
-    [activeRoomId, normalizedServiceKey, orgData?.orgId, queryOrgId, queryRoomId, queryServiceKey, slug],
+    [normalizedServiceKey, queryServiceKey, slug],
   );
 
   const navigateToTab = useCallback(
@@ -951,17 +942,12 @@ export default function HostChurchPage() {
     void router.replace(href, undefined, { shallow: true });
   }, [buildTabHref, querySection, router, slug]);
 
-  const syncHostUrl = useCallback((nextRoomId?: string | null, nextServiceKey?: string) => {
+  const syncHostUrl = useCallback((nextServiceKey?: string) => {
     const key = (nextServiceKey || normalizedServiceKey || queryServiceKey).trim();
-    const effectiveOrgId = (orgData?.orgId || queryOrgId || "").trim();
-    const href = buildTabHref(activeTab, {
-      serviceKey: key || undefined,
-      orgId: effectiveOrgId || undefined,
-      roomId: nextRoomId ?? null,
-    });
+    const href = buildTabHref(activeTab, { serviceKey: key || undefined });
     if (!href) return;
     void router.replace(href, undefined, { shallow: true });
-  }, [activeTab, buildTabHref, normalizedServiceKey, orgData?.orgId, queryOrgId, queryServiceKey, router]);
+  }, [activeTab, buildTabHref, normalizedServiceKey, queryServiceKey, router]);
 
   const openExistingLiveService = (row: ServiceRow): boolean => {
     const liveKey = (row.serviceKey || "").trim();
@@ -977,7 +963,7 @@ export default function HostChurchPage() {
       serviceKey: liveKey,
       churchSlug: slug,
     });
-    syncHostUrl(roomId, liveKey);
+    syncHostUrl(liveKey);
     setErrorMsg(null);
     return true;
   };
@@ -1004,7 +990,6 @@ export default function HostChurchPage() {
           roomId: undefined,
         });
         const params = new URLSearchParams();
-        params.set("orgId", cleanOrgId);
         if (normalizedServiceKey) params.set("serviceKey", normalizedServiceKey);
         const query = params.toString();
         await router.replace(
@@ -1575,7 +1560,7 @@ export default function HostChurchPage() {
       serviceKey: nextServiceKey || normalizedServiceKey || undefined,
       churchSlug: slug,
     });
-    syncHostUrl(undefined, nextServiceKey || normalizedServiceKey);
+    syncHostUrl(nextServiceKey || normalizedServiceKey);
   }, [normalizedServiceKey, resolvedOrgId, slug, syncHostUrl]);
 
   const endRoomRequest = useCallback(async (roomToEnd: string, reason: string) => {
@@ -1716,18 +1701,7 @@ export default function HostChurchPage() {
         autoStartRoomRef.current = null;
         setAutoStartMicPending(false);
       }
-      if (nextOrgId && nextOrgId !== queryOrgId) {
-        const href = buildTabHref("broadcast", {
-          serviceKey: data.serviceKey || startKey,
-          orgId: nextOrgId,
-          roomId: data.roomId,
-        });
-        if (href) {
-          void router.replace(href, undefined, { shallow: true });
-        }
-      } else {
-        syncHostUrl(data.roomId, data.serviceKey || startKey);
-      }
+      syncHostUrl(data.serviceKey || startKey);
       setErrorMsg(null);
       if (resolvedOrgId) {
         void loadBillingProfile({ refresh: true });
@@ -1742,7 +1716,7 @@ export default function HostChurchPage() {
   };
 
   const endService = async () => {
-    const roomToEnd = activeRoomId || queryRoomId;
+    const roomToEnd = activeRoomId;
     if (!resolvedOrgId || !roomToEnd) return;
     busyRef.current = true;
     setBusy(true);
