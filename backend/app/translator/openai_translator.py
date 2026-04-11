@@ -2,9 +2,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 import httpx
+import os
 from ..env import ENV
 from ..utils.translate import _infer_subject_from_english, _openai_chat_options
 import re
+
+_GUARDRAIL_DEBUG = os.getenv("GUARDRAIL_DEBUG", "").lower() in {"1", "true", "yes"}
 
 FIRST_PERSON_KO_MARKERS = [
     "나는", "난", "내가", "내게", "나를", "나도", "나만", "나와", "나에게", "나한테", "나의",
@@ -239,7 +242,8 @@ def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> st
         return en
 
     debug_tag = "[guardrail]"
-    print(debug_tag, "ko:", ko, "raw_en:", en, "pronoun_key:", pronoun_key)
+    if _GUARDRAIL_DEBUG:
+        print(debug_tag, "ko:", ko, "raw_en:", en, "pronoun_key:", pronoun_key)
 
     updated = en
 

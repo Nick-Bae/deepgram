@@ -31,8 +31,8 @@ DG_ENDPOINT = os.getenv("DEEPGRAM_ENDPOINT", "wss://api.deepgram.com/v1/listen")
 DG_KEY      = os.getenv("DEEPGRAM_API_KEY")
 DG_MODEL    = os.getenv("DEEPGRAM_MODEL", "nova-3")   # Korean supported
 DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
-DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 1500, min_value=200, max_value=6000)
-DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 1000, min_value=300, max_value=6000)
+DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 500, min_value=200, max_value=6000)
+DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 600, min_value=300, max_value=6000)
 _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
 DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 100, min_value=0, max_value=200)
 DG_DEBUG    = os.getenv("DEEPGRAM_DEBUG", "0") not in ("0", "", "false", "False")

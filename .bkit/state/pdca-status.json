@@ -1,7 +1,8 @@
 {
   "version": "3.0",
-  "lastUpdated": "2026-04-11T13:21:46.501Z",
+  "lastUpdated": "2026-04-11T17:59:22.450Z",
   "activeFeatures": [
+    "security-hardening",
     "billing",
     "admin",
     "routes",
@@ -23,6 +24,14 @@
   ],
   "primaryFeature": "frontend",
   "features": {
+    "security-hardening": {
+      "phase": "check",
+      "matchRate": 100,
+      "startedAt": "2026-04-11T15:00:00.000Z",
+      "planDoc": "docs/01-plan/features/security-hardening.plan.md",
+      "designDoc": "docs/02-design/features/security-hardening.design.md",
+      "analysisDoc": "docs/03-analysis/security-hardening.analysis.md"
+    },
     "contact-us-form": {
       "phase": "completed",
       "matchRate": 100,
@@ -164,7 +173,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-21T01:30:50.279Z",
-        "lastUpdated": "2026-04-11T13:21:46.501Z"
+        "lastUpdated": "2026-04-11T17:59:10.377Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/backend/app/main.py"
     },
@@ -230,7 +239,7 @@
       "documents": {},
       "timestamps": {
         "started": "2026-03-27T13:13:00.559Z",
-        "lastUpdated": "2026-03-27T13:13:00.559Z"
+        "lastUpdated": "2026-04-11T17:59:22.450Z"
       },
       "lastFile": "/home/namju/project/real-time-translation/backend/app/translator/openai_translator.py"
     },
@@ -270,7 +279,7 @@
   "session": {
     "startedAt": "2026-03-20T20:05:09.411Z",
     "onboardingCompleted": false,
-    "lastActivity": "2026-04-11T13:21:46.501Z"
+    "lastActivity": "2026-04-11T17:59:22.450Z"
   },
   "history": [
     {
@@ -3582,6 +3591,24 @@
     {
       "timestamp": "2026-04-11T13:21:46.501Z",
       "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-11T17:59:10.377Z",
+      "feature": "backend",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-11T17:59:18.635Z",
+      "feature": "translator",
+      "phase": "do",
+      "action": "updated"
+    },
+    {
+      "timestamp": "2026-04-11T17:59:22.450Z",
+      "feature": "translator",
       "phase": "do",
       "action": "updated"
     }
