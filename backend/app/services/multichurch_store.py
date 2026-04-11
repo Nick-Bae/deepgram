@@ -2592,6 +2592,21 @@ class InMemoryMultiChurchStore:
                 return None
             return active_room_id
 
+    def live_rooms(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            for (org_id, room_id), room in self._rooms.items():
+                if room.get("status") != "live":
+                    continue
+                out.append(
+                    {
+                        "orgId": org_id,
+                        "roomId": room_id,
+                        "serviceKey": room.get("serviceKey"),
+                    }
+                )
+        return out
+
     def stale_live_rooms(self, *, idle_seconds: int, max_duration_seconds: int) -> List[Dict[str, Any]]:
         now = _utcnow()
         out: List[Dict[str, Any]] = []
@@ -5034,6 +5049,21 @@ class FirestoreMultiChurchStore:
             return None
         room = room_snap.to_dict() or {}
         return str(room_id) if room.get("status") == "live" else None
+
+    def live_rooms(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for org_snap in self._db.collection("organizations").stream():
+            org_id = org_snap.id
+            for room_snap in self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream():
+                room = room_snap.to_dict() or {}
+                out.append(
+                    {
+                        "orgId": org_id,
+                        "roomId": room_snap.id,
+                        "serviceKey": room.get("serviceKey"),
+                    }
+                )
+        return out
 
     def stale_live_rooms(self, *, idle_seconds: int, max_duration_seconds: int) -> List[Dict[str, Any]]:
         now = _utcnow()

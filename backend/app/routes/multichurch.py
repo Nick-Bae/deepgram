@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from app import validators
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.auth.guards import require_org_role
+from app.socket_manager import manager
 from app.services.multichurch_store import multichurch_store
 from app.services.script_store import script_store
 
@@ -267,6 +268,7 @@ def end_room(
 
     # Free in-memory sermon script for this room
     script_store.clear(room_id=room_id)
+    manager.forget_room(org_id, room_id)
 
     return result
 

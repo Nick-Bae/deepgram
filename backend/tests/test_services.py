@@ -149,6 +149,38 @@ class ServiceManagementTests(unittest.TestCase):
         )
         self.assertEqual(started.get("status"), "live")
 
+    def test_live_rooms_lists_only_active_rooms(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(
+            store,
+            owner_uid="owner-service-4",
+            slug="service-org-d",
+            name="Service Org D",
+        )
+
+        started = store.start_service(
+            org_id,
+            "sun-11am",
+            host_uid="owner-service-4",
+            source="ko",
+            target="en",
+        )
+        room_id = str(started.get("roomId") or "")
+        self.assertTrue(room_id)
+
+        live_rooms = store.live_rooms()
+        self.assertIn(
+            {"orgId": org_id, "roomId": room_id, "serviceKey": "sun-11am"},
+            live_rooms,
+        )
+
+        store.end_room(org_id, room_id, reason="host_end")
+        live_rooms_after = store.live_rooms()
+        self.assertNotIn(
+            {"orgId": org_id, "roomId": room_id, "serviceKey": "sun-11am"},
+            live_rooms_after,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

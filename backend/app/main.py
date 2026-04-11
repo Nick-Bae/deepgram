@@ -3,7 +3,7 @@
 import os, json, asyncio, logging, time, re
 from collections import deque
 from threading import Lock
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -88,10 +88,12 @@ def _safe_append_segment(
 
 # Global display pacing config (broadcast to display clients)
 APP_DISPLAY_SPEED = {"speed": 1.0}
-ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "900"))  # 15 min
+ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "300"))  # 5 min
 ROOM_MAX_DURATION_SEC = int(os.getenv("ROOM_MAX_DURATION_SEC", "10800"))  # 3 hours
 ROOM_SWEEPER_INTERVAL_SEC = int(os.getenv("ROOM_SWEEPER_INTERVAL_SEC", "60"))
 ROOM_USAGE_TICK_SEC = int(os.getenv("ROOM_USAGE_TICK_SEC", "300"))  # 5 min
+ROOM_HOST_PRESENCE_GRACE_SEC = _env_int("ROOM_HOST_PRESENCE_GRACE_SEC", 120, min_value=0, max_value=3600)
+STT_NO_SPEECH_TIMEOUT_SEC = _env_int("STT_NO_SPEECH_TIMEOUT_SEC", 120, min_value=30, max_value=3600)
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
 WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
@@ -727,14 +729,33 @@ async def _room_sweeper_loop() -> None:
     while True:
         try:
             await asyncio.sleep(max(15, ROOM_SWEEPER_INTERVAL_SEC))
-            stale_rooms = multichurch_store.stale_live_rooms(
+            candidate_rooms = multichurch_store.stale_live_rooms(
                 idle_seconds=max(60, ROOM_IDLE_TIMEOUT_SEC),
                 max_duration_seconds=max(600, ROOM_MAX_DURATION_SEC),
             )
-            cap_rooms = multichurch_store.enforce_live_usage_caps(
-                tick_seconds=max(60, ROOM_USAGE_TICK_SEC),
+            candidate_rooms.extend(
+                multichurch_store.enforce_live_usage_caps(
+                    tick_seconds=max(60, ROOM_USAGE_TICK_SEC),
+                )
             )
-            for room in stale_rooms + cap_rooms:
+            seen_room_keys = {
+                (_clean_token(room.get("orgId")) or "", _clean_token(room.get("roomId")) or "")
+                for room in candidate_rooms
+            }
+            if ROOM_HOST_PRESENCE_GRACE_SEC > 0:
+                for room in multichurch_store.live_rooms():
+                    org_id = _clean_token(room.get("orgId"))
+                    room_id = _clean_token(room.get("roomId"))
+                    if not org_id or not room_id:
+                        continue
+                    elapsed = manager.note_room_host_absence(org_id, room_id)
+                    room_key = (org_id, room_id)
+                    if room_key in seen_room_keys:
+                        continue
+                    if elapsed >= ROOM_HOST_PRESENCE_GRACE_SEC:
+                        candidate_rooms.append({"orgId": org_id, "roomId": room_id, "reason": "host_absent"})
+                        seen_room_keys.add(room_key)
+            for room in candidate_rooms:
                 org_id = _clean_token(room.get("orgId"))
                 room_id = _clean_token(room.get("roomId"))
                 reason = _clean_token(room.get("reason")) or "idle_timeout"
@@ -743,6 +764,7 @@ async def _room_sweeper_loop() -> None:
                 try:
                     result = multichurch_store.end_room(org_id, room_id, reason=reason)
                     if result.get("alreadyEnded"):
+                        manager.forget_room(org_id, room_id)
                         print(f"[ROOM_SWEEPER] room already ended — no double billing org={org_id} room={room_id}")
                         continue
                 except ValueError:
@@ -750,6 +772,7 @@ async def _room_sweeper_loop() -> None:
                 except Exception as exc:
                     print(f"[ROOM_SWEEPER] end_room failed org={org_id} room={room_id} err={exc}")
                     continue
+                manager.forget_room(org_id, room_id)
                 try:
                     await manager.broadcast_room(
                         org_id,
@@ -764,7 +787,11 @@ async def _room_sweeper_loop() -> None:
                             "message": (
                                 "Trial minutes exhausted. Upgrade to continue."
                                 if reason == "trial_expired"
-                                else ("Monthly limit reached. Please contact your admin." if reason == "monthly_limit_reached" else None)
+                                else (
+                                    "Monthly limit reached. Please contact your admin."
+                                    if reason == "monthly_limit_reached"
+                                    else ("Host disconnected. Broadcast ended." if reason == "host_absent" else None)
+                                )
                             ),
                         },
                     )
@@ -1340,6 +1367,68 @@ def _fail_open_meta(exc: Exception) -> dict[str, Any]:
     }
 
 
+def _format_duration_label(seconds: int) -> str:
+    total = max(1, int(seconds))
+    minutes, remainder = divmod(total, 60)
+    if minutes and remainder:
+        minute_label = "minute" if minutes == 1 else "minutes"
+        second_label = "second" if remainder == 1 else "seconds"
+        return f"{minutes} {minute_label} {remainder} {second_label}"
+    if minutes:
+        minute_label = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {minute_label}"
+    second_label = "second" if total == 1 else "seconds"
+    return f"{total} {second_label}"
+
+
+def _stt_idle_timeout_message(timeout_seconds: int) -> str:
+    return f"No speech detected for {_format_duration_label(timeout_seconds)}. Microphone stream stopped."
+
+
+async def _stt_idle_watchdog(
+    *,
+    closed: asyncio.Event,
+    last_speech_activity: Callable[[], float],
+    timeout_seconds: int,
+    websocket: WebSocket,
+    deepgram: Any,
+    org_id: Optional[str],
+    room_id: Optional[str],
+) -> None:
+    while not closed.is_set():
+        idle_for = time.monotonic() - last_speech_activity()
+        remaining = timeout_seconds - idle_for
+        if remaining <= 0:
+            timeout_message = _stt_idle_timeout_message(timeout_seconds)
+            print(f"[DG][idle-timeout] org={org_id} room={room_id} timeout={timeout_seconds}s")
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "reason": "speech_idle_timeout",
+                        "message": timeout_message,
+                    }
+                )
+            except Exception:
+                pass
+            closed.set()
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                pass
+            try:
+                await deepgram.close()
+            except Exception:
+                pass
+            break
+        try:
+            await asyncio.wait_for(closed.wait(), timeout=min(5.0, max(0.25, remaining)))
+        except asyncio.TimeoutError:
+            continue
+        except asyncio.CancelledError:
+            break
+
+
 @app.websocket("/ws/stt/deepgram")
 async def ws_stt_deepgram(websocket: WebSocket):
     src_lang_full = _clean_lang(websocket.query_params.get("source"), "ko")
@@ -1433,6 +1522,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     closed = asyncio.Event()
     finalize_event = asyncio.Event()
     last_audio_touch_ts = 0.0
+    last_speech_activity_ts = time.monotonic()
     total_audio_bytes = 0
     prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
 
@@ -1465,14 +1555,6 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     # your AudioWorklet streams raw 16-bit PCM @ 48k
                     total_audio_bytes += len(b)
                     await dg.send(b)
-                    if org_id and room_id:
-                        now_ts = time.time()
-                        if (now_ts - last_audio_touch_ts) >= 20:
-                            last_audio_touch_ts = now_ts
-                            try:
-                                multichurch_store.touch_audio(org_id, room_id)
-                            except Exception:
-                                pass
                 elif (t := msg.get("text")):
                     # allow client-side finalize
                     try:
@@ -1486,6 +1568,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             closed.set()
 
     async def from_deepgram_to_server():
+        nonlocal last_audio_touch_ts, last_speech_activity_ts
         """
         Option A: translate only when a sentence is complete.
         Commit rules:
@@ -1894,6 +1977,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 is_final = bool(evt.get("is_final"))
                 speech_final = bool(evt.get("speech_final") or False)
 
+                # Update idle clock only when Deepgram detects actual speech,
+                # not on silent PCM bytes which the AudioWorklet streams continuously.
+                if transcript:
+                    last_speech_activity_ts = time.monotonic()
+                    if org_id and room_id:
+                        now_ts = time.time()
+                        if (now_ts - last_audio_touch_ts) >= 20:
+                            last_audio_touch_ts = now_ts
+                            try:
+                                multichurch_store.touch_audio(org_id, room_id)
+                            except Exception:
+                                pass
+
                 # show partial text in the UI; optionally emit early preview translations
                 if transcript and not is_final:
                     try:
@@ -1966,11 +2062,23 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     consumer = asyncio.create_task(from_client_to_deepgram())
     producer = asyncio.create_task(from_deepgram_to_server())
+    idle_watchdog = asyncio.create_task(
+        _stt_idle_watchdog(
+            closed=closed,
+            last_speech_activity=lambda: last_speech_activity_ts,
+            timeout_seconds=STT_NO_SPEECH_TIMEOUT_SEC,
+            websocket=websocket,
+            deepgram=dg,
+            org_id=org_id,
+            room_id=room_id,
+        )
+    )
     await closed.wait()
     consumer.cancel()
     producer.cancel()
+    idle_watchdog.cancel()
     try:
-        await asyncio.gather(consumer, producer, return_exceptions=True)
+        await asyncio.gather(consumer, producer, idle_watchdog, return_exceptions=True)
     except Exception:
         pass
     try:
