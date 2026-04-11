@@ -150,7 +150,7 @@ async function verifyAuthenticatedSender(idToken: string): Promise<Authenticated
 }
 
 async function verifyTurnstile(turnstileToken: string, ip: string): Promise<boolean> {
-  const secret = (process.env.TURNSTILE_SECRET_KEY || "").trim();
+  const secret = (process.env.CLOUDFLARE_TURNSTILE_SECRET || process.env.TURNSTILE_SECRET_KEY || "").trim();
   if (!secret) return true;
   if (!turnstileToken) return false;
 

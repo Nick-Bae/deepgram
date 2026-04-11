@@ -668,9 +668,33 @@ export default function HomePage() {
                 </p>
               </div>
 
-              {/* right mockup */}
-              <div>
-                <ProductMockup isLoggedIn={isLoggedIn} dashboardHref={dashboardHref} resolvingDashboard={resolvingDashboard} />
+              {/* right: worship translation image */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+                {/* gradient border wrapper */}
+                <div
+                  style={{
+                    position: "relative" as const,
+                    padding: 2,
+                    borderRadius: 26,
+                    background: "conic-gradient(from 180deg at 50% 50%, #d4a94a 0deg, #4a7fd4 90deg, #2ec4b6 180deg, #9b6fe8 270deg, #d4a94a 360deg)",
+                    boxShadow: "0 0 48px rgba(74,127,212,0.22), 0 0 80px rgba(212,169,74,0.14), 0 0 40px rgba(46,196,182,0.12)",
+                  }}
+                >
+                  <div style={{ borderRadius: 24, overflow: "hidden" as const, background: "#070e1c" }}>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src="/worship-translation-logo.png"
+                      alt="Worship Translation"
+                      style={{
+                        width: "100%",
+                        maxWidth: 500,
+                        display: "block",
+                        filter: "brightness(0.75) sepia(0.6) hue-rotate(188deg) saturate(2.2) contrast(1.1)",
+                        mixBlendMode: "screen" as const,
+                      }}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
           </div>
