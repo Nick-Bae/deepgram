@@ -63,6 +63,7 @@ type StartResponse = {
 };
 
 const POLL_MS = 12000;
+const ROOM_SYNC_GRACE_MS = 30000;
 const DEFAULT_SERVICE_KEY = "sun-11am";
 const BILLING_ADMIN_EMAILS = new Set(
   `${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAILS || ""},${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAIL || ""}`
@@ -308,6 +309,7 @@ export default function HostChurchPage() {
   const scrollToPanelRef = useRef(false);
   const roomStartTimeRef = useRef<number | null>(null);
   const autoStartRoomRef = useRef<{ roomId: string; rollbackOnFailure: boolean } | null>(null);
+  const pendingRoomSyncRef = useRef<{ roomId: string; serviceKey: string; expiresAt: number } | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [autoStartMicSignal, setAutoStartMicSignal] = useState(0);
   const [autoStartMicPending, setAutoStartMicPending] = useState(false);
@@ -700,9 +702,25 @@ export default function HostChurchPage() {
       const selectedKey = (selected?.serviceKey || preferredKey || "").trim();
       if (selectedKey && selectedKey !== serviceKey) setServiceKey(selectedKey);
 
-      // Preserve a room that was just started locally until the services payload
-      // catches up, otherwise the console can disappear right after launch.
-      const rowRoomId = selected?.activeRoomId || activeRoomId || null;
+      const backendRoomId = (selected?.activeRoomId || "").trim();
+      const localRoomId = (activeRoomId || "").trim();
+      const pendingRoomSync = pendingRoomSyncRef.current;
+      let rowRoomId = backendRoomId || null;
+
+      // Preserve a newly-started room only until the services payload catches up.
+      if (backendRoomId) {
+        if (pendingRoomSync?.roomId === backendRoomId) pendingRoomSyncRef.current = null;
+      } else if (
+        pendingRoomSync &&
+        pendingRoomSync.roomId === localRoomId &&
+        pendingRoomSync.serviceKey === selectedKey &&
+        Date.now() < pendingRoomSync.expiresAt
+      ) {
+        rowRoomId = localRoomId || null;
+      } else if (pendingRoomSync?.roomId === localRoomId) {
+        pendingRoomSyncRef.current = null;
+      }
+
       setActiveRoomId(rowRoomId);
       persistStreamContext({
         orgId: data.orgId,
@@ -949,6 +967,7 @@ export default function HostChurchPage() {
     const liveKey = (row.serviceKey || "").trim();
     const roomId = (row.activeRoomId || "").trim();
     if (!liveKey || !roomId) return false;
+    pendingRoomSyncRef.current = null;
     scrollToPanelRef.current = true;
     setActiveRoomId(roomId);
     if (liveKey !== serviceKey) setServiceKey(liveKey);
@@ -1547,6 +1566,7 @@ export default function HostChurchPage() {
   };
 
   const clearLiveRoomState = useCallback((nextServiceKey?: string) => {
+    pendingRoomSyncRef.current = null;
     setActiveRoomId(null);
     clearRoomInSession();
     persistStreamContext({
@@ -1673,6 +1693,11 @@ export default function HostChurchPage() {
       roomStartTimeRef.current = Date.now();
       setElapsedSec(0);
       setActiveRoomId(data.roomId);
+      pendingRoomSyncRef.current = {
+        roomId: data.roomId,
+        serviceKey: data.serviceKey || startKey,
+        expiresAt: Date.now() + ROOM_SYNC_GRACE_MS,
+      };
       if (data.serviceKey && data.serviceKey !== serviceKey) setServiceKey(data.serviceKey);
       persistStreamContext({
         orgId: nextOrgId || undefined,

@@ -88,11 +88,11 @@ def _safe_append_segment(
 
 # Global display pacing config (broadcast to display clients)
 APP_DISPLAY_SPEED = {"speed": 1.0}
-ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "300"))  # 5 min
+ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "900"))  # 15 min
 ROOM_MAX_DURATION_SEC = int(os.getenv("ROOM_MAX_DURATION_SEC", "10800"))  # 3 hours
 ROOM_SWEEPER_INTERVAL_SEC = int(os.getenv("ROOM_SWEEPER_INTERVAL_SEC", "60"))
 ROOM_USAGE_TICK_SEC = int(os.getenv("ROOM_USAGE_TICK_SEC", "300"))  # 5 min
-ROOM_HOST_PRESENCE_GRACE_SEC = _env_int("ROOM_HOST_PRESENCE_GRACE_SEC", 120, min_value=0, max_value=3600)
+ROOM_HOST_PRESENCE_GRACE_SEC = _env_int("ROOM_HOST_PRESENCE_GRACE_SEC", 300, min_value=0, max_value=3600)
 STT_NO_SPEECH_TIMEOUT_SEC = _env_int("STT_NO_SPEECH_TIMEOUT_SEC", 120, min_value=30, max_value=3600)
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
