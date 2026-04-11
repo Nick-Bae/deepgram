@@ -139,7 +139,27 @@ type CancelableFn<Args extends unknown[] = unknown[]> = ((...args: Args) => void
   cancel: () => void
 }
 
-export default function TranslationBox() {
+type TranslationBoxProps = {
+  autoStartSignal: number
+  roomId: string
+  sourceLang: string
+  targetLang: string
+  onAutoStartComplete?: () => void
+  onAutoStartFailed?: (message: string) => void
+  onSourceLangChange: (value: string) => void
+  onTargetLangChange: (value: string) => void
+}
+
+export default function TranslationBox({
+  autoStartSignal,
+  roomId,
+  sourceLang,
+  targetLang,
+  onAutoStartComplete,
+  onAutoStartFailed,
+  onSourceLangChange,
+  onTargetLangChange,
+}: TranslationBoxProps) {
   const {
     connected,
     connectionState,
@@ -154,8 +174,6 @@ export default function TranslationBox() {
   const [text, setText] = useState('')
   const [translated, setTranslated] = useState('')
   const [isListening, setIsListening] = useState(false)
-  const [sourceLang, setSourceLang] = useState('ko')
-  const [targetLang, setTargetLang] = useState('en')
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
   const [voicePreference, setVoicePreference] = useState('auto')
@@ -241,8 +259,8 @@ export default function TranslationBox() {
   )
 
   // Deepgram mic producer
-  const dgController: DeepgramProducerController & { finalize?: () => void } = useDeepgramProducer()
-  const { start: dgStart, stop: dgStop, status, partial, errorMsg, inputLevel, finalize } = dgController
+  const dgController: DeepgramProducerController = useDeepgramProducer()
+  const { start: dgStart, stop: dgStop, status, partial, errorMsg, inputLevel, inputMuted, setInputMuted, finalize } = dgController
   const startProducer = useCallback(async () => {
     const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string; earlyCommit?: boolean }) => Promise<void>
     await startWithOptions({ sourceLang, targetLang, earlyCommit: earlyCommitEnabled })
@@ -260,6 +278,7 @@ export default function TranslationBox() {
   const audioUnlockedRef = useRef(false)
   const ttsIdRef = useRef(0)
   const ttsEffectBootRef = useRef(false)
+  const autoStartHandledRef = useRef(0)
   const lastClauseSentRef = useRef('')
   const lastKRFromServerRef = useRef('')
 
@@ -914,7 +933,7 @@ export default function TranslationBox() {
   }, [endsWithSentenceBoundary, status, triggerFinalize])
 
   // ---------- Start/Stop mic ----------
-  const handleStartListening = async () => {
+  const handleStartListening = useCallback(async (options?: { suppressAlert?: boolean; onError?: (message: string) => void }) => {
     lastInterimRef.current = ''
     clauseRef.current = ''
     lastClauseSentRef.current = ''
@@ -926,15 +945,49 @@ export default function TranslationBox() {
 
     try {
       await startProducer()
+      return true
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e)
-      alert(`Mic start failed: ${message}`)
+      options?.onError?.(message)
+      if (!options?.suppressAlert) {
+        alert(`Mic start failed: ${message}`)
+      }
+      return false
     }
-  }
+  }, [flushTTSQueue, startProducer, unlockAudio])
 
   const handleStopListening = () => {
     dgStop()
   }
+
+  const handleToggleInputMuted = useCallback(() => {
+    if (!isListening) return
+    setInputMuted(!inputMuted)
+  }, [inputMuted, isListening, setInputMuted])
+
+  useEffect(() => {
+    if (!roomId || autoStartSignal <= 0) return
+    if (autoStartHandledRef.current === autoStartSignal) return
+
+    autoStartHandledRef.current = autoStartSignal
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void handleStartListening({
+        suppressAlert: true,
+        onError: (message) => {
+          if (!cancelled) onAutoStartFailed?.(message)
+        },
+      }).then((started) => {
+        if (cancelled || !started) return
+        onAutoStartComplete?.()
+      })
+    }, 0)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [autoStartSignal, handleStartListening, onAutoStartComplete, onAutoStartFailed, roomId])
 
   const submitCorrection = useCallback(async (line: { id: number; srcText: string; translated: string }) => {
     if (!correctionDraft.trim() || correctionDraft === line.translated) {
@@ -1086,7 +1139,7 @@ export default function TranslationBox() {
   const broadcastAlertBadgeStyle = hasCriticalBroadcastIssue
     ? { background: 'rgba(188,95,111,0.14)', color: '#8a2720' }
     : { background: 'rgba(198,165,109,0.16)', color: '#7a5c20' }
-  const micActive = isListening || inputLevel > 0.004
+  const micActive = !inputMuted && (isListening || inputLevel > 0.004)
   const waveformActivity = micActive ? Math.min(1, Math.pow(inputLevel * 18, 0.8)) : 0
   const waveformBars = Array.from({ length: 5 }, (_, idx) => {
     const baseHeight = [10, 16, 13, 20, 11][idx] ?? 12
@@ -1171,6 +1224,16 @@ export default function TranslationBox() {
     boxShadow: 'none',
     color: palette.ink,
   } as const
+  const mutedActionStyle = {
+    background: 'rgba(188,95,111,0.12)',
+    boxShadow: 'inset 0 0 0 1px rgba(188,95,111,0.16)',
+    color: '#8a2720',
+  } as const
+  const disabledActionStyle = {
+    ...secondaryButtonStyle,
+    opacity: 0.48,
+    cursor: 'not-allowed' as const,
+  }
   const sectionHeadingStyle = {
     margin: 0,
     fontSize: 'clamp(1.2rem, 1.4vw, 1.55rem)',
@@ -1302,7 +1365,7 @@ export default function TranslationBox() {
                   </div>
                   <select
                     value={sourceLang}
-                    onChange={e => setSourceLang(e.target.value)}
+                    onChange={e => onSourceLangChange(e.target.value)}
                     className="text-xs font-semibold focus:outline-none"
                     style={{ ...inputStyle, border: 'none', borderRadius: 999, padding: '6px 12px' }}
                   >
@@ -1314,14 +1377,26 @@ export default function TranslationBox() {
                   {text ? (
                     <p style={{ margin: 0, color: palette.ink, fontSize: '1.05rem', lineHeight: 1.75, fontWeight: 400 }}>{text}</p>
                   ) : (
-                    <p style={{ margin: 0, color: 'rgba(16,34,56,0.32)', fontSize: '1.05rem', lineHeight: 1.75, fontStyle: 'italic' }}>Listening for Korean speech…</p>
+                    <p style={{ margin: 0, color: 'rgba(16,34,56,0.32)', fontSize: '1.05rem', lineHeight: 1.75, fontStyle: 'italic' }}>
+                      {inputMuted && isListening ? 'Microphone is muted. Audio input is paused.' : `Listening for ${sourceLabel} speech…`}
+                    </p>
                   )}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3 pt-3">
                   <div className="flex h-7 min-w-[84px] flex-1 items-end gap-1">{waveformBars}</div>
                   <button
-                    onClick={isListening ? handleStopListening : handleStartListening}
+                    type="button"
+                    onClick={handleToggleInputMuted}
+                    disabled={!isListening}
+                    aria-pressed={inputMuted}
+                    className="rounded-[1rem] px-4 py-2 text-xs font-black uppercase tracking-[0.16em] transition"
+                    style={!isListening ? disabledActionStyle : inputMuted ? mutedActionStyle : secondaryButtonStyle}
+                  >
+                    {inputMuted ? 'Unmute' : 'Mute'}
+                  </button>
+                  <button
+                    onClick={isListening ? handleStopListening : () => { void handleStartListening() }}
                     className="rounded-[1rem] px-4 py-2 text-xs font-black uppercase tracking-[0.16em] transition"
                     style={isListening ? stopActionStyle : primaryActionStyle}
                   >
@@ -1338,7 +1413,7 @@ export default function TranslationBox() {
                   </div>
                   <select
                     value={targetLang}
-                    onChange={e => setTargetLang(e.target.value)}
+                    onChange={e => onTargetLangChange(e.target.value)}
                     className="text-xs font-semibold focus:outline-none"
                     style={{ ...inputStyle, border: 'none', borderRadius: 999, padding: '6px 12px' }}
                   >

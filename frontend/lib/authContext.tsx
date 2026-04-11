@@ -45,7 +45,7 @@ function authError(code: string, message: string): Error & { code: string } {
 export function AuthProvider({ children }: Props) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [_profileVersion, setProfileVersion] = useState(0);
+  const [, setProfileVersion] = useState(0);
 
   useEffect(() => {
     if (!firebaseConfigured) {

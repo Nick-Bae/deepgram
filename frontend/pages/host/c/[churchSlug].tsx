@@ -307,7 +307,10 @@ export default function HostChurchPage() {
   const controlPanelRef = useRef<HTMLDivElement>(null);
   const scrollToPanelRef = useRef(false);
   const roomStartTimeRef = useRef<number | null>(null);
+  const autoStartRoomRef = useRef<{ roomId: string; rollbackOnFailure: boolean } | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [autoStartMicSignal, setAutoStartMicSignal] = useState(0);
+  const [autoStartMicPending, setAutoStartMicPending] = useState(false);
   const [backendReachable, setBackendReachable] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [orgData, setOrgData] = useState<ServicesResponse | null>(null);
@@ -404,8 +407,6 @@ export default function HostChurchPage() {
   const isTrialPlan = billingPlanToken === "trial";
   const hasSubscriptionPeriod = Boolean(billingProfile?.currentPeriodStart && billingProfile?.currentPeriodEnd);
   const billingMaxServiceKeys = Number(billingProfile?.limits?.maxServiceKeys || 0);
-  const billingMonthlyMinutesLimit = billingProfile?.monthlyMinutesLimit ?? null;
-  const billingMonthlyMinutesUsed = billingProfile?.monthlyMinutesUsed ?? null;
   const trialMinutesLimit = Number(billingProfile?.trialMinutesLimit || 0);
   const trialMinutesUsed = Number(billingProfile?.trialMinutesUsed || 0);
   const trialSecondsLimit = trialMinutesLimit > 0 ? trialMinutesLimit * 60 : 0;
@@ -760,7 +761,13 @@ export default function HostChurchPage() {
 
   const liveServiceRoomId = (liveService?.activeRoomId || "").trim();
   const hasLiveService = Boolean(liveServiceRoomId);
-  const startServiceDisabled = busy || (isTrialExpired && !Boolean(activeRoomId || liveServiceRoomId));
+  const startServiceDisabled = busy || autoStartMicPending || (isTrialExpired && !Boolean(activeRoomId || liveServiceRoomId));
+
+  useEffect(() => {
+    if (activeRoomId) return;
+    autoStartRoomRef.current = null;
+    setAutoStartMicPending(false);
+  }, [activeRoomId]);
 
   useEffect(() => {
     if (!orgData?.services?.length) return;
@@ -926,7 +933,7 @@ export default function HostChurchPage() {
     void router.replace(href, undefined, { shallow: true });
   }, [buildTabHref, querySection, router, slug]);
 
-  const syncHostUrl = (nextRoomId?: string | null, nextServiceKey?: string) => {
+  const syncHostUrl = useCallback((nextRoomId?: string | null, nextServiceKey?: string) => {
     const key = (nextServiceKey || normalizedServiceKey || queryServiceKey).trim();
     const effectiveOrgId = (orgData?.orgId || queryOrgId || "").trim();
     const href = buildTabHref(activeTab, {
@@ -936,7 +943,7 @@ export default function HostChurchPage() {
     });
     if (!href) return;
     void router.replace(href, undefined, { shallow: true });
-  };
+  }, [activeTab, buildTabHref, normalizedServiceKey, orgData?.orgId, queryOrgId, queryServiceKey, router]);
 
   const openExistingLiveService = (row: ServiceRow): boolean => {
     const liveKey = (row.serviceKey || "").trim();
@@ -1539,8 +1546,83 @@ export default function HostChurchPage() {
     }
   };
 
+  const clearLiveRoomState = useCallback((nextServiceKey?: string) => {
+    setActiveRoomId(null);
+    clearRoomInSession();
+    persistStreamContext({
+      orgId: resolvedOrgId || undefined,
+      roomId: undefined,
+      serviceKey: nextServiceKey || normalizedServiceKey || undefined,
+      churchSlug: slug,
+    });
+    syncHostUrl(undefined, nextServiceKey || normalizedServiceKey);
+  }, [normalizedServiceKey, resolvedOrgId, slug, syncHostUrl]);
+
+  const endRoomRequest = useCallback(async (roomToEnd: string, reason: string) => {
+    if (!resolvedOrgId || !roomToEnd) return;
+
+    const idToken = await getIdToken(true);
+    if (!idToken) throw new Error("Please sign in again.");
+    persistAuthToken(idToken);
+
+    const res = await fetch(`${API_URL}/api/org/${encodeURIComponent(resolvedOrgId)}/room/${encodeURIComponent(roomToEnd)}/end`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({
+        reason,
+      }),
+    });
+    if (!res.ok) {
+      const msg = await readErrorMessage(res, "end_service");
+      throw new Error(msg);
+    }
+
+    clearLiveRoomState();
+    void loadBillingProfile({ refresh: true });
+  }, [clearLiveRoomState, getIdToken, loadBillingProfile, resolvedOrgId]);
+
+  const handleAutoStartComplete = useCallback(() => {
+    autoStartRoomRef.current = null;
+    setAutoStartMicPending(false);
+    setErrorMsg(null);
+  }, []);
+
+  const handleAutoStartFailed = useCallback(async (message: string) => {
+    const pending = autoStartRoomRef.current;
+    autoStartRoomRef.current = null;
+    setAutoStartMicPending(false);
+
+    if (!pending) {
+      setErrorMsg(`Microphone did not start: ${message}`);
+      return;
+    }
+
+    if (!pending.rollbackOnFailure) {
+      setErrorMsg(`Microphone did not start: ${message}. The live room stayed active, so you can retry from the audio controls.`);
+      return;
+    }
+
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await endRoomRequest(pending.roomId, "mic_start_failed");
+      setErrorMsg(`Microphone did not start: ${message}. The broadcast room was closed automatically.`);
+    } catch (err: unknown) {
+      const detail = isNetworkError(err) ? "Server unreachable. Check your connection and try again." : err instanceof Error ? err.message : String(err);
+      setErrorMsg(`Microphone did not start: ${message}. Automatic room cleanup failed: ${detail}`);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }, [endRoomRequest]);
+
   const startService = async () => {
     const startKey = serviceKeyForStart.trim();
+    const hadExistingLiveRoom = Boolean(activeRoomId || liveServiceRoomId);
+    const rollbackOnMicFailure = !hadExistingLiveRoom;
     if (!resolvedOrgId && !slug) {
       setErrorMsg("Church slug is missing. Refresh the page.");
       return;
@@ -1598,6 +1680,17 @@ export default function HostChurchPage() {
         serviceKey: data.serviceKey || startKey,
         churchSlug: slug,
       });
+      if (!hadExistingLiveRoom) {
+        autoStartRoomRef.current = {
+          roomId: data.roomId,
+          rollbackOnFailure: rollbackOnMicFailure,
+        };
+        setAutoStartMicPending(true);
+        setAutoStartMicSignal((value) => value + 1);
+      } else {
+        autoStartRoomRef.current = null;
+        setAutoStartMicPending(false);
+      }
       if (nextOrgId && nextOrgId !== queryOrgId) {
         const href = buildTabHref("broadcast", {
           serviceKey: data.serviceKey || startKey,
@@ -1628,35 +1721,11 @@ export default function HostChurchPage() {
     if (!resolvedOrgId || !roomToEnd) return;
     busyRef.current = true;
     setBusy(true);
+    autoStartRoomRef.current = null;
+    setAutoStartMicPending(false);
     try {
-      const idToken = await getIdToken(true);
-      if (!idToken) throw new Error("Please sign in again.");
-      persistAuthToken(idToken);
-      const res = await fetch(`${API_URL}/api/org/${encodeURIComponent(resolvedOrgId)}/room/${encodeURIComponent(roomToEnd)}/end`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${idToken}`,
-        },
-        body: JSON.stringify({
-          reason: "host_end",
-        }),
-      });
-      if (!res.ok) {
-        const msg = await readErrorMessage(res, "end_service");
-        throw new Error(msg);
-      }
-      setActiveRoomId(null);
-      clearRoomInSession();
-      persistStreamContext({
-        orgId: resolvedOrgId,
-        roomId: undefined,
-        serviceKey: normalizedServiceKey || undefined,
-        churchSlug: slug,
-      });
-      syncHostUrl(undefined, normalizedServiceKey);
+      await endRoomRequest(roomToEnd, "host_end");
       setErrorMsg(null);
-      void loadBillingProfile({ refresh: true });
     } catch (err: unknown) {
       const message = isNetworkError(err) ? "Server unreachable. Check your connection and try again." : err instanceof Error ? err.message : String(err);
       setErrorMsg(message || "end_failed");
@@ -2394,7 +2463,7 @@ export default function HostChurchPage() {
                         </>
                       ) : (
                         <button type="button" onClick={startService} disabled={startServiceDisabled} style={{ borderRadius: 16, ...broadcastPrimaryButtonStyle, border: "none", padding: "12px 22px", fontSize: 12, fontWeight: 800, letterSpacing: "0.14em", textTransform: "uppercase" as const, cursor: startServiceDisabled ? "not-allowed" : "pointer", opacity: startServiceDisabled ? 0.6 : 1, whiteSpace: "nowrap" as const }}>
-                          {hasLiveService ? "Rejoin" : "Start Broadcast"}
+                          {autoStartMicPending ? "Starting Audio..." : (hasLiveService ? "Rejoin" : "Start Broadcast")}
                         </button>
                       )}
                     </div>
@@ -2534,7 +2603,16 @@ export default function HostChurchPage() {
                       </div>
                       {/* TranslationBox hero */}
                       <div style={{ borderRadius: 28, overflow: "hidden", boxShadow: "none" }}>
-                        <TranslationBox />
+                        <TranslationBox
+                          autoStartSignal={autoStartMicSignal}
+                          roomId={activeRoomId}
+                          sourceLang={sourceLang}
+                          targetLang={targetLang}
+                          onAutoStartComplete={handleAutoStartComplete}
+                          onAutoStartFailed={handleAutoStartFailed}
+                          onSourceLangChange={setSourceLang}
+                          onTargetLangChange={setTargetLang}
+                        />
                       </div>
                     </div>
                   </section>
