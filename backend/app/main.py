@@ -3,7 +3,7 @@
 import os, json, asyncio, logging, time, re
 from collections import deque
 from threading import Lock
-from typing import Optional, Any, Callable
+from typing import Optional, Any, Callable, Awaitable
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -34,7 +34,7 @@ from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram, _build_keyterm_list, _build_replace_list, DG_DEBUG
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
-from app.utils.translate import _preprocess_source_text, translate_text, TranslationContext  # async wrapper you already have
+from app.utils.translate import _preprocess_source_text, translate_text, translate_text_streaming, TranslationContext
 from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 from app.routes import examples as examples_routes
@@ -47,6 +47,7 @@ from app.routes import billing as billing_routes
 from app.routes import admin as admin_routes
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
+from app.env import ENV
 from app.security_log import security_event, client_ip as _security_client_ip
 
 
@@ -243,7 +244,13 @@ def _resolve_cors_allow_origins() -> list[str]:
 # ------------------------------------------------------------------------------
 # ONE app only
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Real-Time Translation Backend", version="1.0.0")
+app = FastAPI(
+    title="Real-Time Translation Backend",
+    version="1.0.0",
+    docs_url=None if _IS_PRODUCTION else "/docs",
+    redoc_url=None if _IS_PRODUCTION else "/redoc",
+    openapi_url=None if _IS_PRODUCTION else "/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_resolve_cors_allow_origins(),
@@ -461,6 +468,7 @@ async def _translate_text_guarded(
     script_glossary: Optional[list] = None,
     max_tokens: Optional[int] = None,
     out_usage: Optional[dict] = None,
+    model_override: Optional[str] = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
     reservations, blocked = _reserve_translation_budget(org_id=org_id, host_uid=host_uid, source_text=source_text)
     if blocked is not None:
@@ -488,6 +496,7 @@ async def _translate_text_guarded(
             org_id=org_id,
             max_tokens=max_tokens,
             usage_out=usage,
+            model_override=model_override,
         )
     finally:
         _settle_translation_budget(reservations, actual_tokens=int(usage.get("totalTokens") or 0))
@@ -499,6 +508,54 @@ async def _translate_text_guarded(
     if out_usage is not None:
         out_usage.update(usage)
     return translated, None
+
+
+async def _translate_streaming_guarded(
+    source_text: str,
+    source_lang: str,
+    target_lang: str,
+    *,
+    org_id: Optional[str],
+    host_uid: Optional[str],
+    ctx: Optional[TranslationContext],
+    update_ctx: bool = True,
+    custom_prompt: Optional[str] = None,
+    service_prompt: Optional[str] = None,
+    script_examples: Optional[list] = None,
+    script_glossary: Optional[list] = None,
+    on_token: Callable[[str], Awaitable[None]],
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """Budget-guarded streaming translation. Calls on_token for each token chunk."""
+    reservations, blocked = _reserve_translation_budget(
+        org_id=org_id, host_uid=host_uid, source_text=source_text
+    )
+    if blocked is not None:
+        return "", _rate_limit_meta(blocked)
+    usage: dict[str, Any] = {}
+    assembled = ""
+    try:
+        async for token in translate_text_streaming(
+            source_text,
+            source_lang,
+            target_lang,
+            ctx=ctx,
+            update_ctx=update_ctx,
+            custom_prompt=custom_prompt,
+            service_prompt=service_prompt,
+            script_examples=script_examples,
+            script_glossary=script_glossary,
+            org_id=org_id,
+            usage_out=usage,
+        ):
+            assembled += token
+            await on_token(token)
+    finally:
+        _settle_translation_budget(
+            reservations, actual_tokens=int(usage.get("totalTokens") or 0)
+        )
+    if usage.get("failOpen"):
+        return "", _fail_open_meta(RuntimeError(str(usage.get("errorMessage") or "translation_failed")))
+    return assembled, None
 
 
 def _resolve_room_context(
@@ -1578,8 +1635,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
         """
         SENTENCE_PUNCT = tuple(".?!。？！…")
         SENTENCE_PUNCT_CHARS = "".join(SENTENCE_PUNCT)
-        COMMIT_WAIT_MS = 250
-        CJK_PENDING_HOLD_MS = 600
+        COMMIT_WAIT_MS = ENV.COMMIT_WAIT_MS
+        CJK_PENDING_HOLD_MS = ENV.CJK_PENDING_HOLD_MS
         MIN_CONFIDENT_CHARS = 10
         KOREAN_SHORT_MIN_CHARS = 14
         KOREAN_EOS_RE = re.compile(
@@ -1743,7 +1800,27 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 else:
                     try:
                         custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
-                        translated, limit_meta = await _translate_text_guarded(
+                        _stream_seq = seq
+                        _token_msg_base: dict[str, Any] = {
+                            "type": "translation_stream_token",
+                            "seq": _stream_seq,
+                        }
+                        if org_id:
+                            _token_msg_base["orgId"] = org_id
+                        if room_id:
+                            _token_msg_base["roomId"] = room_id
+
+                        async def _on_token(token: str) -> None:
+                            msg = {**_token_msg_base, "token": token}
+                            try:
+                                if org_id and room_id:
+                                    await manager.broadcast_room(org_id, room_id, msg)
+                                else:
+                                    await manager.broadcast(msg)
+                            except Exception:
+                                pass
+
+                        translated, limit_meta = await _translate_streaming_guarded(
                             clean_src,
                             src_lang_full,
                             tgt_lang_full,
@@ -1755,6 +1832,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             service_prompt=service_prompt,
                             script_examples=_script_examples_dg,
                             script_glossary=_cached_script_glossary_dg,
+                            on_token=_on_token,
                         )
                         if limit_meta:
                             meta_payload.update(limit_meta)
@@ -1784,6 +1862,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             service_prompt="",
                             compact_prompt=True,
                             max_tokens=120,
+                            model_override=ENV.PARTIAL_TRANSLATION_MODEL,
                         )
                         if limit_meta:
                             meta_payload.update(limit_meta)

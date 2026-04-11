@@ -6,7 +6,7 @@ import pathlib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 from collections import deque
 from dotenv import load_dotenv
 
@@ -1319,6 +1319,62 @@ def _enforce_we_guardrails(en: str, source_text: str, ctx: Optional[TranslationC
     return updated
 
 
+def _build_user_content_block(
+    masked_text: str,
+    ctx_for_prompt: Optional[TranslationContext],
+    text: str,
+    had_established_context: bool,
+    update_ctx: bool,
+) -> str:
+    """Build the user-turn content string shared by translate_text and translate_text_streaming."""
+    user_content = masked_text
+    if not ctx_for_prompt:
+        return user_content
+
+    prev = ctx_for_prompt.last_english or "(none yet)"
+    subject_hint = ctx_for_prompt.subject or ENV.CONTEXT_SUBJECT
+    pronoun_hint = ctx_for_prompt.pronoun or ENV.CONTEXT_PRONOUN
+
+    if (
+        pronoun_hint in ("he", "she")
+        and not _has_ko_honorific_verb(text)
+        and not _detect_third_person_pronoun(text)
+    ):
+        subject_hint = ENV.CONTEXT_SUBJECT
+        pronoun_hint = ENV.CONTEXT_PRONOUN
+
+    if _should_include_prompt_context(text, update_ctx=update_ctx):
+        recent_context_block = _build_recent_context_block(ctx_for_prompt, current_source_text=text)
+        if had_established_context:
+            user_content = (
+                recent_context_block +
+                f"Previous English sentence: {prev}\n"
+                f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
+                f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
+                f"unless the Korean explicitly names a new entity.\n\n"
+                f"Current text:\n{masked_text}"
+            )
+        else:
+            user_content = (
+                recent_context_block +
+                "No prior context established. Translate naturally. "
+                "Do NOT use \"we\" unless the Korean explicitly contains 우리 or 저희.\n\n"
+                f"Current text:\n{masked_text}"
+            )
+    else:
+        if had_established_context:
+            user_content = (
+                f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
+                f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
+                f"unless the Korean explicitly names a new entity.\n\n"
+                f"Current text:\n{masked_text}"
+            )
+        else:
+            user_content = masked_text
+
+    return user_content
+
+
 async def translate_text(
     text: str,
     source: str,
@@ -1384,55 +1440,7 @@ async def translate_text(
         script_glossary=script_glossary,
         org_id=org_id,
     )
-    user_content = masked_text
-    if ctx_for_prompt:
-        prev = ctx_for_prompt.last_english or "(none yet)"
-        subject_hint = ctx_for_prompt.subject or ENV.CONTEXT_SUBJECT
-        pronoun_hint = ctx_for_prompt.pronoun or ENV.CONTEXT_PRONOUN
-
-        # If context says third-person (he/she) but the Korean clause has no
-        # honorific verb form and no explicit third-person pronoun marker,
-        # the speaker is likely narrating in first person. Fall back to neutral
-        # default so GPT can infer the subject freely from the text.
-        if (
-            pronoun_hint in ("he", "she")
-            and not _has_ko_honorific_verb(text)
-            and not _detect_third_person_pronoun(text)
-        ):
-            subject_hint = ENV.CONTEXT_SUBJECT
-            pronoun_hint = ENV.CONTEXT_PRONOUN
-
-        if _should_include_prompt_context(text, update_ctx=update_ctx):
-            recent_context_block = _build_recent_context_block(ctx_for_prompt, current_source_text=text)
-            if had_established_context:
-                user_content = (
-                    recent_context_block +
-                    f"Previous English sentence: {prev}\n"
-                    f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
-                    f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
-                    f"unless the Korean explicitly names a new entity.\n\n"
-                    f"Current text:\n{masked_text}"
-                )
-            else:
-                # Cold-start: no prior evidence for any subject.
-                # Do not inject a default "we" — let GPT infer from the Korean.
-                user_content = (
-                    recent_context_block +
-                    "No prior context established. Translate naturally. "
-                    "Do NOT use \"we\" unless the Korean explicitly contains 우리 or 저희.\n\n"
-                    f"Current text:\n{masked_text}"
-                )
-        else:
-            if had_established_context:
-                user_content = (
-                    f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
-                    f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
-                    f"unless the Korean explicitly names a new entity.\n\n"
-                    f"Current text:\n{masked_text}"
-                )
-            else:
-                # Cold-start, no context injection needed — translate directly.
-                user_content = masked_text
+    user_content = _build_user_content_block(masked_text, ctx_for_prompt, text, had_established_context, update_ctx)
 
     try:
         model_name = ENV.resolve_translation_model(model_override)
@@ -1536,3 +1544,138 @@ async def translate_text(
             )
         print(f"[TX] OpenAI error (model={ENV.resolve_translation_model(model_override)}): {e}")
         return text
+
+
+async def translate_text_streaming(
+    text: str,
+    source: str,
+    target: str,
+    ctx: Optional[TranslationContext] = None,
+    *,
+    update_ctx: bool = True,
+    custom_prompt: Optional[str] = None,
+    service_prompt: Optional[str] = None,
+    script_examples: Optional[list] = None,
+    script_glossary: Optional[list] = None,
+    org_id: Optional[str] = None,
+    model_override: Optional[str] = None,
+    usage_out: Optional[Dict[str, Any]] = None,
+) -> AsyncIterator[str]:
+    """
+    Async generator that yields translation token chunks as OpenAI produces them.
+    Post-processing (guardrails, glossary unmasking, ctx.remember) happens after
+    the full response is assembled — the same as translate_text().
+
+    Callers MUST exhaust the iterator so that ctx.remember() is called:
+        assembled = ""
+        async for chunk in translate_text_streaming(...):
+            assembled += chunk
+            await ws.send_json({"type": "translation_stream_token", "token": chunk})
+    """
+    text = (text or "").strip()
+    text = _preprocess_source_text(text, source)
+    masked_text, hard_map = _mask_hard_glossary(text, source)
+    if source.lower().startswith("ko"):
+        masked_text = apply_ko_spacing(masked_text)
+    if not masked_text:
+        return
+
+    explicit_first_person = _contains_first_person_markers(text)
+    implicit_first_person = _contains_implicit_first_person_kinship(text)
+
+    if ctx:
+        subj_hint, pronoun_hint = _infer_subject_from_context_history(ctx)
+        ctx.subject = subj_hint
+        ctx.pronoun = pronoun_hint
+
+    if explicit_first_person:
+        ctx_for_prompt = None
+    else:
+        ctx_for_prompt = _context_for_prompt(ctx, text, implicit_first_person=implicit_first_person)
+
+    had_established_context = _has_established_context(ctx_for_prompt)
+    ctx_for_system = ctx_for_prompt if had_established_context else None
+
+    system = _build_system_prompt(
+        source,
+        target,
+        ctx_for_system,
+        current_source_text=text,
+        custom_prompt=custom_prompt,
+        service_prompt=service_prompt,
+        compact_prompt=False,
+        script_examples=script_examples,
+        script_glossary=script_glossary,
+        org_id=org_id,
+    )
+    user_content = _build_user_content_block(masked_text, ctx_for_prompt, text, had_established_context, update_ctx)
+
+    client = _get_client()
+    model_name = ENV.resolve_translation_model(model_override)
+
+    assembled = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+
+    try:
+        stream = await client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            **_openai_chat_options(model_name),
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        async for chunk in stream:
+            delta = ""
+            if chunk.choices:
+                delta = chunk.choices[0].delta.content or ""
+            if delta:
+                assembled += delta
+                yield delta
+            usage_chunk = getattr(chunk, "usage", None)
+            if usage_chunk:
+                prompt_tokens = int(getattr(usage_chunk, "prompt_tokens", 0) or 0)
+                completion_tokens = int(getattr(usage_chunk, "completion_tokens", 0) or 0)
+    except Exception as exc:
+        if usage_out is not None:
+            usage_out.update({"failOpen": True, "errorMessage": str(exc)[:240]})
+        print(f"[TX][stream] OpenAI error (model={model_name}): {exc}")
+        if not assembled:
+            yield text
+        return
+
+    # Post-processing — same guardrails as translate_text()
+    assembled = assembled.strip().strip('"\u201c\u201d')
+    assembled = _unmask_hard_glossary(assembled, hard_map)
+    if ctx and source.lower().startswith("ko"):
+        assembled = _enforce_subject_guardrails(assembled, text, ctx)
+    if source.lower().startswith("ko"):
+        assembled = _enforce_we_guardrails(assembled, text, ctx)
+    if target.lower().startswith("en"):
+        assembled = _normalize_english_pronoun_case(assembled)
+
+    if ctx and update_ctx:
+        explicit_ko_subject = (
+            _contains_first_person_markers(text)
+            or _contains_we_markers(text)
+            or bool(_detect_third_person_pronoun(text))
+        )
+        if had_established_context or explicit_ko_subject:
+            ctx.subject, ctx.pronoun = _infer_subject_from_english(
+                assembled,
+                ctx.subject or ENV.CONTEXT_SUBJECT,
+                ctx.pronoun or ENV.CONTEXT_PRONOUN,
+            )
+        ctx.remember(text, assembled)
+
+    if usage_out is not None:
+        total = prompt_tokens + completion_tokens
+        usage_out.update({
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": total,
+            "model": model_name,
+        })

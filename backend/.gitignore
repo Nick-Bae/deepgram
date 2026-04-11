@@ -5,3 +5,7 @@ key.pem
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Editor/tool temp files
+*.tmp
+*.tmp.*
