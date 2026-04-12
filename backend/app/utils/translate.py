@@ -20,6 +20,9 @@ load_dotenv()
 _client: AsyncOpenAI | None = None
 _CUSTOM_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
 _SERVICE_PROMPT_CACHE: dict[str, object] = {"mtime": None, "text": ""}
+# Cached parsed rows from translation_examples.jsonl — keyed by file mtime.
+# Stores all corrected rows so filtering (by lang/overlap) runs in memory, not on disk.
+_FEWSHOT_ROWS_CACHE: dict[str, object] = {"mtime": None, "rows": []}
 _HANGUL_RE = re.compile(r"[가-힣]")
 # Cache for the static portion of the system prompt (everything except context block).
 # Keyed by (source, target, custom_text_hash, service_text_hash, compact_prompt).
@@ -471,28 +474,22 @@ def _token_set(text: str) -> set[str]:
     return {t for t in tokens if len(t) >= 2}
 
 
-def _load_fewshot_examples(
-    source_lang: str,
-    target_lang: str,
-    *,
-    max_examples: int = 3,
-    current_source_text: Optional[str] = None,
-    org_id: Optional[str] = None,
-) -> List[dict[str, str]]:
-    """Return up to N on-topic, corrected examples.
+def _load_fewshot_rows() -> list[dict]:
+    """Read and cache all corrected rows from translation_examples.jsonl.
 
-    Filters to corrected rows only and requires minimal lexical overlap with the
-    current source clause (if provided) to avoid off-topic bias.
-    When org_id is provided, org-specific corrections are returned first, filled
-    with global corrections (no org_id) if needed.
+    Re-reads only when the file mtime changes. Returns raw parsed records so
+    callers can filter in memory without touching the disk on every GPT call.
     """
-    if not _TRANSLATION_LOG_PATH.exists() or max_examples <= 0:
+    global _FEWSHOT_ROWS_CACHE
+    if not _TRANSLATION_LOG_PATH.exists():
         return []
-
-    org_specific: deque[dict[str, str]] = deque(maxlen=max_examples)
-    global_pool: deque[dict[str, str]] = deque(maxlen=max_examples)
-    overlap_ref = _token_set(current_source_text) if current_source_text else None
-
+    try:
+        mtime = _TRANSLATION_LOG_PATH.stat().st_mtime
+    except OSError:
+        return []
+    if _FEWSHOT_ROWS_CACHE.get("mtime") == mtime:
+        return list(_FEWSHOT_ROWS_CACHE["rows"])  # type: ignore[arg-type]
+    rows: list[dict] = []
     try:
         with open(_TRANSLATION_LOG_PATH, encoding="utf-8") as fh:
             for line in fh:
@@ -503,30 +500,58 @@ def _load_fewshot_examples(
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
-                if record.get("source_lang") != source_lang or record.get("target_lang") != target_lang:
-                    continue
                 if not record.get("corrected"):
-                    continue  # use only curated rows
-
-                source_text = (record.get("stt_text") or "").strip()
-                final_text = (record.get("final_translation") or record.get("auto_translation") or "").strip()
-                if not source_text or not final_text:
                     continue
-
-                if overlap_ref is not None:
-                    if not _token_set(source_text) & overlap_ref:
-                        continue  # skip off-topic examples
-
-                example = {"source": source_text, "target": final_text}
-                rec_org = (record.get("org_id") or "").strip()
-                if org_id and rec_org == org_id:
-                    org_specific.append(example)
-                elif not rec_org:
-                    global_pool.append(example)
+                rows.append(record)
     except Exception as exc:
         print(f"[TX] Failed to read translation examples: {exc}")
         return []
+    _FEWSHOT_ROWS_CACHE = {"mtime": mtime, "rows": rows}
+    return rows
+
+
+def _load_fewshot_examples(
+    source_lang: str,
+    target_lang: str,
+    *,
+    max_examples: int = 3,
+    current_source_text: Optional[str] = None,
+    org_id: Optional[str] = None,
+) -> List[dict[str, str]]:
+    """Return up to N on-topic, corrected examples.
+
+    Filters the mtime-cached row list in memory — no file I/O on warm cache.
+    """
+    if max_examples <= 0:
+        return []
+
+    all_rows = _load_fewshot_rows()
+    if not all_rows:
+        return []
+
+    overlap_ref = _token_set(current_source_text) if current_source_text else None
+    org_specific: deque[dict[str, str]] = deque(maxlen=max_examples)
+    global_pool: deque[dict[str, str]] = deque(maxlen=max_examples)
+
+    for record in all_rows:
+        if record.get("source_lang") != source_lang or record.get("target_lang") != target_lang:
+            continue
+
+        source_text = (record.get("stt_text") or "").strip()
+        final_text = (record.get("final_translation") or record.get("auto_translation") or "").strip()
+        if not source_text or not final_text:
+            continue
+
+        if overlap_ref is not None:
+            if not _token_set(source_text) & overlap_ref:
+                continue
+
+        example = {"source": source_text, "target": final_text}
+        rec_org = (record.get("org_id") or "").strip()
+        if org_id and rec_org == org_id:
+            org_specific.append(example)
+        elif not rec_org:
+            global_pool.append(example)
 
     if org_id:
         combined = list(org_specific)
@@ -1063,18 +1088,6 @@ def _build_system_prompt_base(
         "\nImportant terms (prefer these renderings):\n" + "\n".join(glossary_lines) + "\n"
     ) if glossary_lines else ""
 
-    # Bible names list (Korean -> English)
-    bible_name_lines: list[str] = []
-    if source_name == "Korean" and BIBLE_NAMES:
-        for ko_name, en_name in BIBLE_NAMES.items():
-            bible_name_lines.append(f'- "{ko_name}" → "{en_name}"')
-
-    bible_names_block = ""
-    if bible_name_lines:
-        bible_names_block = (
-            "\nBiblical names/places (standard forms):\n" + "\n".join(bible_name_lines) + "\n"
-        )
-
     return (
         "You are a professional translator for live church worship captions.\n"
         f"Translate {source_name} → {target_name} faithfully and naturally.\n"
@@ -1104,7 +1117,6 @@ def _build_system_prompt_base(
         "- If Korean mentions spouse/kinship terms (아내/남편/부인/배우자/집사람/와이프) without a possessor "
         "(그의/그녀의/그들의), treat them as the speaker's relation (\"my wife/husband\").\n"
         "\n"
-        + bible_names_block
         + glossary_block
         + service_block
         + custom_block
@@ -1678,4 +1690,5 @@ async def translate_text_streaming(
             "completionTokens": completion_tokens,
             "totalTokens": total,
             "model": model_name,
+            "finalText": assembled,  # post-processed, unmasked text for caller
         })
