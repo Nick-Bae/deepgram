@@ -330,20 +330,9 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
           return
         }
 
-        // Streaming token: append tokens progressively until final message arrives
+        // Streaming token: intentionally not updating display state.
+        // Display shows only the complete final sentence when is_final=true arrives.
         if (raw.type === 'translation_stream_token') {
-          const token = typeof raw.token === 'string' ? raw.token : '';
-          const tokenSeq = typeof raw.seq === 'number' ? raw.seq : -1;
-          if (!token || tokenSeq < 0) return;
-          setLast(prev => {
-            const isNewSeq = prev.seq !== tokenSeq;
-            return {
-              ...prev,
-              text: isNewSeq ? token : prev.text + token,
-              seq: tokenSeq,
-              meta: { ...(prev.meta ?? {}), is_final: false },
-            };
-          });
           return;
         }
 

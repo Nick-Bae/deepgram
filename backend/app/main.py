@@ -555,7 +555,9 @@ async def _translate_streaming_guarded(
         )
     if usage.get("failOpen"):
         return "", _fail_open_meta(RuntimeError(str(usage.get("errorMessage") or "translation_failed")))
-    return assembled, None
+    # Use the post-processed text (unmasked glossary, guardrails applied) that
+    # translate_text_streaming stores in usage_out after the loop completes.
+    return usage.get("finalText") or assembled, None
 
 
 def _resolve_room_context(
@@ -1110,9 +1112,8 @@ async def ws_translate(ws: WebSocket):
             from app.utils.translate import _stt_vocab_correct
             src_text = _stt_vocab_correct(src_text, _vocab_set_producer)
 
-        script_match, match_score, script_version, script_threshold, _script_examples_producer = script_store.match_with_examples(
-            src_text,
-            room_id=target_room_id,
+        script_match, match_score, script_version, script_threshold, _script_examples_producer = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: script_store.match_with_examples(src_text, room_id=target_room_id)
         )
         _cached_script_examples_producer = _script_examples_producer
         live_mode = "live"
@@ -1757,14 +1758,16 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     from app.utils.translate import _stt_vocab_correct
                     clean_src = _stt_vocab_correct(clean_src, _vocab_set_dg)
 
-                script_match, match_score, script_version, script_threshold, _script_examples_dg = script_store.match_with_examples(
-                    clean_src,
-                    room_id=room_id,
+                _loop = asyncio.get_running_loop()
+                script_match, match_score, script_version, script_threshold, _script_examples_dg = await _loop.run_in_executor(
+                    None, lambda: script_store.match_with_examples(clean_src, room_id=room_id)
                 )
                 scripture_hit = None
                 if src_lang.startswith("ko"):
                     try:
-                        scripture_hit = detect_scripture_verse(clean_src)
+                        scripture_hit = await _loop.run_in_executor(
+                            None, detect_scripture_verse, clean_src
+                        )
                     except Exception as exc:
                         print("[SCRIPTURE][error]", exc)
 
