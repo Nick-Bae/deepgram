@@ -2,34 +2,31 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+const EXCLUDED_INTERFACE_NAME_RE = /vEthernet|WSL|Hyper-V|Loopback|docker|vboxnet|vmnet|virbr/i;
+const PREFERRED_LAN_IP_RE = /^(10\.|192\.168\.)/;
+
 function getPreferredNetworkIP() {
   try {
     const interfaces = os.networkInterfaces();
     if (!interfaces || typeof interfaces !== 'object') return null;
 
     for (const name of Object.keys(interfaces)) {
-      if (/vEthernet|WSL|Hyper-V|Loopback/i.test(name)) continue;
+      if (EXCLUDED_INTERFACE_NAME_RE.test(name)) continue;
       const entries = interfaces[name] || [];
       for (const iface of entries) {
         if (
           iface.family === 'IPv4' &&
           !iface.internal &&
-          /^(10\.|192\.168\.|172\.)/.test(iface.address)
+          PREFERRED_LAN_IP_RE.test(iface.address)
         ) {
           return iface.address;
         }
       }
     }
 
-    // Fallback: any non-internal IPv4 if private ranges were not found.
-    for (const name of Object.keys(interfaces)) {
-      const entries = interfaces[name] || [];
-      for (const iface of entries) {
-        if (iface.family === 'IPv4' && !iface.internal) {
-          return iface.address;
-        }
-      }
-    }
+    // Fall back to localhost unless the user passes BACKEND_HOST explicitly.
+    // In WSL/Docker setups, 172.x addresses are often ephemeral and not usable
+    // from the browser even though they look like private LAN addresses.
   } catch (err) {
     console.warn(`⚠️ IP detection failed (${err.message}). Falling back to localhost.`);
   }

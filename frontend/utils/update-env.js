@@ -2,23 +2,23 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+const EXCLUDED_INTERFACE_NAME_RE = /vEthernet|WSL|Hyper-V|Loopback|docker|vboxnet|vmnet|virbr/i;
+const PREFERRED_LAN_IP_RE = /^(10\.|192\.168\.)/;
+
 function getPreferredIP() {
   const interfaces = os.networkInterfaces();
-  let candidate = null;
 
   for (const name of Object.keys(interfaces)) {
+    if (EXCLUDED_INTERFACE_NAME_RE.test(name)) continue;
     for (const iface of interfaces[name]) {
       if (iface.family === 'IPv4' && !iface.internal) {
-        if (iface.address.startsWith('10.')) {
-          return iface.address; // Prefer 10.x.x.x (Wi-Fi LAN IP)
-        }
-        if (iface.address.startsWith('172.')) {
-          candidate = iface.address; // Fallback to 172.x.x.x (WSL)
-        }
+        if (PREFERRED_LAN_IP_RE.test(iface.address)) return iface.address;
       }
     }
   }
-  return candidate || '127.0.0.1';
+
+  // Default to localhost unless BACKEND_HOST is provided explicitly.
+  return 'localhost';
 }
 
 const explicitHost = (process.env.BACKEND_HOST || '').trim();
@@ -59,7 +59,7 @@ function upsertEnvVars(envFilePath, updates) {
 
 const content = upsertEnvVars(envPath, {
   NEXT_PUBLIC_API_BASE_URL: `http://${ip}:8000`,
-  NEXT_PUBLIC_WS_URL: `ws://${ip}:8000`,
+  NEXT_PUBLIC_WS_URL: `ws://${ip}:8000/ws/translate`,
 });
 
 if (ip === 'localhost') {
