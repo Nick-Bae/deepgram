@@ -8,3 +8,4 @@ __pycache__/
 backend/google-translation.json
 backend/serviceAccountKey.json
 backend/*serviceAccount*.json
+backend/*firebase-adminsdk*.json
