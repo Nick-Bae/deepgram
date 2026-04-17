@@ -1,4 +1,4 @@
-#!/home/namju/real-time-translation/backend/venv/bin/python3
+#!/home/namju/projects/deepgram/backend/venv/bin/python3.12
 # -*- coding: utf-8 -*-
 import re
 import sys

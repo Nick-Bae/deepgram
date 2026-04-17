@@ -539,7 +539,21 @@ export default function HostChurchPage() {
   useEffect(() => {
     if (activeRoomId && scrollToPanelRef.current) {
       scrollToPanelRef.current = false;
-      controlPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      const scrollPanelIntoView = (attemptsLeft: number) => {
+        const panel = controlPanelRef.current;
+        if (!panel) {
+          if (attemptsLeft > 0) {
+            window.setTimeout(() => scrollPanelIntoView(attemptsLeft - 1), 80);
+          }
+          return;
+        }
+
+        window.requestAnimationFrame(() => {
+          panel.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+      };
+
+      scrollPanelIntoView(4);
     }
   }, [activeRoomId]);
 
@@ -778,11 +792,64 @@ export default function HostChurchPage() {
   const hasLiveService = Boolean(liveServiceRoomId);
   const startServiceDisabled = busy || autoStartMicPending || (isTrialExpired && !Boolean(activeRoomId || liveServiceRoomId));
 
+  const buildTabHref = useCallback(
+    (
+      tab: HostTab,
+      options?: {
+        serviceKey?: string;
+        orgId?: string;
+        roomId?: string | null;
+        churchSlug?: string;
+      },
+    ) => {
+      const churchSlug = (options?.churchSlug || slug || "").trim();
+      if (!churchSlug) return "";
+      const serviceToken = (options?.serviceKey || normalizedServiceKey || queryServiceKey || "").trim();
+      const params = new URLSearchParams();
+      if (serviceToken) params.set("serviceKey", serviceToken);
+      const query = params.toString();
+      const base = `/host/c/${encodeURIComponent(churchSlug)}/${tab}`;
+      return query ? `${base}?${query}` : base;
+    },
+    [normalizedServiceKey, queryServiceKey, slug],
+  );
+
+  const syncHostUrl = useCallback((nextServiceKey?: string) => {
+    const key = (nextServiceKey || normalizedServiceKey || queryServiceKey).trim();
+    const href = buildTabHref(activeTab, { serviceKey: key || undefined });
+    if (!href) return;
+    void router.replace(href, undefined, { shallow: true });
+  }, [activeTab, buildTabHref, normalizedServiceKey, queryServiceKey, router]);
+
+  const openExistingLiveService = useCallback((row: ServiceRow): boolean => {
+    const liveKey = (row.serviceKey || "").trim();
+    const roomId = (row.activeRoomId || "").trim();
+    if (!liveKey || !roomId) return false;
+    pendingRoomSyncRef.current = null;
+    scrollToPanelRef.current = true;
+    setActiveRoomId(roomId);
+    if (liveKey !== serviceKey) setServiceKey(liveKey);
+    persistStreamContext({
+      orgId: resolvedOrgId || undefined,
+      roomId,
+      serviceKey: liveKey,
+      churchSlug: slug,
+    });
+    syncHostUrl(liveKey);
+    setErrorMsg(null);
+    return true;
+  }, [resolvedOrgId, serviceKey, slug, syncHostUrl]);
+
   useEffect(() => {
     if (activeRoomId) return;
     autoStartRoomRef.current = null;
     setAutoStartMicPending(false);
   }, [activeRoomId]);
+
+  useEffect(() => {
+    if (activeRoomId || !liveService || !liveServiceRoomId) return;
+    openExistingLiveService(liveService);
+  }, [activeRoomId, liveService, liveServiceRoomId, openExistingLiveService]);
 
   useEffect(() => {
     if (!orgData?.services?.length) return;
@@ -900,28 +967,6 @@ export default function HostChurchPage() {
     }
   }, [churchNameInput, getIdToken, resolvedOrgId]);
 
-  const buildTabHref = useCallback(
-    (
-      tab: HostTab,
-      options?: {
-        serviceKey?: string;
-        orgId?: string;
-        roomId?: string | null;
-        churchSlug?: string;
-      },
-    ) => {
-      const churchSlug = (options?.churchSlug || slug || "").trim();
-      if (!churchSlug) return "";
-      const serviceToken = (options?.serviceKey || normalizedServiceKey || queryServiceKey || "").trim();
-      const params = new URLSearchParams();
-      if (serviceToken) params.set("serviceKey", serviceToken);
-      const query = params.toString();
-      const base = `/host/c/${encodeURIComponent(churchSlug)}/${tab}`;
-      return query ? `${base}?${query}` : base;
-    },
-    [normalizedServiceKey, queryServiceKey, slug],
-  );
-
   const navigateToTab = useCallback(
     (tab: HostTab) => {
       const href = buildTabHref(tab);
@@ -941,32 +986,6 @@ export default function HostChurchPage() {
     if (!href) return;
     void router.replace(href, undefined, { shallow: true });
   }, [buildTabHref, querySection, router, slug]);
-
-  const syncHostUrl = useCallback((nextServiceKey?: string) => {
-    const key = (nextServiceKey || normalizedServiceKey || queryServiceKey).trim();
-    const href = buildTabHref(activeTab, { serviceKey: key || undefined });
-    if (!href) return;
-    void router.replace(href, undefined, { shallow: true });
-  }, [activeTab, buildTabHref, normalizedServiceKey, queryServiceKey, router]);
-
-  const openExistingLiveService = (row: ServiceRow): boolean => {
-    const liveKey = (row.serviceKey || "").trim();
-    const roomId = (row.activeRoomId || "").trim();
-    if (!liveKey || !roomId) return false;
-    pendingRoomSyncRef.current = null;
-    scrollToPanelRef.current = true;
-    setActiveRoomId(roomId);
-    if (liveKey !== serviceKey) setServiceKey(liveKey);
-    persistStreamContext({
-      orgId: resolvedOrgId || undefined,
-      roomId,
-      serviceKey: liveKey,
-      churchSlug: slug,
-    });
-    syncHostUrl(liveKey);
-    setErrorMsg(null);
-    return true;
-  };
 
   const switchOrganization = useCallback(
     async (nextOrgId: string) => {
@@ -1605,24 +1624,9 @@ export default function HostChurchPage() {
       return;
     }
 
-    if (!pending.rollbackOnFailure) {
-      setErrorMsg(`Microphone did not start: ${message}. The live room stayed active, so you can retry from the audio controls.`);
-      return;
-    }
-
-    busyRef.current = true;
-    setBusy(true);
-    try {
-      await endRoomRequest(pending.roomId, "mic_start_failed");
-      setErrorMsg(`Microphone did not start: ${message}. The broadcast room was closed automatically.`);
-    } catch (err: unknown) {
-      const detail = isNetworkError(err) ? "Server unreachable. Check your connection and try again." : err instanceof Error ? err.message : String(err);
-      setErrorMsg(`Microphone did not start: ${message}. Automatic room cleanup failed: ${detail}`);
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-    }
-  }, [endRoomRequest]);
+    const roomLabel = pending.rollbackOnFailure ? "The live room stayed open." : "The live room stayed active.";
+    setErrorMsg(`Microphone did not start: ${message}. ${roomLabel} Retry from the audio controls.`);
+  }, []);
 
   const startService = async () => {
     const startKey = serviceKeyForStart.trim();
@@ -2574,7 +2578,7 @@ export default function HostChurchPage() {
                     Your trial has ended. Broadcasting is blocked until billing is added.
                   </section>
                 ) : (
-                  <section ref={controlPanelRef} style={{ marginTop: 14, position: "relative", overflow: "hidden", ...(isBroadcastTab ? broadcastGlassPanelStyle : { background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)" }), borderRadius: 36, padding: "20px 24px 24px" }}>
+                  <section ref={controlPanelRef} style={{ marginTop: 14, position: "relative", overflow: "hidden", scrollMarginTop: 24, ...(isBroadcastTab ? broadcastGlassPanelStyle : { background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)" }), borderRadius: 36, padding: "20px 24px 24px" }}>
                     <div style={{ display: "grid", gap: 16 }}>
                       {/* Feed header: label + QR */}
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" as const }}>
