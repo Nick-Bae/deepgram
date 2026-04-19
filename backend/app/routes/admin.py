@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.services.multichurch_store import multichurch_store
@@ -269,6 +270,25 @@ def _serialize_dt(dt: Any) -> Optional[str]:
     return None
 
 
+def _service_export_rows(org_id: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    try:
+        services = multichurch_store.list_services_by_org_id(org_id) or []
+    except Exception:
+        services = []
+    for service in services:
+        rows.append(
+            {
+                "serviceKey": _safe_str(service.get("serviceKey")),
+                "title": _safe_str(service.get("title")) or _safe_str(service.get("serviceKey")),
+                "activeRoomId": _safe_str(service.get("activeRoomId")) or None,
+                "lastRoomId": _safe_str(service.get("lastRoomId")) or None,
+                "roomStatus": _safe_str(service.get("roomStatus"), "waiting"),
+            }
+        )
+    return rows
+
+
 @router.get("/admin/platform-config")
 def get_platform_config(current_user: AuthenticatedUser = Depends(get_current_user_required)):
     _require_master(current_user)
@@ -334,6 +354,50 @@ def get_admin_dashboard(current_user: AuthenticatedUser = Depends(get_current_us
         raise HTTPException(status_code=500, detail="dashboard_error") from exc
 
 
+@router.get("/admin/org/{org_id}/room/{room_id}/segments/export")
+def export_admin_room_segments(
+    org_id: str,
+    room_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    _require_master(current_user)
+    try:
+        segments = multichurch_store.export_room_segments(
+            org_id,
+            room_id,
+            requested_by_uid=current_user.uid,
+            allow_master=True,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="forbidden")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except NotImplementedError:
+        raise HTTPException(status_code=501, detail="not_supported_in_dev_mode")
+
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["seq", "timestamp", "mode", "korean_text", "english_text"])
+    for seg in segments:
+        writer.writerow([
+            seg.get("seq", ""),
+            seg.get("timestamp", ""),
+            seg.get("mode", ""),
+            seg.get("koreanText", ""),
+            seg.get("englishText", ""),
+        ])
+
+    filename = f"{org_id}_{room_id}_translation.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 def _build_dashboard_inmemory() -> Dict[str, Any]:
     store = multichurch_store
     # Access internal state (InMemoryMultiChurchStore only)
@@ -396,6 +460,7 @@ def _build_dashboard_inmemory() -> Dict[str, Any]:
             "hardCapReached": bool(org.get("hardCapReached")),
             "memberCount": member_count,
             "serviceCount": service_count,
+            "services": _service_export_rows(org_id),
             "liveRoomCount": len(org_live_rooms),
             "liveRooms": org_live_rooms,
             "currentMonthMinutes": _safe_int(org.get("currentMonthMinutes")),
@@ -503,6 +568,17 @@ def _build_dashboard_firestore() -> Dict[str, Any]:
             "hardCapReached": bool(org.get("hardCapReached")),
             "memberCount": member_count,
             "serviceCount": service_count,
+            "services": [
+                {
+                    "serviceKey": _safe_str(svc_snap.id),
+                    "title": _safe_str(svc.get("title"), svc_snap.id),
+                    "activeRoomId": _safe_str(svc.get("activeRoomId")) or None,
+                    "lastRoomId": _safe_str(svc.get("lastRoomId")) or None,
+                    "roomStatus": ("live" if _safe_str(svc.get("activeRoomId")) else "waiting"),
+                }
+                for svc_snap in service_snaps
+                for svc in [svc_snap.to_dict() or {}]
+            ],
             "liveRoomCount": len(org_live_rooms),
             "liveRooms": org_live_rooms,
             "currentMonthMinutes": _safe_int(org.get("currentMonthMinutes")),

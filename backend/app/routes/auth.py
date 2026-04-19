@@ -367,7 +367,7 @@ def _send_password_reset_email_via_resend(*, email: str, reset_link: str) -> Non
 @router.get("/auth/me")
 def auth_me(user: AuthenticatedUser = Depends(get_current_user_required)):
     memberships = multichurch_store.list_memberships(user.uid)
-    current_org_id = multichurch_store.get_current_org_id(user.uid)
+    current_org_id = multichurch_store.get_current_org_id(user.uid, memberships=memberships)
     is_master = bool(multichurch_store.is_master_user(user.uid))
     return {
         "user": {

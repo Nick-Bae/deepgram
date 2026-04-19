@@ -199,6 +199,28 @@ class AuthRouteTests(unittest.TestCase):
         self.assertIsNotNone(owner_membership)
         self.assertNotIn("hostToken", owner_membership or {})
 
+    def test_auth_me_reuses_memberships_when_resolving_current_org(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-route-reuse", slug="route-reuse", name="Route Reuse")
+        invite = auth_routes.auth_create_invite(
+            org_id=org_id,
+            payload=auth_routes.CreateInviteRequest(role="viewer"),
+            user=self._user("owner-route-reuse"),
+        )
+        auth_routes.auth_redeem_invite(code=str(invite.get("code") or ""), user=self._user("member-route-reuse"))
+
+        with patch.object(self.store, "list_memberships", wraps=self.store.list_memberships) as list_mock:
+            with patch.object(self.store, "get_current_org_id", wraps=self.store.get_current_org_id) as current_org_mock:
+                me = auth_routes.auth_me(user=self._user("member-route-reuse"))
+
+        self.assertEqual(me.get("currentOrgId"), org_id)
+        self.assertEqual(list_mock.call_count, 1)
+        current_org_mock.assert_called_once()
+        self.assertIn("memberships", current_org_mock.call_args.kwargs)
+        membership_rows = current_org_mock.call_args.kwargs["memberships"]
+        self.assertTrue(isinstance(membership_rows, list))
+        self.assertEqual(len(membership_rows), 1)
+        self.assertEqual(membership_rows[0].get("orgId"), org_id)
+
     def test_bootstrap_owner_response_does_not_expose_host_token(self) -> None:
         response = auth_routes.auth_bootstrap_owner(
             auth_routes.BootstrapOwnerRequest(
