@@ -725,14 +725,22 @@ export default function HostChurchPage() {
       const data: ServicesResponse = await res.json();
       setOrgData(data);
 
-      const preferredKey = (preferredServiceKey || normalizedServiceKey || queryServiceKey || data.services[0]?.serviceKey || DEFAULT_SERVICE_KEY).trim();
+      const pendingRoomSync = pendingRoomSyncRef.current;
+      const pendingServiceKey = (pendingRoomSync?.serviceKey || "").trim();
+      const preferredKey = (
+        preferredServiceKey ||
+        pendingServiceKey ||
+        normalizedServiceKey ||
+        queryServiceKey ||
+        data.services[0]?.serviceKey ||
+        DEFAULT_SERVICE_KEY
+      ).trim();
       const selected = data.services.find((row) => row.serviceKey === preferredKey) || data.services[0];
       const selectedKey = (selected?.serviceKey || preferredKey || "").trim();
       if (selectedKey && selectedKey !== serviceKey) setServiceKey(selectedKey);
 
       const backendRoomId = (selected?.activeRoomId || "").trim();
       const localRoomId = (activeRoomId || "").trim();
-      const pendingRoomSync = pendingRoomSyncRef.current;
       let rowRoomId = backendRoomId || null;
 
       // Preserve a newly-started room only until the services payload catches up.
@@ -741,7 +749,6 @@ export default function HostChurchPage() {
       } else if (
         pendingRoomSync &&
         pendingRoomSync.roomId === localRoomId &&
-        pendingRoomSync.serviceKey === selectedKey &&
         Date.now() < pendingRoomSync.expiresAt
       ) {
         rowRoomId = localRoomId || null;
@@ -1622,8 +1629,9 @@ export default function HostChurchPage() {
     }
 
     clearLiveRoomState();
+    await refreshServices(normalizedServiceKey || undefined);
     void loadBillingProfile({ refresh: true });
-  }, [clearLiveRoomState, getIdToken, loadBillingProfile, resolvedOrgId]);
+  }, [clearLiveRoomState, getIdToken, loadBillingProfile, normalizedServiceKey, refreshServices, resolvedOrgId]);
 
   const handleAutoStartComplete = useCallback(() => {
     autoStartRoomRef.current = null;
@@ -1724,6 +1732,7 @@ export default function HostChurchPage() {
       }
       syncHostUrl(data.serviceKey || startKey);
       setErrorMsg(null);
+      await refreshServices(data.serviceKey || startKey);
       if (resolvedOrgId) {
         void loadBillingProfile({ refresh: true });
       }
