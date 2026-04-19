@@ -931,6 +931,7 @@ class InMemoryMultiChurchStore:
         room_id: str,
         *,
         requested_by_uid: str,
+        allow_master: bool = False,
     ) -> list:
         raise NotImplementedError("segment export not supported in dev mode")
 
@@ -1118,7 +1119,7 @@ class InMemoryMultiChurchStore:
             rows.sort(key=lambda row: (row["orgId"], row["slug"]))
             return rows
 
-    def get_current_org_id(self, uid: str) -> Optional[str]:
+    def get_current_org_id(self, uid: str, memberships: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
         clean_uid = _clean_token(uid)
         if not clean_uid:
             return None
@@ -1127,7 +1128,14 @@ class InMemoryMultiChurchStore:
                 current_org_id = _clean_token((self._users.get(clean_uid) or {}).get("currentOrgId"))
                 if current_org_id and current_org_id in self._orgs:
                     return current_org_id
-                org_ids = sorted(self._orgs.keys())
+                membership_rows = memberships
+                if membership_rows is None:
+                    membership_rows = self.list_memberships(clean_uid)
+                org_ids = sorted(
+                    _clean_token((row or {}).get("orgId"))
+                    for row in membership_rows
+                    if _clean_token((row or {}).get("orgId"))
+                )
                 if not org_ids:
                     return None
                 chosen_org_id = org_ids[0]
@@ -1137,15 +1145,20 @@ class InMemoryMultiChurchStore:
                 return chosen_org_id
 
             current_org_id = _clean_token((self._users.get(clean_uid) or {}).get("currentOrgId"))
-            if current_org_id and (current_org_id, clean_uid) in self._members:
+            membership_rows = memberships
+            if membership_rows is None:
+                membership_rows = self.list_memberships(clean_uid)
+            membership_org_ids = {
+                _clean_token((row or {}).get("orgId"))
+                for row in membership_rows
+                if _clean_token((row or {}).get("orgId"))
+            }
+            if current_org_id and current_org_id in membership_org_ids:
                 return current_org_id
-            memberships = [
-                org_id for (org_id, member_uid) in self._members.keys() if member_uid == clean_uid
-            ]
-            memberships.sort()
-            if not memberships:
+            sorted_membership_org_ids = sorted(membership_org_ids)
+            if not sorted_membership_org_ids:
                 return None
-            chosen_org_id = memberships[0]
+            chosen_org_id = sorted_membership_org_ids[0]
             profile = self._users.setdefault(clean_uid, {})
             profile["currentOrgId"] = chosen_org_id
             profile["updatedAt"] = _utcnow()
@@ -3093,10 +3106,21 @@ class FirestoreMultiChurchStore:
         try:
             for snap in self._org_ref(org_id).collection("services").stream():
                 service = snap.to_dict() or {}
+                active_room_id = service.get("activeRoomId")
+                room_status = "waiting"
+                if active_room_id:
+                    room_snap = self._room_ref(org_id, active_room_id).get()
+                    if room_snap.exists:
+                        room_status = str((room_snap.to_dict() or {}).get("status") or "waiting")
+                    if room_status != "live":
+                        active_room_id = None
                 rows.append({
                     "serviceKey": snap.id,
                     "title": service.get("title") or snap.id,
                     "publishedSermonDate": service.get("publishedSermonDate"),
+                    "activeRoomId": active_room_id,
+                    "lastRoomId": service.get("lastRoomId"),
+                    "roomStatus": room_status,
                     "defaultLanguagePair": service.get("defaultLanguagePair") or {"source": "ko", "target": "en"},
                 })
             rows.sort(key=lambda r: r["serviceKey"])
@@ -3387,32 +3411,38 @@ class FirestoreMultiChurchStore:
         self._set_cached_memberships(clean_uid, rows)
         return rows
 
-    def get_current_org_id(self, uid: str) -> Optional[str]:
+    def get_current_org_id(self, uid: str, memberships: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
         clean_uid = _clean_token(uid)
         if not clean_uid:
             return None
         user_snap = self._user_ref(clean_uid).get()
         current_org_id = _clean_token((user_snap.to_dict() or {}).get("currentOrgId")) if user_snap.exists else None
+        membership_rows = memberships
         if _is_master_uid(clean_uid):
             if current_org_id and self._org_ref(current_org_id).get().exists:
                 return current_org_id
-            memberships = self.list_memberships(clean_uid)
-            if not memberships:
+            if membership_rows is None:
+                membership_rows = self.list_memberships(clean_uid)
+            if not membership_rows:
                 return None
-            fallback_org_id = str(memberships[0]["orgId"])
+            fallback_org_id = str(membership_rows[0]["orgId"])
             self._user_ref(clean_uid).set(
                 {"currentOrgId": fallback_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
                 merge=True,
             )
             return fallback_org_id
-        if current_org_id:
-            member_snap = self._org_ref(current_org_id).collection("members").document(clean_uid).get()
-            if member_snap.exists:
-                return current_org_id
-        memberships = self.list_memberships(clean_uid)
-        if not memberships:
+        if membership_rows is None:
+            membership_rows = self.list_memberships(clean_uid)
+        membership_org_ids = {
+            _clean_token((row or {}).get("orgId"))
+            for row in membership_rows
+            if _clean_token((row or {}).get("orgId"))
+        }
+        if current_org_id and current_org_id in membership_org_ids:
+            return current_org_id
+        if not membership_rows:
             return None
-        fallback_org_id = str(memberships[0]["orgId"])
+        fallback_org_id = str(membership_rows[0]["orgId"])
         self._user_ref(clean_uid).set(
             {"currentOrgId": fallback_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
             merge=True,
@@ -5007,13 +5037,14 @@ class FirestoreMultiChurchStore:
         room_id: str,
         *,
         requested_by_uid: str,
+        allow_master: bool = False,
     ) -> list:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
         if not clean_org_id or not clean_uid:
             raise ValueError("room_not_found")
         role = self._member_role(clean_org_id, clean_uid)
-        if role not in {"owner", "admin", "host"}:
+        if role not in {"owner", "admin", "host"} and not (allow_master and self.is_master_user(clean_uid)):
             raise PermissionError("forbidden")
         room_snap = self._room_ref(clean_org_id, room_id).get()
         if not room_snap.exists:

@@ -20,6 +20,14 @@ type LiveRoom = {
   orgName?: string;
 };
 
+type ServiceExportRow = {
+  serviceKey: string;
+  title: string;
+  activeRoomId?: string | null;
+  lastRoomId?: string | null;
+  roomStatus?: string;
+};
+
 type OrgRow = {
   orgId: string;
   name: string;
@@ -30,6 +38,7 @@ type OrgRow = {
   hardCapReached: boolean;
   memberCount: number;
   serviceCount: number;
+  services: ServiceExportRow[];
   liveRoomCount: number;
   liveRooms: LiveRoom[];
   currentMonthMinutes: number;
@@ -199,6 +208,35 @@ function deltaLabel(current: number, prev: number): React.ReactElement | null {
   );
 }
 
+async function downloadAdminTranslationLog(
+  orgId: string,
+  roomId: string,
+  getToken: () => Promise<string | null>,
+): Promise<void> {
+  const token = await getToken();
+  if (!token) throw new Error("Not authenticated");
+  const res = await fetch(`${API_URL}/api/admin/org/${orgId}/room/${roomId}/segments/export`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const data = await res.json();
+      detail = typeof data?.detail === "string" ? data.detail : "";
+    } catch {}
+    throw new Error(detail || `Export failed (HTTP ${res.status})`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `translation_${roomId}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
 function UsageBar({ used, max }: { used: number; max: number }) {
@@ -239,6 +277,7 @@ export default function AdminDashboardPage() {
   const [search, setSearch] = useState("");
   const [planFilter, setPlanFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [downloadingRoomId, setDownloadingRoomId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!user) return;
@@ -1031,7 +1070,11 @@ export default function AdminDashboardPage() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((org) => (
+                {filtered.map((org) => {
+                  const downloadableServices = (org.services || []).filter(
+                    (service) => service.lastRoomId && service.activeRoomId !== service.lastRoomId,
+                  );
+                  return (
                   <tr
                     key={org.orgId}
                     style={{
@@ -1095,7 +1138,7 @@ export default function AdminDashboardPage() {
                     </td>
                     <td style={{ ...styles.td, color: "#9ca3af", fontSize: 12 }}>{fmtDate(org.createdAt)}</td>
                     <td style={styles.td}>
-                      <div style={{ display: "flex", gap: 6 }}>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                         {org.stripeCustomerId && (
                           <a
                             href={`https://dashboard.stripe.com/customers/${org.stripeCustomerId}`}
@@ -1107,10 +1150,41 @@ export default function AdminDashboardPage() {
                             Stripe
                           </a>
                         )}
+                        {downloadableServices.map((service) => {
+                          const roomId = service.lastRoomId as string;
+                          const isDownloading = downloadingRoomId === roomId;
+                          return (
+                            <button
+                              key={`${org.orgId}:${service.serviceKey}:${roomId}`}
+                              type="button"
+                              style={{
+                                ...styles.actionBtn,
+                                opacity: isDownloading ? 0.65 : 1,
+                                cursor: isDownloading ? "not-allowed" : "pointer",
+                              }}
+                              disabled={isDownloading}
+                              title={`Download latest ended room log for ${service.title}`}
+                              onClick={async () => {
+                                setDownloadingRoomId(roomId);
+                                setError(null);
+                                try {
+                                  await downloadAdminTranslationLog(org.orgId, roomId, getIdToken);
+                                } catch (e: unknown) {
+                                  setError(e instanceof Error ? e.message : String(e));
+                                } finally {
+                                  setDownloadingRoomId((current) => (current === roomId ? null : current));
+                                }
+                              }}
+                            >
+                              {isDownloading ? "Downloading…" : `Log: ${service.title}`}
+                            </button>
+                          );
+                        })}
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
                 {filtered.length === 0 && (
                   <tr>
                     <td colSpan={11} style={{ ...styles.td, textAlign: "center", color: "#9ca3af", padding: "32px 16px" }}>
