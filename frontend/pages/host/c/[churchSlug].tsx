@@ -159,6 +159,16 @@ function isNetworkError(err: unknown): boolean {
   return err instanceof TypeError && /fetch|network|failed/i.test((err as TypeError).message);
 }
 
+function isBackendUnavailableError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message.toLowerCase() : String(err || "").toLowerCase();
+  return (
+    isNetworkError(err) ||
+    message.includes("request timed out after") ||
+    message.includes("cannot reach backend api") ||
+    message.includes("server unreachable")
+  );
+}
+
 function isStaleFirebaseUserError(err: unknown): boolean {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
   if (code === "auth/user-not-found" || code === "auth/user-token-expired" || code === "auth/user-disabled") {
@@ -667,7 +677,14 @@ export default function HostChurchPage() {
         `/host/c/${encodeURIComponent(preferredSlug)}/${activeTab}${query ? `?${query}` : ""}`,
       );
     };
-    hydrateMembershipToken().catch(() => {});
+    hydrateMembershipToken().catch((err: unknown) => {
+      if (cancelled) return;
+      if (isBackendUnavailableError(err)) {
+        setBackendReachable(false);
+      }
+      const message = err instanceof Error ? err.message : "Failed to load account access.";
+      setErrorMsg(message);
+    });
     return () => {
       cancelled = true;
     };

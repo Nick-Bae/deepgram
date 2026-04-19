@@ -60,6 +60,15 @@ function isInvalidSessionError(err: unknown): boolean {
   return message.includes("invalid_id_token") || message.includes("session is invalid") || message.includes("invalid id token");
 }
 
+function isBackendUnavailableError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message.toLowerCase() : String(err || "").toLowerCase();
+  return (
+    message.includes("request timed out after") ||
+    message.includes("cannot reach backend api") ||
+    message.includes("server unreachable")
+  );
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -120,6 +129,7 @@ export default function LoginPage() {
     () => (nextPath ? `/signup?next=${encodeURIComponent(nextPath)}` : "/signup"),
     [nextPath],
   );
+  const hasSafeNextPath = Boolean(nextPath && nextPath !== "/login" && !nextPath.startsWith("/login?"));
 
   const redirectFromMembership = async (idToken: string) => {
     const me = await fetchAuthMe(idToken);
@@ -165,12 +175,21 @@ export default function LoginPage() {
     throw new Error("Please sign in again.");
   };
 
+  const redirectUsingNextPathFallback = async (err: unknown) => {
+    if (!hasSafeNextPath || !isBackendUnavailableError(err)) throw err;
+    await router.replace(nextPath);
+  };
+
   const continueExistingSession = async () => {
     setSessionBusy(true);
     setErrorMsg(null);
     try {
       await redirectWithFreshSession();
     } catch (err) {
+      try {
+        await redirectUsingNextPathFallback(err);
+        return;
+      } catch {}
       if (isInvalidSessionError(err)) {
         try {
           await logout();
@@ -205,6 +224,10 @@ export default function LoginPage() {
       await login(email.trim(), password);
       await redirectWithFreshSession();
     } catch (err) {
+      try {
+        await redirectUsingNextPathFallback(err);
+        return;
+      } catch {}
       const code = typeof err === "object" && err && "code" in err ? String((err as { code?: string }).code || "") : "";
       if (code === "auth/too-many-requests" || code === "auth/wrong-password" || code === "auth/invalid-credential") {
         void reportLoginFailed(email.trim());
@@ -227,6 +250,10 @@ export default function LoginPage() {
       await loginWithGoogle();
       await redirectWithFreshSession();
     } catch (err) {
+      try {
+        await redirectUsingNextPathFallback(err);
+        return;
+      } catch {}
       if (isInvalidSessionError(err)) {
         try {
           await logout();
