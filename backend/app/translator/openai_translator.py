@@ -53,6 +53,8 @@ PRONOUN_FORMS = {
         "would": "I would",
         "would_contracted": "I'd",
         "can": "I can",
+        "do": "I do",
+        "does_negation": "I do not",
     },
     "he": {
         "subject": "He",
@@ -69,6 +71,8 @@ PRONOUN_FORMS = {
         "would": "He would",
         "would_contracted": "He'd",
         "can": "He can",
+        "do": "He does",
+        "does_negation": "He does not",
     },
     "she": {
         "subject": "She",
@@ -85,6 +89,8 @@ PRONOUN_FORMS = {
         "would": "She would",
         "would_contracted": "She'd",
         "can": "She can",
+        "do": "She does",
+        "does_negation": "She does not",
     },
     "they": {
         "subject": "They",
@@ -101,6 +107,8 @@ PRONOUN_FORMS = {
         "would": "They would",
         "would_contracted": "They'd",
         "can": "They can",
+        "do": "They do",
+        "does_negation": "They do not",
     },
 }
 
@@ -286,6 +294,8 @@ def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> st
         (r"\bwe['’]d\b", forms.get("would_contracted") or forms.get("would")),
         (r"\bwe would\b", forms.get("would")),
         (r"\bwe can\b", forms.get("can")),
+        (r"\bwe do not\b", forms.get("does_negation") or forms.get("do")),
+        (r"\bwe do\b", forms.get("do")),
         (r"\bwe\b", forms.get("subject")),
         (r"\bus\b", forms.get("object")),
         (r"\bour\b", forms.get("possessive")),
@@ -303,6 +313,8 @@ def _enforce_subject_guardrails(en: str, ko: str, ctx: TranslationContext) -> st
         (r"\bI['’]d\b", forms.get("would_contracted") or forms.get("would")),
         (r"\bI would\b", forms.get("would")),
         (r"\bI can\b", forms.get("can")),
+        (r"\bI do not\b", forms.get("does_negation") or forms.get("do")),
+        (r"\bI do\b", forms.get("do")),
         (r"\bI\b", forms.get("subject")),
         (r"\bme\b", forms.get("object")),
         (r"\bmy\b", forms.get("possessive")),

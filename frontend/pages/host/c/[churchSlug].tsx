@@ -2542,7 +2542,7 @@ export default function HostChurchPage() {
                           {copyUrlBusy ? "Copying…" : copyUrlNotice || "Copy URL"}
                         </button>
                         <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", ...broadcastMutedChipStyle, borderRadius: 999, padding: "7px 13px", fontSize: 12, fontWeight: 700, textDecoration: "none", whiteSpace: "nowrap" as const }}>
-                          Listener ↗
+                          Viewer ↗
                         </a>
                         <button type="button" onClick={() => { void shareListenerUrl(); }} disabled={shareUrlBusy} style={{ ...broadcastMutedChipStyle, borderRadius: 999, border: "none", padding: "7px 13px", fontSize: 12, fontWeight: 700, cursor: shareUrlBusy ? "default" : "pointer", whiteSpace: "nowrap" as const }}>
                           {shareUrlBusy ? "Sharing…" : "Share"}

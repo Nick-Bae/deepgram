@@ -39,7 +39,11 @@ def _utterance_end_ms_env(name: str, default: int = 1000) -> int:
 DG_ENDPOINT = os.getenv("DEEPGRAM_ENDPOINT", "wss://api.deepgram.com/v1/listen")
 DG_KEY      = os.getenv("DEEPGRAM_API_KEY")
 DG_MODEL    = os.getenv("DEEPGRAM_MODEL", "nova-3")   # Korean supported
+DG_MODEL_FALLBACK = os.getenv("DEEPGRAM_MODEL_FALLBACK", "nova-2")  # for languages nova-3 doesn't support
 DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
+
+# nova-3 does not support Chinese; use nova-2 fallback for these language codes.
+_NOVA3_UNSUPPORTED = frozenset({"zh", "zh-cn", "zh-sg", "zh-tw", "zh-hk", "cmn", "yue"})
 DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 500, min_value=200, max_value=6000)
 DG_UTTER_END_MS = _utterance_end_ms_env("DG_UTTER_END_MS", 1000)
 _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
@@ -246,6 +250,19 @@ def _qs(
 
     return urlencode(params, doseq=True)
 
+
+def deepgram_model_for_language(language: str) -> str:
+    """Return the appropriate Deepgram model for the given language code.
+
+    nova-3 does not support Chinese; fall back to nova-2 for those codes.
+    Callers can override both models via DEEPGRAM_MODEL / DEEPGRAM_MODEL_FALLBACK env vars.
+    """
+    lang_key = (language or "").strip().lower()
+    if DG_MODEL.startswith("nova-3") and lang_key in _NOVA3_UNSUPPORTED:
+        return DG_MODEL_FALLBACK
+    return DG_MODEL
+
+
 async def connect_to_deepgram(
     model: Optional[str] = None,
     language: Optional[str] = None,
@@ -256,7 +273,7 @@ async def connect_to_deepgram(
     if not DG_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY not set")
 
-    m  = model or DG_MODEL
+    m  = model or deepgram_model_for_language(language or DG_LANGUAGE)
     lg = language or DG_LANGUAGE
 
     # Use keyword biasing only for Korean; avoid skewing other languages.

@@ -126,6 +126,41 @@ class TranslationContextTests(unittest.TestCase):
             "It is a word of faith that I hold dear. I am grateful, and I’ll keep it.",
         )
 
+    def test_infer_subject_from_english_keeps_this_god_as_he(self) -> None:
+        subject, pronoun = translate_module._infer_subject_from_english(
+            "This God here is the One who made the heavens and the earth.",
+            "the congregation",
+            "we",
+        )
+        self.assertEqual(subject, "This God here is the One who made the heavens and the earth")
+        self.assertEqual(pronoun, "he")
+
+    def test_infer_subject_from_context_history_uses_noun_led_prior_subject(self) -> None:
+        ctx = translate_module.TranslationContext(subject="the congregation", pronoun="we")
+        ctx.remember("이 하나님은 하늘과 땅을 지으신 분입니다.", "This God here is the One who made the heavens and the earth.")
+
+        subject, pronoun = translate_module._infer_subject_from_context_history(ctx)
+
+        self.assertEqual(subject, "This God here is the One who made the heavens and the earth")
+        self.assertEqual(pronoun, "he")
+
+    def test_enforce_subject_guardrails_keeps_divine_third_person_without_honorific(self) -> None:
+        ctx = translate_module.TranslationContext(
+            subject="This God here is the One who made the heavens and the earth",
+            pronoun="he",
+        )
+
+        guarded = translate_module._enforce_subject_guardrails(
+            "Even now, I do not ignore the groaning of my people.",
+            "지금도 자기 백성의 신음을 모른 척하지",
+            ctx,
+        )
+
+        self.assertEqual(
+            guarded,
+            "Even now, he does not ignore the groaning of his people.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
