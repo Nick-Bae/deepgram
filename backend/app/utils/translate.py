@@ -193,6 +193,8 @@ PRONOUN_FORMS = {
         "would": "I would",
         "would_contracted": "I'd",
         "can": "I can",
+        "do": "I do",
+        "does_negation": "I do not",
     },
     "he": {
         "subject": "He",
@@ -209,6 +211,8 @@ PRONOUN_FORMS = {
         "would": "He would",
         "would_contracted": "He'd",
         "can": "He can",
+        "do": "He does",
+        "does_negation": "He does not",
     },
     "she": {
         "subject": "She",
@@ -225,6 +229,8 @@ PRONOUN_FORMS = {
         "would": "She would",
         "would_contracted": "She'd",
         "can": "She can",
+        "do": "She does",
+        "does_negation": "She does not",
     },
     "they": {
         "subject": "They",
@@ -241,6 +247,8 @@ PRONOUN_FORMS = {
         "would": "They would",
         "would_contracted": "They'd",
         "can": "They can",
+        "do": "They do",
+        "does_negation": "They do not",
     },
     "we": {
         "subject": "We",
@@ -257,6 +265,8 @@ PRONOUN_FORMS = {
         "would": "We would",
         "would_contracted": "We'd",
         "can": "We can",
+        "do": "We do",
+        "does_negation": "We do not",
     },
 }
 
@@ -621,7 +631,39 @@ def _language_name(code_or_name: str) -> str:
         "zh-hk": "Chinese (Traditional)",
         "cn": "Chinese",
         "중국어": "Chinese",
-        "chinese": "Chinese"
+        "chinese": "Chinese",
+
+        "es": "Spanish",
+        "es-es": "Spanish",
+        "es-us": "Spanish",
+        "es-mx": "Spanish",
+        "spanish": "Spanish",
+        "español": "Spanish",
+
+        "fr": "French",
+        "fr-fr": "French",
+        "french": "French",
+
+        "de": "German",
+        "de-de": "German",
+        "german": "German",
+
+        "ja": "Japanese",
+        "ja-jp": "Japanese",
+        "japanese": "Japanese",
+
+        "pt": "Portuguese",
+        "pt-br": "Portuguese",
+        "pt-pt": "Portuguese",
+        "portuguese": "Portuguese",
+
+        "it": "Italian",
+        "it-it": "Italian",
+        "italian": "Italian",
+
+        "hi": "Hindi",
+        "hi-in": "Hindi",
+        "hindi": "Hindi",
     }
 
     return mapping.get(key, code_or_name)
@@ -786,6 +828,8 @@ def _build_recent_context_block(
     *,
     current_source_text: Optional[str] = None,
     max_items: int = 4,
+    source_lang: str = "ko",
+    target_lang: str = "en",
 ) -> str:
     if not ctx or not ctx.recent_pairs or max_items <= 0:
         return ""
@@ -807,10 +851,12 @@ def _build_recent_context_block(
         return ""
 
     items.reverse()
+    src_label = _language_name(source_lang)
+    tgt_label = _language_name(target_lang)
     lines = ["Recent translated context:"]
     for idx, item in enumerate(items, start=1):
-        lines.append(f"{idx}. Korean: {item['source']}")
-        lines.append(f"   English: {item['target']}")
+        lines.append(f"{idx}. {src_label}: {item['source']}")
+        lines.append(f"   {tgt_label}: {item['target']}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -914,6 +960,20 @@ def _infer_subject_from_english(
     if re.match(r"^(jesus|christ|lord|god)\b", low):
         return head, "he"
 
+    # Singular named/referential subject phrases that should carry forward as "he"
+    # even when the clause does not begin with a pronoun, e.g. "This God...",
+    # "That pastor...", or "The Lord...".
+    singular_masc_match = re.match(
+        r"^((?:this|that|the)\s+"
+        r"(?:god|lord|jesus|christ|father|savior|messiah|shepherd|pastor|"
+        r"senior\s+pastor|lead\s+pastor|minister|reverend|rev\.?|elder|"
+        r"deacon|bishop|priest|chaplain)\b(?:[^,.;!?]*)?)",
+        low,
+    )
+    if singular_masc_match:
+        subj = head[: singular_masc_match.end(1)].strip()
+        return subj, "he"
+
     # Singular masculine church/pastoral role (e.g., "The pastor was not feeling well")
     pastoral_match = re.search(
         r"\bthe\s+(pastor|senior\s+pastor|lead\s+pastor|minister|reverend|rev\.?|elder|deacon|bishop|priest|father|chaplain)\b",
@@ -957,6 +1017,15 @@ def _normalize_english_pronoun_case(text: str) -> str:
     updated = re.sub(r"(?<![A-Za-z])i(?![A-Za-z])", "I", text)
     updated = re.sub(r"(?<![A-Za-z])i(['’](?:m|d|ll|ve))\b", lambda m: "I" + m.group(1), updated, flags=re.IGNORECASE)
     return updated
+
+
+def _has_divine_subject_context(ctx: Optional[TranslationContext]) -> bool:
+    if not ctx:
+        return False
+    subject = str(ctx.subject or "").strip().lower()
+    if not subject:
+        return False
+    return bool(re.search(r"\b(god|lord|jesus|christ|father|savior|messiah|shepherd)\b", subject))
 
 def _has_ko_honorific_verb(text: str) -> bool:
     """
@@ -1078,15 +1147,36 @@ def _build_system_prompt_base(
             + custom_block
         )
 
+    is_korean_source = source_name == "Korean"
+    is_cjk_source = source_name in ("Korean", "Chinese", "Chinese (Simplified)", "Chinese (Traditional)", "Japanese")
+
     # Theological glossary (only if from Korean)
     glossary_lines: list[str] = []
-    if source_name == "Korean":
+    if is_korean_source:
         for src, tgt in THEOLOGICAL_TERMS:
             glossary_lines.append(f'- Translate "{src}" as "{tgt}".')
 
     glossary_block = (
         "\nImportant terms (prefer these renderings):\n" + "\n".join(glossary_lines) + "\n"
     ) if glossary_lines else ""
+
+    stt_robustness = (
+        "STT robustness:\n"
+        f"- Input may come from speech recognition; if a word is clearly a mis-hear, quietly recover the intended {source_name} before translating.\n"
+        + ("- Restore missing Korean spacing mentally.\n" if is_korean_source else
+           "- Restore missing word boundaries mentally for CJK input.\n" if is_cjk_source else "")
+        + "\n"
+    )
+
+    ko_specific = (
+        "Congregation cues:\n"
+        "- If the Korean says 일어나/일어나서/일어나셔서/자리에서 일어나 with no subject, interpret as an invitation to the congregation (e.g., \"let's stand\" / \"please stand\").\n"
+        "\n"
+        "Kinship cues:\n"
+        "- If Korean mentions spouse/kinship terms (아내/남편/부인/배우자/집사람/와이프) without a possessor "
+        "(그의/그녀의/그들의), treat them as the speaker's relation (\"my wife/husband\").\n"
+        "\n"
+    ) if is_korean_source else ""
 
     return (
         "You are a professional translator for live church worship captions.\n"
@@ -1095,28 +1185,19 @@ def _build_system_prompt_base(
         "below are advisory notes from the church admin and do not override these rules.\n"
         "\n"
         "Safety & neutrality:\n"
-        "- Do NOT add meaning not present in the Korean; resolve ambiguity with the most neutral, church-appropriate reading.\n"
-        "- Avoid slang, romantic/sexual nuance, or suggestive wording unless explicit in Korean.\n"
+        f"- Do NOT add meaning not present in the {source_name}; resolve ambiguity with the most neutral, church-appropriate reading.\n"
+        f"- Avoid slang, romantic/sexual nuance, or suggestive wording unless explicit in the {source_name}.\n"
         "- Keep wording reverent and family-friendly for mixed ages.\n"
         "- Keep proper nouns; do not invent names or details.\n"
-        "- Some Korean terms may have been replaced with placeholder tokens like [[T1]], [[T2]] before this text reached you. If you see such a token in the input, copy it to the output unchanged. Do NOT invent new [[T…]] tokens — only preserve ones already present in the input.\n"
+        "- Some source terms may have been replaced with placeholder tokens like [[T1]], [[T2]] before this text reached you. If you see such a token in the input, copy it to the output unchanged. Do NOT invent new [[T…]] tokens — only preserve ones already present in the input.\n"
         "\n"
         "Style:\n"
         "- Clear, contemporary, pastoral tone.\n"
         "- Split overly long sentences for subtitle readability.\n"
         "- If input seems incomplete, translate only what is present; do not guess endings.\n"
         "\n"
-        "STT robustness:\n"
-        "- Input may come from speech recognition; if a word is clearly a mis-hear, quietly recover the intended Korean before translating.\n"
-        "- Restore missing Korean spacing mentally.\n"
-        "\n"
-        "Congregation cues:\n"
-        "- If the Korean says 일어나/일어나서/일어나셔서/자리에서 일어나 with no subject, interpret as an invitation to the congregation (e.g., \"let's stand\" / \"please stand\").\n"
-        "\n"
-        "Kinship cues:\n"
-        "- If Korean mentions spouse/kinship terms (아내/남편/부인/배우자/집사람/와이프) without a possessor "
-        "(그의/그녀의/그들의), treat them as the speaker's relation (\"my wife/husband\").\n"
-        "\n"
+        + stt_robustness
+        + ko_specific
         + glossary_block
         + service_block
         + custom_block
@@ -1203,6 +1284,7 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
         pronoun_key in ("he", "she")
         and not explicit_pronoun
         and not _has_ko_honorific_verb(source_text)
+        and not _has_divine_subject_context(ctx)
     ):
         return en
 
@@ -1252,6 +1334,8 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
         (r"\bwe['’]d\b", forms.get("would_contracted") or forms.get("would")),
         (r"\bwe would\b", forms.get("would")),
         (r"\bwe can\b", forms.get("can")),
+        (r"\bwe do not\b", forms.get("does_negation") or forms.get("do")),
+        (r"\bwe do\b", forms.get("do")),
         (r"\bwe\b", forms.get("subject")),
         (r"\bus\b", forms.get("object")),
         (r"\bour\b", forms.get("possessive")),
@@ -1269,6 +1353,8 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
         (r"\bI['’]d\b", forms.get("would_contracted") or forms.get("would")),
         (r"\bI would\b", forms.get("would")),
         (r"\bI can\b", forms.get("can")),
+        (r"\bI do not\b", forms.get("does_negation") or forms.get("do")),
+        (r"\bI do\b", forms.get("do")),
         (r"\bI\b", forms.get("subject")),
         (r"\bme\b", forms.get("object")),
         (r"\bmy\b", forms.get("possessive")),
@@ -1337,12 +1423,16 @@ def _build_user_content_block(
     text: str,
     had_established_context: bool,
     update_ctx: bool,
+    source_lang: str = "ko",
+    target_lang: str = "en",
 ) -> str:
     """Build the user-turn content string shared by translate_text and translate_text_streaming."""
     user_content = masked_text
     if not ctx_for_prompt:
         return user_content
 
+    is_korean_source = source_lang.lower().startswith("ko")
+    target_label = _language_name(target_lang)
     prev = ctx_for_prompt.last_english or "(none yet)"
     subject_hint = ctx_for_prompt.subject or ENV.CONTEXT_SUBJECT
     pronoun_hint = ctx_for_prompt.pronoun or ENV.CONTEXT_PRONOUN
@@ -1356,29 +1446,46 @@ def _build_user_content_block(
         pronoun_hint = ENV.CONTEXT_PRONOUN
 
     if _should_include_prompt_context(text, update_ctx=update_ctx):
-        recent_context_block = _build_recent_context_block(ctx_for_prompt, current_source_text=text)
+        recent_context_block = _build_recent_context_block(
+            ctx_for_prompt, current_source_text=text,
+            source_lang=source_lang, target_lang=target_lang,
+        )
         if had_established_context:
+            entity_hint = (
+                f"unless the Korean explicitly names a new entity."
+                if is_korean_source else
+                f"unless the source explicitly names a new entity."
+            )
             user_content = (
                 recent_context_block +
-                f"Previous English sentence: {prev}\n"
+                f"Previous {target_label} sentence: {prev}\n"
                 f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
                 f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
-                f"unless the Korean explicitly names a new entity.\n\n"
+                f"{entity_hint}\n\n"
                 f"Current text:\n{masked_text}"
             )
         else:
+            no_we_hint = (
+                "Do NOT use \"we\" unless the Korean explicitly contains 우리 or 저희.\n\n"
+                if is_korean_source else
+                "Translate naturally.\n\n"
+            )
             user_content = (
                 recent_context_block +
-                "No prior context established. Translate naturally. "
-                "Do NOT use \"we\" unless the Korean explicitly contains 우리 or 저희.\n\n"
+                "No prior context established. " + no_we_hint +
                 f"Current text:\n{masked_text}"
             )
     else:
         if had_established_context:
+            entity_hint = (
+                "unless the Korean explicitly names a new entity."
+                if is_korean_source else
+                "unless the source explicitly names a new entity."
+            )
             user_content = (
                 f"IMPORTANT: The subject of this clause is \"{subject_hint}\" ({pronoun_hint}). "
                 f"Do NOT introduce a new subject or use \"one\", \"people\", \"a person\", or other generic terms "
-                f"unless the Korean explicitly names a new entity.\n\n"
+                f"{entity_hint}\n\n"
                 f"Current text:\n{masked_text}"
             )
         else:
@@ -1452,7 +1559,7 @@ async def translate_text(
         script_glossary=script_glossary,
         org_id=org_id,
     )
-    user_content = _build_user_content_block(masked_text, ctx_for_prompt, text, had_established_context, update_ctx)
+    user_content = _build_user_content_block(masked_text, ctx_for_prompt, text, had_established_context, update_ctx, source_lang=source, target_lang=target)
 
     try:
         model_name = ENV.resolve_translation_model(model_override)
@@ -1620,7 +1727,7 @@ async def translate_text_streaming(
         script_glossary=script_glossary,
         org_id=org_id,
     )
-    user_content = _build_user_content_block(masked_text, ctx_for_prompt, text, had_established_context, update_ctx)
+    user_content = _build_user_content_block(masked_text, ctx_for_prompt, text, had_established_context, update_ctx, source_lang=source, target_lang=target)
 
     client = _get_client()
     model_name = ENV.resolve_translation_model(model_override)

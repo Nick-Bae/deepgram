@@ -289,6 +289,8 @@ def _dispatch_soft_cap_email(org_id: str, org: Dict[str, Any]) -> None:
 
 _HARD_INACTIVE_ORG_STATUSES: set[str] = {"inactive", "disabled", "suspended", "deleted"}
 
+_FS_TIMEOUT = 15.0  # seconds — prevents gRPC stalls from hanging indefinitely
+
 
 def _status_token(raw: Any) -> str:
     return str(raw or "").strip().lower()
@@ -2894,7 +2896,7 @@ class FirestoreMultiChurchStore:
         }
         ref = self._user_membership_ref(clean_uid, clean_org_id)
         if transaction is None:
-            ref.set(payload, merge=True)
+            ref.set(payload, merge=True, timeout=_FS_TIMEOUT)
             return
         transaction.set(ref, payload, merge=True)
 
@@ -2957,7 +2959,7 @@ class FirestoreMultiChurchStore:
         }
         event_ref = self._org_invite_audit_ref(uuid4().hex)
         if transaction is None:
-            event_ref.set(payload, merge=True)
+            event_ref.set(payload, merge=True, timeout=_FS_TIMEOUT)
             return
         transaction.set(event_ref, payload, merge=True)
 
@@ -2965,7 +2967,7 @@ class FirestoreMultiChurchStore:
         current = now or _utcnow()
         cutoff = current - timedelta(days=INVITE_RETENTION_DAYS)
         query = self._where(self._db.collection("orgInvites"), "orgId", "==", org_id)
-        for invite_snap in query.stream():
+        for invite_snap in query.stream(timeout=_FS_TIMEOUT):
             invite = invite_snap.to_dict() or {}
             invite_status = str(invite.get("status") or "")
             expires_at = invite.get("expiresAt")
@@ -2973,6 +2975,7 @@ class FirestoreMultiChurchStore:
                 self._org_invite_ref(invite_snap.id).set(
                     {"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
                     merge=True,
+                    timeout=_FS_TIMEOUT,
                 )
                 invite_status = INVITE_STATUS_EXPIRED
             if invite_status == INVITE_STATUS_ACTIVE:
@@ -2984,7 +2987,7 @@ class FirestoreMultiChurchStore:
                 or invite.get("createdAt")
             )
             if isinstance(marker, datetime) and marker <= cutoff:
-                self._org_invite_ref(invite_snap.id).delete()
+                self._org_invite_ref(invite_snap.id).delete(timeout=_FS_TIMEOUT)
 
     def _count_active_org_invites(self, *, org_id: str, now: Optional[datetime] = None) -> int:
         self._cleanup_org_invites(org_id=org_id, now=now)
@@ -2994,7 +2997,7 @@ class FirestoreMultiChurchStore:
             "==",
             INVITE_STATUS_ACTIVE,
         )
-        return sum(1 for _ in query.stream())
+        return sum(1 for _ in query.stream(timeout=_FS_TIMEOUT))
 
     def _member_role(self, org_id: str, uid: Optional[str]) -> Optional[str]:
         clean_uid = _clean_token(uid)
@@ -3002,7 +3005,7 @@ class FirestoreMultiChurchStore:
             return None
         if _is_master_uid(clean_uid):
             return "owner"
-        member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
+        member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get(timeout=_FS_TIMEOUT)
         if not member_snap.exists:
             return None
         member = member_snap.to_dict() or {}
@@ -3020,7 +3023,7 @@ class FirestoreMultiChurchStore:
             "softCapEmailSentKey": None,
             "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
         }
-        self._org_ref(org_id).set(update, merge=True)
+        self._org_ref(org_id).set(update, merge=True, timeout=_FS_TIMEOUT)
         merged = dict(org)
         merged.update({"currentMonthKey": current_key, "currentMonthMinutes": 0, "hardCapReached": False})
         return merged
@@ -3029,7 +3032,7 @@ class FirestoreMultiChurchStore:
         rows = (
             self._where(self._db.collection("organizations"), "slug", "==", (slug or "").strip().lower())
             .limit(1)
-            .stream()
+            .stream(timeout=_FS_TIMEOUT)
         )
         row = next(rows, None)
         return row.id if row else None
@@ -3038,7 +3041,7 @@ class FirestoreMultiChurchStore:
         org_id = self._resolve_org_id_by_slug(slug)
         if not org_id:
             return None
-        service_snap = self._service_ref(org_id, service_key).get()
+        service_snap = self._service_ref(org_id, service_key).get(timeout=_FS_TIMEOUT)
         if not service_snap.exists:
             return None
         service = service_snap.to_dict() or {}
@@ -3046,7 +3049,7 @@ class FirestoreMultiChurchStore:
         room_doc = None
         room_status = "waiting"
         if active_room_id:
-            room_snap = self._room_ref(org_id, active_room_id).get()
+            room_snap = self._room_ref(org_id, active_room_id).get(timeout=_FS_TIMEOUT)
             if room_snap.exists:
                 room_doc = room_snap.to_dict() or {}
                 room_status = str(room_doc.get("status") or "waiting")
@@ -3072,16 +3075,16 @@ class FirestoreMultiChurchStore:
         org_id = self._resolve_org_id_by_slug(slug)
         if not org_id:
             return None
-        org_snap = self._org_ref(org_id).get()
+        org_snap = self._org_ref(org_id).get(timeout=_FS_TIMEOUT)
         org = org_snap.to_dict() if org_snap.exists else {}
         rows: List[Dict[str, Any]] = []
-        for snap in self._org_ref(org_id).collection("services").stream():
+        for snap in self._org_ref(org_id).collection("services").stream(timeout=_FS_TIMEOUT):
             service_key = snap.id
             service = snap.to_dict() or {}
             active_room_id = service.get("activeRoomId")
             room_status = "waiting"
             if active_room_id:
-                room_snap = self._room_ref(org_id, active_room_id).get()
+                room_snap = self._room_ref(org_id, active_room_id).get(timeout=_FS_TIMEOUT)
                 if room_snap.exists:
                     room_status = str((room_snap.to_dict() or {}).get("status") or "waiting")
                 if room_status != "live":
@@ -3104,12 +3107,12 @@ class FirestoreMultiChurchStore:
         """List services for an org by orgId directly (no slug resolution needed)."""
         rows: List[Dict[str, Any]] = []
         try:
-            for snap in self._org_ref(org_id).collection("services").stream():
+            for snap in self._org_ref(org_id).collection("services").stream(timeout=_FS_TIMEOUT):
                 service = snap.to_dict() or {}
                 active_room_id = service.get("activeRoomId")
                 room_status = "waiting"
                 if active_room_id:
-                    room_snap = self._room_ref(org_id, active_room_id).get()
+                    room_snap = self._room_ref(org_id, active_room_id).get(timeout=_FS_TIMEOUT)
                     if room_snap.exists:
                         room_status = str((room_snap.to_dict() or {}).get("status") or "waiting")
                     if room_status != "live":
@@ -3146,7 +3149,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_name")
 
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -3159,6 +3162,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         self._invalidate_membership_cache(clean_uid)
         org = org_snap.to_dict() or {}
@@ -3205,7 +3209,7 @@ class FirestoreMultiChurchStore:
         src = (_clean_token(source) or "ko").lower()
         tgt = (_clean_token(target) or "en").lower()
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
@@ -3214,7 +3218,7 @@ class FirestoreMultiChurchStore:
             raise PermissionError("forbidden")
 
         service_ref = self._service_ref(clean_org_id, normalized_key)
-        if service_ref.get().exists:
+        if service_ref.get(timeout=_FS_TIMEOUT).exists:
             raise ValueError("service_exists")
 
         now = _utcnow()
@@ -3228,7 +3232,7 @@ class FirestoreMultiChurchStore:
             max_service_keys = _billing_max_service_keys(billing)
             if max_service_keys > 0:
                 service_query = self._org_ref(clean_org_id).collection("services").limit(max_service_keys)
-                existing_count = sum(1 for _ in service_query.stream())
+                existing_count = sum(1 for _ in service_query.stream(timeout=_FS_TIMEOUT))
                 if existing_count >= max_service_keys:
                     raise PermissionError("plan_limit_reached")
 
@@ -3243,6 +3247,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return {
             "orgId": clean_org_id,
@@ -3263,7 +3268,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_uid")
         normalized_key = _normalize_service_key(service_key)
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -3271,18 +3276,18 @@ class FirestoreMultiChurchStore:
             raise PermissionError("forbidden")
 
         service_ref = self._service_ref(clean_org_id, normalized_key)
-        service_snap = service_ref.get()
+        service_snap = service_ref.get(timeout=_FS_TIMEOUT)
         if not service_snap.exists:
             raise ValueError("service_not_found")
         service = service_snap.to_dict() or {}
         active_room_id = _clean_token(service.get("activeRoomId"))
         if active_room_id:
-            room_snap = self._room_ref(clean_org_id, active_room_id).get()
+            room_snap = self._room_ref(clean_org_id, active_room_id).get(timeout=_FS_TIMEOUT)
             if room_snap.exists:
                 room = room_snap.to_dict() or {}
                 if str(room.get("status") or "") == "live":
                     raise ValueError("service_active")
-        service_ref.delete()
+        service_ref.delete(timeout=_FS_TIMEOUT)
         return {"deleted": True, "orgId": clean_org_id, "serviceKey": normalized_key}
 
     def _membership_row(self, *, org_id: str, org: Dict[str, Any], role: Optional[str]) -> Dict[str, Any]:
@@ -3313,10 +3318,10 @@ class FirestoreMultiChurchStore:
                 field_path = "__name__"
 
         try:
-            member_snaps = list(self._where(members_query, field_path, "==", uid).stream())
+            member_snaps = list(self._where(members_query, field_path, "==", uid).stream(timeout=_FS_TIMEOUT))
         except Exception:
             try:
-                member_snaps = list(members_query.where("__name__", "==", uid).stream())
+                member_snaps = list(members_query.where("__name__", "==", uid).stream(timeout=_FS_TIMEOUT))
             except Exception:
                 return None
 
@@ -3330,7 +3335,7 @@ class FirestoreMultiChurchStore:
             if not org_id or org_id in seen_org_ids:
                 continue
             seen_org_ids.add(org_id)
-            org_snap = org_ref.get()
+            org_snap = org_ref.get(timeout=_FS_TIMEOUT)
             if not org_snap.exists:
                 continue
             org = org_snap.to_dict() or {}
@@ -3340,9 +3345,9 @@ class FirestoreMultiChurchStore:
 
     def _list_memberships_by_full_org_scan(self, uid: str) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        for org_snap in self._db.collection("organizations").stream():
+        for org_snap in self._db.collection("organizations").stream(timeout=_FS_TIMEOUT):
             org_id = org_snap.id
-            member_snap = self._org_ref(org_id).collection("members").document(uid).get()
+            member_snap = self._org_ref(org_id).collection("members").document(uid).get(timeout=_FS_TIMEOUT)
             if not member_snap.exists:
                 continue
             org = org_snap.to_dict() or {}
@@ -3365,14 +3370,14 @@ class FirestoreMultiChurchStore:
                     org=(org_snap.to_dict() or {}),
                     role="owner",
                 )
-                for org_snap in self._db.collection("organizations").stream()
+                for org_snap in self._db.collection("organizations").stream(timeout=_FS_TIMEOUT)
             ]
             rows.sort(key=lambda row: (row["orgId"], row["slug"]))
             self._set_cached_memberships(clean_uid, rows)
             return rows
 
         rows: List[Dict[str, Any]] = []
-        indexed_memberships = list(self._user_ref(clean_uid).collection("memberships").stream())
+        indexed_memberships = list(self._user_ref(clean_uid).collection("memberships").stream(timeout=_FS_TIMEOUT))
         if indexed_memberships:
             stale_org_ids: List[str] = []
             for index_snap in indexed_memberships:
@@ -3381,11 +3386,11 @@ class FirestoreMultiChurchStore:
                 if not org_id:
                     continue
                 org_ref = self._org_ref(org_id)
-                member_snap = org_ref.collection("members").document(clean_uid).get()
+                member_snap = org_ref.collection("members").document(clean_uid).get(timeout=_FS_TIMEOUT)
                 if not member_snap.exists:
                     stale_org_ids.append(org_id)
                     continue
-                org_snap = org_ref.get()
+                org_snap = org_ref.get(timeout=_FS_TIMEOUT)
                 if not org_snap.exists:
                     stale_org_ids.append(org_id)
                     continue
@@ -3396,7 +3401,7 @@ class FirestoreMultiChurchStore:
                 if _normalize_role(index_doc.get("role"), fallback="viewer") != role:
                     self._upsert_user_membership_index(uid=clean_uid, org_id=org_id, role=role)
             for stale_org_id in stale_org_ids:
-                self._user_membership_ref(clean_uid, stale_org_id).delete()
+                self._user_membership_ref(clean_uid, stale_org_id).delete(timeout=_FS_TIMEOUT)
         if not indexed_memberships or not rows:
             rows = self._list_memberships_from_collection_group(clean_uid)
             if rows is None:
@@ -3415,11 +3420,11 @@ class FirestoreMultiChurchStore:
         clean_uid = _clean_token(uid)
         if not clean_uid:
             return None
-        user_snap = self._user_ref(clean_uid).get()
+        user_snap = self._user_ref(clean_uid).get(timeout=_FS_TIMEOUT)
         current_org_id = _clean_token((user_snap.to_dict() or {}).get("currentOrgId")) if user_snap.exists else None
         membership_rows = memberships
         if _is_master_uid(clean_uid):
-            if current_org_id and self._org_ref(current_org_id).get().exists:
+            if current_org_id and self._org_ref(current_org_id).get(timeout=_FS_TIMEOUT).exists:
                 return current_org_id
             if membership_rows is None:
                 membership_rows = self.list_memberships(clean_uid)
@@ -3429,6 +3434,7 @@ class FirestoreMultiChurchStore:
             self._user_ref(clean_uid).set(
                 {"currentOrgId": fallback_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
             return fallback_org_id
         if membership_rows is None:
@@ -3446,6 +3452,7 @@ class FirestoreMultiChurchStore:
         self._user_ref(clean_uid).set(
             {"currentOrgId": fallback_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return fallback_org_id
 
@@ -3456,16 +3463,17 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_uid")
         if not clean_org_id:
             raise ValueError("org_not_found")
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         if not _is_master_uid(clean_uid):
-            member_snap = self._org_ref(clean_org_id).collection("members").document(clean_uid).get()
+            member_snap = self._org_ref(clean_org_id).collection("members").document(clean_uid).get(timeout=_FS_TIMEOUT)
             if not member_snap.exists:
                 raise PermissionError("org_access_denied")
         self._user_ref(clean_uid).set(
             {"currentOrgId": clean_org_id, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return clean_org_id
 
@@ -3479,7 +3487,7 @@ class FirestoreMultiChurchStore:
             return []
         try:
             emails: List[str] = []
-            for doc in self._org_ref(clean_org_id).collection("members").stream():
+            for doc in self._org_ref(clean_org_id).collection("members").stream(timeout=_FS_TIMEOUT):
                 data = doc.to_dict() or {}
                 role = str(data.get("role") or "").strip().lower()
                 if role not in {"owner", "admin"}:
@@ -3497,7 +3505,7 @@ class FirestoreMultiChurchStore:
         if not clean_org_id:
             return org_id or ""
         try:
-            org_snap = self._org_ref(clean_org_id).get()
+            org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
             if org_snap.exists:
                 return str((org_snap.to_dict() or {}).get("name") or clean_org_id)
         except Exception:
@@ -3510,7 +3518,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         now = _utcnow()
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
@@ -3527,6 +3535,7 @@ class FirestoreMultiChurchStore:
                     "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
         return dict(billing)
 
@@ -3536,7 +3545,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         now = _utcnow()
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
@@ -3554,6 +3563,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return dict(merged)
 
@@ -3563,7 +3573,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         now = _utcnow()
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
@@ -3580,10 +3590,11 @@ class FirestoreMultiChurchStore:
                     "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
         live_rooms = [
             room_snap.to_dict() or {}
-            for room_snap in self._where(self._org_ref(clean_org_id).collection("rooms"), "status", "==", "live").stream()
+            for room_snap in self._where(self._org_ref(clean_org_id).collection("rooms"), "status", "==", "live").stream(timeout=_FS_TIMEOUT)
         ]
         return _effective_trial_seconds_remaining_for_rooms(billing, live_rooms, now=now)
 
@@ -3593,7 +3604,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         now = _utcnow()
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = self._roll_billing_period_if_needed(clean_org_id, org_snap.to_dict() or {}, now=now)
@@ -3628,12 +3639,12 @@ class FirestoreMultiChurchStore:
         clean_subscription = _clean_token(stripe_subscription_id)
         if clean_subscription:
             query = self._where(self._db.collection("organizations"), "billing.stripeSubscriptionId", "==", clean_subscription).limit(1)
-            snap = next(query.stream(), None)
+            snap = next(query.stream(timeout=_FS_TIMEOUT), None)
             if snap is not None:
                 return snap.id
         if clean_customer:
             query = self._where(self._db.collection("organizations"), "billing.stripeCustomerId", "==", clean_customer).limit(1)
-            snap = next(query.stream(), None)
+            snap = next(query.stream(timeout=_FS_TIMEOUT), None)
             if snap is not None:
                 return snap.id
         return None
@@ -3649,7 +3660,7 @@ class FirestoreMultiChurchStore:
         if not clean_event_id:
             raise ValueError("invalid_event_id")
         ref = self._billing_event_ref(clean_event_id)
-        snap = ref.get()
+        snap = ref.get(timeout=_FS_TIMEOUT)
         if snap.exists:
             return False
         ref.set(
@@ -3660,6 +3671,7 @@ class FirestoreMultiChurchStore:
                 "createdAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return True
 
@@ -3678,7 +3690,7 @@ class FirestoreMultiChurchStore:
         if not clean_uid:
             raise ValueError("invalid_uid")
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         if not _is_billing_admin(clean_uid, email=clean_email):
@@ -3704,7 +3716,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_uid")
 
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         if not _is_billing_admin(clean_uid, email=clean_email):
@@ -3716,6 +3728,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         merged_org = org_snap.to_dict() or {}
         merged_org["billingLimitsEnabled"] = bool(enabled)
@@ -3728,7 +3741,7 @@ class FirestoreMultiChurchStore:
             return
         limit = max(0, int(monthly_minutes))
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             return
         org = org_snap.to_dict() or {}
@@ -3738,18 +3751,18 @@ class FirestoreMultiChurchStore:
         }
         if limit == 0 or int(org.get("currentMonthMinutes") or 0) < limit:
             update["softCapReached"] = False
-        org_ref.set(update, merge=True)
+        org_ref.set(update, merge=True, timeout=_FS_TIMEOUT)
 
     def ensure_sermon_prep_budget_not_reached(self, *, org_id: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         now = _utcnow()
         period_key = _yyyymm(now)
-        usage_snap = self._usage_ref(clean_org_id, period_key).get()
+        usage_snap = self._usage_ref(clean_org_id, period_key).get(timeout=_FS_TIMEOUT)
         payload = _sermon_usage_payload(
             org_id=clean_org_id,
             org=(org_snap.to_dict() or {}),
@@ -3781,7 +3794,7 @@ class FirestoreMultiChurchStore:
         safe_limit = max(1, min(200, int(limit or 25)))
         resolved_period = _normalize_period_key(period_key, now=_utcnow())
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -3789,9 +3802,9 @@ class FirestoreMultiChurchStore:
             raise PermissionError("forbidden")
 
         usage_ref = self._usage_ref(clean_org_id, resolved_period)
-        usage_snap = usage_ref.get()
+        usage_snap = usage_ref.get(timeout=_FS_TIMEOUT)
         sermon_rows: List[Dict[str, Any]] = []
-        for sermon_snap in usage_ref.collection("sermons").stream():
+        for sermon_snap in usage_ref.collection("sermons").stream(timeout=_FS_TIMEOUT):
             row = sermon_snap.to_dict() or {}
             row_sermon_id = _clean_token(row.get("sermonId"))
             if clean_sermon_id and row_sermon_id != clean_sermon_id:
@@ -3827,7 +3840,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_budget")
 
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         if not _is_billing_admin(clean_uid, email=clean_email):
@@ -3839,6 +3852,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return self.get_org_sermon_prep_usage(
             org_id=clean_org_id,
@@ -3873,7 +3887,7 @@ class FirestoreMultiChurchStore:
             usd = _round_usd(_estimate_sermon_prep_usd(prompt_tokens=prompt, completion_tokens=completion))
         model_name = str(model or "").strip()
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
 
@@ -3890,6 +3904,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
 
         sermon_ref = self._usage_sermon_ref(clean_org_id, period_key, clean_sermon_id)
@@ -3905,10 +3920,10 @@ class FirestoreMultiChurchStore:
         }
         if model_name:
             sermon_payload["lastModel"] = model_name
-        sermon_ref.set(sermon_payload, merge=True)
+        sermon_ref.set(sermon_payload, merge=True, timeout=_FS_TIMEOUT)
 
-        usage_snap = usage_ref.get()
-        sermon_rows = [(snap.to_dict() or {}) for snap in usage_ref.collection("sermons").stream()]
+        usage_snap = usage_ref.get(timeout=_FS_TIMEOUT)
+        sermon_rows = [(snap.to_dict() or {}) for snap in usage_ref.collection("sermons").stream(timeout=_FS_TIMEOUT)]
         payload = _sermon_usage_payload(
             org_id=clean_org_id,
             org=(org_snap.to_dict() or {}),
@@ -3950,6 +3965,7 @@ class FirestoreMultiChurchStore:
                     "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
         except Exception:
             pass
@@ -3976,6 +3992,7 @@ class FirestoreMultiChurchStore:
                     "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
         except Exception:
             pass
@@ -3999,7 +4016,7 @@ class FirestoreMultiChurchStore:
         with self._platform_config_lock:
             if not self._platform_config_loaded:
                 try:
-                    snap = self._config_ref().get()
+                    snap = self._config_ref().get(timeout=_FS_TIMEOUT)
                     if snap.exists:
                         self._platform_config = snap.to_dict() or {}
                 except Exception:
@@ -4018,7 +4035,7 @@ class FirestoreMultiChurchStore:
             else:
                 cleaned[k] = float(v)
         try:
-            self._config_ref().set(cleaned, merge=True)
+            self._config_ref().set(cleaned, merge=True, timeout=_FS_TIMEOUT)
         except Exception:
             pass
         with self._platform_config_lock:
@@ -4033,8 +4050,8 @@ class FirestoreMultiChurchStore:
         live_usd = sermon_prompt = sermon_completion = sermon_total = sermon_requests = 0
         sermon_usd = deepgram_secs = deepgram_usd = 0.0
         try:
-            for org_snap in self._db.collection("organizations").stream():
-                usage_snap = self._usage_ref(org_snap.id, pk).get()
+            for org_snap in self._db.collection("organizations").stream(timeout=_FS_TIMEOUT):
+                usage_snap = self._usage_ref(org_snap.id, pk).get(timeout=_FS_TIMEOUT)
                 if not usage_snap.exists:
                     continue
                 usage = usage_snap.to_dict() or {}
@@ -4091,7 +4108,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_uid")
         invite_role = _normalize_invite_role(role)
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         creator_role = self._member_role(clean_org_id, clean_creator_uid)
@@ -4107,7 +4124,7 @@ class FirestoreMultiChurchStore:
         code = _new_invite_code()
         invite_id = _invite_code_hash(code)
         invite_ref = self._org_invite_ref(invite_id)
-        while invite_ref.get().exists:
+        while invite_ref.get(timeout=_FS_TIMEOUT).exists:
             code = _new_invite_code()
             invite_id = _invite_code_hash(code)
             invite_ref = self._org_invite_ref(invite_id)
@@ -4156,7 +4173,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("invite_not_found")
 
         invite_ref = self._org_invite_ref(_invite_code_hash(clean_code))
-        invite_snap = invite_ref.get()
+        invite_snap = invite_ref.get(timeout=_FS_TIMEOUT)
         if not invite_snap.exists:
             raise ValueError("invite_not_found")
         invite = invite_snap.to_dict() or {}
@@ -4166,17 +4183,17 @@ class FirestoreMultiChurchStore:
         now = _utcnow()
         expires_at = invite.get("expiresAt")
         if isinstance(expires_at, datetime) and expires_at <= now:
-            invite_ref.set({"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True)
+            invite_ref.set({"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True, timeout=_FS_TIMEOUT)
             raise ValueError("invite_expired")
 
         org_id = _clean_token(invite.get("orgId"))
         if not org_id:
             raise ValueError("org_not_found")
-        org_snap = self._org_ref(org_id).get()
+        org_snap = self._org_ref(org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
-        member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get()
+        member_snap = self._org_ref(org_id).collection("members").document(clean_uid).get(timeout=_FS_TIMEOUT)
         return {
             "inviteId": str(invite.get("inviteId") or invite_snap.id),
             "orgId": org_id,
@@ -4333,7 +4350,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_uid")
         status_filter = _normalize_invite_status(status)
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
@@ -4345,7 +4362,7 @@ class FirestoreMultiChurchStore:
         self._cleanup_org_invites(org_id=clean_org_id, now=now)
         rows: List[Dict[str, Any]] = []
         query = self._where(self._db.collection("orgInvites"), "orgId", "==", clean_org_id)
-        for invite_snap in query.stream():
+        for invite_snap in query.stream(timeout=_FS_TIMEOUT):
             invite = invite_snap.to_dict() or {}
             invite_status = str(invite.get("status") or "")
             expires_at = invite.get("expiresAt")
@@ -4354,6 +4371,7 @@ class FirestoreMultiChurchStore:
                 self._org_invite_ref(invite_snap.id).set(
                     {"status": INVITE_STATUS_EXPIRED, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
                     merge=True,
+                    timeout=_FS_TIMEOUT,
                 )
                 invite["status"] = INVITE_STATUS_EXPIRED
             if status_filter and invite_status != status_filter:
@@ -4380,7 +4398,7 @@ class FirestoreMultiChurchStore:
         if not clean_uid:
             raise ValueError("invalid_uid")
 
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         org = org_snap.to_dict() or {}
@@ -4473,6 +4491,7 @@ class FirestoreMultiChurchStore:
                     "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
             return {
                 "created": False,
@@ -4489,9 +4508,9 @@ class FirestoreMultiChurchStore:
             raise ValueError("slug_taken")
 
         org_id = slug
-        if self._org_ref(org_id).get().exists:
+        if self._org_ref(org_id).get(timeout=_FS_TIMEOUT).exists:
             suffix = 1
-            while self._org_ref(f"{slug}-{suffix}").get().exists:
+            while self._org_ref(f"{slug}-{suffix}").get(timeout=_FS_TIMEOUT).exists:
                 suffix += 1
             org_id = f"{slug}-{suffix}"
 
@@ -4519,6 +4538,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         org_ref.collection("members").document(clean_uid).set(
             {
@@ -4529,6 +4549,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         self._db.collection("users").document(clean_uid).set(
             {
@@ -4538,6 +4559,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         self._upsert_user_membership_index(uid=clean_uid, org_id=org_id, role="owner")
         self._invalidate_membership_cache(clean_uid)
@@ -4555,6 +4577,7 @@ class FirestoreMultiChurchStore:
                     "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
             service_rows.append({"serviceKey": service_key, "title": title})
 
@@ -4575,7 +4598,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         if not clean_uid:
             raise ValueError("invalid_uid")
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -4604,7 +4627,7 @@ class FirestoreMultiChurchStore:
         if not clean_uid:
             raise ValueError("invalid_uid")
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -4617,6 +4640,7 @@ class FirestoreMultiChurchStore:
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
             },
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         self._invalidate_org_prompt_cache(clean_org_id)
         return {
@@ -4633,7 +4657,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         if not clean_uid:
             raise ValueError("invalid_uid")
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -4659,7 +4683,7 @@ class FirestoreMultiChurchStore:
         if not clean_uid:
             raise ValueError("invalid_uid")
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -4669,6 +4693,7 @@ class FirestoreMultiChurchStore:
         org_ref.set(
             {"sttKeyterms": cleaned, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return {"orgId": clean_org_id, "keyterms": cleaned}
 
@@ -4677,7 +4702,7 @@ class FirestoreMultiChurchStore:
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             return []
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             return []
         org = org_snap.to_dict() or {}
@@ -4690,7 +4715,7 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         if not clean_uid:
             raise ValueError("invalid_uid")
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -4716,7 +4741,7 @@ class FirestoreMultiChurchStore:
         if not clean_uid:
             raise ValueError("invalid_uid")
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get()
+        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
         role = self._member_role(clean_org_id, clean_uid)
@@ -4726,6 +4751,7 @@ class FirestoreMultiChurchStore:
         org_ref.set(
             {"sttReplacements": cleaned, "updatedAt": gcf_firestore.SERVER_TIMESTAMP},
             merge=True,
+            timeout=_FS_TIMEOUT,
         )
         return {"orgId": clean_org_id, "replacements": cleaned}
 
@@ -4734,7 +4760,7 @@ class FirestoreMultiChurchStore:
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             return []
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             return []
         org = org_snap.to_dict() or {}
@@ -4748,7 +4774,7 @@ class FirestoreMultiChurchStore:
         cached = self._get_cached_org_prompt(clean_org_id)
         if cached is not None:
             return cached
-        org_snap = self._org_ref(clean_org_id).get()
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             payload = {"orgId": clean_org_id, "prompt": "", "service_prompt": ""}
             self._set_cached_org_prompt(clean_org_id, payload)
@@ -4763,7 +4789,7 @@ class FirestoreMultiChurchStore:
         return payload
 
     def authorize_host(self, org_id: str, *, host_uid: Optional[str] = None, host_token: Optional[str] = None) -> bool:
-        org_snap = self._org_ref(org_id).get()
+        org_snap = self._org_ref(org_id).get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             return False
         org = org_snap.to_dict() or {}
@@ -4772,7 +4798,7 @@ class FirestoreMultiChurchStore:
         if uid:
             if _is_master_uid(uid):
                 return True
-            member_snap = self._org_ref(org_id).collection("members").document(uid).get()
+            member_snap = self._org_ref(org_id).collection("members").document(uid).get(timeout=_FS_TIMEOUT)
             if member_snap.exists:
                 role = str((member_snap.to_dict() or {}).get("role") or "").strip().lower()
                 if role in {"owner", "admin", "host"}:
@@ -5005,6 +5031,7 @@ class FirestoreMultiChurchStore:
             room_ref.collection("finalTranscript").document("latest").set(
                 {"text": transcript, "createdAt": gcf_firestore.SERVER_TIMESTAMP},
                 merge=True,
+                timeout=_FS_TIMEOUT,
             )
         return result
 
@@ -5046,20 +5073,20 @@ class FirestoreMultiChurchStore:
         role = self._member_role(clean_org_id, clean_uid)
         if role not in {"owner", "admin", "host"} and not (allow_master and self.is_master_user(clean_uid)):
             raise PermissionError("forbidden")
-        room_snap = self._room_ref(clean_org_id, room_id).get()
+        room_snap = self._room_ref(clean_org_id, room_id).get(timeout=_FS_TIMEOUT)
         if not room_snap.exists:
             raise ValueError("room_not_found")
         segments_ref = self._room_ref(clean_org_id, room_id).collection("segments")
-        snaps = segments_ref.order_by("seq").stream()
+        snaps = segments_ref.order_by("seq").stream(timeout=_FS_TIMEOUT)
         return [snap.to_dict() for snap in snaps if snap.to_dict()]
 
     def touch_audio(self, org_id: str, room_id: str) -> None:
-        self._room_ref(org_id, room_id).set({"lastAudioAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True)
+        self._room_ref(org_id, room_id).set({"lastAudioAt": gcf_firestore.SERVER_TIMESTAMP}, merge=True, timeout=_FS_TIMEOUT)
 
     def bump_listener_peak(self, org_id: str, room_id: str, viewer_count: int) -> None:
         # Firestore lacks a server-side max primitive; this is best-effort.
         ref = self._room_ref(org_id, room_id)
-        snap = ref.get()
+        snap = ref.get(timeout=_FS_TIMEOUT)
         if not snap.exists:
             return
         room = snap.to_dict() or {}
@@ -5068,14 +5095,14 @@ class FirestoreMultiChurchStore:
             ref.set({"listenerCountPeak": int(viewer_count)}, merge=True)
 
     def get_active_room(self, org_id: str, service_key: str) -> Optional[str]:
-        snap = self._service_ref(org_id, service_key).get()
+        snap = self._service_ref(org_id, service_key).get(timeout=_FS_TIMEOUT)
         if not snap.exists:
             return None
         service = snap.to_dict() or {}
         room_id = service.get("activeRoomId")
         if not room_id:
             return None
-        room_snap = self._room_ref(org_id, str(room_id)).get()
+        room_snap = self._room_ref(org_id, str(room_id)).get(timeout=_FS_TIMEOUT)
         if not room_snap.exists:
             return None
         room = room_snap.to_dict() or {}
@@ -5083,9 +5110,9 @@ class FirestoreMultiChurchStore:
 
     def live_rooms(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        for org_snap in self._db.collection("organizations").stream():
+        for org_snap in self._db.collection("organizations").stream(timeout=_FS_TIMEOUT):
             org_id = org_snap.id
-            for room_snap in self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream():
+            for room_snap in self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream(timeout=_FS_TIMEOUT):
                 room = room_snap.to_dict() or {}
                 out.append(
                     {
@@ -5099,9 +5126,9 @@ class FirestoreMultiChurchStore:
     def stale_live_rooms(self, *, idle_seconds: int, max_duration_seconds: int) -> List[Dict[str, Any]]:
         now = _utcnow()
         out: List[Dict[str, Any]] = []
-        for org_snap in self._db.collection("organizations").stream():
+        for org_snap in self._db.collection("organizations").stream(timeout=_FS_TIMEOUT):
             org_id = org_snap.id
-            for room_snap in self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream():
+            for room_snap in self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream(timeout=_FS_TIMEOUT):
                 room = room_snap.to_dict() or {}
                 started_at = room.get("startedAt")
                 last_audio_at = room.get("lastAudioAt") or started_at
@@ -5121,7 +5148,7 @@ class FirestoreMultiChurchStore:
         tick_min = _tick_minutes(tick_seconds)
         out: List[Dict[str, Any]] = []
 
-        for org_snap in self._db.collection("organizations").stream():
+        for org_snap in self._db.collection("organizations").stream(timeout=_FS_TIMEOUT):
             org_id = org_snap.id
             org = self._roll_billing_period_if_needed(org_id, org_snap.to_dict() or {}, now=now)
             billing_limits_enabled = _org_billing_limits_enabled(org)
@@ -5140,7 +5167,7 @@ class FirestoreMultiChurchStore:
             trial_billing_next = dict(billing)
             trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(trial_billing_next)
 
-            room_snaps = list(self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream())
+            room_snaps = list(self._where(self._org_ref(org_id).collection("rooms"), "status", "==", "live").stream(timeout=_FS_TIMEOUT))
             live_room_ids = [snap.id for snap in room_snaps]
             if not live_room_ids:
                 continue
@@ -5174,7 +5201,7 @@ class FirestoreMultiChurchStore:
                     trial_delta_seconds += delta_seconds
 
                 next_tick_at = last_tick_at + timedelta(seconds=increments * tick_seconds)
-                self._room_ref(org_id, room_snap.id).set({"lastUsageTickAt": next_tick_at}, merge=True)
+                self._room_ref(org_id, room_snap.id).set({"lastUsageTickAt": next_tick_at}, merge=True, timeout=_FS_TIMEOUT)
 
                 if has_monthly_cap and (current_minutes + org_delta) >= max_minutes:
                     cap_reached = True
@@ -5202,7 +5229,7 @@ class FirestoreMultiChurchStore:
                     trial_billing_next["updatedAt"] = now
                     org_update["billing"] = dict(trial_billing_next)
                 if org_update:
-                    self._org_ref(org_id).set(org_update, merge=True)
+                    self._org_ref(org_id).set(org_update, merge=True, timeout=_FS_TIMEOUT)
 
             if usage_delta > 0:
                 self._usage_ref(org_id, period_key).set(
@@ -5211,6 +5238,7 @@ class FirestoreMultiChurchStore:
                         "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
                     },
                     merge=True,
+                    timeout=_FS_TIMEOUT,
                 )
 
             if cap_reached or trial_reached:
@@ -5244,7 +5272,7 @@ class FirestoreMultiChurchStore:
                 "lang_src": lang_src,
                 "lang_tgt": lang_tgt,
                 "pairs": pairs,
-            })
+            }, timeout=_FS_TIMEOUT)
         except Exception:
             pass
 
@@ -5256,7 +5284,7 @@ class FirestoreMultiChurchStore:
                 .collection("organizations").document(org_id)
                 .collection("sermons")
             )
-            docs = col_ref.order_by("created_at", direction="DESCENDING").limit(1).get()
+            docs = col_ref.order_by("created_at", direction="DESCENDING").limit(1).get(timeout=_FS_TIMEOUT)
             for doc in docs:
                 return doc.to_dict()
         except Exception:
@@ -5288,10 +5316,7 @@ class FirestoreMultiChurchStore:
         """Create or overwrite a draft sermon for a specific service slot + date."""
         try:
             ref = self._sermon_ref(org_id, service_key, service_date)
-            existing = ref.get()
-            if existing.exists and existing.to_dict().get("status") == "published":
-                # Never silently overwrite a published sermon
-                return
+            existing = ref.get(timeout=_FS_TIMEOUT)
             data: dict = {
                 "serviceKey": service_key,
                 "serviceDate": service_date,
@@ -5307,9 +5332,9 @@ class FirestoreMultiChurchStore:
             if not existing.exists:
                 data["createdBy"] = created_by
                 data["createdAt"] = gcf_firestore.SERVER_TIMESTAMP
-                ref.set(data)
+                ref.set(data, timeout=_FS_TIMEOUT)
             else:
-                ref.update(data)
+                ref.update(data, timeout=_FS_TIMEOUT)
         except Exception:
             pass
 
@@ -5318,7 +5343,7 @@ class FirestoreMultiChurchStore:
     ) -> Optional[dict]:
         """Return a sermon doc (any status) for a service slot + date, or None."""
         try:
-            doc = self._sermon_ref(org_id, service_key, service_date).get()
+            doc = self._sermon_ref(org_id, service_key, service_date).get(timeout=_FS_TIMEOUT)
             return doc.to_dict() if doc.exists else None
         except Exception:
             return None
@@ -5339,7 +5364,7 @@ class FirestoreMultiChurchStore:
                 "status": "published",
                 "publishedAt": gcf_firestore.SERVER_TIMESTAMP,
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
-            })
+            }, timeout=_FS_TIMEOUT)
             # Update service pointer
             svc_ref = (
                 self._db
@@ -5349,8 +5374,8 @@ class FirestoreMultiChurchStore:
             svc_ref.update({
                 "publishedSermonDate": service_date,
                 "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
-            })
-            doc = ref.get()
+            }, timeout=_FS_TIMEOUT)
+            doc = ref.get(timeout=_FS_TIMEOUT)
             return doc.to_dict() if doc.exists else None
         except Exception:
             return None
@@ -5360,7 +5385,7 @@ class FirestoreMultiChurchStore:
     ) -> Optional[dict]:
         """Return the published sermon for a service slot + date, or None."""
         try:
-            doc = self._sermon_ref(org_id, service_key, service_date).get()
+            doc = self._sermon_ref(org_id, service_key, service_date).get(timeout=_FS_TIMEOUT)
             if not doc.exists:
                 return None
             data = doc.to_dict()
@@ -5379,7 +5404,7 @@ class FirestoreMultiChurchStore:
                 .collection("services").document(service_key)
                 .collection("sermons")
             )
-            docs = col_ref.order_by("serviceDate", direction="DESCENDING").limit(limit).get()
+            docs = col_ref.order_by("serviceDate", direction="DESCENDING").limit(limit).get(timeout=_FS_TIMEOUT)
             return [d.to_dict() for d in docs if d.exists]
         except Exception:
             return []

@@ -815,6 +815,28 @@ export function saveServiceSermon(
   );
 }
 
+export function fetchServiceSermon(
+  idToken: string,
+  orgId: string,
+  serviceKey: string,
+  serviceDate: string,
+): Promise<{
+  serviceKey: string;
+  serviceDate: string;
+  status: string;
+  threshold?: number;
+  langSrc?: string;
+  langTgt?: string;
+  pairs?: Array<{ source: string; target: string }>;
+  segmentCount?: number;
+}> {
+  return authFetch(
+    `/api/org/${encodeURIComponent(orgId)}/services/${encodeURIComponent(serviceKey)}/sermon/${encodeURIComponent(serviceDate)}`,
+    idToken,
+    { method: "GET" },
+  );
+}
+
 export function publishServiceSermon(
   idToken: string,
   orgId: string,

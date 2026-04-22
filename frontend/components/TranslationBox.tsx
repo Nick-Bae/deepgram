@@ -126,7 +126,7 @@ const HANGUL_CHAR_RE = /[\uac00-\ud7a3]/
 const SILENT_AUDIO_DATA_URL = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AACJWAAACABAAZGF0YQAAAAA='
 const DISPLAY_SPEED_MIN = 0.6
 const DISPLAY_SPEED_MAX = 1.6
-const DISPLAY_SPEED_STEP = 0.1
+const DISPLAY_SPEED_STEP = 0.05
 const DISPLAY_SPEED_STORAGE_KEY = 'display_speed_factor'
 const DEEPGRAM_WARNING_DELAY_MS = 3000
 
@@ -272,6 +272,7 @@ export default function TranslationBox({
   const ttsQueueRef = useRef<QueuedTTS[]>([])
   const speakingRef = useRef(false)
   const lastHandledSeqRef = useRef(0)       // gate: handle each seq once (final or soft-final)
+  const lastFinalTranslatedAtRef = useRef(0) // timestamp of last final translation display
   const currentSpokenRef = useRef('')
   const pendingControllersRef = useRef<Set<AbortController>>(new Set())
   const pendingRequestsRef = useRef<Map<string, Promise<string>>>(new Map())
@@ -757,7 +758,15 @@ export default function TranslationBox({
 
     if (incoming) {
       console.log('[FE][WS][in]', { seq, isFinal, out: clip(incoming) });
-      setTranslated(incoming);
+      if (isFinal) {
+        lastFinalTranslatedAtRef.current = Date.now();
+        setTranslated(incoming);
+      } else {
+        const dwellElapsed = Date.now() - lastFinalTranslatedAtRef.current;
+        if (dwellElapsed >= 1500 || incoming.length >= 30) {
+          setTranslated(incoming);
+        }
+      }
     } else if (isFinal) {
       console.log('[FE][WS][in][suppressed-target]', { seq, src: clip(committedSrc || '(none)') });
       setTranslated('');
@@ -938,6 +947,7 @@ export default function TranslationBox({
     clauseRef.current = ''
     lastClauseSentRef.current = ''
     lastKRFromServerRef.current = ''
+    lastFinalTranslatedAtRef.current = 0
     setText('')
     setTranslated('')
     flushTTSQueue()

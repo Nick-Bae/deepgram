@@ -171,6 +171,7 @@ function ProductMockup({ isLoggedIn, dashboardHref, resolvingDashboard }: {
 }) {
   const ctaHref = isLoggedIn ? dashboardHref : "/signup";
   const ctaLabel = isLoggedIn ? (resolvingDashboard ? "Loading..." : "Open Dashboard") : "Start Free Trial";
+  const ctaDisabled = isLoggedIn && resolvingDashboard;
 
   return (
     <div
@@ -269,27 +270,52 @@ function ProductMockup({ isLoggedIn, dashboardHref, resolvingDashboard }: {
 
         {/* CTA + QR */}
         <div style={{ display: "flex", gap: 10, alignItems: "stretch" }}>
-          <Link
-            href={ctaHref}
-            style={{
-              flex: 1,
-              background: `linear-gradient(135deg, ${C.gold} 0%, ${C.goldLight} 100%)`,
-              color: C.navy,
-              borderRadius: 9,
-              padding: "11px 0",
-              fontSize: 11,
-              fontWeight: 800,
-              textAlign: "center",
-              letterSpacing: "0.1em",
-              textTransform: "uppercase",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              boxShadow: "0 4px 20px rgba(184,154,94,0.35)",
-            }}
-          >
-            {ctaLabel}
-          </Link>
+          {ctaDisabled ? (
+            <span
+              aria-disabled="true"
+              style={{
+                flex: 1,
+                background: `linear-gradient(135deg, rgba(184,154,94,0.58) 0%, rgba(212,184,122,0.58) 100%)`,
+                color: "rgba(15,31,61,0.72)",
+                borderRadius: 9,
+                padding: "11px 0",
+                fontSize: 11,
+                fontWeight: 800,
+                textAlign: "center",
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                boxShadow: "0 4px 20px rgba(184,154,94,0.18)",
+                cursor: "progress",
+              }}
+            >
+              {ctaLabel}
+            </span>
+          ) : (
+            <Link
+              href={ctaHref}
+              style={{
+                flex: 1,
+                background: `linear-gradient(135deg, ${C.gold} 0%, ${C.goldLight} 100%)`,
+                color: C.navy,
+                borderRadius: 9,
+                padding: "11px 0",
+                fontSize: 11,
+                fontWeight: 800,
+                textAlign: "center",
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                boxShadow: "0 4px 20px rgba(184,154,94,0.35)",
+              }}
+            >
+              {ctaLabel}
+            </Link>
+          )}
           <QRPlaceholder size={42} />
         </div>
       </div>
@@ -484,21 +510,40 @@ export default function HomePage() {
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           {!authLoading && (
             isLoggedIn ? (
-              <Link
-                href={dashboardHref}
-                style={{
-                  padding: "9px 20px",
-                  background: C.gold,
-                  color: C.white,
-                  fontSize: "0.8rem",
-                  fontWeight: 700,
-                  letterSpacing: "0.08em",
-                  textTransform: "uppercase",
-                  borderRadius: 4,
-                }}
-              >
-                Dashboard
-              </Link>
+              resolvingDashboard ? (
+                <span
+                  aria-disabled="true"
+                  style={{
+                    padding: "9px 20px",
+                    background: "rgba(184,154,94,0.55)",
+                    color: "rgba(255,255,255,0.82)",
+                    fontSize: "0.8rem",
+                    fontWeight: 700,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    borderRadius: 4,
+                    cursor: "progress",
+                  }}
+                >
+                  Loading...
+                </span>
+              ) : (
+                <Link
+                  href={dashboardHref}
+                  style={{
+                    padding: "9px 20px",
+                    background: C.gold,
+                    color: C.white,
+                    fontSize: "0.8rem",
+                    fontWeight: 700,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    borderRadius: 4,
+                  }}
+                >
+                  Dashboard
+                </Link>
+              )
             ) : (
               <>
                 <Link
@@ -579,10 +624,19 @@ export default function HomePage() {
           ))}
           <div style={{ marginTop: 24, display: "flex", gap: 12 }}>
             {isLoggedIn ? (
-              <Link href={dashboardHref} onClick={() => setMobileNavOpen(false)}
-                style={{ padding: "13px 24px", background: C.gold, color: C.white, borderRadius: 4, fontSize: "0.9rem", fontWeight: 700 }}>
-                {resolvingDashboard ? "Loading..." : "Dashboard"}
-              </Link>
+              resolvingDashboard ? (
+                <span
+                  aria-disabled="true"
+                  style={{ padding: "13px 24px", background: "rgba(184,154,94,0.55)", color: "rgba(255,255,255,0.82)", borderRadius: 4, fontSize: "0.9rem", fontWeight: 700, cursor: "progress" }}
+                >
+                  Loading...
+                </span>
+              ) : (
+                <Link href={dashboardHref} onClick={() => setMobileNavOpen(false)}
+                  style={{ padding: "13px 24px", background: C.gold, color: C.white, borderRadius: 4, fontSize: "0.9rem", fontWeight: 700 }}>
+                  Dashboard
+                </Link>
+              )
             ) : (
               <>
                 <Link href="/login" onClick={() => setMobileNavOpen(false)}

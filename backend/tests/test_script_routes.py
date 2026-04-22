@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
@@ -164,6 +164,32 @@ class ScriptRouteTests(unittest.TestCase):
         self.assertEqual(segments[0]["id"], 1)
         self.assertEqual(segments[0]["ko"], "오늘 본문은 역대하 마지막 장입니다.")
         self.assertEqual(segments[0]["en"], "EN::오늘 본문은 역대하 마지막 장입니다.")
+
+    def test_split_korean_text_treats_single_newlines_as_soft_wraps(self) -> None:
+        parts = script_routes._split_korean_text(
+            "오늘 본문은\n역대하 마지막 장입니다.\n하나님은\n신실하십니다.",
+            True,
+        )
+        self.assertEqual(
+            parts,
+            [
+                "오늘 본문은 역대하 마지막 장입니다.",
+                "하나님은 신실하십니다.",
+            ],
+        )
+
+    def test_split_korean_text_preserves_blank_line_paragraph_boundaries(self) -> None:
+        parts = script_routes._split_korean_text(
+            "첫 문장입니다\n\n둘째 문장은 끝 표시가 없습니다",
+            True,
+        )
+        self.assertEqual(
+            parts,
+            [
+                "첫 문장입니다",
+                "둘째 문장은 끝 표시가 없습니다",
+            ],
+        )
 
     def test_sermon_translation_concurrency_scales_for_long_drafts(self) -> None:
         with patch.object(script_routes, "SERMON_TRANSLATION_CONCURRENCY", 2):
@@ -378,6 +404,65 @@ class ScriptRouteTests(unittest.TestCase):
         stored_a = self.scripts.get_sermon("2026-03-08-am", org_id=org_a)
         self.assertIsNotNone(stored_b)
         self.assertIsNone(stored_a)
+
+    def test_publish_service_sermon_allows_republish_when_already_published(self) -> None:
+        store = Mock()
+        store.get_sermon_draft.return_value = {
+            "status": "published",
+            "threshold": 0.84,
+            "pairs": [{"source": "은혜입니다.", "target": "It is grace."}],
+        }
+        store.publish_sermon.return_value = {"status": "published"}
+
+        with (
+            patch.object(script_routes, "multichurch_store", store),
+            patch.object(script_routes, "require_org_role"),
+            patch.object(script_routes.script_store, "load") as load_mock,
+        ):
+            result = script_routes.publish_service_sermon(
+                org_id="org-1",
+                service_key="sun-11am",
+                service_date="2026-04-27",
+                user=_user("owner-service-publish"),
+            )
+
+        self.assertEqual(result.get("status"), "published")
+        store.publish_sermon.assert_called_once_with("org-1", "sun-11am", "2026-04-27")
+        load_mock.assert_called_once()
+
+    def test_save_service_sermon_replaces_existing_published_copy_with_draft(self) -> None:
+        store = Mock()
+
+        with (
+            patch.object(script_routes, "multichurch_store", store),
+            patch.object(script_routes, "require_org_role"),
+        ):
+            result = script_routes.save_service_sermon(
+                org_id="org-1",
+                service_key="sun-11am",
+                service_date="2026-04-27",
+                body=script_routes.ServiceSermonSaveRequest(
+                    segments=[
+                        script_routes.SermonSegment(
+                            id=1,
+                            ko="새 설교 원고입니다.",
+                            en="This is the updated sermon script.",
+                        )
+                    ],
+                    threshold=0.91,
+                ),
+                user=_user("owner-service-save"),
+            )
+
+        self.assertEqual(result.get("status"), "draft")
+        store.save_sermon_draft.assert_called_once_with(
+            "org-1",
+            "sun-11am",
+            "2026-04-27",
+            pairs=[{"source": "새 설교 원고입니다.", "target": "This is the updated sermon script."}],
+            threshold=0.91,
+            created_by="owner-service-save",
+        )
 
 
 if __name__ == "__main__":

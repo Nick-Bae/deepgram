@@ -16,7 +16,7 @@ from app.utils.translate import translate_text
 
 router = APIRouter(tags=["script"])
 SCRIPT_EDITOR_ROLES = {"owner", "admin", "host"}
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。？！…])\s+|\n+")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。？！…])\s+|\n{2,}")
 SERMON_TRANSLATION_MODEL = ENV.SERMON_TRANSLATION_MODEL
 
 
@@ -101,9 +101,14 @@ def _split_korean_text(raw: str, auto_split: bool) -> list[str]:
     text = (raw or "").strip()
     if not text:
         return []
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not auto_split:
         return [line.strip() for line in text.splitlines() if line.strip()]
-    return [part.strip() for part in SENTENCE_SPLIT_RE.split(text) if part.strip()]
+    # Treat single newlines as soft wraps from pasted documents, not sentence breaks.
+    normalized = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+    normalized = re.sub(r"\n[ \t]+", "\n", normalized)
+    return [part.strip() for part in SENTENCE_SPLIT_RE.split(normalized) if part.strip()]
 
 
 def _resolve_org_prompt_overrides(org_id: str) -> tuple[str | None, str | None]:
@@ -581,8 +586,6 @@ def publish_service_sermon(
     doc = multichurch_store.get_sermon_draft(org_id, service_key, service_date)
     if not doc:
         raise HTTPException(status_code=404, detail="sermon_not_found")
-    if doc.get("status") == "published":
-        raise HTTPException(status_code=409, detail="already_published")
     pairs = doc.get("pairs") or []
     if not pairs:
         raise HTTPException(status_code=400, detail="sermon_has_no_segments")

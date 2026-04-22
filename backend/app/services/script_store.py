@@ -101,6 +101,7 @@ class ScriptBuffer:
     threshold: float = 0.84
     version: int = 0
     sermons: Dict[str, dict[str, Any]] = field(default_factory=dict)
+    target_lang: str = "en"
 
 
 class ScriptStore:
@@ -147,6 +148,7 @@ class ScriptStore:
         room_id: Optional[str] = None,
         service_key: Optional[str] = None,
         service_date: Optional[str] = None,
+        target_lang: str = "en",
     ) -> Tuple[int, float, int]:
         """
         Replace the buffer with the provided pairs.
@@ -164,6 +166,7 @@ class ScriptStore:
             key = self._org_key(org_id, room_id=room_id, service_key=service_key, service_date=service_date)
             buffer = self._buffers.get(key) or ScriptBuffer()
             buffer.pairs = cleaned
+            buffer.target_lang = (target_lang or "en").split("-")[0].lower()
             if threshold is not None:
                 buffer.threshold = max(0.0, min(1.0, float(threshold)))
             buffer.version += 1
@@ -258,6 +261,7 @@ class ScriptStore:
         room_id: Optional[str] = None,
         example_min_score: float = 0.20,
         example_max: int = 3,
+        target_lang: Optional[str] = None,
     ) -> Tuple[Optional["ScriptPair"], float, int, float, List["ScriptPair"]]:
         """
         Single O(N) scan returning (best_match, score, version, threshold, examples).
@@ -274,6 +278,12 @@ class ScriptStore:
             pairs_snapshot = list(buffer.pairs)
             threshold = buffer.threshold
             version = buffer.version
+            stored_target_lang = buffer.target_lang
+
+        # Skip script matching when the buffer was prepared for a different target language
+        requested_lang = (target_lang or "en").split("-")[0].lower()
+        if requested_lang != stored_target_lang:
+            return None, 0.0, version, threshold, []
 
         if not query:
             return None, 0.0, version, threshold, []

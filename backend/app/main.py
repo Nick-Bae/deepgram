@@ -31,7 +31,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 # --- local modules (single import each) ---
 from app.socket_manager import manager
-from app.deepgram_session import connect_to_deepgram, _build_keyterm_list, _build_replace_list, DG_DEBUG
+from app.deepgram_session import connect_to_deepgram, deepgram_model_for_language, _build_keyterm_list, _build_replace_list, DG_DEBUG
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
 from app.utils.translate import _preprocess_source_text, translate_text, translate_text_streaming, TranslationContext
@@ -675,10 +675,25 @@ def _try_reload_sermon(
                 return True
 
         doc = None
+        resolved_service_date = (service_date or "").strip() or None
         # 1. Try service-specific published sermon (preferred)
-        if service_key and service_date:
-            doc = multichurch_store.get_published_sermon(org_id, service_key, service_date)
-            if not doc:
+        if service_key:
+            if not resolved_service_date:
+                try:
+                    service_rows = multichurch_store.list_services_by_org_id(org_id) or []
+                    for row in service_rows:
+                        if str(row.get("serviceKey") or "").strip() == service_key:
+                            candidate = str(row.get("publishedSermonDate") or "").strip()
+                            if candidate:
+                                resolved_service_date = candidate
+                            break
+                except Exception:
+                    resolved_service_date = None
+
+            if resolved_service_date:
+                doc = multichurch_store.get_published_sermon(org_id, service_key, resolved_service_date)
+
+            if not doc and service_date and resolved_service_date != service_date:
                 logger.warning(
                     "no published sermon for %s/%s/%s, falling back to org-latest",
                     org_id, service_key, service_date,
@@ -707,7 +722,7 @@ def _try_reload_sermon(
         )
         logger.info(
             "sermon loaded for room %s (%d pairs, service=%s, date=%s)",
-            room_id or org_id, len(doc["pairs"]), service_key or "n/a", service_date or "n/a",
+            room_id or org_id, len(doc["pairs"]), service_key or "n/a", resolved_service_date or service_date or "n/a",
         )
         return True
     except Exception:
@@ -1113,7 +1128,7 @@ async def ws_translate(ws: WebSocket):
             src_text = _stt_vocab_correct(src_text, _vocab_set_producer)
 
         script_match, match_score, script_version, script_threshold, _script_examples_producer = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: script_store.match_with_examples(src_text, room_id=target_room_id)
+            None, lambda: script_store.match_with_examples(src_text, room_id=target_room_id, target_lang=tgt_lang_full)
         )
         _cached_script_examples_producer = _script_examples_producer
         live_mode = "live"
@@ -1534,14 +1549,11 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     # Auto-reload sermon from Firestore if script store is empty (fire-and-forget)
     if org_id:
-        from datetime import datetime, timezone as _tz
-        _today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
         asyncio.get_running_loop().run_in_executor(
             None, lambda: _try_reload_sermon(
                 org_id,
                 room_id=room_id,
                 service_key=service_key,
-                service_date=_today,
             )
         )
 
@@ -1573,7 +1585,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         dg_replacements = []
 
     try:
-        dg = await connect_to_deepgram(language=dg_language, keywords=dg_keywords, replacements=dg_replacements)
+        dg = await connect_to_deepgram(model=deepgram_model_for_language(dg_language), language=dg_language, keywords=dg_keywords, replacements=dg_replacements)
     except Exception as e:
         await websocket.send_json({"type": "error", "message": f"Deepgram connect failed: {e}"})
         await websocket.close()
@@ -1760,7 +1772,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 _loop = asyncio.get_running_loop()
                 script_match, match_score, script_version, script_threshold, _script_examples_dg = await _loop.run_in_executor(
-                    None, lambda: script_store.match_with_examples(clean_src, room_id=room_id)
+                    None, lambda: script_store.match_with_examples(clean_src, room_id=room_id, target_lang=tgt_lang_full)
                 )
                 scripture_hit = None
                 if src_lang.startswith("ko"):

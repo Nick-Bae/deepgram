@@ -8,6 +8,7 @@ import {
   draftOrgSermon,
   finalizeOrgSermon,
   draftServiceSermon,
+  fetchServiceSermon,
   saveServiceSermon,
   publishServiceSermon,
   type SermonDraftSegment,
@@ -124,6 +125,61 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
     await logout();
     void router.replace(`/login?next=${encodeURIComponent(nextPath)}`);
   }, [logout, router]);
+
+  useEffect(() => {
+    if (!serviceKey || !orgId || !serviceDate.trim()) return;
+    let cancelled = false;
+
+    const loadExistingServiceSermon = async () => {
+      try {
+        const idToken = await getIdToken(true);
+        if (!idToken || cancelled) return;
+
+        const doc = await fetchServiceSermon(idToken, orgId, serviceKey, serviceDate.trim());
+        if (cancelled) return;
+
+        const pairs = Array.isArray(doc.pairs) ? doc.pairs : [];
+        const nextSegments = pairs.map((pair, idx) => ({
+          id: idx + 1,
+          ko: String(pair?.source || "").trim(),
+          en: String(pair?.target || "").trim(),
+        })).filter((row) => row.ko || row.en);
+
+        setSegments(nextSegments);
+        setThreshold(typeof doc.threshold === "number" ? doc.threshold : 0.84);
+        setLangSrc((doc.langSrc || "ko").trim() || "ko");
+        setLangTgt((doc.langTgt || "en").trim() || "en");
+        setPublished(doc.status === "published");
+        setKorean(nextSegments.map((row) => row.ko).join("\n"));
+        setMessage(
+          nextSegments.length
+            ? `✅ Loaded ${doc.status === "published" ? "published" : "saved"} sermon: ${nextSegments.length} rows.`
+            : null,
+        );
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (cancelled) return;
+        if (msg.toLowerCase().includes("sermon_not_found")) {
+          setSegments([]);
+          setKorean("");
+          setPublished(false);
+          setMessage(null);
+          return;
+        }
+        if (isSessionExpiredError(msg)) {
+          setMessage("❌ Session expired. Redirecting to login...");
+          await redirectToLogin();
+          return;
+        }
+        setMessage(`❌ ${msg}`);
+      }
+    };
+
+    void loadExistingServiceSermon();
+    return () => {
+      cancelled = true;
+    };
+  }, [getIdToken, isSessionExpiredError, orgId, redirectToLogin, serviceDate, serviceKey]);
 
   const onDownloadJson = () => {
     if (!segments.length) {
@@ -418,7 +474,7 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
             checked={autoSplit}
             onChange={(e) => setAutoSplit(e.target.checked)}
           />
-          Auto split by sentence punctuation
+          Auto split by sentence punctuation (ignore soft line breaks)
         </label>
       </details>
 
