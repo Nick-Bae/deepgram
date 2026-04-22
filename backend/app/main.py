@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
 
 load_dotenv()
 
@@ -1613,6 +1614,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
     if org_id:
         prompt_overrides_cache[org_id] = _prompt_overrides_for_org(org_id)
 
+    async def _send_to_producer(message: dict[str, Any]) -> bool:
+        if closed.is_set():
+            return False
+        if websocket.application_state == WebSocketState.DISCONNECTED:
+            return False
+        if websocket.client_state == WebSocketState.DISCONNECTED:
+            return False
+        try:
+            await websocket.send_json(message)
+            return True
+        except Exception:
+            return False
+
     async def from_client_to_deepgram():
         nonlocal last_audio_touch_ts, total_audio_bytes
         try:
@@ -1916,10 +1930,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
             }
 
             try:
-                await websocket.send_json(live_msg_new)
-                await websocket.send_json(live_msg_legacy)
-            except Exception as e:
-                print("[DG] send back to producer failed:", e)
+                sent_new = await _send_to_producer(live_msg_new)
+                sent_legacy = await _send_to_producer(live_msg_legacy)
+                if not sent_new or not sent_legacy:
+                    print("[DG] producer socket already closed; skipped echo back to host")
+            except Exception:
+                pass
 
             try:
                 if org_id and room_id:
@@ -2088,7 +2104,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 # show partial text in the UI; optionally emit early preview translations
                 if transcript and not is_final:
                     try:
-                        await websocket.send_json({"type": "stt.partial", "text": transcript})
+                        await _send_to_producer({"type": "stt.partial", "text": transcript})
                     except:
                         pass
 
