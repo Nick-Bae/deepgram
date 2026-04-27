@@ -1996,9 +1996,9 @@ export default function HostChurchPage() {
     boxShadow: "0 12px 24px rgba(126,104,81,0.06), inset 0 1px 0 rgba(255,255,255,0.74)",
   } as const;
   const broadcastPrimaryButtonStyle = {
-    background: "linear-gradient(145deg, #d4b87a, #b88a52)",
+    background: "linear-gradient(145deg, #c47a5e, #ab664e)",
     color: "#ffffff",
-    boxShadow: "0 16px 32px rgba(184,154,94,0.24)",
+    boxShadow: "0 16px 32px rgba(171,102,78,0.30)",
   } as const;
   const broadcastSecondaryButtonStyle = {
     background: "linear-gradient(180deg, rgba(255,255,255,0.64), rgba(255,255,255,0.36))",
@@ -2006,9 +2006,9 @@ export default function HostChurchPage() {
     boxShadow: "0 12px 24px rgba(126,104,81,0.08), inset 0 1px 0 rgba(255,255,255,0.84), inset 0 0 0 1px rgba(120,98,78,0.12)",
   } as const;
   const broadcastDarkButtonStyle = {
-    background: "linear-gradient(180deg, #3b4960 0%, #2d3650 100%)",
+    background: "linear-gradient(180deg, #8d3149 0%, #71273a 100%)",
     color: "#ffffff",
-    boxShadow: "0 16px 30px rgba(45,54,80,0.22)",
+    boxShadow: "0 16px 30px rgba(113,39,58,0.28)",
   } as const;
   const broadcastInsetCardStyle = {
     background: "linear-gradient(180deg, rgba(255,255,255,0.44), rgba(255,255,255,0.24))",
@@ -2572,24 +2572,15 @@ export default function HostChurchPage() {
                 </div>
               </section>
 
-              {/* ── Standby worship banner ── */}
+              {/* ── Standby worship logo (no container, blends with page bg) ── */}
               {!activeRoomId ? (
-                <div style={{ marginTop: 16, borderRadius: 36, overflow: "hidden", position: "relative", ...broadcastGlassPanelStyle, background: "linear-gradient(135deg, #cfb58d 0%, #8e7248 48%, #cfb58d 100%)", padding: 0 }}>
+                <div style={{ marginTop: 16, display: "flex", justifyContent: "center", alignItems: "center", padding: "24px 16px" }}>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src="/worship-banner.png?v=20260410-3"
-                    alt="Worship"
-                    style={{ width: "100%", display: "block", height: 420, objectFit: "cover", objectPosition: "center" }}
+                    src="/worship-translation-logo-transparent.png"
+                    alt="Worship Translation"
+                    style={{ display: "block", width: "100%", maxWidth: 720, height: "auto", objectFit: "contain" }}
                   />
-                  {/* bottom gradient overlay */}
-                  <div style={{ position: "absolute", inset: 0, background: "linear-gradient(to bottom, transparent 40%, rgba(26,22,18,0.62) 100%)", pointerEvents: "none" }} />
-                  {/* bottom-left label */}
-                  {/* <div style={{ position: "absolute", bottom: 20, left: 24, display: "flex", flexDirection: "column" as const, gap: 4 }}>
-                    <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.22em", textTransform: "uppercase" as const, color: "rgba(255,255,255,0.55)" }}>Ready to broadcast</span>
-                    <span style={{ fontSize: 14, fontWeight: 600, color: "rgba(255,255,255,0.92)", letterSpacing: "-0.01em" }}>Select a service and press Start Broadcast</span>
-                  </div> */}
-                  {/* subtle top-edge glass line */}
-                  <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 1, background: "rgba(255,255,255,0.38)", pointerEvents: "none" }} />
                 </div>
               ) : null}
 
