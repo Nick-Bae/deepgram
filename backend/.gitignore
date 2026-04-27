@@ -9,3 +9,6 @@ __pycache__/
 # Editor/tool temp files
 *.tmp
 *.tmp.*
+
+# Python virtualenv
+venv/
