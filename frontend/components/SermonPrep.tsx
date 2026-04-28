@@ -17,10 +17,25 @@ import {
 type Props = {
   orgId: string;
   serviceKey?: string;
+  services?: Array<{ serviceKey: string; title: string; publishedSermonDate?: string }>;
+  onServiceKeyChange?: (serviceKey: string) => void;
 };
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 50;
+const LANGUAGE_OPTIONS = [
+  { value: "ko", label: "Korean" },
+  { value: "en", label: "English" },
+  { value: "es", label: "Spanish" },
+  { value: "zh-cn", label: "Chinese (Simplified)" },
+  { value: "zh-tw", label: "Chinese (Traditional)" },
+  { value: "ja", label: "Japanese" },
+  { value: "fr", label: "French" },
+  { value: "de", label: "German" },
+  { value: "pt", label: "Portuguese" },
+  { value: "it", label: "Italian" },
+  { value: "hi", label: "Hindi" },
+] as const;
 
 function buildDefaultSermonId(): string {
   const now = new Date();
@@ -40,7 +55,7 @@ function buildDefaultServiceDate(): string {
   return nextSunday.toISOString().slice(0, 10);
 }
 
-export default function SermonPrep({ orgId, serviceKey }: Props) {
+export default function SermonPrep({ orgId, serviceKey, services = [], onServiceKeyChange }: Props) {
   const router = useRouter();
   const { getIdToken, logout } = useAuth();
   const [sermonId, setSermonId] = useState(buildDefaultSermonId());
@@ -61,6 +76,10 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
   const [jumpRow, setJumpRow] = useState("");
 
   const readyCount = useMemo(() => segments.filter((row) => row.en.trim().length > 0).length, [segments]);
+  const selectedService = useMemo(
+    () => services.find((svc) => svc.serviceKey === serviceKey) || null,
+    [serviceKey, services],
+  );
   const allRowsReady = segments.length > 0 && readyCount === segments.length;
   const firstIncompleteRowId = useMemo(
     () => segments.find((row) => !row.en.trim())?.id ?? null,
@@ -296,7 +315,12 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
     try {
       const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
-      await saveServiceSermon(idToken, orgId, serviceKey, serviceDate.trim(), { segments, threshold });
+      await saveServiceSermon(idToken, orgId, serviceKey, serviceDate.trim(), {
+        segments,
+        threshold,
+        lang_src: langSrc,
+        lang_tgt: langTgt,
+      });
       setMessage(`✅ Draft saved (${segments.length} rows).`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -318,7 +342,12 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
       const idToken = await getIdToken(true);
       if (!idToken) throw new Error("Please sign in again.");
       // Save latest edits first, then publish
-      await saveServiceSermon(idToken, orgId, serviceKey, serviceDate.trim(), { segments, threshold });
+      await saveServiceSermon(idToken, orgId, serviceKey, serviceDate.trim(), {
+        segments,
+        threshold,
+        lang_src: langSrc,
+        lang_tgt: langTgt,
+      });
       await publishServiceSermon(idToken, orgId, serviceKey, serviceDate.trim());
       setPublished(true);
       setMessage(`✅ Published for ${serviceKey} on ${serviceDate}. Sermon is now active for this service.`);
@@ -393,19 +422,57 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
         </p>
       </div>
 
-      <div className="mt-5 grid gap-4 md:grid-cols-2">
-        {serviceKey ? (
-          <label className="space-y-1 text-sm text-slate-700">
-            <span className="font-medium text-slate-700">Step 1: Service Date</span>
-            <input
-              type="date"
-              value={serviceDate}
-              onChange={(e) => { setServiceDate(e.target.value); setPublished(false); }}
-              className="w-full rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white focus:border-[#22d3ee] focus:outline-none"
-            />
-            <span className="text-xs text-slate-500">Sermon for: {serviceKey}</span>
-          </label>
-        ) : (
+      {serviceKey ? (
+        <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+          <p className="mb-2 text-sm font-medium text-slate-700">Step 1: Choose service and date</p>
+          <div className="grid gap-4 md:grid-cols-[1fr_1fr_1fr]">
+            <label className="space-y-1 text-sm text-slate-700">
+              <span className="font-medium text-slate-700">Service</span>
+              <select
+                value={serviceKey}
+                onChange={(e) => {
+                  onServiceKeyChange?.(e.target.value);
+                  setPublished(false);
+                }}
+                disabled={!onServiceKeyChange || services.length === 0}
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-sky-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {services.length ? (
+                  services.map((svc) => (
+                    <option key={svc.serviceKey} value={svc.serviceKey}>
+                      {svc.title || svc.serviceKey}
+                      {svc.publishedSermonDate ? ` - published ${svc.publishedSermonDate}` : ""}
+                    </option>
+                  ))
+                ) : (
+                  <option value={serviceKey}>{selectedService?.title || serviceKey}</option>
+                )}
+              </select>
+            </label>
+
+            <label className="space-y-1 text-sm text-slate-700">
+              <span className="font-medium text-slate-700">Service Date</span>
+              <input
+                type="date"
+                value={serviceDate}
+                onChange={(e) => { setServiceDate(e.target.value); setPublished(false); }}
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-sky-500 focus:outline-none"
+              />
+            </label>
+
+            <label className="space-y-1 text-sm text-slate-700">
+              <span className="font-medium text-slate-700">Rows ready</span>
+              <div className="rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white">
+                {readyCount}/{segments.length || 0} EN rows
+              </div>
+            </label>
+          </div>
+          <p className="mt-2 text-xs text-slate-500">
+            Sermon for: {selectedService?.title || serviceKey}
+          </p>
+        </div>
+      ) : (
+        <div className="mt-5 grid gap-4 md:grid-cols-2">
           <label className="space-y-1 text-sm text-slate-700">
             <span className="font-medium text-slate-700">Step 1: Sermon ID</span>
             <input
@@ -415,24 +482,24 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
               placeholder="2026-03-08-am"
             />
           </label>
-        )}
 
-        <label className="space-y-1 text-sm text-slate-700">
-          <span className="font-medium text-slate-700">Rows ready</span>
-          <div className="rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white">
-            {readyCount}/{segments.length || 0} EN rows
-          </div>
-        </label>
-      </div>
+          <label className="space-y-1 text-sm text-slate-700">
+            <span className="font-medium text-slate-700">Rows ready</span>
+            <div className="rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white">
+              {readyCount}/{segments.length || 0} EN rows
+            </div>
+          </label>
+        </div>
+      )}
 
       <label className="mt-4 block space-y-2 text-sm text-slate-700">
-        <span className="font-medium text-slate-700">Step 2: Korean sermon text (paste only Korean)</span>
+        <span className="font-medium text-slate-700">Step 2: Sermon text</span>
         <textarea
           value={korean}
           onChange={(e) => setKorean(e.target.value)}
           rows={8}
           className="w-full rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white placeholder-white/35 focus:border-[#22d3ee] focus:outline-none"
-          placeholder="오늘 본문은 ..."
+          placeholder="Paste sermon text here..."
         />
       </label>
 
@@ -453,19 +520,31 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
           </label>
           <label className="space-y-1">
             <span>Source lang</span>
-            <input
+            <select
               value={langSrc}
               onChange={(e) => setLangSrc(e.target.value)}
               className="w-full rounded-lg border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white focus:border-[#22d3ee] focus:outline-none"
-            />
+            >
+              {LANGUAGE_OPTIONS.map((lang) => (
+                <option key={lang.value} value={lang.value}>
+                  {lang.label}
+                </option>
+              ))}
+            </select>
           </label>
           <label className="space-y-1">
             <span>Target lang</span>
-            <input
+            <select
               value={langTgt}
               onChange={(e) => setLangTgt(e.target.value)}
               className="w-full rounded-lg border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white focus:border-[#22d3ee] focus:outline-none"
-            />
+            >
+              {LANGUAGE_OPTIONS.map((lang) => (
+                <option key={lang.value} value={lang.value}>
+                  {lang.label}
+                </option>
+              ))}
+            </select>
           </label>
         </div>
         <label className="mt-3 inline-flex items-center gap-2">
@@ -496,7 +575,7 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
               disabled={busyDraft || busySave || busyPublish || !segments.length}
               className="inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-400 px-5 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-cyan-400 hover:text-cyan-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {busySave ? "Saving..." : "Step 4a: Save Draft"}
+              {busySave ? "Saving..." : "Step 4: Save Draft"}
             </button>
             <button
               type="button"
@@ -504,7 +583,7 @@ export default function SermonPrep({ orgId, serviceKey }: Props) {
               disabled={busyDraft || busySave || busyPublish || !segments.length || !allRowsReady || published}
               className="inline-flex items-center justify-center gap-2 rounded-2xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-[#041018] shadow-[0_15px_45px_rgba(16,185,129,0.28)] transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {busyPublish ? "Publishing..." : published ? "✓ Published" : "Step 4b: Publish for Service"}
+              {busyPublish ? "Publishing..." : published ? "✓ Published" : "Step 5: Publish for Service"}
             </button>
             {published ? null : (
               <span className="text-xs text-amber-600">
