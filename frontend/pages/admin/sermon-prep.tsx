@@ -203,29 +203,17 @@ export default function AdminSermonPrepPage() {
                   Role: {selectedMembership.role || "viewer"}
                 </span>
               ) : null}
-              {services.length > 0 ? (
-                <>
-                  <label className="text-sm font-medium text-slate-700">Service</label>
-                  <select
-                    value={selectedServiceKey}
-                    onChange={(e) => setSelectedServiceKey(e.target.value)}
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-sky-500 focus:outline-none"
-                  >
-                    {services.map((svc) => (
-                      <option key={svc.serviceKey} value={svc.serviceKey}>
-                        {svc.title || svc.serviceKey}
-                        {svc.publishedSermonDate ? ` ✓ ${svc.publishedSermonDate}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              ) : null}
             </div>
             {membershipError ? <p className="text-sm text-rose-600">{membershipError}</p> : null}
           </header>
 
           {canManageScript ? (
-            <SermonPrep orgId={selectedOrgId} serviceKey={selectedServiceKey || undefined} />
+            <SermonPrep
+              orgId={selectedOrgId}
+              serviceKey={selectedServiceKey || undefined}
+              services={services}
+              onServiceKeyChange={setSelectedServiceKey}
+            />
           ) : (
             <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">
               Sermon prep is available to owner/admin/host roles.

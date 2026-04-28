@@ -95,6 +95,8 @@ class ServiceSermonDraftRequest(BaseModel):
 class ServiceSermonSaveRequest(BaseModel):
     segments: list[SermonSegment] = Field(default_factory=list)
     threshold: float = Field(default=0.84, ge=0.0, le=1.0)
+    lang_src: str = Field(default="ko", min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    lang_tgt: str = Field(default="en", min_length=2, max_length=20, pattern=validators.LANG_CODE)
 
 
 def _split_korean_text(raw: str, auto_split: bool) -> list[str]:
@@ -348,7 +350,12 @@ def finalize_sermon(
     if not pairs:
         raise HTTPException(status_code=400, detail="segments must be a non-empty list")
 
-    loaded, used_threshold, version = script_store.load(pairs, body.threshold, org_id=org_id)
+    loaded, used_threshold, version = script_store.load(
+        pairs,
+        body.threshold,
+        org_id=org_id,
+        target_lang=target_lang,
+    )
     payload = {
         "sermon_id": sermon_id,
         "threshold": used_threshold,
@@ -548,6 +555,8 @@ def save_service_sermon(
     if not body.segments:
         raise HTTPException(status_code=400, detail="segments must be a non-empty list")
 
+    source_lang = body.lang_src.strip().lower() or "ko"
+    target_lang = body.lang_tgt.strip().lower() or "en"
     pairs: list[dict] = []
     for idx, seg in enumerate(body.segments):
         ko = seg.ko.strip()
@@ -560,6 +569,8 @@ def save_service_sermon(
         org_id, service_key, service_date,
         pairs=pairs,
         threshold=body.threshold,
+        lang_src=source_lang,
+        lang_tgt=target_lang,
         created_by=user.uid,
     )
     return {
@@ -601,6 +612,7 @@ def publish_service_sermon(
         service_key=service_key,
         service_date=service_date,
         org_id=org_id,
+        target_lang=str(doc.get("langTgt") or doc.get("lang_tgt") or "en"),
     )
 
     return {

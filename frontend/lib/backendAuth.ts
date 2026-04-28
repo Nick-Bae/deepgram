@@ -799,6 +799,8 @@ export function saveServiceSermon(
   payload: {
     segments: SermonDraftSegment[];
     threshold?: number;
+    lang_src?: string;
+    lang_tgt?: string;
   },
 ): Promise<{ status: string; serviceKey: string; serviceDate: string; segmentCount: number }> {
   return authFetch(
@@ -810,6 +812,8 @@ export function saveServiceSermon(
       body: JSON.stringify({
         segments: payload.segments,
         threshold: payload.threshold ?? 0.84,
+        lang_src: payload.lang_src || "ko",
+        lang_tgt: payload.lang_tgt || "en",
       }),
     },
   );

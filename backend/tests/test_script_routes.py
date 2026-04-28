@@ -461,6 +461,8 @@ class ScriptRouteTests(unittest.TestCase):
             "2026-04-27",
             pairs=[{"source": "새 설교 원고입니다.", "target": "This is the updated sermon script."}],
             threshold=0.91,
+            lang_src="ko",
+            lang_tgt="en",
             created_by="owner-service-save",
         )
 
