@@ -42,8 +42,8 @@ def _resolve_sermon_translation_concurrency(segment_count: int) -> int:
 
 
 class Pair(BaseModel):
-    source: str = Field(..., min_length=1, description="Korean source text")
-    target: str = Field(..., min_length=1, description="English target text")
+    source: str = Field(..., min_length=1, description="Source text")
+    target: str = Field(..., min_length=1, description="Translated text")
 
 
 class UploadPayload(BaseModel):
@@ -280,7 +280,7 @@ async def draft_sermon(
     target_lang = body.lang_tgt.strip().lower() or "en"
     parts = _split_korean_text(body.korean, body.auto_split)
     if not parts:
-        raise HTTPException(status_code=400, detail="No valid Korean segments found")
+        raise HTTPException(status_code=400, detail="No valid sermon segments found")
 
     translated, usage_totals = await _translate_segments(
         segments=parts,
@@ -343,7 +343,7 @@ def finalize_sermon(
         ko = seg.ko.strip()
         en = seg.en.strip()
         if not ko or not en:
-            raise HTTPException(status_code=400, detail=f"segments[{idx}] must include both ko and en")
+            raise HTTPException(status_code=400, detail=f"segments[{idx}] must include source and translation text")
         normalized_segments.append({"id": idx + 1, "ko": ko, "en": en})
         pairs.append({"source": ko, "target": en})
 
@@ -497,7 +497,7 @@ async def draft_service_sermon(
 
     raw_segments = _split_korean_text(body.korean, body.auto_split)
     if not raw_segments:
-        raise HTTPException(status_code=400, detail="korean text produced no segments")
+        raise HTTPException(status_code=400, detail="sermon text produced no segments")
 
     translated_rows, usage = await _translate_segments(
         segments=raw_segments,
@@ -562,7 +562,7 @@ def save_service_sermon(
         ko = seg.ko.strip()
         en = seg.en.strip()
         if not ko or not en:
-            raise HTTPException(status_code=400, detail=f"segments[{idx}] must include both ko and en")
+            raise HTTPException(status_code=400, detail=f"segments[{idx}] must include source and translation text")
         pairs.append({"source": ko, "target": en})
 
     multichurch_store.save_sermon_draft(

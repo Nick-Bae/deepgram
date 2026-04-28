@@ -164,7 +164,7 @@ export default function AdminSermonPrepPage() {
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Admin</p>
                 <h1 className="text-2xl font-semibold text-slate-900">Sermon Prep</h1>
                 <p className="text-sm text-slate-600">
-                  Generate a Korean-to-English draft, edit it, and save final script pairs before service.
+                  Generate a translation draft, edit it, and save final script pairs before service.
                 </p>
               </div>
               <div className="flex gap-2">
