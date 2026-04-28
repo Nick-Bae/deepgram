@@ -76,6 +76,10 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
   const [jumpRow, setJumpRow] = useState("");
 
   const readyCount = useMemo(() => segments.filter((row) => row.en.trim().length > 0).length, [segments]);
+  const targetLanguageLabel = useMemo(
+    () => LANGUAGE_OPTIONS.find((lang) => lang.value === langTgt)?.label || "translation",
+    [langTgt],
+  );
   const selectedService = useMemo(
     () => services.find((svc) => svc.serviceKey === serviceKey) || null,
     [serviceKey, services],
@@ -223,7 +227,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
       return;
     }
     if (!korean.trim()) {
-      setMessage("❌ Paste Korean sermon text first.");
+      setMessage("❌ Paste sermon text first.");
       return;
     }
     if (serviceKey && !serviceDate.trim()) {
@@ -333,7 +337,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
   const onPublish = async () => {
     if (!orgId || !serviceKey || !serviceDate.trim() || !segments.length) return;
     if (segments.some((row) => !row.en.trim())) {
-      setMessage("❌ Every English row must be filled before publishing.");
+      setMessage("❌ Every translation row must be filled before publishing.");
       return;
     }
     setBusyPublish(true);
@@ -378,7 +382,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
       return;
     }
     if (segments.some((row) => !row.en.trim())) {
-      setMessage("❌ Every English row must be filled before saving.");
+      setMessage("❌ Every translation row must be filled before saving.");
       return;
     }
 
@@ -416,9 +420,9 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
     <section className="rounded-[32px] border border-slate-200 bg-white p-6 shadow-[0_35px_120px_rgba(3,7,18,0.25)] backdrop-blur">
       <div className="space-y-1">
         <p className="text-xs uppercase tracking-[0.35em] text-slate-500">Sermon Prep</p>
-        <h2 className="text-xl font-semibold text-slate-900">Before Sunday (KO → EN)</h2>
+        <h2 className="text-xl font-semibold text-slate-900">Before Sunday</h2>
         <p className="text-sm text-slate-600">
-          5-10 minute workflow: paste Korean, generate draft, polish English, save final.
+          5-10 minute workflow: paste sermon text, generate a translation draft, polish it, and save final.
         </p>
       </div>
 
@@ -463,7 +467,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
             <label className="space-y-1 text-sm text-slate-700">
               <span className="font-medium text-slate-700">Rows ready</span>
               <div className="rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white">
-                {readyCount}/{segments.length || 0} EN rows
+                {readyCount}/{segments.length || 0} translated rows
               </div>
             </label>
           </div>
@@ -486,7 +490,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
           <label className="space-y-1 text-sm text-slate-700">
             <span className="font-medium text-slate-700">Rows ready</span>
             <div className="rounded-xl border border-white/15 bg-[#050b16] px-3 py-2 text-sm text-white">
-              {readyCount}/{segments.length || 0} EN rows
+              {readyCount}/{segments.length || 0} translated rows
             </div>
           </label>
         </div>
@@ -519,7 +523,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
             />
           </label>
           <label className="space-y-1">
-            <span>Source lang</span>
+            <span>Source language</span>
             <select
               value={langSrc}
               onChange={(e) => setLangSrc(e.target.value)}
@@ -533,7 +537,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
             </select>
           </label>
           <label className="space-y-1">
-            <span>Target lang</span>
+            <span>Target language</span>
             <select
               value={langTgt}
               onChange={(e) => setLangTgt(e.target.value)}
@@ -694,8 +698,8 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
             <div className="min-w-[900px]">
               <div className="grid grid-cols-[56px_minmax(0,1fr)_minmax(0,1fr)] bg-slate-100 text-left text-sm text-slate-700">
                 <div className="border-b border-white/10 px-3 py-2 font-semibold">#</div>
-                <div className="border-b border-white/10 px-3 py-2 font-semibold">Korean (read-only)</div>
-                <div className="border-b border-white/10 px-3 py-2 font-semibold">English (editable)</div>
+                <div className="border-b border-white/10 px-3 py-2 font-semibold">Source text</div>
+                <div className="border-b border-white/10 px-3 py-2 font-semibold">{targetLanguageLabel} translation</div>
               </div>
               <div className="divide-y divide-white/10">
                 {visibleSegments.map((row) => (
@@ -732,7 +736,7 @@ export default function SermonPrep({ orgId, serviceKey, services = [], onService
             {JSON.stringify(exportPayload, null, 2)}
           </pre>
           {!allRowsReady ? (
-            <p className="mt-2 text-sm text-amber-200">Fill every English row before saving final.</p>
+            <p className="mt-2 text-sm text-amber-200">Fill every translation row before saving final.</p>
           ) : null}
         </div>
       ) : null}
