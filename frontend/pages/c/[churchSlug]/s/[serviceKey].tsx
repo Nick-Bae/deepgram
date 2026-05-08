@@ -1,4 +1,5 @@
 import Head from "next/head";
+import Link from "next/link";
 import { useRouter } from "next/router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -534,6 +535,33 @@ export default function ChurchServiceListenerPage() {
           )}
         </div>
       )}
+      {/* Plan SC: FR-07 — corner Help link, low opacity, does not occlude feed */}
+      <Link
+        href="/help"
+        aria-label="Help"
+        style={{
+          position: "fixed",
+          bottom: 12,
+          right: 14,
+          padding: "6px 12px",
+          borderRadius: 999,
+          fontSize: 12,
+          fontWeight: 600,
+          color: "rgba(242,243,244,0.55)",
+          background: "rgba(15,45,77,0.45)",
+          border: "1px solid rgba(242,243,244,0.18)",
+          textDecoration: "none",
+          letterSpacing: "0.04em",
+          backdropFilter: "blur(6px)",
+          WebkitBackdropFilter: "blur(6px)",
+          zIndex: 50,
+          transition: "color 200ms ease, background 200ms ease",
+        }}
+        onMouseEnter={(e) => { e.currentTarget.style.color = "#F2F3F4"; e.currentTarget.style.background = "rgba(15,45,77,0.85)"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(242,243,244,0.55)"; e.currentTarget.style.background = "rgba(15,45,77,0.45)"; }}
+      >
+        Help
+      </Link>
     </main>
     </>
   );

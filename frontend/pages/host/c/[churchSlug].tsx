@@ -2429,6 +2429,14 @@ export default function HostChurchPage() {
                 </div>
                 {isMasterUser && <Link href="/admin" style={{ display: "inline-block", marginTop: 6, fontSize: 11, color: isBroadcastTab ? BC.blush : DC.gold, textDecoration: "none", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase" }}>Admin</Link>}
               </div>
+              {/* Plan SC: FR-06 — Help link in host header near LOGOUT */}
+              <Link
+                href="/help"
+                className="host-help-link"
+                style={{ display: "inline-flex", alignItems: "center", border: isBroadcastTab ? "1px solid rgba(255,255,255,0.32)" : "1px solid rgba(120,98,78,0.18)", background: isBroadcastTab ? "rgba(255,255,255,0.10)" : "rgba(255,255,255,0.62)", color: isBroadcastTab ? BC.cloud : "#2f2b28", fontWeight: 700, fontSize: 12, letterSpacing: isBroadcastTab ? "0.12em" : "normal", textTransform: isBroadcastTab ? "uppercase" as const : "none", padding: "11px 16px", borderRadius: 999, textDecoration: "none", whiteSpace: "nowrap" as const }}
+              >
+                Help
+              </Link>
               <button
                 type="button"
                 onClick={async () => { clearStreamContext(); clearHostToken(); clearAuthToken(); await logout(); }}
@@ -2576,15 +2584,48 @@ export default function HostChurchPage() {
                 </div>
               </section>
 
-              {/* ── Standby worship logo (no container, blends with page bg) ── */}
+              {/* ── Standby worship wordmark (CSS text — solid color, 3D, transparent bg) ── */}
               {!activeRoomId ? (
-                <div style={{ marginTop: 16, display: "flex", justifyContent: "center", alignItems: "center", padding: "24px 16px" }}>
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src="/worship-translation-logo-transparent.png"
-                    alt="Worship Translation"
-                    style={{ display: "block", width: "100%", maxWidth: 720, height: "auto", objectFit: "contain" }}
-                  />
+                <div
+                  aria-label="Worship Translation"
+                  style={{
+                    marginTop: 16,
+                    display: "flex",
+                    flexDirection: "column" as const,
+                    justifyContent: "center",
+                    alignItems: "center",
+                    padding: "32px 16px 40px",
+                    color: "#855763",
+                    userSelect: "none" as const,
+                    lineHeight: 1,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontFamily: "'Great Vibes', cursive",
+                      fontSize: "clamp(72px, 14vw, 168px)",
+                      fontWeight: 400,
+                      letterSpacing: "-0.005em",
+                      textShadow:
+                        "0 -1px 0 rgba(255,255,255,0.65), 0 1px 0 rgba(58,28,38,0.55), 1px 2px 0 rgba(74,40,52,0.45), 2px 4px 8px rgba(0,0,0,0.18)",
+                      transform: "translateY(0)",
+                    }}
+                  >
+                    Worship
+                  </span>
+                  <span
+                    style={{
+                      fontFamily: "'Manrope', 'Segoe UI', sans-serif",
+                      fontSize: "clamp(28px, 5.4vw, 64px)",
+                      fontWeight: 800,
+                      letterSpacing: "0.18em",
+                      marginTop: "0.05em",
+                      textShadow:
+                        "0 -1px 0 rgba(255,255,255,0.65), 0 1px 0 rgba(58,28,38,0.55), 1px 2px 0 rgba(74,40,52,0.5), 2px 4px 0 rgba(58,28,38,0.35), 3px 6px 10px rgba(0,0,0,0.18)",
+                    }}
+                  >
+                    TRANSLATION
+                  </span>
                 </div>
               ) : null}
 

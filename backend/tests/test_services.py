@@ -4,7 +4,10 @@ import unittest
 from unittest.mock import patch
 
 from app.services import multichurch_store as multichurch_store_module
-from app.services.multichurch_store import InMemoryMultiChurchStore
+from app.services.multichurch_store import (
+    InMemoryMultiChurchStore,
+    _patch_firestore_stream_retry_metadata,
+)
 
 
 def _bootstrap_owner(
@@ -25,6 +28,40 @@ def _bootstrap_owner(
         target="en",
     )
     return str(result["orgId"])
+
+
+class _FakeCallable:
+    pass
+
+
+class _FakeTransport:
+    def __init__(self) -> None:
+        self.run_query = _FakeCallable()
+        self._wrapped_methods = {self.run_query: _FakeCallable()}
+        self._wrapped_methods[self.run_query]._retry = object()
+
+
+class _FakeFirestoreApi:
+    def __init__(self) -> None:
+        self._transport = _FakeTransport()
+
+
+class _FakeFirestoreDb:
+    def __init__(self) -> None:
+        self._firestore_api = _FakeFirestoreApi()
+
+
+class FirestoreCompatibilityTests(unittest.TestCase):
+    def test_stream_retry_metadata_is_backfilled_for_raw_run_query_callable(self) -> None:
+        db = _FakeFirestoreDb()
+        raw_run_query = db._firestore_api._transport.run_query
+        wrapped_run_query = db._firestore_api._transport._wrapped_methods[raw_run_query]
+
+        self.assertFalse(hasattr(raw_run_query, "_retry"))
+
+        _patch_firestore_stream_retry_metadata(db)
+
+        self.assertIs(raw_run_query._retry, wrapped_run_query._retry)
 
 
 class ServiceManagementTests(unittest.TestCase):

@@ -58,6 +58,14 @@ _BOOTSTRAP_ORG_RATE_MAX = _env_int(
 )
 _bootstrap_org_rate_hits: Dict[str, Deque[float]] = {}
 _bootstrap_org_rate_lock = Lock()
+_SLUG_AVAILABILITY_RATE_WINDOW_SECONDS = _env_int(
+    "SLUG_AVAILABILITY_RATE_WINDOW_SECONDS", 60, min_value=5, max_value=3600
+)
+_SLUG_AVAILABILITY_RATE_MAX_PER_IP = _env_int(
+    "SLUG_AVAILABILITY_RATE_MAX_PER_IP", 120, min_value=1, max_value=5000
+)
+_slug_availability_ip_hits: Dict[str, Deque[float]] = {}
+_slug_availability_rate_lock = Lock()
 _LOGIN_FAILED_RATE_WINDOW_SECONDS = 60
 _LOGIN_FAILED_RATE_MAX_PER_IP = 30
 _login_failed_ip_hits: Dict[str, Deque[float]] = {}
@@ -220,6 +228,27 @@ def _enforce_bootstrap_org_rate_limit(uid: str) -> None:
             stale = [k for k, v in _bootstrap_org_rate_hits.items() if not v or v[-1] <= cutoff]
             for sk in stale:
                 _bootstrap_org_rate_hits.pop(sk, None)
+
+
+def _enforce_slug_availability_rate_limit(ip: str) -> None:
+    clean_ip = (ip or "").strip() or "unknown"
+    now = time.monotonic()
+    cutoff = now - _SLUG_AVAILABILITY_RATE_WINDOW_SECONDS
+    with _slug_availability_rate_lock:
+        bucket = _slug_availability_ip_hits.get(clean_ip)
+        if bucket is None:
+            bucket = deque()
+            _slug_availability_ip_hits[clean_ip] = bucket
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= _SLUG_AVAILABILITY_RATE_MAX_PER_IP:
+            security_event("rate_limit_hit", detail="slug_availability_rate_limited", ip=clean_ip)
+            raise HTTPException(status_code=429, detail="slug_availability_rate_limited")
+        bucket.append(now)
+        if len(_slug_availability_ip_hits) > 4096:
+            stale = [k for k, v in _slug_availability_ip_hits.items() if not v or v[-1] <= cutoff]
+            for sk in stale:
+                _slug_availability_ip_hits.pop(sk, None)
 
 
 def _enforce_login_failed_rate_limit(ip: str) -> None:
@@ -448,9 +477,10 @@ def auth_bootstrap_owner(
 
 @router.get("/auth/slug-availability")
 def auth_slug_availability(
+    request: Request,
     slug: str = Query(..., min_length=2, max_length=80, pattern=validators.CHURCH_SLUG),
-    user: AuthenticatedUser = Depends(get_current_user_required),
 ):
+    _enforce_slug_availability_rate_limit(_client_ip(request))
     try:
         return multichurch_store.check_org_slug_availability(slug=slug, max_suggestions=3)
     except ValueError as exc:

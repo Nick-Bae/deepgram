@@ -292,6 +292,23 @@ _HARD_INACTIVE_ORG_STATUSES: set[str] = {"inactive", "disabled", "suspended", "d
 _FS_TIMEOUT = 15.0  # seconds — prevents gRPC stalls from hanging indefinitely
 
 
+def _patch_firestore_stream_retry_metadata(db: Any) -> None:
+    """Backfill retry metadata expected by google-cloud-firestore query streams."""
+    try:
+        transport = db._firestore_api._transport
+        wrapped_methods = getattr(transport, "_wrapped_methods", {}) or {}
+        for method_name in ("run_query",):
+            raw_callable = getattr(transport, method_name, None)
+            wrapped_callable = wrapped_methods.get(raw_callable)
+            if raw_callable is None or wrapped_callable is None:
+                continue
+            if not hasattr(raw_callable, "_retry") and hasattr(wrapped_callable, "_retry"):
+                raw_callable._retry = wrapped_callable._retry
+    except Exception:
+        # Compatibility patch only; Firestore calls should still surface their own errors.
+        return
+
+
 def _status_token(raw: Any) -> str:
     return str(raw or "").strip().lower()
 
@@ -2798,6 +2815,7 @@ class FirestoreMultiChurchStore:
             or None
         )
         self._db = gcf_firestore.Client(project=project_id, database="worship-translation")
+        _patch_firestore_stream_retry_metadata(self._db)
         self._global_host_token = (os.getenv("HOST_API_TOKEN") or "").strip()
         self._membership_cache_ttl_seconds = _env_int(
             "MULTICHURCH_MEMBERSHIP_CACHE_TTL_SECONDS",
