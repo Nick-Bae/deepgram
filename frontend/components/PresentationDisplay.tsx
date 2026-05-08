@@ -4,10 +4,10 @@
 // slide's aspect ratio (letterboxing acceptable, never squashed).
 "use client";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import type { SlideRef } from "../utils/useSubtitleSocket";
+import type { Slide } from "../utils/useSlideSync";
 
 type Props = {
-  slide: SlideRef | null;
+  slide: Slide | null;
   lastKr?: string;
   enLines: string[];
   connected: boolean;
@@ -26,7 +26,7 @@ export default function PresentationDisplay({
   waitingMessage,
 }: Props) {
   // Cross-fade between slides without a layout shift.
-  const [renderedSlide, setRenderedSlide] = useState<SlideRef | null>(slide);
+  const [renderedSlide, setRenderedSlide] = useState<Slide | null>(slide);
   const [imgError, setImgError] = useState(false);
   const fadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -103,7 +103,7 @@ export default function PresentationDisplay({
           <img
             key={renderedSlide.slideId}
             src={renderedSlide.url}
-            alt={`Slide ${renderedSlide.index + 1}`}
+            alt={`Slide ${renderedSlide.order + 1}`}
             style={slideImgStyle}
             onError={() => setImgError(true)}
             draggable={false}
@@ -112,7 +112,7 @@ export default function PresentationDisplay({
           <SlidePlaceholder
             label={
               renderedSlide
-                ? `Slide ${renderedSlide.index + 1} — image unavailable`
+                ? `Slide ${renderedSlide.order + 1} — image unavailable`
                 : "No slide selected"
             }
           />
