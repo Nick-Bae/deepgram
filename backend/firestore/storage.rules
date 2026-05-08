@@ -1,0 +1,27 @@
+rules_version = '2';
+
+// Firebase Storage rules for the Real-Time Translation Platform.
+//
+// Server SDK (Cloud Run service account) bypasses these rules — all uploads go
+// through the FastAPI /slides endpoints, never directly from the client. These
+// rules apply to direct client SDK access only.
+//
+// Slide layout (presentation-display-mode, Design Ref: §3.3):
+//   orgs/{orgId}/services/{serviceKey}/slides/{filename}
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Slides — read-only from clients; writes happen server-side via Admin SDK.
+    match /orgs/{orgId}/services/{serviceKey}/slides/{filename} {
+      // Public read so anonymous display clients can fetch the slide image.
+      // Backend uses signed URLs by default; this rule covers the public-visibility flag.
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Default deny for everything else.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

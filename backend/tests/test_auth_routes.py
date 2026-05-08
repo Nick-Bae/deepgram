@@ -24,6 +24,7 @@ class AuthRouteTests(unittest.TestCase):
         auth_routes._invite_rate_hits.clear()
         auth_routes._password_reset_ip_hits.clear()
         auth_routes._password_reset_email_hits.clear()
+        auth_routes._slug_availability_ip_hits.clear()
 
     @staticmethod
     def _user(uid: str, *, email: str | None = None, display_name: str | None = None) -> AuthenticatedUser:
@@ -239,7 +240,7 @@ class AuthRouteTests(unittest.TestCase):
 
     def test_slug_availability_reports_taken_and_suggests_alternatives(self) -> None:
         self._bootstrap_owner(uid="owner-route-slug-1", slug="route-slug", name="Route Slug")
-        payload = auth_routes.auth_slug_availability(slug="route-slug")
+        payload = auth_routes.auth_slug_availability(slug="route-slug", request=self._request())
         self.assertEqual(payload.get("slug"), "route-slug")
         self.assertFalse(bool(payload.get("available")))
         suggestions = payload.get("suggestions") or []
@@ -247,16 +248,26 @@ class AuthRouteTests(unittest.TestCase):
         self.assertTrue(bool(suggestions))
         self.assertTrue(all(str(row).startswith("route-slug-") for row in suggestions))
 
-        available_payload = auth_routes.auth_slug_availability(slug="route-slug-new")
+        available_payload = auth_routes.auth_slug_availability(slug="route-slug-new", request=self._request())
         self.assertEqual(available_payload.get("slug"), "route-slug-new")
         self.assertTrue(bool(available_payload.get("available")))
         self.assertEqual(available_payload.get("suggestions"), [])
 
     def test_slug_availability_rejects_invalid_slug(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
-            auth_routes.auth_slug_availability(slug="!!!")
+            auth_routes.auth_slug_availability(slug="!!!", request=self._request())
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(ctx.exception.detail, "invalid_slug")
+
+    def test_slug_availability_rate_limit_returns_429(self) -> None:
+        with patch.object(auth_routes, "_SLUG_AVAILABILITY_RATE_MAX_PER_IP", 1):
+            first = auth_routes.auth_slug_availability(slug="route-rate-slug", request=self._request("203.0.113.10"))
+            self.assertTrue(bool(first.get("available")))
+
+            with self.assertRaises(HTTPException) as second_ctx:
+                auth_routes.auth_slug_availability(slug="route-rate-slug-2", request=self._request("203.0.113.10"))
+            self.assertEqual(second_ctx.exception.status_code, 429)
+            self.assertEqual(second_ctx.exception.detail, "slug_availability_rate_limited")
 
     def test_password_reset_route_sends_email_when_link_generated(self) -> None:
         with patch.object(auth_routes, "generate_password_reset_link_value", return_value="https://reset-link") as link_mock:
