@@ -77,6 +77,10 @@ type InviteRoleChoice = Extract<InviteRole, "admin" | "host">;
 type PaidPlanKey = Exclude<BillingPlanKey, "trial">;
 type HostTab = "broadcast" | "settings" | "billing" | "team";
 const PAID_PLAN_KEYS: PaidPlanKey[] = ["starter", "growth", "premium"];
+const INVITE_ROLE_DESCRIPTIONS: Record<InviteRoleChoice, string> = {
+  admin: "Admin can manage settings, billing, services, team invites, and broadcasts.",
+  host: "Host can only run live broadcasts.",
+};
 
 
 const PLAN_SUMMARIES: Record<PaidPlanKey, { title: string; monthlyPrice: string; annualPrice: string; annualMonthlyRate: string; annualSavings: string; minuteLimit: string; description: string }> = {
@@ -2479,9 +2483,6 @@ export default function HostChurchPage() {
                       <span className="broadcast-session-title" title={selectedService?.title || liveService?.title || "Choose a service"} style={{ fontSize: 17, fontWeight: 600, letterSpacing: "-0.02em", color: BC.cloud }}>
                         {selectedService?.title || liveService?.title || "Choose a service"}
                       </span>
-                      <span style={{ fontSize: 12, fontWeight: 700, color: BC.mist, letterSpacing: "0.08em", whiteSpace: "nowrap" as const }}>
-                        {(sourceLang || "ko").toUpperCase()} → {(targetLang || "en").toUpperCase()}
-                      </span>
                       {activeRoomId ? (
                         <span style={{ ...broadcastMutedChipStyle, padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, letterSpacing: "0.10em", whiteSpace: "nowrap" as const }}>
                           {formatCountdownSeconds(elapsedSec)} elapsed
@@ -2526,11 +2527,8 @@ export default function HostChurchPage() {
                     ) : null}
                   </div>
 
-                  {/* ── Info strip: plan · share · diagnostics toggle ── */}
+                  {/* ── Info strip: listener links · diagnostics toggle ── */}
                   <div className="broadcast-info-strip">
-                    <span style={{ ...broadcastMutedChipStyle, padding: "7px 13px", borderRadius: 999, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" as const }}>
-                      {formatPlanLabel(billingPlanToken)} plan
-                    </span>
                     {billingAlertMessage ? (
                       <span style={{ padding: "7px 13px", borderRadius: 999, background: "rgba(243,166,176,0.14)", boxShadow: "inset 0 0 0 1px rgba(243,166,176,0.32)", color: "#c05060", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" as const }}>
                         {billingAlertMessage}
@@ -2580,7 +2578,7 @@ export default function HostChurchPage() {
                 </div>
               </section>
 
-              {/* ── Standby worship wordmark (CSS text — solid color, 3D, transparent bg) ── */}
+              {/* ── Standby worship wordmark ── */}
               {!activeRoomId ? (
                 <div
                   aria-label="Worship Translation"
@@ -2590,21 +2588,31 @@ export default function HostChurchPage() {
                     flexDirection: "column" as const,
                     justifyContent: "center",
                     alignItems: "center",
-                    padding: "32px 16px 40px",
-                    color: "#855763",
+                    minHeight: "clamp(300px, 44vh, 520px)",
+                    padding: "42px 16px 54px",
+                    color: "#b9aa8d",
+                    background:
+                      "radial-gradient(ellipse at 50% 42%, rgba(177,158,126,0.20) 0%, rgba(177,158,126,0.12) 30%, rgba(238,231,221,0.04) 58%, rgba(238,231,221,0) 76%)",
                     userSelect: "none" as const,
                     lineHeight: 1,
+                    isolation: "isolate" as const,
                   }}
                 >
                   <span
                     style={{
-                      fontFamily: "'Great Vibes', cursive",
-                      fontSize: "clamp(72px, 14vw, 168px)",
+                      position: "relative",
+                      display: "inline-block",
+                      fontFamily: "'Luckiest Guy', 'Great Vibes', cursive",
+                      fontSize: "clamp(72px, 11.4vw, 158px)",
+                      fontStyle: "normal",
                       fontWeight: 400,
-                      letterSpacing: "-0.005em",
+                      letterSpacing: "0.015em",
+                      color: "#b9ad98",
+                      WebkitTextStroke: "1px rgba(255,255,255,0.28)",
                       textShadow:
-                        "0 -1px 0 rgba(255,255,255,0.65), 0 1px 0 rgba(58,28,38,0.55), 1px 2px 0 rgba(74,40,52,0.45), 2px 4px 8px rgba(0,0,0,0.18)",
-                      transform: "translateY(0)",
+                        "0 -2px 0 rgba(255,255,255,0.74), 0 2px 0 rgba(107,94,79,0.66), 3px 6px 0 rgba(122,105,82,0.42), 6px 11px 0 rgba(102,88,71,0.24), 12px 20px 24px rgba(78,66,54,0.22), -7px -9px 20px rgba(255,255,255,0.30)",
+                      transform: "translateY(0.03em)",
+                      filter: "drop-shadow(0 20px 22px rgba(78,66,54,0.18))",
                     }}
                   >
                     Worship
@@ -2612,12 +2620,14 @@ export default function HostChurchPage() {
                   <span
                     style={{
                       fontFamily: "'Manrope', 'Segoe UI', sans-serif",
-                      fontSize: "clamp(28px, 5.4vw, 64px)",
+                      fontSize: "clamp(34px, 5.8vw, 82px)",
                       fontWeight: 800,
                       letterSpacing: "0.18em",
-                      marginTop: "0.05em",
+                      marginTop: "0.02em",
+                      color: "#a89574",
                       textShadow:
-                        "0 -1px 0 rgba(255,255,255,0.65), 0 1px 0 rgba(58,28,38,0.55), 1px 2px 0 rgba(74,40,52,0.5), 2px 4px 0 rgba(58,28,38,0.35), 3px 6px 10px rgba(0,0,0,0.18)",
+                        "0 -2px 0 rgba(255,255,255,0.62), 0 2px 0 rgba(96,79,58,0.70), 2px 4px 0 rgba(118,97,70,0.48), 4px 8px 0 rgba(95,78,58,0.26), 9px 15px 18px rgba(78,66,54,0.20), -5px -7px 18px rgba(255,255,255,0.26)",
+                      filter: "drop-shadow(0 16px 18px rgba(78,66,54,0.15))",
                     }}
                   >
                     TRANSLATION
@@ -3454,32 +3464,38 @@ export default function HostChurchPage() {
                     <h3 style={settingsTitleStyle}>Invite Team Member</h3>
                     <p style={settingsBodyTextStyle}>
                       Create a one-time invite link for another user to join this church as host or admin.
+                      Admin can manage everything; host can only broadcast.
                     </p>
                   </div>
 
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "end" }}>
-                    <label style={{ display: "grid", gap: 6 }}>
-                      <span style={{ fontSize: 12, color: DC.mid }}>Role</span>
-                      <select
-                        value={inviteRole}
-                        onChange={(e) => setInviteRole(e.target.value as InviteRoleChoice)}
-                        style={{ ...settingsInlineFieldStyle, minWidth: 180 }}
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "end" }}>
+                      <label style={{ display: "grid", gap: 6, flex: "1 1 260px", maxWidth: 568 }}>
+                        <span style={{ fontSize: 12, color: DC.mid }}>Role</span>
+                        <select
+                          value={inviteRole}
+                          onChange={(e) => setInviteRole(e.target.value as InviteRoleChoice)}
+                          style={{ ...settingsInlineFieldStyle, minWidth: 180, width: "100%" }}
+                        >
+                          <option value="host">host</option>
+                          <option value="admin">admin</option>
+                        </select>
+                      </label>
+                      <button
+                        onClick={generateInviteLink}
+                        disabled={inviteBusy || !resolvedOrgId}
+                        style={{
+                          ...settingsButtonPrimaryStyle,
+                          opacity: inviteBusy || !resolvedOrgId ? 0.6 : 1,
+                          cursor: inviteBusy || !resolvedOrgId ? "not-allowed" : "pointer",
+                        }}
                       >
-                        <option value="host">host</option>
-                        <option value="admin">admin</option>
-                      </select>
-                    </label>
-                    <button
-                      onClick={generateInviteLink}
-                      disabled={inviteBusy || !resolvedOrgId}
-                      style={{
-                        ...settingsButtonPrimaryStyle,
-                        opacity: inviteBusy || !resolvedOrgId ? 0.6 : 1,
-                        cursor: inviteBusy || !resolvedOrgId ? "not-allowed" : "pointer",
-                      }}
-                    >
-                      {inviteBusy ? "Generating..." : "Generate Invite Link"}
-                    </button>
+                        {inviteBusy ? "Generating..." : "Generate Invite Link"}
+                      </button>
+                    </div>
+                    <p style={{ ...settingsBodyTextStyle, maxWidth: 568 }}>
+                      {INVITE_ROLE_DESCRIPTIONS[inviteRole]}
+                    </p>
                   </div>
 
                   {inviteError ? <p style={{ margin: 0, color: "#b95567", fontSize: 13 }}>Error: {inviteError}</p> : null}
@@ -3544,6 +3560,11 @@ export default function HostChurchPage() {
                         <div key={row.inviteId} style={settingsServiceRowStyle}>
                           <div style={{ minWidth: 0 }}>
                             <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: DC.navy }}>Role: {row.role}</p>
+                            {(row.role === "admin" || row.role === "host") ? (
+                              <p style={{ ...settingsBodyTextStyle, marginTop: 4 }}>
+                                {INVITE_ROLE_DESCRIPTIONS[row.role]}
+                              </p>
+                            ) : null}
                             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
                               <span style={{ ...settingsPillBaseStyle, border: `1px solid rgba(184,154,94,0.3)`, background: "rgba(184,154,94,0.1)", color: DC.gold }}>
                                 Expires {formatDateTime(row.expiresAt || null)}
