@@ -108,7 +108,7 @@ async def synthesize_async(
 
     voice_payload: Dict[str, str] = {
         "languageCode": lang_code,
-        "model_name": model_name,
+        "modelName": model_name,
     }
     if voice:
         voice_payload["name"] = voice.strip()

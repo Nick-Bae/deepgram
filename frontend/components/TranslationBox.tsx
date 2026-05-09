@@ -38,41 +38,34 @@ type TTSVoicePresetMap = Record<string, TTSVoiceOption[]>
 
 const GOOGLE_TTS_PRESETS: TTSVoicePresetMap = {
   en: [
-    { value: 'en-US-Neural2-F', label: 'Neural2 F · warm' },
-    { value: 'en-US-Neural2-G', label: 'Neural2 G · broadcast' },
-    { value: 'en-US-Journey-D', label: 'Journey D · storyteller' },
+    { value: 'en-US-Standard-D', label: 'Standard D · male · lowest latency' },
+    { value: 'en-US-Neural2-D', label: 'Neural2 D · male · fast narrator' },
+    { value: 'en-US-Neural2-A', label: 'Neural2 A · male · fast clear' },
+    { value: 'en-US-Neural2-I', label: 'Neural2 I · male · fast bright' },
+    { value: 'en-US-Neural2-J', label: 'Neural2 J · male · fast steady' },
+    { value: 'en-US-Wavenet-D', label: 'Wavenet D · male · natural' },
   ],
   ko: [
     { value: 'ko-KR-Neural2-A', label: 'Neural2 A · standard' },
-    { value: 'ko-KR-Neural2-C', label: 'Neural2 C · bright female' },
+    { value: 'ko-KR-Neural2-B', label: 'Neural2 B · bright female' },
+    { value: 'ko-KR-Neural2-C', label: 'Neural2 C · steady male' },
   ],
   es: [
     { value: 'es-US-Neural2-A', label: 'Neural2 A · US Spanish' },
-    { value: 'es-ES-Neural2-B', label: 'Neural2 B · Castilian' },
+    { value: 'es-ES-Neural2-A', label: 'Neural2 A · Castilian female' },
+    { value: 'es-ES-Neural2-F', label: 'Neural2 F · Castilian male' },
   ],
   zh: [
     { value: 'cmn-CN-Wavenet-A', label: 'Wavenet A · Mandarin' },
     { value: 'cmn-CN-Wavenet-D', label: 'Wavenet D · newsy' },
   ],
   default: [
-    { value: 'en-US-Neural2-F', label: 'Neural2 F · English' },
-  ],
-}
-
-const GEMINI_TTS_PRESETS: TTSVoicePresetMap = {
-  en: [
-    { value: 'Enceladus', label: 'Enceladus · cinematic (Gemini)' },
-    { value: 'Kore', label: 'Kore · crisp (Gemini)' },
-    { value: 'Zephyr', label: 'Zephyr · airy (Gemini)' },
-  ],
-  default: [
-    { value: 'Enceladus', label: 'Enceladus · cinematic (Gemini)' },
+    { value: 'en-US-Standard-D', label: 'Standard D · male · lowest latency' },
   ],
 }
 
 const TTS_PROVIDER_OPTIONS = [
   { value: 'google', label: 'Google Cloud TTS · low latency' },
-  { value: 'gemini_flash', label: 'Gemini Flash TTS · expressive' },
 ] as const
 
 type TTSProvider = (typeof TTS_PROVIDER_OPTIONS)[number]['value']
@@ -176,7 +169,7 @@ export default function TranslationBox({
   const [isListening, setIsListening] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
-  const [voicePreference, setVoicePreference] = useState('auto')
+  const [voicePreference, setVoicePreference] = useState('en-US-Standard-D')
   const [ttsProvider, setTtsProvider] = useState<TTSProvider>('google')
   const [isBroadcasting, setIsBroadcasting] = useState(true)
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
@@ -194,9 +187,8 @@ export default function TranslationBox({
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
   const targetBaseLang = (targetLang || 'en').split('-')[0]
   const voiceOptions = useMemo(() => {
-    const presets = ttsProvider === 'gemini_flash' ? GEMINI_TTS_PRESETS : GOOGLE_TTS_PRESETS
-    return presets[targetBaseLang] ?? presets.default
-  }, [targetBaseLang, ttsProvider])
+    return GOOGLE_TTS_PRESETS[targetBaseLang] ?? GOOGLE_TTS_PRESETS.default
+  }, [targetBaseLang])
   const scriptureMeta = useMemo(() => {
     const meta = last?.meta
     if (!meta || meta.kind !== 'scripture') return null
