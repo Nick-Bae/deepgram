@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
+import type { CSSProperties } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
 import { API_URL } from '../utils/urls'
@@ -183,6 +184,7 @@ export default function TranslationBox({
   const [correctionDraft, setCorrectionDraft] = useState('')
   const [correctionSaved, setCorrectionSaved] = useState<Set<number>>(new Set())
   const [showAdvancedControls, setShowAdvancedControls] = useState(false)
+  const [hoveredSourceAction, setHoveredSourceAction] = useState<'mute' | 'listen' | null>(null)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
   const targetBaseLang = (targetLang || 'en').split('-')[0]
@@ -1215,26 +1217,60 @@ export default function TranslationBox({
     background: 'linear-gradient(145deg, #d4b87a, #b89a5e)',
     boxShadow: '0 14px 28px rgba(184,154,94,0.24)',
     color: '#ffffff',
+    cursor: 'pointer',
+  } as const
+  const primaryActionHoverStyle = {
+    background: 'linear-gradient(145deg, #e1c989, #c7a967)',
+    boxShadow: '0 18px 34px rgba(184,154,94,0.34)',
+    transform: 'translateY(-1px)',
   } as const
   const stopActionStyle = {
     background: '#102238',
     boxShadow: '0 14px 28px rgba(16,34,56,0.22)',
     color: '#f8fafc',
+    cursor: 'pointer',
+  } as const
+  const stopActionHoverStyle = {
+    background: '#193653',
+    boxShadow: '0 18px 34px rgba(16,34,56,0.32)',
+    transform: 'translateY(-1px)',
   } as const
   const secondaryButtonStyle = {
     background: 'rgba(255,255,255,0.96)',
     boxShadow: 'none',
     color: palette.ink,
+    cursor: 'pointer',
+  } as const
+  const secondaryButtonHoverStyle = {
+    background: '#ffffff',
+    boxShadow: '0 12px 24px rgba(15,45,77,0.10), inset 0 0 0 1px rgba(15,45,77,0.08)',
+    transform: 'translateY(-1px)',
   } as const
   const mutedActionStyle = {
     background: 'rgba(188,95,111,0.12)',
     boxShadow: 'inset 0 0 0 1px rgba(188,95,111,0.16)',
     color: '#8a2720',
+    cursor: 'pointer',
+  } as const
+  const mutedActionHoverStyle = {
+    background: 'rgba(188,95,111,0.18)',
+    boxShadow: '0 12px 24px rgba(188,95,111,0.12), inset 0 0 0 1px rgba(188,95,111,0.24)',
+    transform: 'translateY(-1px)',
   } as const
   const disabledActionStyle = {
     ...secondaryButtonStyle,
     opacity: 0.48,
     cursor: 'not-allowed' as const,
+  }
+  const sourceMuteButtonStyle: CSSProperties = !isListening
+    ? disabledActionStyle
+    : {
+        ...(inputMuted ? mutedActionStyle : secondaryButtonStyle),
+        ...(hoveredSourceAction === 'mute' ? (inputMuted ? mutedActionHoverStyle : secondaryButtonHoverStyle) : {}),
+      }
+  const sourceListenButtonStyle: CSSProperties = {
+    ...(isListening ? stopActionStyle : primaryActionStyle),
+    ...(hoveredSourceAction === 'listen' ? (isListening ? stopActionHoverStyle : primaryActionHoverStyle) : {}),
   }
   const sectionHeadingStyle = {
     margin: 0,
@@ -1392,15 +1428,23 @@ export default function TranslationBox({
                     onClick={handleToggleInputMuted}
                     disabled={!isListening}
                     aria-pressed={inputMuted}
+                    onMouseEnter={() => setHoveredSourceAction('mute')}
+                    onMouseLeave={() => setHoveredSourceAction(null)}
+                    onFocus={() => setHoveredSourceAction('mute')}
+                    onBlur={() => setHoveredSourceAction(null)}
                     className="rounded-[1rem] px-4 py-2 text-xs font-black uppercase tracking-[0.16em] transition"
-                    style={!isListening ? disabledActionStyle : inputMuted ? mutedActionStyle : secondaryButtonStyle}
+                    style={sourceMuteButtonStyle}
                   >
                     {inputMuted ? 'Unmute' : 'Mute'}
                   </button>
                   <button
                     onClick={isListening ? handleStopListening : () => { void handleStartListening() }}
+                    onMouseEnter={() => setHoveredSourceAction('listen')}
+                    onMouseLeave={() => setHoveredSourceAction(null)}
+                    onFocus={() => setHoveredSourceAction('listen')}
+                    onBlur={() => setHoveredSourceAction(null)}
                     className="rounded-[1rem] px-4 py-2 text-xs font-black uppercase tracking-[0.16em] transition"
-                    style={isListening ? stopActionStyle : primaryActionStyle}
+                    style={sourceListenButtonStyle}
                   >
                     {isListening ? 'Stop' : 'Start'}
                   </button>
