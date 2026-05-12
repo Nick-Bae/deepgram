@@ -162,6 +162,7 @@ export default function TranslationBox() {
   const [correcting, setCorrecting] = useState<number | null>(null)
   const [correctionDraft, setCorrectionDraft] = useState('')
   const [correctionSaved, setCorrectionSaved] = useState<Set<number>>(new Set())
+  const [showAdvancedControls, setShowAdvancedControls] = useState(false)
   const sourceLabel = useMemo(() => languageName(sourceLang), [sourceLang])
   const targetLabel = useMemo(() => languageName(targetLang), [targetLang])
   const targetBaseLang = (targetLang || 'en').split('-')[0]
@@ -948,25 +949,33 @@ export default function TranslationBox() {
   }, [correctionDraft])
 
   const ttsAudienceEnabled = !isMuted
-  const latencyLabel = latencyMs !== null ? `${Math.max(latencyMs, 0).toFixed(0)} ms` : 'Calibrating…'
+  const palette = {
+    cloud: '#F2F3F4',
+    sand: '#DED1C6',
+    rose: '#A77693',
+    navy: '#174871',
+    deep: '#0F2D4D',
+    ink: '#102238',
+    muted: '#627186',
+  } as const
   const socketStatusLabel =
     connectionState === 'connected'
       ? 'Connected'
       : connectionState === 'disconnected'
       ? 'Disconnected'
       : 'Reconnecting...'
-  const socketStatusClasses =
+  const socketStatusStyle =
     connectionState === 'connected'
-      ? 'border-emerald-200 bg-emerald-50/80 text-emerald-700'
+      ? { background: 'rgba(91,179,130,0.14)', boxShadow: 'inset 0 0 0 1px rgba(91,179,130,0.20)', color: '#2f6d4f' }
       : connectionState === 'disconnected'
-      ? 'border-rose-200 bg-rose-50/80 text-rose-600'
-      : 'border-amber-200 bg-amber-50/80 text-amber-600'
-  const socketDotClasses =
+      ? { background: 'rgba(188,95,111,0.12)', boxShadow: 'inset 0 0 0 1px rgba(188,95,111,0.18)', color: '#8a2720' }
+      : { background: 'rgba(198,165,109,0.14)', boxShadow: 'inset 0 0 0 1px rgba(198,165,109,0.22)', color: '#7a5c20' }
+  const socketDotStyle =
     connectionState === 'connected'
-      ? 'bg-emerald-500 animate-pulse'
+      ? { background: '#6ee7a7' }
       : connectionState === 'disconnected'
-      ? 'bg-rose-500'
-      : 'bg-amber-500 animate-pulse'
+      ? { background: '#fda4af' }
+      : { background: '#fbbf24' }
   const lastHeartbeatLabel = useMemo(() => {
     if (!lastSeenAt) return 'Waiting'
     const ageSeconds = Math.max(0, Math.floor((socketClock - lastSeenAt) / 1000))
@@ -999,414 +1008,398 @@ export default function TranslationBox() {
       />
     )
   })
-  const shellStyle = {
-    background: '#ffffff',
-    boxShadow: '0 4px 24px rgba(15,31,61,0.07)',
-    border: '1px solid #e4ddd2',
+  const pairedPanelStyle = {
+    borderRadius: 24,
+    padding: '18px 18px 16px',
+    background: 'linear-gradient(180deg, rgba(255,255,255,0.90), rgba(248,250,252,0.82))',
+    boxShadow: '0 18px 40px rgba(15,45,77,0.08)',
+    backdropFilter: 'blur(18px)',
+    WebkitBackdropFilter: 'blur(18px)',
   } as const
-  const panelStyle = {
-    background: '#f7f4ef',
+  const dashboardCardStyle = {
+    borderRadius: 24,
+    padding: '18px 18px 20px',
+    background: 'linear-gradient(180deg, rgba(255,255,255,0.86), rgba(248,250,252,0.80))',
+    boxShadow: '0 18px 40px rgba(15,45,77,0.08)',
+    backdropFilter: 'blur(18px)',
+    WebkitBackdropFilter: 'blur(18px)',
+  } as const
+  const softPanelStyle = {
+    background: 'linear-gradient(180deg, rgba(255,255,255,0.96), rgba(247,249,252,0.92))',
     boxShadow: 'none',
   } as const
-  const insetStyle = {
-    background: '#ffffff',
+  const sourceSurfaceStyle = {
+    background: 'transparent',
     boxShadow: 'none',
   } as const
-  const accentPanelStyle = {
-    background: 'rgba(184,154,94,0.06)',
+  const targetSurfaceStyle = {
+    ...sourceSurfaceStyle,
+  } as const
+  const topSupplementStyle = {
+    background: 'rgba(247,249,252,0.72)',
     boxShadow: 'none',
   } as const
-  const pillStyle = {
-    background: '#ffffff',
+  const controlSurfaceStyle = {
+    ...softPanelStyle,
+    background: 'rgba(249,250,252,0.94)',
+  } as const
+  const historySurfaceStyle = {
+    ...softPanelStyle,
+    background: 'rgba(251,252,254,0.96)',
+  } as const
+  const chipStyle = {
+    background: 'rgba(247,249,252,0.96)',
+    color: palette.deep,
+    boxShadow: 'none',
+  } as const
+  const inputStyle = {
+    background: 'rgba(255,255,255,0.98)',
+    color: palette.ink,
     boxShadow: 'none',
   } as const
   const primaryActionStyle = {
-    background: '#b89a5e',
-    boxShadow: '0 4px 16px rgba(184,154,94,0.3)',
+    background: 'linear-gradient(145deg, #d4b87a, #b89a5e)',
+    boxShadow: '0 14px 28px rgba(184,154,94,0.24)',
+    color: '#ffffff',
   } as const
   const stopActionStyle = {
-    background: '#9f3650',
-    boxShadow: '0 4px 16px rgba(159,54,80,0.25)',
+    background: '#102238',
+    boxShadow: '0 14px 28px rgba(16,34,56,0.22)',
+    color: '#f8fafc',
   } as const
+  const secondaryButtonStyle = {
+    background: 'rgba(255,255,255,0.96)',
+    boxShadow: 'none',
+    color: palette.ink,
+  } as const
+  const sectionHeadingStyle = {
+    margin: 0,
+    fontSize: 'clamp(1.2rem, 1.4vw, 1.55rem)',
+    fontWeight: 800,
+    letterSpacing: '-0.04em',
+    color: palette.ink,
+  } as const
+  const panelHeadingStyle = {
+    fontSize: 14,
+    fontWeight: 700,
+    letterSpacing: '-0.02em',
+    color: palette.ink,
+  } as const
+  const utilityLabelStyle = {
+    fontSize: 11,
+    fontWeight: 800,
+    letterSpacing: '0.16em',
+    textTransform: 'uppercase' as const,
+    color: 'rgba(15,45,77,0.52)',
+  } as const
+  const utilityBodyStyle = {
+    fontSize: 13,
+    lineHeight: 1.7,
+    color: 'rgba(16,34,56,0.66)',
+  } as const
+  const toggleOnStyle = {
+    background: 'linear-gradient(145deg, #d4b87a, #b89a5e)',
+    boxShadow: 'inset 0 0 0 1px rgba(184,154,94,0.12)',
+  } as const
+  const toggleOffStyle = {
+    background: 'rgba(120,98,78,0.14)',
+    boxShadow: 'inset 0 0 0 1px rgba(120,98,78,0.08)',
+  } as const
+  const tableHeaderStyle = {
+    fontSize: 10,
+    fontWeight: 800,
+    letterSpacing: '0.16em',
+    textTransform: 'uppercase' as const,
+    color: 'rgba(16,34,56,0.44)',
+  } as const
+  const translationFontSize = translated.length > 180 ? '1rem' : translated.length > 90 ? '1.25rem' : 'clamp(1.85rem, 3vw, 2.65rem)'
+  const historyLines = [...committedLines].reverse()
 
   return (
-    <section className="w-full space-y-8 text-slate-800">
-      <div className="relative overflow-hidden px-6 py-6 md:px-8 md:py-8" style={{ ...shellStyle, borderRadius: 12 }}>
-        <div
-          className="pointer-events-none absolute inset-0 opacity-60"
-          style={{ background: 'radial-gradient(circle at 18% 18%, rgba(184,154,94,0.08), transparent 42%)' }}
-        />
-        <div className="pointer-events-none absolute -right-24 top-10 h-64 w-64 rounded-full blur-3xl" style={{ background: 'rgba(184,154,94,0.06)' }} />
-        <div className="relative space-y-6">
-          <header className="flex flex-wrap items-center justify-between gap-6 border-b border-[#e4ddd2] pb-6">
-            <div>
-              <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.28em] text-[#b89a5e]">
-                <span className={`inline-flex h-2 w-2 rounded-full ${isBroadcasting ? 'bg-[#b89a5e] animate-pulse' : 'bg-[#c8bfb0]'}`} />
-                Live
-              </p>
-              <h2 className="mt-2 font-semibold leading-tight text-[#0f1f3d]" style={{ fontFamily: "'Cormorant Garamond', Georgia, serif", fontSize: 'clamp(22px,2.6vw,30px)' }}>Real-Time Sermon Translation</h2>
-              <p className="text-sm text-[#5a5a52]">Monitor, refine, and broadcast translations without leaving this console.</p>
-            </div>
-            <div className="flex flex-col items-start gap-3 text-sm md:flex-row md:items-center md:gap-4">
-              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${socketStatusClasses}`} style={pillStyle}>
-                <span className={`h-2 w-2 rounded-full ${socketDotClasses}`} />
-                Producer socket · {socketStatusLabel}
-              </span>
-              <span
-                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${
-                  status === 'streaming'
-                    ? 'border-emerald-200 bg-emerald-50/80 text-emerald-700'
-                    : 'border-[#e4ddd2] bg-white text-[#5a5a52]'
-                }`}
-              >
-                <span className={`h-2 w-2 rounded-full ${status === 'streaming' ? 'bg-emerald-500 animate-pulse' : 'bg-[#c8bfb0]'}`} />
-                Deepgram · {status}
-              </span>
-              <span className="inline-flex items-center gap-2 rounded-full border border-[#e4ddd2] bg-white px-3 py-1.5 text-xs font-semibold text-[#5a5a52]">
-                Latency · {latencyLabel}
+    <section className="w-full" style={{ color: palette.ink }}>
+      <div className="relative overflow-hidden py-1">
+        <div className="relative grid gap-6">
+          {/* Compact connection status bar — visible only when there is a problem */}
+          {connectionState !== 'connected' ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold" style={socketStatusStyle}>
+                <span className={`h-2 w-2 rounded-full ${connectionState === 'reconnecting' ? 'animate-pulse' : ''}`} style={socketDotStyle} />
+                {socketStatusLabel}
               </span>
             </div>
-          </header>
+          ) : null}
 
           {errorMsg && (
-            <div className="rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm font-medium text-amber-700" style={insetStyle}>
+            <div className="rounded-[1.4rem] px-4 py-3 text-sm font-medium" style={{ background: 'rgba(243,166,176,0.10)', boxShadow: 'inset 0 0 0 1px rgba(243,166,176,0.24)', color: '#9f3650' }}>
               {errorMsg}
             </div>
           )}
 
-          <div className="grid gap-6 md:grid-cols-2">
-            <div className="flex flex-col gap-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
-              <label className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Source Language</label>
-              <div className="mt-3 flex items-center gap-3">
-                <span className="text-lg leading-none" style={{ display: 'flex', alignItems: 'center', lineHeight: 1 }}>{languageFlag(sourceLang)}</span>
-                <select
-                  value={sourceLang}
-                  onChange={e => setSourceLang(e.target.value)}
-                  className="w-full bg-transparent text-base font-semibold text-slate-800 focus:outline-none"
-                >
-                  {availableLanguages.map(l => <option key={l.code} value={l.code} className="text-slate-900">{l.name}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="flex flex-col gap-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
-              <label className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Target Language</label>
-              <div className="mt-3 flex items-center gap-3">
-                <span className="text-lg leading-none" style={{ display: 'flex', alignItems: 'center', lineHeight: 1 }}>{languageFlag(targetLang)}</span>
-                <select
-                  value={targetLang}
-                  onChange={e => setTargetLang(e.target.value)}
-                  className="w-full bg-transparent text-base font-semibold text-slate-800 focus:outline-none"
-                >
-                  {availableLanguages.map(l => <option key={l.code} value={l.code} className="text-slate-900">{l.name}</option>)}
-                </select>
-              </div>
-            </div>
-          </div>
+          {/* Source + Target panels */}
+          <div className="grid gap-4 xl:grid-cols-2 xl:items-stretch">
 
-          <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px] lg:items-stretch">
-            <div className="space-y-6 h-full">
-              <div className="rounded-xl border border-[#e4ddd2] p-5 lg:p-6 h-full" style={panelStyle}>
-                <div className="grid gap-6 lg:grid-cols-2 h-full lg:items-stretch">
-                  <div className="flex flex-col gap-4">
-                    <div className="flex-1 space-y-4 rounded-xl border border-[#e4ddd2] p-5" style={insetStyle}>
-                      <div className="flex items-center justify-between gap-4">
-                        <div>
-                          <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Live Audio Stream</p>
-                          <p className="mt-1 flex items-center gap-1.5 text-base font-semibold text-[#0f1f3d]"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(sourceLang)}</span><span>{sourceLabel}</span></p>
-                        </div>
-                        <div className="flex items-center gap-3 text-sm text-slate-500">
-                          <span className={`relative inline-flex h-11 w-11 items-center justify-center rounded-full border ${micActive ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-white/80 bg-white/60 text-slate-400'}`}>
-                            <span className="text-lg">🎙️</span>
-                            {micActive && <span className="absolute inset-0 rounded-full border border-emerald-300/60 animate-ping" />}
-                          </span>
-                          <div className="flex h-8 items-end gap-1.5">{waveformBars}</div>
-                        </div>
-                      </div>
-                      <textarea
-                        value={text}
-                        onChange={e => setText(e.target.value)}
-                        placeholder="Listening to the speaker in Korean..."
-                        className="min-h-[170px] w-full resize-none rounded-lg border border-[#e4ddd2] bg-white px-4 py-3 text-base text-[#1c1c1c] placeholder:text-[#c8bfb0] focus:border-[#b89a5e] focus:outline-none"
-                      />
-                    </div>
-
-                    <button
-                      onClick={isListening ? handleStopListening : handleStartListening}
-                      className="w-full rounded-[1.5rem] px-6 py-4 text-sm font-black uppercase tracking-[0.24em] text-white transition"
-                      style={isListening ? stopActionStyle : primaryActionStyle}
-                    >
-                      {isListening ? 'Stop Translation' : 'Start Translation'}
-                    </button>
+              <section className="grid gap-0" style={pairedPanelStyle}>
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span style={utilityLabelStyle}>Source</span>
+                    <span style={panelHeadingStyle}>{languageFlag(sourceLang)} {sourceLabel}</span>
                   </div>
-
-                  <div className="flex flex-col gap-4 rounded-xl border border-[#e4ddd2] p-5 text-[#1c1c1c]" style={accentPanelStyle}>
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Translation Output</p>
-                        <p className="flex items-center gap-1.5 text-base font-semibold text-[#0f1f3d]"><span className="leading-none" style={{ lineHeight: 1 }}>{languageFlag(targetLang)}</span><span>{targetLabel}</span></p>
-                      </div>
-                      <span className="rounded-full border border-[#e4ddd2] bg-white px-3 py-1 text-xs font-bold uppercase tracking-[0.18em] text-[#b89a5e]">Broadcast Ready</span>
-                    </div>
-                    {failOpenMeta && (
-                      <div className="rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2 text-sm font-medium text-amber-700" style={insetStyle}>
-                        Translation temporarily unavailable. {failReasonLabel}
-                      </div>
-                    )}
-                    <p className={`min-h-[100px] max-h-[220px] overflow-y-auto whitespace-pre-wrap font-medium leading-relaxed text-[#0f1f3d] ${translated.length > 120 ? 'text-base' : translated.length > 60 ? 'text-lg' : 'text-xl'}`}>
-                      {translated || 'Waiting for the next sentence...'}
-                    </p>
-                    {scriptureMeta && (
-                      <div className="rounded-xl border border-[#e4ddd2] px-4 py-4 text-[#1c1c1c]" style={insetStyle}>
-                        <div className="flex flex-wrap items-center justify-between gap-3">
-                          <div>
-                            <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Scripture Reference</p>
-                            <p className="text-base font-semibold text-[#0f1f3d]" title={scriptureMeta.versionFull || undefined}>
-                              {scriptureMeta.header}
-                            </p>
-                          </div>
-                          <span className="rounded-full border border-[#e4ddd2] bg-white px-3 py-1 text-xs font-bold uppercase tracking-[0.18em] text-[#b89a5e]">
-                            Exact Verse
-                          </span>
-                        </div>
-                        {scriptureMeta.sourceText && (
-                          <div className="mt-3 rounded-lg border border-[#e4ddd2] bg-[#f7f4ef] px-3 py-2 text-sm">
-                            <p className="text-xs font-bold uppercase tracking-[0.2em] text-[#b89a5e]">
-                              {scriptureMeta.sourceLabel || 'Korean Source'}
-                            </p>
-                            <p className="mt-1 text-base text-[#1c1c1c]">{scriptureMeta.sourceText}</p>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                    <div className="rounded-xl border border-[#e4ddd2] px-4 py-3 text-sm text-[#5a5a52]" style={insetStyle}>
-                      <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Next Sentence Preview</p>
-                      <p className="mt-1 text-base text-[#1c1c1c]">{previewSnippet || 'Listening for the next clause...'}</p>
-                    </div>
-                    {committedLines.length > 0 && (
-                      <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={insetStyle}>
-                        <p className="mb-2 text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Recent Translations</p>
-                        <div className="max-h-48 space-y-2 overflow-y-auto">
-                          {[...committedLines].reverse().map(line => (
-                            <div key={line.id} className="group flex items-start gap-2">
-                              <div className="min-w-0 flex-1">
-                                <p className="truncate text-xs text-[#c8bfb0]">{line.srcText}</p>
-                                {correcting === line.id ? (
-                                  <div className="mt-1 flex gap-1">
-                                    <input
-                                      className="flex-1 rounded border border-slate-300 px-2 py-0.5 text-sm text-slate-800 focus:outline-none focus:border-slate-400"
-                                      value={correctionDraft}
-                                      onChange={e => setCorrectionDraft(e.target.value)}
-                                      onKeyDown={e => { if (e.key === 'Enter') submitCorrection(line); if (e.key === 'Escape') setCorrecting(null); }}
-                                      autoFocus
-                                    />
-                                    <button
-                                      onClick={() => submitCorrection(line)}
-                                      className="rounded px-2 py-0.5 text-xs text-white"
-                                      style={{ background: '#b89a5e' }}
-                                    >Save</button>
-                                    <button
-                                      onClick={() => setCorrecting(null)}
-                                      className="rounded px-2 py-0.5 text-xs text-slate-500 hover:text-slate-700"
-                                    >Cancel</button>
-                                  </div>
-                                ) : (
-                                  <p className={`text-sm ${correctionSaved.has(line.id) ? 'text-green-700' : 'text-slate-700'}`}>
-                                    {line.translated}
-                                    {correctionSaved.has(line.id) && <span className="ml-1 text-xs text-green-600">✓</span>}
-                                  </p>
-                                )}
-                              </div>
-                              {correcting !== line.id && !correctionSaved.has(line.id) && (
-                                <button
-                                  title="Correct this translation"
-                                  className="mt-0.5 shrink-0 text-xs text-slate-300 opacity-0 transition-opacity hover:text-slate-600 group-hover:opacity-100"
-                                  onClick={() => { setCorrecting(line.id); setCorrectionDraft(line.translated); }}
-                                >✎</button>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <aside className="space-y-6 rounded-xl border border-[#e4ddd2] p-5" style={panelStyle}>
-              <div className="space-y-4 rounded-xl border border-[#e4ddd2] p-4" style={insetStyle}>
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-semibold text-[#0f1f3d]">Broadcast Output</p>
-                    <p className="text-xs text-[#5a5a52]">Enable or mute stage and display feeds.</p>
-                  </div>
-                  <button
-                    onClick={() => setIsBroadcasting(v => !v)}
-                    className={`relative inline-flex h-8 w-14 items-center rounded-full ${isBroadcasting ? 'bg-[#0f1f3d]' : 'bg-[#d4ccc2]'}`}
-                    aria-pressed={isBroadcasting}
+                  <select
+                    value={sourceLang}
+                    onChange={e => setSourceLang(e.target.value)}
+                    className="text-xs font-semibold focus:outline-none"
+                    style={{ ...inputStyle, border: 'none', borderRadius: 999, padding: '6px 12px' }}
                   >
-                    <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${isBroadcasting ? 'translate-x-6' : 'translate-x-1'}`} />
+                    {availableLanguages.map(l => <option key={l.code} value={l.code} className="bg-white text-slate-900">{l.name}</option>)}
+                  </select>
+                </div>
+
+                <div className="broadcast-scroll px-1 py-2" style={{ ...sourceSurfaceStyle, minHeight: 280, maxHeight: 380, overflowY: 'auto' as const }}>
+                  {text ? (
+                    <p style={{ margin: 0, color: palette.ink, fontSize: '1.05rem', lineHeight: 1.75, fontWeight: 400 }}>{text}</p>
+                  ) : (
+                    <p style={{ margin: 0, color: 'rgba(16,34,56,0.32)', fontSize: '1.05rem', lineHeight: 1.75, fontStyle: 'italic' }}>Listening for Korean speech…</p>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 pt-3">
+                  <div className="flex h-7 min-w-[84px] flex-1 items-end gap-1">{waveformBars}</div>
+                  <button
+                    onClick={isListening ? handleStopListening : handleStartListening}
+                    className="rounded-[1rem] px-4 py-2 text-xs font-black uppercase tracking-[0.16em] transition"
+                    style={isListening ? stopActionStyle : primaryActionStyle}
+                  >
+                    {isListening ? 'Stop' : 'Start'}
                   </button>
                 </div>
-                <div className="flex items-center justify-between border-t border-[#e4ddd2] pt-3 text-sm text-[#5a5a52]">
-                  <div className="flex flex-col">
-                    <span>Display speed</span>
-                    <span className="text-xs text-[#c8bfb0]">{displaySpeed.toFixed(2)}x</span>
+              </section>
+
+              <section className="grid gap-0" style={pairedPanelStyle}>
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span style={utilityLabelStyle}>Target</span>
+                    <span style={panelHeadingStyle}>{languageFlag(targetLang)} {targetLabel}</span>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <select
+                    value={targetLang}
+                    onChange={e => setTargetLang(e.target.value)}
+                    className="text-xs font-semibold focus:outline-none"
+                    style={{ ...inputStyle, border: 'none', borderRadius: 999, padding: '6px 12px' }}
+                  >
+                    {availableLanguages.map(l => <option key={l.code} value={l.code} className="bg-white text-slate-900">{l.name}</option>)}
+                  </select>
+                </div>
+
+                {failOpenMeta && (
+                  <div className="mb-3 rounded-[1.2rem] px-4 py-3 text-sm font-medium" style={{ background: 'rgba(247,197,107,0.14)', boxShadow: 'inset 0 0 0 1px rgba(247,197,107,0.22)', color: '#9a6700' }}>
+                    Translation temporarily unavailable. {failReasonLabel}
+                  </div>
+                )}
+
+                <div className="broadcast-scroll px-1 py-2" style={{ ...targetSurfaceStyle, minHeight: 280, maxHeight: 380, overflowY: 'auto' as const }}>
+                  {[...committedLines].slice(-4).map(line => (
+                    <p key={line.id} style={{ margin: '0 0 12px', color: 'rgba(16,34,56,0.38)', fontSize: '0.95rem', lineHeight: 1.65, fontWeight: 400 }}>
+                      {line.translated}
+                    </p>
+                  ))}
+                  <p style={{ margin: 0, color: translated ? palette.ink : 'rgba(16,34,56,0.28)', fontSize: translationFontSize, lineHeight: 1.45, fontWeight: 500, fontStyle: translated ? 'normal' : 'italic' }}>
+                    {translated || 'Audience output is standing by…'}
+                  </p>
+                </div>
+
+                <div className="pt-3">
+                  {scriptureMeta ? (
+                    <div className="rounded-[1rem] px-3 py-2" style={topSupplementStyle}>
+                      <p style={utilityLabelStyle}>Scripture · {scriptureMeta.header}</p>
+                      {scriptureMeta.sourceText ? <p className="mt-1 text-xs" style={{ margin: '4px 0 0', color: 'rgba(16,34,56,0.62)', lineHeight: 1.6 }}>{scriptureMeta.sourceText}</p> : null}
+                    </div>
+                  ) : previewSnippet ? (
+                    <div className="rounded-[1rem] px-3 py-2" style={topSupplementStyle}>
+                      <p style={utilityLabelStyle}>Next phrase</p>
+                      <p className="mt-1 text-sm" style={{ margin: '4px 0 0', color: 'rgba(16,34,56,0.62)', lineHeight: 1.6 }}>{previewSnippet}</p>
+                    </div>
+                  ) : null}
+                </div>
+              </section>
+          </div>
+
+          <div className="grid gap-4">
+            <div className="grid gap-4 xl:grid-cols-[minmax(280px,0.42fr)_minmax(0,1fr)] xl:items-end">
+              <div>
+                <h3 style={sectionHeadingStyle}>Stream Controls</h3>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h3 style={sectionHeadingStyle}>Transcription History</h3>
+                {historyLines.length > 0 ? (
+                  <span className="rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-[0.12em]" style={{ ...chipStyle, color: palette.ink }}>
+                    {historyLines.length} lines
+                  </span>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="grid gap-6 xl:grid-cols-[minmax(280px,0.42fr)_minmax(0,1fr)]">
+
+            <section className="grid gap-4">
+
+              <div className="grid gap-2.5" style={dashboardCardStyle}>
+                {([
+                  { label: 'Broadcast output', desc: isBroadcasting ? 'Listeners are receiving translated output.' : 'Output is paused for listeners.', value: isBroadcasting, onToggle: () => setIsBroadcasting(v => !v) },
+                  { label: 'Early preview', desc: earlyCommitEnabled ? 'Preview text is shown before final commit.' : 'Only finalized clauses are displayed.', value: earlyCommitEnabled, onToggle: () => setEarlyCommitEnabled(v => !v) },
+                  { label: 'Audience TTS', desc: ttsAudienceEnabled ? 'Speech synthesis is active.' : 'Speech synthesis is muted.', value: ttsAudienceEnabled, onToggle: () => setIsMuted(m => !m) },
+                ] as const).map(item => (
+                  <div key={item.label} className="flex items-center justify-between gap-4 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold" style={{ margin: 0, color: palette.ink }}>{item.label}</p>
+                      <p className="text-xs" style={{ margin: '2px 0 0', color: 'rgba(16,34,56,0.50)', lineHeight: 1.6 }}>{item.desc}</p>
+                    </div>
                     <button
-                      onClick={() => applyDisplaySpeed(displaySpeed + DISPLAY_SPEED_STEP)}
-                      className="rounded-xl border border-white/80 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      style={pillStyle}
+                      onClick={item.onToggle}
+                      className="relative inline-flex h-7 w-12 flex-shrink-0 items-center rounded-full transition"
+                      style={item.value ? toggleOnStyle : toggleOffStyle}
+                      aria-pressed={item.value}
                     >
-                      Slower
-                    </button>
-                    <button
-                      onClick={() => applyDisplaySpeed(displaySpeed - DISPLAY_SPEED_STEP)}
-                      className="rounded-xl border border-white/80 px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      style={pillStyle}
-                    >
-                      Faster
+                      <span className={`inline-block h-5 w-5 rounded-full transition ${item.value ? 'translate-x-6' : 'translate-x-1'}`} style={{ background: item.value ? '#ffffff' : 'rgba(255,255,255,0.78)' }} />
                     </button>
                   </div>
+                ))}
+              </div>
+
+              <div className="grid gap-4" style={dashboardCardStyle}>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p style={{ ...utilityLabelStyle, margin: 0 }}>Advanced Controls</p>
+                  </div>
+                  <button
+                    onClick={() => setShowAdvancedControls(v => !v)}
+                    className="rounded-full px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] transition"
+                    style={{ ...chipStyle, border: 'none', cursor: 'pointer' }}
+                  >
+                    {showAdvancedControls ? 'Hide' : 'Show'}
+                  </button>
                 </div>
               </div>
 
-              <div className="rounded-xl border border-[#e4ddd2] p-4 text-sm" style={insetStyle}>
-                <p className="mb-3 text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">System Status</p>
-                <div className="space-y-2 text-[#5a5a52]">
-                  <div className="flex items-center justify-between">
-                    <span>Last heartbeat</span>
-                    <span className="font-semibold text-[#0f1f3d]">{lastHeartbeatLabel}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Reconnect attempt</span>
-                    <span className="font-semibold text-[#0f1f3d]">{reconnectAttemptLabel}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Socket downtime</span>
-                    <span className="font-semibold text-[#0f1f3d]">{socketDowntimeLabel}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Deepgram engine</span>
-                    <span className="font-semibold text-[#0f1f3d]">{status}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Latency</span>
-                    <span className="font-semibold text-[#0f1f3d]">{latencyLabel}</span>
-                  </div>
-                </div>
-              </div>
-
-              <details className="rounded-xl border border-[#e4ddd2] p-4 text-sm text-[#5a5a52]" style={insetStyle}>
-                <summary className="cursor-pointer text-xs font-bold uppercase tracking-[0.22em] text-[#b89a5e]">
-                  Advanced Controls
-                </summary>
-                <div className="mt-4 space-y-4">
-                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
-                    <div className="min-w-0">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <span className="text-sm font-semibold text-[#0f1f3d]">Early Preview</span>
-                        <span
-                          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white/75 text-[10px] font-black text-slate-500"
-                          title="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
-                          aria-label="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
-                        >
-                          ?
-                        </span>
-                      </div>
-                      <p className="mt-1 text-xs leading-5 text-[#5a5a52]">
-                        Shows translation sooner, but the wording may shift before the final sentence is committed.
-                      </p>
+              {showAdvancedControls ? (
+                <div className="grid gap-3" style={dashboardCardStyle}>
+                  <div className="grid gap-2 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
+                    <div className="flex items-center justify-between gap-4">
+                      <span style={utilityBodyStyle}>Display speed</span>
+                      <span className="text-sm font-semibold" style={{ color: palette.ink }}>{displaySpeed.toFixed(2)}x</span>
                     </div>
-                    <button
-                      onClick={() => setEarlyCommitEnabled(v => !v)}
-                      title="Shows faster preview text before the clause is finalized. Lower latency, but less stable and sometimes less accurate."
-                      aria-label="Toggle early preview translation"
-                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${earlyCommitEnabled ? 'bg-[#0f1f3d]' : 'bg-[#d4ccc2]'}`}
-                      aria-pressed={earlyCommitEnabled}
-                    >
-                      <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${earlyCommitEnabled ? 'translate-x-7' : 'translate-x-1'}`} />
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-2 rounded-xl border border-[#e4ddd2] px-4 py-4" style={panelStyle}>
-                    <div className="min-w-0">
-                      <span className="text-sm font-semibold text-[#0f1f3d]">Audience TTS</span>
-                      <p className="mt-1 text-xs leading-5 text-[#5a5a52]">
-                        Plays the translated sentence through the local monitor output as each final line is committed.
-                      </p>
+                    <div className="flex gap-2">
+                      <button onClick={() => applyDisplaySpeed(displaySpeed + DISPLAY_SPEED_STEP)} className="flex-1 rounded-[0.9rem] px-3 py-2 text-xs font-semibold" style={secondaryButtonStyle}>Slower</button>
+                      <button onClick={() => applyDisplaySpeed(displaySpeed - DISPLAY_SPEED_STEP)} className="flex-1 rounded-[0.9rem] px-3 py-2 text-xs font-semibold" style={secondaryButtonStyle}>Faster</button>
                     </div>
-                    <button
-                      onClick={() => setIsMuted(m => !m)}
-                      className={`relative inline-flex h-8 w-14 min-w-[56px] shrink-0 items-center rounded-full transition ${ttsAudienceEnabled ? 'bg-[#0f1f3d]' : 'bg-[#d4ccc2]'}`}
-                      aria-pressed={ttsAudienceEnabled}
-                    >
-                      <span className={`inline-block h-6 w-6 rounded-full bg-white transition ${ttsAudienceEnabled ? 'translate-x-7' : 'translate-x-1'}`} />
-                    </button>
                   </div>
-                  <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={panelStyle}>
-                    <label className="text-[10px] font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Voice engine</label>
-                    <select
-                      value={ttsProvider}
-                      onChange={(e) => setTtsProvider(e.target.value as TTSProvider)}
-                      className="mt-2 w-full rounded-lg border border-[#e4ddd2] bg-white px-3 py-2 text-sm font-medium text-[#1c1c1c] focus:border-[#b89a5e] focus:outline-none"
-                    >
-                      {TTS_PROVIDER_OPTIONS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
+                  <div className="grid gap-1.5 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
+                    <label style={utilityLabelStyle}>Voice Engine</label>
+                    <select value={ttsProvider} onChange={e => setTtsProvider(e.target.value as TTSProvider)} className="w-full rounded-[0.9rem] px-3 py-2 text-sm font-medium focus:outline-none" style={{ ...inputStyle, border: 'none' }}>
+                      {TTS_PROVIDER_OPTIONS.map(o => <option key={o.value} value={o.value} className="bg-white text-slate-900">{o.label}</option>)}
                     </select>
                   </div>
-                  <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={panelStyle}>
-                    <label className="text-[10px] font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Voice preset</label>
-                    <select
-                      value={voicePreference}
-                      onChange={(e) => setVoicePreference(e.target.value)}
-                      className="mt-2 w-full rounded-lg border border-[#e4ddd2] bg-white px-3 py-2 text-sm font-medium text-[#1c1c1c] focus:border-[#b89a5e] focus:outline-none"
-                    >
-                      <option value="auto">Auto · match language</option>
-                      {voiceOptions.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </option>
-                      ))}
+                  <div className="grid gap-1.5 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
+                    <label style={utilityLabelStyle}>Voice Preset</label>
+                    <select value={voicePreference} onChange={e => setVoicePreference(e.target.value)} className="w-full rounded-[0.9rem] px-3 py-2 text-sm font-medium focus:outline-none" style={{ ...inputStyle, border: 'none' }}>
+                      <option value="auto" className="bg-white text-slate-900">Auto · match language</option>
+                      {voiceOptions.map(o => <option key={o.value} value={o.value} className="bg-white text-slate-900">{o.label}</option>)}
                     </select>
                   </div>
-                  <div className="rounded-xl border border-[#e4ddd2] px-4 py-3" style={panelStyle}>
+                  <div className="grid gap-2 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-[10px] font-bold uppercase tracking-[0.22em] text-[#b89a5e]">Monitor volume</span>
-                      <span className="font-semibold text-[#0f1f3d]">{Math.round(volume * 100)}%</span>
+                      <span style={utilityBodyStyle}>Monitor volume</span>
+                      <span className="text-sm font-semibold" style={{ color: palette.ink }}>{Math.round(volume * 100)}%</span>
                     </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={volume}
-                      onChange={(e) => setVolume(parseFloat(e.target.value))}
-                      className="mt-3 w-full accent-[#b89a5e]"
-                    />
+                    <input type="range" min={0} max={1} step={0.05} value={volume} onChange={e => setVolume(parseFloat(e.target.value))} className="w-full accent-[#1f3a5b]" />
                   </div>
-                  <div className="grid gap-2">
-                    <button
-                      onClick={() => triggerFinalize('manual operator button')}
-                      className="w-full rounded-lg border border-[#e4ddd2] bg-white px-4 py-2 text-xs font-semibold text-[#5a5a52] hover:border-[#b89a5e]"
-                      style={pillStyle}
-                    >
-                      Pulse finalize
-                    </button>
-                    <button
-                      onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')}
-                      className="w-full rounded-lg border border-[#e4ddd2] bg-white px-4 py-2 text-xs font-semibold text-[#5a5a52] hover:border-[#b89a5e]"
-                      style={pillStyle}
-                    >
-                      Test TTS
-                    </button>
+                  <div className="flex gap-2">
+                    <button onClick={() => triggerFinalize('manual operator button')} className="flex-1 rounded-[0.9rem] px-3 py-2 text-xs font-semibold" style={secondaryButtonStyle}>Pulse Finalize</button>
+                    <button onClick={() => enqueueFinalTTS('This is a test of speech synthesis.')} className="flex-1 rounded-[0.9rem] px-3 py-2 text-xs font-semibold" style={secondaryButtonStyle}>Test TTS</button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {[
+                      `Heartbeat · ${lastHeartbeatLabel}`,
+                      `Reconnect · ${reconnectAttemptLabel}`,
+                      `Downtime · ${socketDowntimeLabel}`,
+                      `Deepgram · ${status}`,
+                    ].map(label => (
+                      <span key={label} className="rounded-full px-2.5 py-1 text-[10px] font-semibold" style={chipStyle}>{label}</span>
+                    ))}
                   </div>
                 </div>
-              </details>
-            </aside>
+              ) : null}
+            </section>
+
+            <section className="grid gap-4">
+              {historyLines.length > 0 ? (
+                <div className="broadcast-scroll overflow-y-auto" style={{ ...dashboardCardStyle, maxHeight: 520, padding: '10px 12px 12px' }}>
+                  <div className="grid items-center rounded-[1rem] px-4 py-3" style={{ ...historySurfaceStyle, gridTemplateColumns: 'minmax(0,1fr) minmax(0,1.25fr) 108px' }}>
+                    <span style={tableHeaderStyle}>Source</span>
+                    <span style={tableHeaderStyle}>Translation</span>
+                    <span style={{ ...tableHeaderStyle, textAlign: 'right' }}>Status</span>
+                  </div>
+                  <div className="mt-2 grid gap-2">
+                    {historyLines.map(line => {
+                      const isEditing = correcting === line.id
+                      const isSaved = correctionSaved.has(line.id)
+                      const statusLabel = isEditing ? 'Editing' : isSaved ? 'Verified' : 'Ready'
+                      const statusStyle = isEditing
+                        ? { background: 'rgba(245,158,11,0.12)', color: '#9a6700' }
+                        : isSaved
+                        ? { background: 'rgba(91,179,130,0.14)', color: '#1d6b4f' }
+                        : { background: 'rgba(15,45,77,0.06)', color: 'rgba(15,45,77,0.62)' }
+
+                      return (
+                        <div key={line.id} className="grid items-start gap-3 rounded-[1rem] px-4 py-3" style={{ ...historySurfaceStyle, gridTemplateColumns: 'minmax(0,1fr) minmax(0,1.25fr) 108px' }}>
+                          <p className="text-xs" style={{ margin: 0, color: 'rgba(16,34,56,0.54)', lineHeight: 1.7 }}>{line.srcText}</p>
+                          <div className="min-w-0">
+                            {isEditing ? (
+                              <div className="flex flex-wrap gap-1.5">
+                                <input
+                                  className="min-w-[140px] flex-1 rounded-[0.75rem] px-2 py-1 text-xs focus:outline-none"
+                                  style={{ ...inputStyle, border: 'none' }}
+                                  value={correctionDraft}
+                                  onChange={e => setCorrectionDraft(e.target.value)}
+                                  onKeyDown={e => { if (e.key === 'Enter') submitCorrection(line); if (e.key === 'Escape') setCorrecting(null); }}
+                                  autoFocus
+                                />
+                                <button onClick={() => submitCorrection(line)} className="rounded-[0.75rem] px-2 py-1 text-[10px] font-semibold" style={primaryActionStyle}>Save</button>
+                                <button onClick={() => setCorrecting(null)} className="rounded-[0.75rem] px-2 py-1 text-[10px] font-semibold" style={secondaryButtonStyle}>Cancel</button>
+                              </div>
+                            ) : (
+                              <p className="text-xs" style={{ margin: 0, color: isSaved ? '#1d6b4f' : palette.ink, lineHeight: 1.7 }}>
+                                {line.translated}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex flex-col items-end gap-1.5">
+                            <span className="rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em]" style={statusStyle}>
+                              {statusLabel}
+                            </span>
+                            {!isEditing && !isSaved ? (
+                              <button
+                                className="rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.1em]"
+                                style={secondaryButtonStyle}
+                                onClick={() => { setCorrecting(line.id); setCorrectionDraft(line.translated); }}
+                              >
+                                Edit
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div style={dashboardCardStyle}>
+                  <p style={{ margin: 0, color: 'rgba(16,34,56,0.36)', fontSize: '0.85rem', lineHeight: 1.7, fontStyle: 'italic' }}>
+                    Finalized translation lines will appear here.
+                  </p>
+                </div>
+              )}
+            </section>
+            </div>
           </div>
         </div>
       </div>

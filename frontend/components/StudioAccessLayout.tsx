@@ -249,6 +249,13 @@ export default function StudioAccessLayout({
         <title>{pageTitle}</title>
         <meta name="description" content={pageDescription} />
       </Head>
+      <style>{`
+        @media (max-width: 600px) {
+          article form button,
+          article section button,
+          article > button { display: flex !important; width: 100% !important; box-sizing: border-box !important; }
+        }
+      `}</style>
       <main style={studioPageStyle}>
         {/* Bokeh background */}
         <div aria-hidden="true" style={{ position: "fixed", inset: 0, zIndex: 0, overflow: "hidden", pointerEvents: "none" }}>

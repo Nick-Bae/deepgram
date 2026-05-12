@@ -1,33 +1,87 @@
 @import "tailwindcss";
 
 :root {
-  --background: #070c16;
-  --foreground: #f8fafc;
-  --card: #10172a;
-  --muted: #94a3b8;
-  --accent: #22d3ee;
-  --accent-strong: #00ffff;
-  --success: #48bb78;
-  --danger: #f87171;
+  --background: #00142a;
+  --foreground: #f2f3f4;
+  --card: #001c38;
+  --muted: rgba(242, 243, 244, 0.68);
+  --accent: #174871;
+  --accent-strong: #eeb6d6;
+  --success: #6ee7a7;
+  --danger: #f3a6b0;
+  --surface: #00142a;
+  --surface-container-low: #001c38;
+  --surface-container: #0c2b4b;
+  --surface-container-high: #143353;
+  --surface-bright: #1f3a5b;
+  --primary: #eeb6d6;
+  --primary-container: #613852;
+  --secondary: #174871;
+  --tertiary: #d1c4ba;
+  --dusty-rose: #a77693;
+  --ghost-outline: rgba(242, 243, 244, 0.16);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --font-sans: "Manrope", "Segoe UI", sans-serif;
   --font-mono: var(--font-geist-mono);
 }
 
+html {
+  background: var(--background);
+}
+
 body {
-  background: radial-gradient(circle at top, rgba(34, 211, 238, 0.08), transparent 45%), var(--background);
+  margin: 0;
+  background:
+    radial-gradient(circle at 12% 12%, rgba(238, 182, 214, 0.16), transparent 28%),
+    radial-gradient(circle at 82% 10%, rgba(31, 58, 91, 0.46), transparent 30%),
+    radial-gradient(circle at 76% 76%, rgba(209, 196, 186, 0.12), transparent 22%),
+    linear-gradient(160deg, #00101f 0%, #00142a 38%, #0f2d4d 100%);
   color: var(--foreground);
-  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+  font-family: "Manrope", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
   min-height: 100vh;
+  letter-spacing: -0.01em;
 }
 
 .voice-bar {
   animation: voice-bar 1.15s ease-in-out infinite;
   transform-origin: bottom center;
+}
+
+.broadcast-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(242, 243, 244, 0.16) transparent;
+}
+
+.broadcast-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.broadcast-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.broadcast-scroll::-webkit-scrollbar-thumb {
+  background: rgba(242, 243, 244, 0.16);
+  border-radius: 999px;
+}
+
+.atmospheric-loader {
+  position: relative;
+  overflow: hidden;
+}
+
+.atmospheric-loader::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at center, rgba(209, 196, 186, 0.12), transparent 60%);
+  animation: atmospheric-loader 4.8s ease-in-out infinite;
+  pointer-events: none;
 }
 
 @keyframes voice-bar {
@@ -39,5 +93,17 @@ body {
   }
   100% {
     transform: scaleY(0.35);
+  }
+}
+
+@keyframes atmospheric-loader {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 0.78;
+    transform: scale(1.04);
   }
 }

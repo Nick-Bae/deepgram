@@ -149,8 +149,8 @@ export default function ChurchServiceListenerPage() {
 
   const isLive = connected;
   const isConnecting = socketEnabled && !connected;
-  const dotColor = isLive ? "#34d399" : isConnecting ? "#f59e0b" : "rgba(255,255,255,0.25)";
-  const labelColor = isLive ? "rgba(52,211,153,0.9)" : isConnecting ? "rgba(245,158,11,0.85)" : "rgba(255,255,255,0.38)";
+  const dotColor = isLive ? "#34d399" : isConnecting ? "#f59e0b" : "rgba(222,209,198,0.35)";
+  const labelColor = isLive ? "rgba(52,211,153,0.9)" : isConnecting ? "rgba(245,158,11,0.85)" : "rgba(222,209,198,0.5)";
   const statusLabel = isLive ? "Live" : isConnecting ? "Connecting" : "Standby";
 
   return (
@@ -162,72 +162,145 @@ export default function ChurchServiceListenerPage() {
     <main
       style={{
         minHeight: "100vh",
-        background: "radial-gradient(ellipse at 50% -10%, rgba(30,50,100,0.55) 0%, transparent 65%), #060b18",
-        color: "#fff",
+        background: "#0F2D4D",
+        color: "#F2F3F4",
         fontFamily: "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
         position: "relative",
         overflow: "hidden",
       }}
     >
       <style>{`
+        @keyframes drift-mauve {
+          0%, 100% { transform: translate(0, 0) scale(1); }
+          40%       { transform: translate(6%, -10%) scale(1.08); }
+          75%       { transform: translate(-4%, 5%) scale(0.95); }
+        }
+        @keyframes drift-blue {
+          0%, 100% { transform: translate(0, 0) scale(1); }
+          35%       { transform: translate(-8%, 6%) scale(0.94); }
+          70%       { transform: translate(5%, -4%) scale(1.06); }
+        }
+        @keyframes drift-warm {
+          0%, 100% { transform: translate(0, 0); }
+          50%       { transform: translate(3%, 8%); }
+        }
         @keyframes pulse-live {
-          0%   { box-shadow: 0 0 0 0 rgba(52,211,153,0.5); }
-          70%  { box-shadow: 0 0 0 7px rgba(52,211,153,0); }
+          0%   { box-shadow: 0 0 0 0 rgba(52,211,153,0.55); }
+          70%  { box-shadow: 0 0 0 8px rgba(52,211,153,0); }
           100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
         }
         @keyframes pulse-connecting {
-          0%   { box-shadow: 0 0 0 0 rgba(245,158,11,0.5); }
-          70%  { box-shadow: 0 0 0 7px rgba(245,158,11,0); }
+          0%   { box-shadow: 0 0 0 0 rgba(245,158,11,0.55); }
+          70%  { box-shadow: 0 0 0 8px rgba(245,158,11,0); }
           100% { box-shadow: 0 0 0 0 rgba(245,158,11,0); }
         }
-        .dot-live        { animation: pulse-live 2s ease infinite; }
-        .dot-connecting  { animation: pulse-connecting 1.2s ease infinite; }
-        .toggle-btn:hover  { background: rgba(255,255,255,0.18) !important; }
-        .toggle-btn:active { transform: scale(0.96); }
+        @keyframes text-in {
+          from { opacity: 0; transform: translateY(6px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+        .orb-mauve     { animation: drift-mauve 24s ease-in-out infinite; }
+        .orb-blue      { animation: drift-blue 30s ease-in-out infinite; }
+        .orb-warm      { animation: drift-warm 36s ease-in-out infinite; }
+        .dot-live      { animation: pulse-live 2s ease infinite; }
+        .dot-connecting{ animation: pulse-connecting 1.2s ease infinite; }
+        .ctrl-btn { transition: background 150ms ease, opacity 150ms ease, transform 100ms ease; }
+        .ctrl-btn:hover  { background: rgba(167,118,147,0.2) !important; opacity: 1 !important; }
+        .ctrl-btn:active { transform: scale(0.95); }
         @media (hover: none) { .kb-hint { display: none; } }
       `}</style>
 
-      {/* Connection indicator */}
+      {/* Animated background orbs */}
+      <div style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none", overflow: "hidden" }}>
+        <div
+          className="orb-mauve"
+          style={{
+            position: "absolute",
+            width: "80vmax",
+            height: "80vmax",
+            borderRadius: "50%",
+            background: "radial-gradient(circle, rgba(167,118,147,0.52) 0%, transparent 68%)",
+            bottom: "-28vmax",
+            left: "-18vmax",
+            filter: "blur(32px)",
+          }}
+        />
+        <div
+          className="orb-blue"
+          style={{
+            position: "absolute",
+            width: "65vmax",
+            height: "65vmax",
+            borderRadius: "50%",
+            background: "radial-gradient(circle, rgba(23,72,113,0.72) 0%, transparent 68%)",
+            top: "-18vmax",
+            right: "-10vmax",
+            filter: "blur(28px)",
+          }}
+        />
+        <div
+          className="orb-warm"
+          style={{
+            position: "absolute",
+            width: "35vmax",
+            height: "35vmax",
+            borderRadius: "50%",
+            background: "radial-gradient(circle, rgba(222,209,198,0.14) 0%, transparent 70%)",
+            top: "25vh",
+            left: "35vw",
+            filter: "blur(48px)",
+          }}
+        />
+      </div>
+
+      {/* Status indicator */}
       <div
         style={{
           position: "fixed",
-          top: 14,
-          left: 14,
+          top: 20,
+          left: 20,
           zIndex: 20,
           display: "flex",
           alignItems: "center",
-          gap: 7,
-          fontSize: 12,
-          fontWeight: 700,
-          color: labelColor,
-          letterSpacing: "0.05em",
-          textTransform: "uppercase",
-          fontFamily: "Inter, system-ui, sans-serif",
+          gap: 8,
+          padding: "6px 12px 6px 10px",
+          borderRadius: 999,
+          background: (isLive || isConnecting) ? "rgba(15,45,77,0.6)" : "transparent",
+          border: (isLive || isConnecting) ? "1px solid rgba(255,255,255,0.08)" : "none",
+          backdropFilter: (isLive || isConnecting) ? "blur(12px)" : "none",
+          transition: "background 300ms ease",
         }}
       >
         <span
           className={isLive ? "dot-live" : isConnecting ? "dot-connecting" : ""}
           style={{
-            width: 8,
-            height: 8,
+            width: 7,
+            height: 7,
             borderRadius: "50%",
             display: "inline-block",
             background: dotColor,
             flexShrink: 0,
           }}
         />
-        {statusLabel}
+        {(isLive || isConnecting) && (
+          <span style={{
+            fontSize: 11,
+            fontWeight: 600,
+            letterSpacing: "0.08em",
+            textTransform: "uppercase",
+            color: labelColor,
+          }}>
+            {statusLabel}
+          </span>
+        )}
       </div>
 
       {/* Top-right controls */}
-      <div style={{ position: "fixed", top: 14, right: 14, zIndex: 20, display: "flex", gap: 8 }}>
-        {/* Audio toggle */}
+      <div style={{ position: "fixed", top: 20, right: 20, zIndex: 20, display: "flex", gap: 6 }}>
         <button
           type="button"
           onClick={() => {
             const next = !ttsEnabled;
             setTtsEnabled(next);
-            // Must call speechSynthesis inside the user gesture to unlock it on iOS/Android.
             if (next && typeof window !== "undefined" && "speechSynthesis" in window) {
               try {
                 window.speechSynthesis.cancel();
@@ -236,51 +309,46 @@ export default function ChurchServiceListenerPage() {
               } catch {}
             }
           }}
-          className="toggle-btn"
+          className="ctrl-btn"
           style={{
-            background: ttsEnabled ? "rgba(52,211,153,0.18)" : "rgba(0,0,0,0.55)",
-            color: ttsEnabled ? "rgba(52,211,153,1)" : "rgba(255,255,255,0.6)",
-            border: ttsEnabled ? "1px solid rgba(52,211,153,0.5)" : "1px solid rgba(255,255,255,0.22)",
-            padding: "6px 14px",
+            background: ttsEnabled ? "rgba(52,211,153,0.15)" : "rgba(15,45,77,0.5)",
+            color: ttsEnabled ? "rgba(52,211,153,0.95)" : "rgba(222,209,198,0.55)",
+            border: ttsEnabled ? "1px solid rgba(52,211,153,0.4)" : "1px solid rgba(167,118,147,0.25)",
+            padding: "7px 14px",
             borderRadius: 999,
-            fontSize: 12,
-            letterSpacing: "0.06em",
+            fontSize: 11,
+            letterSpacing: "0.07em",
             textTransform: "uppercase",
-            fontWeight: 700,
+            fontWeight: 600,
             cursor: "pointer",
-            backdropFilter: "blur(8px)",
-            transition: "all 150ms ease",
+            backdropFilter: "blur(12px)",
           }}
           aria-pressed={ttsEnabled}
-          title={ttsEnabled ? "Audio on — tap to mute" : "Tap to hear translation"}
         >
-          {ttsEnabled ? "🔊 Audio" : "🔇 Audio"}
+          {ttsEnabled ? "♪ Audio" : "Audio"}
         </button>
 
-        {/* Display mode toggle */}
         <button
           type="button"
           onClick={toggleDisplayMode}
-          className="toggle-btn"
+          className="ctrl-btn"
           style={{
-            position: "relative",
-            background: "rgba(0,0,0,0.55)",
-            color: "rgba(255,255,255,0.9)",
-            border: "1px solid rgba(255,255,255,0.22)",
-            padding: "6px 14px",
+            background: "rgba(15,45,77,0.5)",
+            color: "rgba(222,209,198,0.55)",
+            border: "1px solid rgba(167,118,147,0.25)",
+            padding: "7px 14px",
             borderRadius: 999,
-            fontSize: 12,
-            letterSpacing: "0.06em",
+            fontSize: 11,
+            letterSpacing: "0.07em",
             textTransform: "uppercase",
-            fontWeight: 700,
+            fontWeight: 600,
             cursor: "pointer",
-            backdropFilter: "blur(8px)",
-            transition: "background 150ms ease, transform 100ms ease",
+            backdropFilter: "blur(12px)",
           }}
           aria-pressed={displayMode === "fullScreen"}
         >
-          {displayMode === "subtitle" ? "Full Screen" : "Subtitle"}{" "}
-          <span className="kb-hint" style={{ opacity: 0.55, fontWeight: 400 }}>[F]</span>
+          {displayMode === "subtitle" ? "Expand" : "Subtitle"}
+          <span className="kb-hint" style={{ opacity: 0.45, fontWeight: 400 }}> [F]</span>
         </button>
       </div>
 
@@ -289,25 +357,27 @@ export default function ChurchServiceListenerPage() {
         <div
           style={{
             position: "fixed",
-            top: 48,
+            top: 56,
             left: "50%",
             transform: "translateX(-50%)",
             zIndex: 20,
             color: "#fca5a5",
-            fontSize: 13,
-            background: "rgba(127,29,29,0.45)",
-            border: "1px solid rgba(252,165,165,0.35)",
-            borderRadius: 10,
-            padding: "7px 14px",
-            backdropFilter: "blur(8px)",
-            whiteSpace: "nowrap",
+            fontSize: 12,
+            background: "rgba(15,45,77,0.8)",
+            border: "1px solid rgba(252,165,165,0.25)",
+            borderRadius: 12,
+            padding: "8px 16px",
+            backdropFilter: "blur(12px)",
+            maxWidth: "calc(100vw - 40px)",
+            textAlign: "center",
+            letterSpacing: "0.02em",
           }}
         >
           {friendlyError(errorMsg)}
         </div>
       )}
 
-      {/* Subtitle mode — centered at bottom */}
+      {/* Subtitle mode */}
       {displayMode === "subtitle" ? (
         <div
           style={{
@@ -317,36 +387,46 @@ export default function ChurchServiceListenerPage() {
             right: 0,
             zIndex: 10,
             pointerEvents: "none",
-            background: "linear-gradient(to top, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0.55) 60%, transparent 100%)",
-            padding: "5vh 4vw 4vh",
+            padding: "8vh 5vw 5vh",
             display: "flex",
             justifyContent: "center",
           }}
         >
           <div
             style={{
-              width: "min(1100px, 92vw)",
+              width: "min(1000px, 90vw)",
               display: "flex",
               flexDirection: "column",
-              gap: "0.4em",
+              alignItems: "center",
+              gap: "0.5em",
               textAlign: "center",
             }}
           >
-            {/* Korean source line */}
             {lastKr && (
               <div
                 style={{
-                  fontSize: "clamp(13px, 1.6vw, 24px)",
-                  color: "rgba(255,255,255,0.6)",
-                  letterSpacing: "0.02em",
-                  lineHeight: 1.3,
+                  fontSize: "clamp(12px, 1.4vw, 20px)",
+                  color: "rgba(167,118,147,0.75)",
+                  letterSpacing: "0.12em",
+                  lineHeight: 1.4,
+                  fontWeight: 300,
+                  fontStyle: "italic",
                 }}
               >
                 {lastKr}
               </div>
             )}
 
-            {/* English translation lines */}
+            {lastKr && enLines.length > 0 && (
+              <div style={{
+                width: 32,
+                height: 1,
+                background: "rgba(167,118,147,0.3)",
+                borderRadius: 1,
+                margin: "0.1em 0",
+              }} />
+            )}
+
             {enLines.length > 0 ? (
               enLines.map((line, i) => {
                 const isCurrent = i === enLines.length - 1;
@@ -354,13 +434,16 @@ export default function ChurchServiceListenerPage() {
                   <div
                     key={`${i}-${line.slice(0, 12)}`}
                     style={{
-                      fontSize: isCurrent ? "clamp(26px, 4.2vw, 64px)" : "clamp(18px, 3vw, 44px)",
-                      fontWeight: isCurrent ? 700 : 400,
+                      fontSize: isCurrent ? "clamp(28px, 4.5vw, 68px)" : "clamp(16px, 2.6vw, 40px)",
+                      fontWeight: isCurrent ? 700 : 300,
                       wordBreak: "break-word",
-                      lineHeight: 1.25,
-                      opacity: isCurrent ? 1 : 0.48,
-                      color: "#fff",
-                      transition: "opacity 250ms ease",
+                      lineHeight: 1.2,
+                      opacity: isCurrent ? 1 : 0.35,
+                      color: isCurrent ? "#F2F3F4" : "#DED1C6",
+                      letterSpacing: isCurrent ? "-0.01em" : "0",
+                      textShadow: isCurrent ? "0 2px 24px rgba(15,45,77,0.8), 0 0 60px rgba(167,118,147,0.15)" : "none",
+                      transition: "opacity 300ms ease",
+                      animation: isCurrent ? "text-in 250ms ease forwards" : "none",
                     }}
                   >
                     {line}
@@ -370,11 +453,12 @@ export default function ChurchServiceListenerPage() {
             ) : (
               <div
                 style={{
-                  fontSize: "clamp(20px, 3.2vw, 48px)",
+                  fontSize: "clamp(18px, 3vw, 44px)",
                   fontWeight: 300,
-                  opacity: 0.38,
+                  opacity: 0.3,
                   fontStyle: "italic",
-                  color: "#fff",
+                  color: "#DED1C6",
+                  letterSpacing: "0.01em",
                 }}
               >
                 {waitingMessage}
@@ -383,76 +467,71 @@ export default function ChurchServiceListenerPage() {
           </div>
         </div>
       ) : (
-        /* Fullscreen mode — large text, centered */
+        /* Fullscreen mode */
         <div
           style={{
             position: "fixed",
             inset: 0,
             display: "flex",
+            flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
-            padding: "10vh 6vw 12vh",
+            padding: "12vh 7vw 14vh",
             textAlign: "center",
             zIndex: 8,
           }}
         >
-          <div
-            style={{
-              maxWidth: "min(1320px, 94vw)",
-              width: "100%",
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              gap: "1.6rem",
-            }}
-          >
-            {lastKr && (
-              <div
-                style={{
-                  opacity: 0.72,
-                  fontSize: "clamp(18px, 2.8vw, 52px)",
-                  letterSpacing: "0.04em",
-                  lineHeight: 1.3,
-                  color: "rgba(255,255,255,0.8)",
-                }}
-              >
-                {lastKr}
-              </div>
-            )}
-
+          {lastKr && (
             <div
               style={{
-                fontSize: "clamp(48px, 10vw, 140px)",
-                fontWeight: enLines.length > 0 ? 700 : 300,
-                lineHeight: 1.1,
-                letterSpacing: "-0.01em",
-                textShadow: enLines.length > 0 ? "0 2px 12px rgba(0,0,0,1), 0 4px 48px rgba(0,0,0,0.9), 0 1px 3px rgba(0,0,0,1)" : "none",
-                color: enLines.length > 0 ? "#fff" : "rgba(255,255,255,0.28)",
-                fontStyle: enLines.length > 0 ? "normal" : "italic",
-                transition: "color 300ms ease",
+                fontSize: "clamp(15px, 2.2vw, 36px)",
+                fontWeight: 300,
+                fontStyle: "italic",
+                letterSpacing: "0.1em",
+                color: "rgba(167,118,147,0.7)",
+                marginBottom: "1.2rem",
               }}
             >
-              {currentEn}
+              {lastKr}
             </div>
+          )}
 
-            {recentEn.length > 0 && (
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "0.25em",
-                  opacity: 0.42,
-                  fontSize: "clamp(16px, 2.8vw, 40px)",
-                  fontWeight: 400,
-                  textShadow: "0 1px 8px rgba(0,0,0,1)",
-                }}
-              >
-                {recentEn.map((line, idx) => (
-                  <div key={`${idx}-${line.slice(0, 12)}`}>{line}</div>
-                ))}
-              </div>
-            )}
+          <div
+            style={{
+              maxWidth: "min(1400px, 92vw)",
+              fontSize: "clamp(52px, 11vw, 160px)",
+              fontWeight: enLines.length > 0 ? 700 : 200,
+              lineHeight: 1.05,
+              letterSpacing: enLines.length > 0 ? "-0.02em" : "0.02em",
+              color: enLines.length > 0 ? "#F2F3F4" : "rgba(222,209,198,0.2)",
+              fontStyle: enLines.length > 0 ? "normal" : "italic",
+              textShadow: enLines.length > 0 ? "0 0 80px rgba(167,118,147,0.2), 0 4px 32px rgba(15,45,77,0.6)" : "none",
+              transition: "color 400ms ease, font-weight 400ms ease",
+              animation: enLines.length > 0 ? "text-in 300ms ease forwards" : "none",
+            }}
+          >
+            {currentEn}
           </div>
+
+          {recentEn.length > 0 && (
+            <div
+              style={{
+                marginTop: "2rem",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.3em",
+                opacity: 0.3,
+                fontSize: "clamp(14px, 2.4vw, 36px)",
+                fontWeight: 300,
+                color: "#DED1C6",
+                letterSpacing: "0.01em",
+              }}
+            >
+              {recentEn.map((line, idx) => (
+                <div key={`${idx}-${line.slice(0, 12)}`}>{line}</div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </main>
