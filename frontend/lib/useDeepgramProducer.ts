@@ -13,6 +13,7 @@ type StartOptions = {
   sourceLang?: string;
   targetLang?: string;
   earlyCommit?: boolean;
+  engine?: "deepgram" | "openai-realtime-translate";
   orgId?: string;
   roomId?: string;
   serviceKey?: string;
@@ -48,6 +49,9 @@ function hasSessionCredentials() {
 
 function wsDeepgramURL(opts?: StartOptions, streamContext?: StreamContext) {
   const env = enforceSecureProtocol(process.env.NEXT_PUBLIC_WS_URL || "");
+  const path = opts?.engine === "openai-realtime-translate"
+    ? "/ws/stt/openai-realtime-translate"
+    : "/ws/stt/deepgram";
   const params = new URLSearchParams();
   const src = sanitizeLang(opts?.sourceLang);
   const tgt = sanitizeLang(opts?.targetLang);
@@ -69,13 +73,13 @@ function wsDeepgramURL(opts?: StartOptions, streamContext?: StreamContext) {
     if (env.startsWith("ws")) {
       const u = new URL(env);
       u.pathname = ""; u.search = ""; u.hash = "";
-      return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram${suffix}`;
+      return `${u.toString().replace(/\/$/, "")}${path}${suffix}`;
     }
   } catch { }
   const u = new URL(window.location.href);
   u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
   u.pathname = ""; u.search = ""; u.hash = "";
-  return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram${suffix}`;
+  return `${u.toString().replace(/\/$/, "")}${path}${suffix}`;
 }
 
 const PCM_WORKLET_INLINE = `
