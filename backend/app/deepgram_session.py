@@ -27,15 +27,6 @@ def _int_env(name: str, default: int, *, min_value: Optional[int] = None, max_va
     return val
 
 
-def _utterance_end_ms_env(name: str, default: int = 1000) -> int:
-    """
-    Deepgram live streaming currently requires utterance_end_ms to be within
-    1000-5000ms on the shared service. Older local env files used lower values
-    like 300/600, which now cause a 400 reject during websocket connect.
-    """
-    return _int_env(name, default, min_value=1000, max_value=5000)
-
-
 DG_ENDPOINT = os.getenv("DEEPGRAM_ENDPOINT", "wss://api.deepgram.com/v1/listen")
 DG_KEY      = os.getenv("DEEPGRAM_API_KEY")
 DG_MODEL    = os.getenv("DEEPGRAM_MODEL", "nova-3")   # Korean supported
@@ -45,7 +36,7 @@ DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 # nova-3 does not support Chinese; use nova-2 fallback for these language codes.
 _NOVA3_UNSUPPORTED = frozenset({"zh", "zh-cn", "zh-sg", "zh-tw", "zh-hk", "cmn", "yue"})
 DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 500, min_value=200, max_value=6000)
-DG_UTTER_END_MS = _utterance_end_ms_env("DG_UTTER_END_MS", 1000)
+DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 600, min_value=300, max_value=6000)
 _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
 DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 100, min_value=0, max_value=200)
 DG_DEBUG    = os.getenv("DEEPGRAM_DEBUG", "0") not in ("0", "", "false", "False")
@@ -221,7 +212,6 @@ def _qs(
         ("smart_format", "true"),
         ("interim_results", "true"),
         ("encoding", "linear16"),
-        ("channels", "1"),
         ("sample_rate", str(sample_rate)),
         ("vad_events", "true"),
     ]

@@ -2,6 +2,10 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+
+const EXCLUDED_INTERFACE_NAME_RE = /vEthernet|WSL|Hyper-V|Loopback|docker|vboxnet|vmnet|virbr/i;
+const PREFERRED_LAN_IP_RE = /^(10\.|192\.168\.)/;
+
 function isWslEnvironment() {
   if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
   try {
@@ -12,30 +16,34 @@ function isWslEnvironment() {
 }
 
 function getPreferredIP() {
-  const interfaces = os.networkInterfaces();
-  let tenCandidate = null;
-  let homeLanCandidate = null;
-  let private172Candidate = null;
-  let fallback = null;
+  try {
+    const interfaces = os.networkInterfaces();
+    if (!interfaces || typeof interfaces !== 'object') return null;
 
-  for (const name of Object.keys(interfaces)) {
-    if (/vEthernet|WSL|Hyper-V|Loopback|Docker/i.test(name)) continue;
-    for (const iface of interfaces[name] || []) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        if (iface.address.startsWith('10.')) tenCandidate ||= iface.address;
-        else if (iface.address.startsWith('192.168.')) homeLanCandidate ||= iface.address;
-        else if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(iface.address)) private172Candidate ||= iface.address;
-        else fallback ||= iface.address;
+    for (const name of Object.keys(interfaces)) {
+      if (EXCLUDED_INTERFACE_NAME_RE.test(name)) continue;
+      for (const iface of interfaces[name] || []) {
+        if (
+          iface.family === 'IPv4' &&
+          !iface.internal &&
+          PREFERRED_LAN_IP_RE.test(iface.address)
+        ) {
+          return iface.address;
+        }
       }
     }
+  } catch (err) {
+    console.warn(`⚠️ IP detection failed (${err.message}). Falling back to localhost.`);
   }
-  return tenCandidate || homeLanCandidate || private172Candidate || fallback || '127.0.0.1';
+
+  return null;
 }
 
 const explicitHost = (process.env.BACKEND_HOST || '').trim();
 const autoDetect = /^(1|true|yes)$/i.test((process.env.AUTO_DETECT_BACKEND_IP || '').trim());
 const runningInWsl = isWslEnvironment();
-const ip = explicitHost || (runningInWsl ? 'localhost' : (autoDetect ? getPreferredIP() : 'localhost'));
+const detectedIp = autoDetect ? getPreferredIP() : null;
+const ip = explicitHost || (runningInWsl ? 'localhost' : (detectedIp || 'localhost'));
 const envPath = path.join(__dirname, '../.env.local');
 function upsertEnvVars(envFilePath, updates) {
   const existing = fs.existsSync(envFilePath)
@@ -71,7 +79,7 @@ function upsertEnvVars(envFilePath, updates) {
 
 const content = upsertEnvVars(envPath, {
   NEXT_PUBLIC_API_BASE_URL: `http://${ip}:8000`,
-  NEXT_PUBLIC_WS_URL: `ws://${ip}:8000`,
+  NEXT_PUBLIC_WS_URL: `ws://${ip}:8000/ws/translate`,
 });
 
 if (ip === 'localhost') {

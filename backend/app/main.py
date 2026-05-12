@@ -1,6 +1,6 @@
 
 # backend/app/main.py
-import os, json, asyncio, logging, time, re
+import os, json, asyncio, logging, time, re, base64
 from collections import deque
 from threading import Lock
 from typing import Optional, Any, Callable, Awaitable
@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
+import websockets
 
 load_dotenv()
 
@@ -157,6 +158,12 @@ _tx_window_entries: dict[str, deque[dict[str, float]]] = {}
 
 # 16-bit PCM @ 48 kHz: 48000 samples/s × 2 bytes/sample = 96000 bytes/s
 _DEEPGRAM_BYTES_PER_SECOND = 96000
+_OPENAI_REALTIME_TRANSLATE_BYTES_PER_SECOND = 96000
+OPENAI_REALTIME_TRANSLATE_MODEL = os.getenv("OPENAI_REALTIME_TRANSLATE_MODEL", "gpt-realtime-translate")
+OPENAI_REALTIME_TRANSLATE_URL = (
+    "wss://api.openai.com/v1/realtime/translations"
+    f"?model={OPENAI_REALTIME_TRANSLATE_MODEL}"
+)
 _room_sweeper_task: asyncio.Task | None = None
 
 # Per-IP concurrent connection limit for unauthenticated /ws/translate viewers.
@@ -2208,6 +2215,345 @@ async def ws_stt_deepgram(websocket: WebSocket):
             )
         except Exception:
             pass
+
+def _target_language_for_openai_realtime(raw: Optional[str]) -> str:
+    token = (raw or "en").strip().lower()
+    if not token:
+        return "en"
+    aliases = {
+        "en-us": "en",
+        "en-gb": "en",
+        "ko-kr": "ko",
+        "es-es": "es",
+        "es-us": "es",
+        "zh-cn": "zh",
+        "zh-hans": "zh",
+        "zh-tw": "zh",
+        "zh-hant": "zh",
+    }
+    return aliases.get(token, token.split("-")[0] or "en")
+
+
+def _downsample_pcm16_48k_to_24k(pcm: bytes) -> bytes:
+    """Drop every other 16-bit sample. The browser worklet sends mono PCM16 at 48 kHz."""
+    if len(pcm) < 4:
+        return pcm
+    even_len = len(pcm) - (len(pcm) % 4)
+    out = bytearray(even_len // 2)
+    j = 0
+    for i in range(0, even_len, 4):
+        out[j:j + 2] = pcm[i:i + 2]
+        j += 2
+    return bytes(out)
+
+
+def _looks_like_english_sentence(text: str) -> bool:
+    clean = (text or "").strip()
+    if len(clean) < 8:
+        return False
+    return clean[-1:] in {".", "!", "?", "…"}
+
+
+@app.websocket("/ws/stt/openai-realtime-translate")
+async def ws_stt_openai_realtime_translate(websocket: WebSocket):
+    src_lang_full = _clean_lang(websocket.query_params.get("source"), "ko")
+    tgt_lang_full = _clean_lang(websocket.query_params.get("target"), "en")
+    tgt_lang = _target_language_for_openai_realtime(tgt_lang_full)
+    ctx = _context_from_query_params(websocket.query_params)
+    org_id, room_id = _resolve_room_context(
+        org_id=ctx.get("orgId"),
+        room_id=ctx.get("roomId"),
+        service_key=ctx.get("serviceKey"),
+        church_slug=ctx.get("churchSlug"),
+    )
+    service_key = ctx.get("serviceKey")
+    church_slug = ctx.get("churchSlug")
+    host_uid_claim = _uid_from_id_token(ctx.get("idToken"))
+    host_token_claim = ctx.get("hostToken")
+
+    if not org_id or not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+        security_event("ws_auth_rejected", path="/ws/stt/openai-realtime-translate", org_id=org_id or "",
+                       ip=_security_client_ip(websocket), detail="host_auth_failed")
+        await websocket.close(code=1008)
+        return
+    if not room_id:
+        security_event("ws_auth_rejected", path="/ws/stt/openai-realtime-translate", org_id=org_id,
+                       ip=_security_client_ip(websocket), detail="missing_room_id")
+        await websocket.close(code=1008)
+        return
+
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "message": "OPENAI_API_KEY is not configured"})
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+
+    try:
+        oai = await websockets.connect(
+            OPENAI_REALTIME_TRANSLATE_URL,
+            additional_headers={
+                "Authorization": f"Bearer {api_key}",
+                "OpenAI-Safety-Identifier": host_uid_claim or org_id or "worship-translation-host",
+            },
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_size=8 * 1024 * 1024,
+        )
+    except TypeError:
+        # Compatibility with older websockets versions.
+        oai = await websockets.connect(
+            OPENAI_REALTIME_TRANSLATE_URL,
+            extra_headers={
+                "Authorization": f"Bearer {api_key}",
+                "OpenAI-Safety-Identifier": host_uid_claim or org_id or "worship-translation-host",
+            },
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_size=8 * 1024 * 1024,
+        )
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": f"OpenAI realtime translate connect failed: {exc}"})
+        await websocket.close(code=1011)
+        return
+
+    await oai.send(json.dumps({
+        "type": "session.update",
+        "session": {
+            "audio": {
+                "input": {
+                    "transcription": {"model": "gpt-realtime-whisper"},
+                    "noise_reduction": {"type": "near_field"},
+                },
+                "output": {
+                    "language": tgt_lang,
+                },
+            },
+        },
+    }))
+
+    seq = 0
+    closed = asyncio.Event()
+    output_buffer = ""
+    source_buffer = ""
+    flush_task: asyncio.Task | None = None
+    last_audio_touch_ts = 0.0
+    total_audio_bytes = 0
+
+    async def _send_to_producer(message: dict[str, Any]) -> None:
+        if closed.is_set():
+            return
+        if websocket.application_state == WebSocketState.DISCONNECTED:
+            return
+        try:
+            await websocket.send_json(message)
+        except Exception:
+            pass
+
+    async def _broadcast_translation(text: str, *, partial: bool, src_text: str = "") -> None:
+        nonlocal seq
+        clean = " ".join((text or "").split())
+        if not clean:
+            return
+        if not partial:
+            seq += 1
+        meta_payload: dict[str, Any] = {
+            "mode": "openai_realtime_translate",
+            "provider": "openai",
+            "engine": "gpt-realtime-translate",
+            "partial": partial,
+            "segment_id": seq + (1 if partial else 0),
+            "rev": 0,
+            "seq": seq + (1 if partial else 0),
+            "is_final": not partial,
+        }
+        if org_id:
+            meta_payload["org_id"] = org_id
+        if room_id:
+            meta_payload["room_id"] = room_id
+        if service_key:
+            meta_payload["service_key"] = service_key
+        if church_slug:
+            meta_payload["church_slug"] = church_slug
+
+        live_msg_new = {
+            "mode": "realtime" if partial else "live",
+            "text": clean,
+            "seq": meta_payload["seq"],
+            "src": {"text": src_text, "lang": src_lang_full},
+            "tgt": {"lang": tgt_lang_full},
+            "meta": meta_payload.copy(),
+        }
+        if org_id:
+            live_msg_new["orgId"] = org_id
+        if room_id:
+            live_msg_new["roomId"] = room_id
+
+        live_msg_legacy = {
+            "type": "translation",
+            "payload": clean,
+            "lang": tgt_lang_full,
+            "meta": meta_payload.copy(),
+        }
+
+        await _send_to_producer(live_msg_new)
+        await _send_to_producer(live_msg_legacy)
+        try:
+            if org_id and room_id:
+                await asyncio.gather(
+                    manager.broadcast_room(org_id, room_id, live_msg_new),
+                    manager.broadcast_room(org_id, room_id, live_msg_legacy),
+                )
+            else:
+                await asyncio.gather(manager.broadcast(live_msg_new), manager.broadcast(live_msg_legacy))
+        except Exception as exc:
+            print("[OAI-RT][broadcast][error]", exc)
+
+        if not partial and org_id and room_id and clean:
+            if src_text:
+                try:
+                    await manager.broadcast_room(org_id, room_id, {"type": "final_kr", "text": src_text})
+                except Exception:
+                    pass
+            import datetime as _dt
+            _seg_ts = _dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+            asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _safe_append_segment(
+                    org_id, room_id, seq, src_text, clean, "openai_realtime_translate", None, _seg_ts,
+                ),
+            )
+
+    async def _commit_output(reason: str) -> None:
+        nonlocal output_buffer, source_buffer, flush_task
+        text = output_buffer.strip()
+        if not text:
+            return
+        src_text = source_buffer.strip()
+        output_buffer = ""
+        source_buffer = ""
+        flush_task = None
+        print(f"[OAI-RT][commit][{reason}] '{text[:80]}'")
+        await _broadcast_translation(text, partial=False, src_text=src_text)
+
+    def _schedule_idle_flush(delay: float = 1.15) -> None:
+        nonlocal flush_task
+        if flush_task and not flush_task.done():
+            flush_task.cancel()
+        snapshot = output_buffer
+
+        async def _flush_if_idle() -> None:
+            try:
+                await asyncio.sleep(delay)
+                if output_buffer and output_buffer == snapshot:
+                    await _commit_output("idle")
+            except asyncio.CancelledError:
+                pass
+
+        flush_task = asyncio.create_task(_flush_if_idle())
+
+    async def from_client_to_openai() -> None:
+        nonlocal last_audio_touch_ts, total_audio_bytes
+        try:
+            while True:
+                msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                if (b := msg.get("bytes")):
+                    total_audio_bytes += len(b)
+                    pcm24 = _downsample_pcm16_48k_to_24k(b)
+                    await oai.send(json.dumps({
+                        "type": "session.input_audio_buffer.append",
+                        "audio": base64.b64encode(pcm24).decode("ascii"),
+                    }))
+                    if org_id and room_id:
+                        now_ts = time.time()
+                        if (now_ts - last_audio_touch_ts) >= 20:
+                            last_audio_touch_ts = now_ts
+                            asyncio.get_running_loop().run_in_executor(
+                                None, multichurch_store.touch_audio, org_id, room_id
+                            )
+                elif (t := msg.get("text")):
+                    try:
+                        payload = json.loads(t)
+                    except Exception:
+                        payload = {}
+                    if payload.get("type") in {"finalize", "stop"}:
+                        await _commit_output("client_finalize")
+                        if payload.get("type") == "stop":
+                            break
+        except Exception as exc:
+            print("[OAI-RT][client->openai][error]", exc)
+        finally:
+            closed.set()
+
+    async def from_openai_to_server() -> None:
+        nonlocal output_buffer, source_buffer
+        try:
+            async for raw in oai:
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+                etype = str(event.get("type") or "")
+                if etype == "error":
+                    err = event.get("error") or {}
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    await _send_to_producer({"type": "error", "message": msg or "OpenAI realtime translate error"})
+                    continue
+                if etype == "session.output_transcript.delta":
+                    delta = str(event.get("delta") or "")
+                    if not delta:
+                        continue
+                    output_buffer += delta
+                    await _broadcast_translation(output_buffer, partial=True, src_text=source_buffer.strip())
+                    if _looks_like_english_sentence(output_buffer):
+                        await _commit_output("sentence")
+                    else:
+                        _schedule_idle_flush()
+                    continue
+                if etype == "session.input_transcript.delta":
+                    delta = str(event.get("delta") or "")
+                    if not delta:
+                        continue
+                    source_buffer += delta
+                    await _send_to_producer({"type": "stt.partial", "text": source_buffer.strip()})
+                    continue
+                if etype.endswith(".done") or etype.endswith(".completed"):
+                    if "output_transcript" in etype or etype == "session.output_audio.done":
+                        await _commit_output("done")
+        except Exception as exc:
+            print("[OAI-RT][openai->server][error]", exc)
+        finally:
+            closed.set()
+
+    consumer = asyncio.create_task(from_client_to_openai())
+    producer = asyncio.create_task(from_openai_to_server())
+    await closed.wait()
+    consumer.cancel()
+    producer.cancel()
+    if flush_task and not flush_task.done():
+        flush_task.cancel()
+    try:
+        await asyncio.gather(consumer, producer, return_exceptions=True)
+    except Exception:
+        pass
+    try:
+        await _commit_output("shutdown")
+    except Exception:
+        pass
+    try:
+        await oai.close()
+    except Exception:
+        pass
+    if org_id and total_audio_bytes > 0:
+        _audio_secs = total_audio_bytes / _OPENAI_REALTIME_TRANSLATE_BYTES_PER_SECOND
+        _usd = (_audio_secs / 60.0) * 0.034
+        print(f"[OAI-RT][usage] org={org_id} room={room_id} audio_secs={_audio_secs:.1f} estimated_usd={_usd:.4f}")
 
 DEFAULT_DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 

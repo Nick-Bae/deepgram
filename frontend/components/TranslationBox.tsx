@@ -70,6 +70,7 @@ const TTS_PROVIDER_OPTIONS = [
 ] as const
 
 type TTSProvider = (typeof TTS_PROVIDER_OPTIONS)[number]['value']
+type TranslationEngine = 'deepgram' | 'openai-realtime-translate'
 type BroadcastIssueTone = 'warning' | 'critical'
 type BroadcastIssue = {
   id: string
@@ -174,6 +175,7 @@ export default function TranslationBox({
   const [ttsProvider, setTtsProvider] = useState<TTSProvider>('google')
   const [isBroadcasting, setIsBroadcasting] = useState(true)
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
+  const [translationEngine, setTranslationEngine] = useState<TranslationEngine>('deepgram')
   const [displaySpeed, setDisplaySpeed] = useState(1)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const [socketClock, setSocketClock] = useState(() => Date.now())
@@ -255,21 +257,24 @@ export default function TranslationBox({
   // Deepgram mic producer
   const dgController: DeepgramProducerController = useDeepgramProducer()
   const { start: dgStart, stop: dgStop, status, partial, errorMsg, inputLevel, inputMuted, setInputMuted, finalize } = dgController
+  const engineLabel = translationEngine === 'openai-realtime-translate' ? 'OpenAI Realtime Translate' : 'Deepgram + GPT'
   const startProducer = useCallback(async () => {
-    const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string; earlyCommit?: boolean }) => Promise<void>
-    await startWithOptions({ sourceLang, targetLang, earlyCommit: earlyCommitEnabled })
-  }, [dgStart, earlyCommitEnabled, sourceLang, targetLang])
+    const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string; earlyCommit?: boolean; engine?: TranslationEngine }) => Promise<void>
+    await startWithOptions({ sourceLang, targetLang, earlyCommit: earlyCommitEnabled, engine: translationEngine })
+  }, [dgStart, earlyCommitEnabled, sourceLang, targetLang, translationEngine])
   const dgFinalize = useMemo(() => finalize ?? (() => {}), [finalize])
 
   // TTS refs
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const ttsQueueRef = useRef<QueuedTTS[]>([])
   const speakingRef = useRef(false)
-  const lastHandledSeqRef = useRef(0)       // gate: handle each seq once (final or soft-final)
+  const lastHandledSeqRef = useRef(0)       // gate finalized broadcasts only
+  const softTTSHandledSeqRef = useRef(0)
   const lastFinalTranslatedAtRef = useRef(0) // timestamp of last final translation display
   const currentSpokenRef = useRef('')
   const pendingControllersRef = useRef<Set<AbortController>>(new Set())
   const pendingRequestsRef = useRef<Map<string, Promise<string>>>(new Map())
+  const queuedTTSKeysRef = useRef<Set<string>>(new Set())
   const audioUnlockedRef = useRef(false)
   const ttsIdRef = useRef(0)
   const ttsEffectBootRef = useRef(false)
@@ -573,6 +578,7 @@ export default function TranslationBox({
     pendingControllersRef.current.clear();
     ttsQueueRef.current.forEach(chunk => URL.revokeObjectURL(chunk.url));
     ttsQueueRef.current = [];
+    queuedTTSKeysRef.current.clear();
     speakingRef.current = false;
     currentSpokenRef.current = '';
     const audio = audioRef.current;
@@ -651,6 +657,7 @@ export default function TranslationBox({
     const finalize = () => {
       const finished = ttsQueueRef.current.shift();
       if (finished) {
+        queuedTTSKeysRef.current.delete(finished.text);
         URL.revokeObjectURL(finished.url);
       }
       speakingRef.current = false;
@@ -688,12 +695,17 @@ export default function TranslationBox({
       console.log('[FE][TTS][drop-current-dup]', clip(t));
       return;
     }
+    if (queuedTTSKeysRef.current.has(t)) {
+      console.log('[FE][TTS][drop-queued-dup]', clip(t));
+      return;
+    }
     const tail = ttsQueueRef.current[ttsQueueRef.current.length - 1];
     if (tail?.text === t) {
       console.log('[FE][TTS][drop-tail-dup]', clip(t));
       return;
     }
 
+    queuedTTSKeysRef.current.add(t);
     unlockAudio();
     fetchTTSAudio(t)
       .then((url) => {
@@ -705,6 +717,7 @@ export default function TranslationBox({
         }
       })
       .catch((err) => {
+        queuedTTSKeysRef.current.delete(t);
         console.warn('[FE][TTS][fetch-error]', err);
       });
   }, [fetchTTSAudio, isMuted, playNext, unlockAudio]);
@@ -839,9 +852,14 @@ export default function TranslationBox({
       };
       softMapRef.current.set(seq, entry);
       const stable = entry.count >= 2 || (now - entry.first) > 900;
-      if (stable && endsWithSentenceBoundary(incoming) && seq > lastHandledSeqRef.current) {
+      if (
+        stable &&
+        endsWithSentenceBoundary(incoming) &&
+        seq > lastHandledSeqRef.current &&
+        seq > softTTSHandledSeqRef.current
+      ) {
         console.log('[FE][WS][soft-final]', { seq, out: clip(incoming) });
-        lastHandledSeqRef.current = seq;
+        softTTSHandledSeqRef.current = seq;
         if (!isMuted && incoming !== currentSpokenRef.current) {
           enqueueFinalTTS(incoming);
         }
@@ -1093,7 +1111,7 @@ export default function TranslationBox({
       issues.push({
         id: 'deepgram-error',
         tone: 'critical',
-        title: 'Microphone or Deepgram connection failed',
+        title: `Microphone or ${engineLabel} connection failed`,
         detail: errorMsg,
       })
     } else if (deepgramRecovering) {
@@ -1119,6 +1137,7 @@ export default function TranslationBox({
     connectionState,
     deepgramDowntimeLabel,
     deepgramRecovering,
+    engineLabel,
     disconnectStartedAt,
     errorMsg,
     failOpenMeta,
@@ -1354,7 +1373,7 @@ export default function TranslationBox({
                   ) : null}
                   {status !== 'streaming' && status !== 'idle' && status !== 'stopped' ? (
                     <span className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[11px] font-semibold" style={broadcastAlertBadgeStyle}>
-                      Deepgram {status}
+                      {engineLabel} {status}
                     </span>
                   ) : null}
                 </div>
@@ -1516,7 +1535,7 @@ export default function TranslationBox({
               <div className="grid gap-2.5" style={dashboardCardStyle}>
                 {([
                   { label: 'Broadcast output', desc: isBroadcasting ? 'Listeners are receiving translated output.' : 'Output is paused for listeners.', value: isBroadcasting, onToggle: () => setIsBroadcasting(v => !v) },
-                  { label: 'Early preview', desc: earlyCommitEnabled ? 'Preview text is shown before final commit.' : 'Only finalized clauses are displayed.', value: earlyCommitEnabled, onToggle: () => setEarlyCommitEnabled(v => !v) },
+                  { label: 'Early preview', desc: translationEngine === 'deepgram' ? (earlyCommitEnabled ? 'Preview text is shown before final commit.' : 'Only finalized clauses are displayed.') : 'Handled by the OpenAI realtime translation stream.', value: translationEngine === 'deepgram' && earlyCommitEnabled, onToggle: () => translationEngine === 'deepgram' && setEarlyCommitEnabled(v => !v) },
                   { label: 'Audience TTS', desc: ttsAudienceEnabled ? 'Speech synthesis is active.' : 'Speech synthesis is muted.', value: ttsAudienceEnabled, onToggle: () => setIsMuted(m => !m) },
                 ] as const).map(item => (
                   <div key={item.label} className="flex items-center justify-between gap-4 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
@@ -1553,6 +1572,19 @@ export default function TranslationBox({
 
               {showAdvancedControls ? (
                 <div className="grid gap-3" style={dashboardCardStyle}>
+                  <div className="grid gap-1.5 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
+                    <label style={utilityLabelStyle}>Translation Engine</label>
+                    <select
+                      value={translationEngine}
+                      onChange={e => setTranslationEngine(e.target.value as TranslationEngine)}
+                      disabled={isListening}
+                      className="w-full rounded-[0.9rem] px-3 py-2 text-sm font-medium focus:outline-none"
+                      style={{ ...inputStyle, border: 'none', opacity: isListening ? 0.62 : 1 }}
+                    >
+                      <option value="deepgram" className="bg-white text-slate-900">Deepgram + GPT text translation</option>
+                      <option value="openai-realtime-translate" className="bg-white text-slate-900">OpenAI gpt-realtime-translate</option>
+                    </select>
+                  </div>
                   <div className="grid gap-2 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
                     <div className="flex items-center justify-between gap-4">
                       <span style={utilityBodyStyle}>Display speed</span>
@@ -1593,7 +1625,7 @@ export default function TranslationBox({
                       `Reconnect · ${reconnectAttemptLabel}`,
                       `Downtime · ${socketDowntimeLabel}`,
                       `Latency · ${latencyMs === null ? '—' : `${latencyMs}ms`}`,
-                      `Deepgram · ${status}`,
+                      `${engineLabel} · ${status}`,
                     ].map(label => (
                       <span key={label} className="rounded-full px-2.5 py-1 text-[10px] font-semibold" style={chipStyle}>{label}</span>
                     ))}
