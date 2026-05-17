@@ -39,7 +39,7 @@ DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 # nova-3 does not support Chinese; use nova-2 fallback for these language codes.
 _NOVA3_UNSUPPORTED = frozenset({"zh", "zh-cn", "zh-sg", "zh-tw", "zh-hk", "cmn", "yue"})
 DG_ENDPOINTING_MS = _int_env("DG_ENDPOINTING_MS", 500, min_value=200, max_value=6000)
-DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 600, min_value=300, max_value=6000)
+DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 1000, min_value=1000, max_value=6000)
 _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
 DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 100, min_value=0, max_value=200)
 DG_DEBUG    = os.getenv("DEEPGRAM_DEBUG", "0") not in ("0", "", "false", "False")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from urllib.parse import parse_qs
 import unittest
+from unittest.mock import patch
 
 from app import deepgram_session
 
@@ -58,6 +59,18 @@ class DeepgramSessionTests(unittest.TestCase):
             len(f"{deepgram_session.DG_ENDPOINT}?{query}"),
             2200,
         )
+
+    def test_utterance_end_env_rejects_values_below_deepgram_floor(self) -> None:
+        with patch.dict("os.environ", {"DG_UTTER_END_MS": "600"}):
+            self.assertEqual(
+                deepgram_session._int_env(
+                    "DG_UTTER_END_MS",
+                    1000,
+                    min_value=1000,
+                    max_value=6000,
+                ),
+                1000,
+            )
 
 
 if __name__ == "__main__":
