@@ -1,11 +1,14 @@
 # backend/app/deepgram_session.py
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlencode
 from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 import websockets
 from websockets import legacy as ws_legacy  # fallback for websockets<=13
+from websockets.exceptions import InvalidStatus
+from websockets.legacy.exceptions import InvalidStatusCode
 
 from app.config.deepgram_keywords import DEFAULT_DEEPGRAM_KEYWORDS, DEFAULT_DEEPGRAM_REPLACEMENTS
 
@@ -40,11 +43,14 @@ DG_UTTER_END_MS = _int_env("DG_UTTER_END_MS", 600, min_value=300, max_value=6000
 _ENV_KEYWORDS = [t.strip() for t in os.getenv("DEEPGRAM_KEYWORDS", "").split(",") if t.strip()]
 DG_KEYWORDS_LIMIT = _int_env("DEEPGRAM_KEYWORDS_LIMIT", 100, min_value=0, max_value=200)
 DG_DEBUG    = os.getenv("DEEPGRAM_DEBUG", "0") not in ("0", "", "false", "False")
+DG_MAX_URL_CHARS = _int_env("DG_MAX_URL_CHARS", 7500, min_value=2000, max_value=16000)
 
 _KEYWORD_FILE_ENV = os.getenv("DEEPGRAM_KEYWORDS_FILE")
 DG_KEYWORDS_FILE = Path(_KEYWORD_FILE_ENV).expanduser() if _KEYWORD_FILE_ENV else None
 _KEYWORD_CACHE: Optional[List[str]] = None
 _KEYWORD_MTIME: Optional[float] = None
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_TERM_CHARS = 100
 
 
 def _inline_keywords() -> List[str]:
@@ -64,7 +70,7 @@ def _normalize_keyword_entries(raw: Optional[List[str]]) -> List[Tuple[str, Opti
         if not token:
             continue
 
-        term, _, boost = token.partition(":")
+        term, sep, boost = token.partition(":")
         term = term.strip()
         if not term:
             continue
@@ -79,10 +85,21 @@ def _normalize_keyword_entries(raw: Optional[List[str]]) -> List[Tuple[str, Opti
             try:
                 float(boost)
             except ValueError:
-                boost = ""
+                continue
+        elif sep:
+            continue
         normalized.append((term, boost or None))
 
     return normalized
+
+
+def _clean_deepgram_text(value: object, *, allow_colon: bool = True) -> str:
+    text = _CONTROL_CHARS_RE.sub(" ", str(value or "")).strip()
+    text = re.sub(r"\s+", " ", text)
+    if not allow_colon and ":" in text:
+        return ""
+    return text[:_MAX_TERM_CHARS].strip()
+
 
 def _load_keywords_from_file() -> Optional[List[str]]:
     global _KEYWORD_CACHE, _KEYWORD_MTIME
@@ -178,8 +195,8 @@ def _build_replace_list(
 
     def _add(pairs: List[Tuple[str, str]]) -> None:
         for find, replacement in pairs:
-            find = (find or "").strip()
-            replacement = (replacement or "").strip()
+            find = _clean_deepgram_text(find, allow_colon=False)
+            replacement = _clean_deepgram_text(replacement)
             if not find:
                 continue
             key = find.lower()
@@ -194,6 +211,24 @@ def _build_replace_list(
         print(f"[DG] _build_replace_list: {len(result)} pairs "
               f"(org={len(org_custom or [])}, defaults={len(DEFAULT_DEEPGRAM_REPLACEMENTS)})")
     return result
+
+
+def _append_with_url_budget(
+    params: List[Tuple[str, str]],
+    name: str,
+    values: List[str],
+    *,
+    endpoint: str = DG_ENDPOINT,
+) -> int:
+    added = 0
+    for value in values:
+        candidate = params + [(name, value)]
+        candidate_url = f"{endpoint}?{urlencode(candidate, doseq=True)}"
+        if len(candidate_url) > DG_MAX_URL_CHARS:
+            break
+        params.append((name, value))
+        added += 1
+    return added
 
 
 def _qs(
@@ -224,21 +259,54 @@ def _qs(
 
     # Repeated 'keywords' with a boost works on nova-2/enhanced/base
     if normalized_keywords and model in ("nova-2", "enhanced", "base"):
-        for term, boost in normalized_keywords:
-            bias = boost or "3"
-            params.append(("keywords", f"{term}:{bias}"))
+        values = [f"{term}:{boost or '3'}" for term, boost in normalized_keywords]
+        added = _append_with_url_budget(params, "keywords", values)
+        if DG_DEBUG and added < len(values):
+            print(f"[DG] trimmed keywords by URL budget: {len(values)} -> {added}")
 
     # If someone flips to nova-3 later, map keywords -> keyterm (nova-3 style)
     if model.startswith("nova-3") and normalized_keywords:
-        for term, _ in normalized_keywords:
-            params.append(("keyterm", term))
+        values = [_clean_deepgram_text(term, allow_colon=False) for term, _ in normalized_keywords]
+        values = [term for term in values if term]
+        added = _append_with_url_budget(params, "keyterm", values)
+        if DG_DEBUG and added < len(values):
+            print(f"[DG] trimmed keyterms by URL budget: {len(values)} -> {added}")
 
     # Find-and-replace: post-processing corrections (nova-3, not Flux)
     if replacements:
-        for find, replacement in replacements:
-            params.append(("replace", f"{find}:{replacement}"))
+        values = [
+            f"{find}:{replacement}"
+            for find, replacement in _build_replace_list(replacements, limit=200)
+        ]
+        added = _append_with_url_budget(params, "replace", values)
+        if DG_DEBUG and added < len(values):
+            print(f"[DG] trimmed replacements by URL budget: {len(values)} -> {added}")
 
     return urlencode(params, doseq=True)
+
+
+def _deepgram_connect_error(exc: Exception) -> str:
+    if isinstance(exc, InvalidStatus):
+        response = exc.response
+        parts = [f"server rejected WebSocket connection: HTTP {response.status_code}"]
+        request_id = response.headers.get("dg-request-id") or response.headers.get("request-id")
+        if request_id:
+            parts.append(f"request_id={request_id}")
+        body = getattr(response, "body", b"") or b""
+        if body:
+            detail = body.decode("utf-8", errors="replace").strip()
+            if detail:
+                parts.append(detail[:500])
+        return " | ".join(parts)
+
+    if isinstance(exc, InvalidStatusCode):
+        parts = [f"server rejected WebSocket connection: HTTP {exc.status_code}"]
+        request_id = exc.headers.get("dg-request-id") or exc.headers.get("request-id")
+        if request_id:
+            parts.append(f"request_id={request_id}")
+        return " | ".join(parts)
+
+    return str(exc)
 
 
 def deepgram_model_for_language(language: str) -> str:
@@ -288,10 +356,15 @@ async def connect_to_deepgram(
         )
     except TypeError:
         # websockets <=13: legacy API uses extra_headers
-        return await ws_legacy.client.connect(
-            url,
-            extra_headers=headers,
-            ping_interval=20,
-            open_timeout=20,
-            max_size=None,
-        )
+        try:
+            return await ws_legacy.client.connect(
+                url,
+                extra_headers=headers,
+                ping_interval=20,
+                open_timeout=20,
+                max_size=None,
+            )
+        except Exception as exc:
+            raise RuntimeError(_deepgram_connect_error(exc)) from exc
+    except Exception as exc:
+        raise RuntimeError(_deepgram_connect_error(exc)) from exc
