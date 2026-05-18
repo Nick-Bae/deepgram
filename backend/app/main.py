@@ -1767,6 +1767,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             }
             if meta_extra:
                 meta_payload.update(meta_extra)
+            meta_payload.setdefault("source_text", clean_src)
             if org_id:
                 meta_payload["org_id"] = org_id
             if room_id:

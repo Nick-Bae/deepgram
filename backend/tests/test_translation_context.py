@@ -144,6 +144,30 @@ class TranslationContextTests(unittest.TestCase):
         self.assertEqual(subject, "This God here is the One who made the heavens and the earth")
         self.assertEqual(pronoun, "he")
 
+    def test_infer_subject_from_context_history_uses_proper_name_led_prior_subject(self) -> None:
+        ctx = translate_module.TranslationContext(subject="the congregation", pronoun="we")
+        ctx.remember("느헤미야는 토비아의 세간을 밖으로 내던집니다.", "Nehemiah throws Tobiah's belongings outside.")
+
+        subject, pronoun = translate_module._infer_subject_from_context_history(ctx)
+
+        self.assertEqual(subject, "Nehemiah")
+        self.assertEqual(pronoun, "he")
+
+    def test_user_content_keeps_named_subject_for_short_subjectless_continuation(self) -> None:
+        ctx = translate_module.TranslationContext(subject="Nehemiah", pronoun="he")
+        ctx.remember("느헤미야는 토비아의 세간을 밖으로 내던집니다.", "Nehemiah throws Tobiah's belongings outside.")
+
+        block = translate_module._build_user_content_block(
+            "방을 정결하게",
+            ctx,
+            "방을 정결하게",
+            had_established_context=True,
+            update_ctx=True,
+        )
+
+        self.assertIn('The subject of this clause is "Nehemiah" (he)', block)
+        self.assertNotIn('The subject of this clause is "the congregation" (we)', block)
+
     def test_enforce_subject_guardrails_keeps_divine_third_person_without_honorific(self) -> None:
         ctx = translate_module.TranslationContext(
             subject="This God here is the One who made the heavens and the earth",

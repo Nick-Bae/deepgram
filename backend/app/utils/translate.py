@@ -774,6 +774,30 @@ def _has_established_context(ctx: Optional[TranslationContext]) -> bool:
     return bool(ctx.recent_pairs or ctx.last_english)
 
 
+def _has_named_third_person_context(ctx: Optional[TranslationContext]) -> bool:
+    """True when recent context names a third-person actor worth carrying forward."""
+    if not ctx:
+        return False
+    pronoun = _normalize_pronoun(ctx)
+    if pronoun not in ("he", "she"):
+        return False
+    subject = " ".join((ctx.subject or "").split()).strip()
+    if not subject:
+        return False
+    low = subject.lower()
+    generic_subjects = {
+        "",
+        "the congregation",
+        "the speaker",
+        "the man being described",
+        "the woman being described",
+        "the people being described",
+    }
+    if low in generic_subjects:
+        return False
+    return True
+
+
 _CONTEXTUAL_KO_PREFIXES = (
     "그리고",
     "그런데",
@@ -959,6 +983,31 @@ def _infer_subject_from_english(
         return head, "she"
     if re.match(r"^(jesus|christ|lord|god)\b", low):
         return head, "he"
+
+    # Proper-name led narration, common in scripture/sermon examples:
+    # "Nehemiah throws..." should establish Nehemiah as the carried subject
+    # for the next subjectless Korean clause.
+    name_match = re.match(r"^([A-Z][A-Za-z'’-]{2,})(?:\s|$)", head)
+    if name_match:
+        name = name_match.group(1).strip()
+        if name.lower() not in {
+            "the",
+            "this",
+            "that",
+            "these",
+            "those",
+            "and",
+            "but",
+            "then",
+            "therefore",
+            "so",
+            "when",
+            "where",
+            "what",
+            "why",
+            "how",
+        }:
+            return name, "he"
 
     # Singular named/referential subject phrases that should carry forward as "he"
     # even when the clause does not begin with a pronoun, e.g. "This God...",
@@ -1285,6 +1334,7 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
         and not explicit_pronoun
         and not _has_ko_honorific_verb(source_text)
         and not _has_divine_subject_context(ctx)
+        and not (_has_named_third_person_context(ctx) and _needs_recent_context(source_text))
     ):
         return en
 
@@ -1441,6 +1491,7 @@ def _build_user_content_block(
         pronoun_hint in ("he", "she")
         and not _has_ko_honorific_verb(text)
         and not _detect_third_person_pronoun(text)
+        and not (_has_named_third_person_context(ctx_for_prompt) and _needs_recent_context(text))
     ):
         subject_hint = ENV.CONTEXT_SUBJECT
         pronoun_hint = ENV.CONTEXT_PRONOUN

@@ -385,6 +385,7 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
               meta: { ...(prev.meta ?? {}), ...meta },
             }));
           } else {
+            const srcText = typeof meta.source_text === 'string' ? meta.source_text : undefined;
             setLast({
               text: b.payload ?? meta.translated ?? '',
               lang: b.lang ?? 'en',
@@ -395,6 +396,7 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
               segmentId: segId,
               rev,
               seq,
+              srcText,
               meta,
             });
           }
