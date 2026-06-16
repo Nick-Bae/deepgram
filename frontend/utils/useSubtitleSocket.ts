@@ -18,23 +18,29 @@ type Translation = {
   };
 };
 type DisplayConfig = { type: "display_config"; speed?: number; speedFactor?: number };
+type TranslatedAudio = { type: "translated_audio"; data: string; sampleRate?: number; provider?: string };
 
 function isInterim(m: any): m is InterimKR { return m && m.type === "interim_kr" && typeof m.text === "string"; }
 function isFinalKR(m: any): m is FinalKR   { return m && m.type === "final_kr"  && typeof m.text === "string"; }
 function isFastFinal(m: any): m is FastFinal { return m && m.type === "fast_final" && typeof m.en === "string"; }
 function isTranslation(m: any): m is Translation { return m && m.type === "translation"; }
 function isDisplayConfig(m: any): m is DisplayConfig { return m && m.type === "display_config"; }
+function isTranslatedAudio(m: any): m is TranslatedAudio {
+  return m && m.type === "translated_audio" && typeof m.data === "string";
+}
 
 type Options = {
   maxLines?: number;           // how many lines to keep on screen
   track?: "en" | "kr" | "both" // which language(s) to keep as lines
   enabled?: boolean;
+  onTranslatedAudio?: (data: string, sampleRate: number, provider?: string) => void;
 };
 
 export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const maxLines = Math.max(1, opts.maxLines ?? 3);
   const track = opts.track ?? "en";
   const enabled = opts.enabled ?? true;
+  const onTranslatedAudioRef = useRef(opts.onTranslatedAudio);
   const streamContext = useMemo(() => resolveStreamContext(explicitUrl), [explicitUrl]);
 
   const [connected, setConnected] = useState(false);
@@ -59,6 +65,10 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const stopFlag = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const contextRef = useRef<StreamContext>({});
+
+  useEffect(() => {
+    onTranslatedAudioRef.current = opts.onTranslatedAudio;
+  }, [opts.onTranslatedAudio]);
 
   // Resolve viewing WS URL (append role=viewer)
   const resolvedUrl = useMemo(() => {
@@ -313,6 +323,15 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
               const raw = typeof msg.speed === "number" ? msg.speed : msg.speedFactor;
               const next = typeof raw === "number" && Number.isFinite(raw) ? raw : 1;
               displaySpeedRef.current = Math.max(0.6, Math.min(1.6, next));
+              return;
+            }
+
+            if (isTranslatedAudio(msg)) {
+              onTranslatedAudioRef.current?.(
+                msg.data,
+                typeof msg.sampleRate === "number" ? msg.sampleRate : 24000,
+                msg.provider,
+              );
               return;
             }
 

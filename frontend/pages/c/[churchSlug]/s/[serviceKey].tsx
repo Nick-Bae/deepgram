@@ -7,6 +7,7 @@ import { API_URL, WS_URL } from "../../../../utils/urls";
 import { useSubtitleSocket } from "../../../../utils/useSubtitleSocket";
 import { appendStreamContextToUrl, clearRoomInSession, persistStreamContext } from "../../../../utils/streamContext";
 import { useTTS } from "../../../../utils/useTTS";
+import { usePcmAudioPlayer } from "../../../../utils/usePcmAudioPlayer";
 
 type ResolveResponse = {
   orgId: string;
@@ -108,20 +109,30 @@ export default function ChurchServiceListenerPage() {
     );
   }, [resolveData, serviceKey, slug, socketEnabled]);
 
+  const targetLang = resolveData?.languagePair?.target || "en";
+  const { enabled: ttsEnabled, setEnabled: setTtsEnabled, speak } = useTTS(targetLang);
+  const { enqueue: enqueuePcmAudio, unlock: unlockPcmAudio } = usePcmAudioPlayer(ttsEnabled);
+  const lastNativeAudioAtRef = useRef(0);
+  const handleTranslatedAudio = useCallback((data: string, sampleRate: number) => {
+    if (enqueuePcmAudio(data, sampleRate)) {
+      lastNativeAudioAtRef.current = Date.now();
+    }
+  }, [enqueuePcmAudio]);
+
   const { connected, krLines, enLines } = useSubtitleSocket(scopedWsUrl, {
     maxLines: 4,
     track: "both",
     enabled: socketEnabled,
+    onTranslatedAudio: handleTranslatedAudio,
   });
 
-  const targetLang = resolveData?.languagePair?.target || "en";
-  const { enabled: ttsEnabled, setEnabled: setTtsEnabled, speak } = useTTS(targetLang);
   const lastSpokenLineRef = useRef("");
 
   useEffect(() => {
     const lastLine = enLines[enLines.length - 1];
     if (!lastLine || lastLine === lastSpokenLineRef.current) return;
     lastSpokenLineRef.current = lastLine;
+    if (Date.now() - lastNativeAudioAtRef.current < 2500) return;
     speak(lastLine);
   }, [enLines, speak]);
 
@@ -302,6 +313,9 @@ export default function ChurchServiceListenerPage() {
           onClick={() => {
             const next = !ttsEnabled;
             setTtsEnabled(next);
+            if (next) {
+              void unlockPcmAudio();
+            }
             if (next && typeof window !== "undefined" && "speechSynthesis" in window) {
               try {
                 window.speechSynthesis.cancel();

@@ -13,7 +13,7 @@ type StartOptions = {
   sourceLang?: string;
   targetLang?: string;
   earlyCommit?: boolean;
-  engine?: "deepgram" | "openai-realtime-translate";
+  engine?: "deepgram" | "openai-realtime-translate" | "gemini-live-translate";
   orgId?: string;
   roomId?: string;
   serviceKey?: string;
@@ -51,7 +51,9 @@ function wsDeepgramURL(opts?: StartOptions, streamContext?: StreamContext) {
   const env = enforceSecureProtocol(process.env.NEXT_PUBLIC_WS_URL || "");
   const path = opts?.engine === "openai-realtime-translate"
     ? "/ws/stt/openai-realtime-translate"
-    : "/ws/stt/deepgram";
+    : opts?.engine === "gemini-live-translate"
+      ? "/ws/stt/gemini-live-translate"
+      : "/ws/stt/deepgram";
   const params = new URLSearchParams();
   const src = sanitizeLang(opts?.sourceLang);
   const tgt = sanitizeLang(opts?.targetLang);

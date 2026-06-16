@@ -70,7 +70,7 @@ const TTS_PROVIDER_OPTIONS = [
 ] as const
 
 type TTSProvider = (typeof TTS_PROVIDER_OPTIONS)[number]['value']
-type TranslationEngine = 'deepgram' | 'openai-realtime-translate'
+type TranslationEngine = 'deepgram' | 'openai-realtime-translate' | 'gemini-live-translate'
 type BroadcastIssueTone = 'warning' | 'critical'
 type BroadcastIssue = {
   id: string
@@ -257,7 +257,12 @@ export default function TranslationBox({
   // Deepgram mic producer
   const dgController: DeepgramProducerController = useDeepgramProducer()
   const { start: dgStart, stop: dgStop, status, partial, errorMsg, inputLevel, inputMuted, setInputMuted, finalize } = dgController
-  const engineLabel = translationEngine === 'openai-realtime-translate' ? 'OpenAI Realtime Translate' : 'Deepgram + GPT'
+  const engineLabel =
+    translationEngine === 'openai-realtime-translate'
+      ? 'OpenAI Realtime Translate'
+      : translationEngine === 'gemini-live-translate'
+        ? 'Gemini 3.5 Live Translate'
+        : 'Deepgram + GPT'
   const startProducer = useCallback(async () => {
     const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string; earlyCommit?: boolean; engine?: TranslationEngine }) => Promise<void>
     await startWithOptions({ sourceLang, targetLang, earlyCommit: earlyCommitEnabled, engine: translationEngine })
@@ -1535,7 +1540,7 @@ export default function TranslationBox({
               <div className="grid gap-2.5" style={dashboardCardStyle}>
                 {([
                   { label: 'Broadcast output', desc: isBroadcasting ? 'Listeners are receiving translated output.' : 'Output is paused for listeners.', value: isBroadcasting, onToggle: () => setIsBroadcasting(v => !v) },
-                  { label: 'Early preview', desc: translationEngine === 'deepgram' ? (earlyCommitEnabled ? 'Preview text is shown before final commit.' : 'Only finalized clauses are displayed.') : 'Handled by the OpenAI realtime translation stream.', value: translationEngine === 'deepgram' && earlyCommitEnabled, onToggle: () => translationEngine === 'deepgram' && setEarlyCommitEnabled(v => !v) },
+                  { label: 'Early preview', desc: translationEngine === 'deepgram' ? (earlyCommitEnabled ? 'Preview text is shown before final commit.' : 'Only finalized clauses are displayed.') : 'Handled by the selected realtime translation stream.', value: translationEngine === 'deepgram' && earlyCommitEnabled, onToggle: () => translationEngine === 'deepgram' && setEarlyCommitEnabled(v => !v) },
                   { label: 'Audience TTS', desc: ttsAudienceEnabled ? 'Speech synthesis is active.' : 'Speech synthesis is muted.', value: ttsAudienceEnabled, onToggle: () => setIsMuted(m => !m) },
                 ] as const).map(item => (
                   <div key={item.label} className="flex items-center justify-between gap-4 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
@@ -1583,6 +1588,7 @@ export default function TranslationBox({
                     >
                       <option value="deepgram" className="bg-white text-slate-900">Deepgram + GPT text translation</option>
                       <option value="openai-realtime-translate" className="bg-white text-slate-900">OpenAI gpt-realtime-translate</option>
+                      <option value="gemini-live-translate" className="bg-white text-slate-900">Gemini 3.5 Live Translate (preview)</option>
                     </select>
                   </div>
                   <div className="grid gap-2 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
