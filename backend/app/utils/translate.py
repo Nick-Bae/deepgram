@@ -669,6 +669,28 @@ def _language_name(code_or_name: str) -> str:
     return mapping.get(key, code_or_name)
 
 
+def _primary_language(code_or_name: str, default: str = "") -> str:
+    key = (code_or_name or "").strip().lower()
+    if not key:
+        return default
+    if key in {"korean", "한국어", "kr"}:
+        return "ko"
+    if key in {"english", "영어"}:
+        return "en"
+    return key.split("-", 1)[0] or default
+
+
+def contains_hangul(text: str) -> bool:
+    return bool(_HANGUL_RE.search(text or ""))
+
+
+def is_invalid_translation_output(text: str, source: str, target: str) -> bool:
+    """Reject Korean text leaking into English target output."""
+    source_primary = _primary_language(source, "ko")
+    target_primary = _primary_language(target, "en")
+    return source_primary != target_primary and target_primary == "en" and contains_hangul(text)
+
+
 def _normalize_pronoun(ctx: Optional[TranslationContext]) -> Optional[str]:
     if not ctx:
         return None
@@ -1665,6 +1687,16 @@ async def translate_text(
             out = _enforce_we_guardrails(out, text, ctx)
         if target.lower().startswith("en"):
             out = _normalize_english_pronoun_case(out)
+        if is_invalid_translation_output(out, source, target):
+            if usage_out is not None:
+                usage_out.update(
+                    {
+                        "failOpen": True,
+                        "errorMessage": "target_language_mismatch",
+                    }
+                )
+            print("[TX] rejected translation containing Korean for English target")
+            return ""
 
         if ctx and update_ctx:
             # Only propagate subject/pronoun from the English output when we had
@@ -1826,6 +1858,22 @@ async def translate_text_streaming(
         assembled = _enforce_we_guardrails(assembled, text, ctx)
     if target.lower().startswith("en"):
         assembled = _normalize_english_pronoun_case(assembled)
+    if is_invalid_translation_output(assembled, source, target):
+        if usage_out is not None:
+            total = prompt_tokens + completion_tokens
+            usage_out.update(
+                {
+                    "promptTokens": prompt_tokens,
+                    "completionTokens": completion_tokens,
+                    "totalTokens": total,
+                    "model": model_name,
+                    "finalText": "",
+                    "failOpen": True,
+                    "errorMessage": "target_language_mismatch",
+                }
+            )
+        print("[TX][stream] rejected translation containing Korean for English target")
+        return
 
     if ctx and update_ctx:
         explicit_ko_subject = (

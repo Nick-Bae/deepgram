@@ -21,10 +21,12 @@ class TranslationContextTests(unittest.TestCase):
         ctx.remember("둘째 문장", "Second sentence")
         ctx.remember("셋째 문장", "Third sentence")
         ctx.remember("넷째 문장", "Fourth sentence")
+        ctx.remember("다섯째 문장", "Fifth sentence")
+        ctx.remember("여섯째 문장", "Sixth sentence")
 
-        self.assertEqual(len(ctx.recent_pairs), 3)
+        self.assertEqual(len(ctx.recent_pairs), 5)
         self.assertEqual(ctx.recent_pairs[0]["source"], "둘째 문장")
-        self.assertEqual(ctx.last_english, "Fourth sentence")
+        self.assertEqual(ctx.last_english, "Sixth sentence")
 
     def test_build_recent_context_block_uses_recent_bilingual_history(self) -> None:
         ctx = translate_module.TranslationContext()

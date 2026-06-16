@@ -4,7 +4,9 @@ import {
   createUserWithEmailAndPassword,
   deleteUser,
   getAdditionalUserInfo,
+  linkWithPopup,
   onAuthStateChanged,
+  reauthenticateWithPopup,
   sendEmailVerification,
   signInWithEmailAndPassword,
   signInWithPopup,
@@ -23,6 +25,13 @@ type AuthContextValue = {
   configured: boolean;
   missingEnv: readonly string[];
   getIdToken: (forceRefresh?: boolean) => Promise<string | null>;
+  getGoogleAccessToken: () => string | null;
+  /** True if the current user has google.com in providerData. */
+  hasGoogleLinked: () => boolean;
+  /** Links Google as an additional provider on the current user (for
+   *  email/password accounts), or re-authorizes if already linked but the
+   *  cached access token is gone/expired. Returns the fresh access token. */
+  connectGoogleForDocs: () => Promise<string>;
   login: (email: string, password: string) => Promise<User>;
   loginWithGoogle: () => Promise<User>;
   signupWithGoogle: () => Promise<User>;
@@ -31,6 +40,13 @@ type AuthContextValue = {
   sendPasswordReset: (email: string) => Promise<void>;
   logout: () => Promise<void>;
 };
+
+const GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents.readonly";
+// Drive scope lets us open the Google Picker so users browse their docs
+// instead of pasting URLs; readonly is the narrowest scope Picker will accept
+// to list arbitrary user files.
+const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly";
+const GOOGLE_TOKEN_STORAGE_KEY = "wt:google_access_token";
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
@@ -82,11 +98,29 @@ export function AuthProvider({ children }: Props) {
     return cred.user;
   }, []);
 
+  const buildGoogleProvider = useCallback(() => {
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: "select_account" });
+    // Docs scope lets the backend read content via the Docs API; Drive scope
+    // lets the frontend open Google Picker so users browse their files. Token
+    // is stashed in sessionStorage and forwarded as X-Google-Access-Token at
+    // ingest time.
+    provider.addScope(GOOGLE_DOCS_SCOPE);
+    provider.addScope(GOOGLE_DRIVE_SCOPE);
+    return provider;
+  }, []);
+
+  const stashGoogleAccessToken = useCallback((token: string | null | undefined) => {
+    if (!token || typeof window === "undefined") return;
+    try {
+      window.sessionStorage.setItem(GOOGLE_TOKEN_STORAGE_KEY, token);
+    } catch {}
+  }, []);
+
   const continueWithGoogle = useCallback(async (allowNewUser: boolean): Promise<User> => {
     const client = getFirebaseClient();
     if (!client) throw new Error("firebase_not_configured");
-    const provider = new GoogleAuthProvider();
-    provider.setCustomParameters({ prompt: "select_account" });
+    const provider = buildGoogleProvider();
     const cred = await signInWithPopup(client.auth, provider);
     const isNewUser = Boolean(getAdditionalUserInfo(cred)?.isNewUser);
     if (!allowNewUser && isNewUser) {
@@ -99,9 +133,48 @@ export function AuthProvider({ children }: Props) {
       setUser(null);
       throw authError("auth/google-signup-required", "Please sign up before using Google sign-in.");
     }
+    const oauthCred = GoogleAuthProvider.credentialFromResult(cred);
+    stashGoogleAccessToken(oauthCred?.accessToken);
     setUser(cred.user);
     return cred.user;
+  }, [buildGoogleProvider, stashGoogleAccessToken]);
+
+  const getGoogleAccessToken = useCallback((): string | null => {
+    if (typeof window === "undefined") return null;
+    try {
+      return window.sessionStorage.getItem(GOOGLE_TOKEN_STORAGE_KEY);
+    } catch {
+      return null;
+    }
   }, []);
+
+  const hasGoogleLinked = useCallback((): boolean => {
+    const activeUser = user || getFirebaseClient()?.auth.currentUser || null;
+    return Boolean(activeUser?.providerData?.some((p) => p.providerId === "google.com"));
+  }, [user]);
+
+  const connectGoogleForDocs = useCallback(async (): Promise<string> => {
+    const client = getFirebaseClient();
+    if (!client) throw new Error("firebase_not_configured");
+    const activeUser = user || client.auth.currentUser;
+    if (!activeUser) throw new Error("auth_required");
+
+    const provider = buildGoogleProvider();
+    const alreadyLinked = activeUser.providerData.some((p) => p.providerId === "google.com");
+    // linkWithPopup fails if google.com is already linked (auth/provider-already-linked).
+    // For that case, reauthenticate to get a fresh access token instead.
+    const cred = alreadyLinked
+      ? await reauthenticateWithPopup(activeUser, provider)
+      : await linkWithPopup(activeUser, provider);
+    const oauthCred = GoogleAuthProvider.credentialFromResult(cred);
+    const accessToken = oauthCred?.accessToken;
+    if (!accessToken) {
+      throw new Error("google_access_token_missing");
+    }
+    stashGoogleAccessToken(accessToken);
+    setUser(client.auth.currentUser);
+    return accessToken;
+  }, [buildGoogleProvider, stashGoogleAccessToken, user]);
 
   const loginWithGoogle = useCallback(async (): Promise<User> => {
     return continueWithGoogle(false);
@@ -201,6 +274,9 @@ export function AuthProvider({ children }: Props) {
       configured: firebaseConfigured,
       missingEnv: missingFirebaseEnv,
       getIdToken,
+      getGoogleAccessToken,
+      hasGoogleLinked,
+      connectGoogleForDocs,
       login,
       loginWithGoogle,
       signupWithGoogle,
@@ -209,7 +285,21 @@ export function AuthProvider({ children }: Props) {
       sendPasswordReset: sendPasswordResetValue,
       logout,
     }),
-    [getIdToken, loading, login, loginWithGoogle, logout, sendPasswordResetValue, signup, signupWithGoogle, updateDisplayNameValue, user],
+    [
+      connectGoogleForDocs,
+      getGoogleAccessToken,
+      getIdToken,
+      hasGoogleLinked,
+      loading,
+      login,
+      loginWithGoogle,
+      logout,
+      sendPasswordResetValue,
+      signup,
+      signupWithGoogle,
+      updateDisplayNameValue,
+      user,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

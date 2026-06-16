@@ -36,7 +36,13 @@ from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram, deepgram_model_for_language, _build_keyterm_list, _build_replace_list, DG_DEBUG
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
-from app.utils.translate import _preprocess_source_text, translate_text, translate_text_streaming, TranslationContext
+from app.utils.translate import (
+    _preprocess_source_text,
+    is_invalid_translation_output,
+    translate_text,
+    translate_text_streaming,
+    TranslationContext,
+)
 from app.scripture import detect_scripture_verse
 from app.routes import translate as translate_routes  # your existing REST routes
 from app.routes import examples as examples_routes
@@ -47,6 +53,8 @@ from app.routes import multichurch as multichurch_routes
 from app.routes import auth as auth_routes
 from app.routes import billing as billing_routes
 from app.routes import admin as admin_routes
+from app.routes import sermon_review as sermon_review_routes
+from app.sermon_review.lookup import get_reviewed_text
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.env import ENV
@@ -325,6 +333,7 @@ app.include_router(multichurch_routes.router, prefix="/api")
 app.include_router(auth_routes.router, prefix="/api")
 app.include_router(billing_routes.router, prefix="/api")
 app.include_router(admin_routes.router, prefix="/api")
+app.include_router(sermon_review_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
@@ -528,6 +537,14 @@ async def _translate_text_guarded(
     if source_primary != target_primary and bool(usage.get("failOpen")):
         error_message = str(usage.get("errorMessage") or "translation_failed")
         return "", _fail_open_meta(RuntimeError(error_message))
+    if is_invalid_translation_output(translated, source_lang, target_lang):
+        return "", {
+            "fail_open": True,
+            "reason": "target_language_mismatch",
+            "code": "target_language_mismatch",
+            "provider": "translation_guardrail",
+            "message": "Suppressed Korean text in English translation output.",
+        }
     if out_usage is not None:
         out_usage.update(usage)
     return translated, None
@@ -548,7 +565,7 @@ async def _translate_streaming_guarded(
     script_glossary: Optional[list] = None,
     on_token: Callable[[str], Awaitable[None]],
 ) -> tuple[str, Optional[dict[str, Any]]]:
-    """Budget-guarded streaming translation. Calls on_token for each token chunk."""
+    """Budget-guarded streaming translation. Emits tokens only after validation."""
     reservations, blocked = _reserve_translation_budget(
         org_id=org_id, host_uid=host_uid, source_text=source_text
     )
@@ -571,7 +588,6 @@ async def _translate_streaming_guarded(
             usage_out=usage,
         ):
             assembled += token
-            await on_token(token)
     finally:
         _settle_translation_budget(
             reservations, actual_tokens=int(usage.get("totalTokens") or 0)
@@ -580,7 +596,10 @@ async def _translate_streaming_guarded(
         return "", _fail_open_meta(RuntimeError(str(usage.get("errorMessage") or "translation_failed")))
     # Use the post-processed text (unmasked glossary, guardrails applied) that
     # translate_text_streaming stores in usage_out after the loop completes.
-    return usage.get("finalText") or assembled, None
+    translated = usage.get("finalText") or assembled
+    if translated:
+        await on_token(translated)
+    return translated, None
 
 
 def _resolve_room_context(
@@ -1173,45 +1192,77 @@ async def ws_translate(ws: WebSocket):
         elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
             translated = src_text
         else:
-            try:
-                custom_prompt, service_prompt = _cached_prompt_overrides(target_org_id)
-                _tx_usage: dict[str, Any] = {}
-                translated, limit_meta = await _translate_text_guarded(
-                    src_text,
-                    src_lang_full,
-                    tgt_lang_full,
-                    org_id=target_org_id,
-                    host_uid=host_uid_claim,
-                    ctx=translation_ctx,
-                    update_ctx=True,
-                    custom_prompt=custom_prompt,
-                    service_prompt=service_prompt,
-                    script_examples=_cached_script_examples_producer,
-                    script_glossary=_cached_script_glossary_producer,
-                    out_usage=_tx_usage,
-                )
-                if limit_meta:
-                    meta_payload.update(limit_meta)
-                if target_org_id and _tx_usage.get("totalTokens"):
-                    _p = int(_tx_usage.get("promptTokens") or 0)
-                    _c = int(_tx_usage.get("completionTokens") or 0)
-                    _t = int(_tx_usage.get("totalTokens") or 0)
-                    _cfg = multichurch_store.get_platform_config()
-                    _usd = (_p * _cfg["liveTranslationInputCostPerMillion"] + _c * _cfg["liveTranslationOutputCostPerMillion"]) / 1_000_000
-                    try:
-                        multichurch_store.record_live_translation_usage(
+            reviewed_text: Optional[str] = None
+            if target_org_id and payload_service_key:
+                try:
+                    reviewed_text = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: get_reviewed_text(
+                            store=multichurch_store,
                             org_id=target_org_id,
-                            prompt_tokens=_p,
-                            completion_tokens=_c,
-                            total_tokens=_t,
-                            estimated_usd=_usd,
-                        )
-                    except Exception:
-                        pass
-            except Exception as exc:
-                print("[WS translate][producer_commit][error]", exc)
-                translated = src_text
-                meta_payload.update(_fail_open_meta(exc))
+                            service_key=payload_service_key,
+                            korean_text=src_text,
+                        ),
+                    )
+                except Exception:
+                    reviewed_text = None
+            if reviewed_text:
+                translated = reviewed_text
+                live_mode = "reviewed"
+                meta_payload.update(
+                    {
+                        "mode": "reviewed",
+                        "source_version": "sermon-review",
+                    }
+                )
+                translation_ctx.remember(src_text, translated)
+            else:
+                try:
+                    custom_prompt, service_prompt = _cached_prompt_overrides(target_org_id)
+                    _tx_usage: dict[str, Any] = {}
+                    translated, limit_meta = await _translate_text_guarded(
+                        src_text,
+                        src_lang_full,
+                        tgt_lang_full,
+                        org_id=target_org_id,
+                        host_uid=host_uid_claim,
+                        ctx=translation_ctx,
+                        update_ctx=True,
+                        custom_prompt=custom_prompt,
+                        service_prompt=service_prompt,
+                        script_examples=_cached_script_examples_producer,
+                        script_glossary=_cached_script_glossary_producer,
+                        out_usage=_tx_usage,
+                    )
+                    if limit_meta:
+                        meta_payload.update(limit_meta)
+                    if target_org_id and _tx_usage.get("totalTokens"):
+                        _p = int(_tx_usage.get("promptTokens") or 0)
+                        _c = int(_tx_usage.get("completionTokens") or 0)
+                        _t = int(_tx_usage.get("totalTokens") or 0)
+                        _cfg = multichurch_store.get_platform_config()
+                        _usd = (_p * _cfg["liveTranslationInputCostPerMillion"] + _c * _cfg["liveTranslationOutputCostPerMillion"]) / 1_000_000
+                        try:
+                            multichurch_store.record_live_translation_usage(
+                                org_id=target_org_id,
+                                prompt_tokens=_p,
+                                completion_tokens=_c,
+                                total_tokens=_t,
+                                estimated_usd=_usd,
+                            )
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    print("[WS translate][producer_commit][error]", exc)
+                    translated = ""
+                    meta_payload.update(_fail_open_meta(exc))
+
+        translated = _suppress_invalid_translation_output(
+            translated,
+            src_lang_full,
+            tgt_lang_full,
+            meta_payload,
+        )
 
         live_msg_new = {
             "mode": live_mode if not is_partial else "realtime",
@@ -1464,6 +1515,26 @@ def _fail_open_meta(exc: Exception) -> dict[str, Any]:
         "provider": "openai",
         "message": msg[:120],
     }
+
+
+def _suppress_invalid_translation_output(
+    translated: str,
+    source_lang: str,
+    target_lang: str,
+    meta_payload: dict[str, Any],
+) -> str:
+    if not is_invalid_translation_output(translated, source_lang, target_lang):
+        return translated
+    meta_payload.update(
+        {
+            "fail_open": True,
+            "reason": "target_language_mismatch",
+            "code": "target_language_mismatch",
+            "provider": "translation_guardrail",
+            "message": "Suppressed Korean text in English translation output.",
+        }
+    )
+    return ""
 
 
 def _format_duration_label(seconds: int) -> str:
@@ -1900,7 +1971,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             meta_payload.update(limit_meta)
                     except Exception as e:
                         print("[TX] error:", e)
-                        translated = clean_src
+                        translated = ""
                         meta_payload.update(_fail_open_meta(e))
             else:
                 # previews: skip scripture/script matching for speed
@@ -1930,8 +2001,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             meta_payload.update(limit_meta)
                     except Exception as e:
                         print("[TX][preview] error:", e)
-                        translated = clean_src
+                        translated = ""
                         meta_payload.update(_fail_open_meta(e))
+
+            translated = _suppress_invalid_translation_output(
+                translated,
+                src_lang_full,
+                tgt_lang_full,
+                meta_payload,
+            )
 
             live_msg_new = {
                 "mode": live_mode,

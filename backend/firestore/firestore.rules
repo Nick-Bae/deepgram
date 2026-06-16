@@ -64,8 +64,10 @@ service cloud.firestore {
       }
 
       match /sermons/{sermonId} {
-        // Backend writes only via Admin SDK (bypasses rules). No client read or write.
-        allow read, write: if false;
+        // editing-sermon feature (Design §3.3): org members read sermons
+        // for the review UI. Backend writes only via Admin SDK.
+        allow read: if isOrgMember(orgId);
+        allow create, update, delete: if false;
       }
     }
   }

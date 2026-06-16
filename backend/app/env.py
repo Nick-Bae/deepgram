@@ -35,6 +35,18 @@ class ENV:
     WAITK_LO: int = int(os.getenv("WAITK_LO", "4"))
     WAITK_HI: int = int(os.getenv("WAITK_HI", "7"))
 
+    # Sermon Review (editing-sermon feature) — Design §10.3
+    SERMON_MAX_SEGMENTS: int = int(os.getenv("SERMON_MAX_SEGMENTS", "1000"))
+    SERMON_MAX_UPLOAD_BYTES: int = int(
+        os.getenv("SERMON_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024))
+    )
+    SERMON_SOURCE_MAX_BYTES: int = int(
+        os.getenv("SERMON_SOURCE_MAX_BYTES", str(1 * 1024 * 1024))
+    )
+    SERMON_XLSX_MAX_DECOMPRESSED_BYTES: int = int(
+        os.getenv("SERMON_XLSX_MAX_DECOMPRESSED_BYTES", str(50 * 1024 * 1024))
+    )
+
     @classmethod
     def resolve_translation_model(cls, model_override: str | None = None, *, sermon: bool = False) -> str:
         override = (model_override or "").strip()

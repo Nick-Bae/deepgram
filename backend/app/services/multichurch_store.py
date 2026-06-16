@@ -2804,6 +2804,156 @@ class InMemoryMultiChurchStore:
     def list_services_by_org_id(self, org_id: str) -> List[Dict[str, Any]]:
         return []  # no-op for in-memory store
 
+    # -- editing-sermon feature (Design §3.3) --------------------------------
+    # Sermons live at organizations/{orgId}/sermons/{sermonId} as a single doc
+    # with segments[]. Cost-bounded: 1 read per export, 1 write per import.
+    # Methods are namespaced `review_sermon_*` to disambiguate from the legacy
+    # service-scoped sermon-prep methods above.
+
+    def _ensure_review_sermons(self) -> None:
+        if not hasattr(self, "_review_sermons"):
+            # keyed by (org_id, sermon_id) -> dict mirroring Sermon model
+            self._review_sermons: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def create_review_sermon(self, sermon: Dict[str, Any]) -> Dict[str, Any]:
+        self._ensure_review_sermons()
+        org_id = str(sermon.get("orgId") or "").strip()
+        sermon_id = str(sermon.get("sermonId") or "").strip()
+        if not org_id or not sermon_id:
+            raise ValueError("create_review_sermon: orgId and sermonId required")
+        if (org_id, sermon_id) in self._review_sermons:
+            from app.sermon_review.models import SermonConflictError
+            raise SermonConflictError(
+                f"Sermon {sermon_id} already exists in org {org_id}"
+            )
+        stored = dict(sermon)
+        self._review_sermons[(org_id, sermon_id)] = stored
+        return dict(stored)
+
+    def get_review_sermon(
+        self, org_id: str, sermon_id: str
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_review_sermons()
+        found = self._review_sermons.get((org_id, sermon_id))
+        return dict(found) if found else None
+
+    def list_review_sermons(self, org_id: str) -> List[Dict[str, Any]]:
+        self._ensure_review_sermons()
+        items = [
+            dict(doc)
+            for (oid, _sid), doc in self._review_sermons.items()
+            if oid == org_id
+        ]
+        items.sort(
+            key=lambda d: d.get("updatedAt") or _utcnow(),
+            reverse=True,
+        )
+        return items
+
+    def update_review_sermon_segments(
+        self,
+        org_id: str,
+        sermon_id: str,
+        *,
+        segment_updates: List[Dict[str, Any]],
+        expected_updated_at: datetime,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Apply per-segment reviews atomically with an updatedAt precondition.
+
+        Each `segment_updates` element must include "segmentId" and may
+        include "reviewedTranslation", "notes", "status". Empty
+        reviewedTranslation falls back to appTranslation per Design FR-13.
+        """
+        from app.sermon_review.models import (
+            SermonConflictError,
+            SermonNotFoundError,
+        )
+
+        self._ensure_review_sermons()
+        with self._lock:
+            stored = self._review_sermons.get((org_id, sermon_id))
+            if stored is None:
+                raise SermonNotFoundError(
+                    f"Sermon {sermon_id} not found in org {org_id}"
+                )
+            if stored.get("updatedAt") != expected_updated_at:
+                raise SermonConflictError(
+                    "Sermon was modified by another writer since you "
+                    "downloaded the Review File."
+                )
+
+            updates_by_id = {
+                str(u.get("segmentId") or ""): u for u in segment_updates
+            }
+            new_segments: List[Dict[str, Any]] = []
+            for seg in stored.get("segments") or []:
+                seg_copy = dict(seg)
+                sid = str(seg_copy.get("segmentId") or "")
+                upd = updates_by_id.get(sid)
+                if upd:
+                    reviewed = (upd.get("reviewedTranslation") or "").strip()
+                    seg_copy["reviewedTranslation"] = (
+                        reviewed
+                        if reviewed
+                        else seg_copy.get("appTranslation", "")
+                    )
+                    if "notes" in upd:
+                        seg_copy["notes"] = str(upd.get("notes") or "")
+                    if "status" in upd:
+                        seg_copy["status"] = str(upd.get("status") or "Draft")
+                new_segments.append(seg_copy)
+
+            stored["segments"] = new_segments
+            stored["updatedAt"] = now or _utcnow()
+            self._review_sermons[(org_id, sermon_id)] = stored
+            return dict(stored)
+
+    def link_review_sermon_to_service(
+        self,
+        org_id: str,
+        service_key: str,
+        sermon_id: Optional[str],
+        *,
+        replace: bool = False,
+    ) -> Dict[str, Any]:
+        """Link or unlink (sermon_id=None) a sermon to a service.
+
+        Raises ServiceAlreadyLinkedError when replacing without explicit
+        replace=True per Design §6.1.
+        """
+        from app.sermon_review.models import (
+            ServiceAlreadyLinkedError,
+            SermonNotFoundError,
+        )
+
+        self._ensure_review_sermons()
+        service = self._services.get((org_id, service_key))
+        if service is None:
+            raise LookupError(
+                f"Service {service_key!r} not found in org {org_id}"
+            )
+        if sermon_id is not None:
+            if (org_id, sermon_id) not in self._review_sermons:
+                raise SermonNotFoundError(
+                    f"Sermon {sermon_id} not found in org {org_id}"
+                )
+            existing = service.get("linkedSermonId")
+            if existing and existing != sermon_id and not replace:
+                raise ServiceAlreadyLinkedError(
+                    f"Service {service_key!r} is already linked to "
+                    f"sermon {existing!r}"
+                )
+
+        service["linkedSermonId"] = sermon_id
+        service["updatedAt"] = _utcnow()
+        self._services[(org_id, service_key)] = service
+        return {
+            "orgId": org_id,
+            "serviceKey": service_key,
+            "linkedSermonId": sermon_id,
+        }
+
 
 class FirestoreMultiChurchStore:
     def __init__(self) -> None:
@@ -5426,6 +5576,181 @@ class FirestoreMultiChurchStore:
             return [d.to_dict() for d in docs if d.exists]
         except Exception:
             return []
+
+    # -- editing-sermon feature (Design §3.3) --------------------------------
+    # Top-level org-scoped review sermons: organizations/{orgId}/sermons/{sermonId}
+    # Disambiguated from the legacy service-scoped sermons subcollection.
+
+    def _review_sermon_ref(self, org_id: str, sermon_id: str):
+        return (
+            self._db
+            .collection("organizations").document(org_id)
+            .collection("sermons").document(sermon_id)
+        )
+
+    def _review_sermons_col(self, org_id: str):
+        return (
+            self._db
+            .collection("organizations").document(org_id)
+            .collection("sermons")
+        )
+
+    def create_review_sermon(self, sermon: Dict[str, Any]) -> Dict[str, Any]:
+        from app.sermon_review.models import SermonConflictError
+
+        org_id = str(sermon.get("orgId") or "").strip()
+        sermon_id = str(sermon.get("sermonId") or "").strip()
+        if not org_id or not sermon_id:
+            raise ValueError("create_review_sermon: orgId and sermonId required")
+
+        ref = self._review_sermon_ref(org_id, sermon_id)
+        snap = ref.get(timeout=_FS_TIMEOUT)
+        if snap.exists:
+            raise SermonConflictError(
+                f"Sermon {sermon_id} already exists in org {org_id}"
+            )
+        payload = dict(sermon)
+        ref.set(payload, timeout=_FS_TIMEOUT)
+        return payload
+
+    def get_review_sermon(
+        self, org_id: str, sermon_id: str
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            snap = self._review_sermon_ref(org_id, sermon_id).get(
+                timeout=_FS_TIMEOUT
+            )
+            return snap.to_dict() if snap.exists else None
+        except Exception:
+            return None
+
+    def list_review_sermons(self, org_id: str) -> List[Dict[str, Any]]:
+        try:
+            docs = (
+                self._review_sermons_col(org_id)
+                .order_by("updatedAt", direction="DESCENDING")
+                .get(timeout=_FS_TIMEOUT)
+            )
+            return [d.to_dict() for d in docs if d.exists]
+        except Exception:
+            return []
+
+    def update_review_sermon_segments(
+        self,
+        org_id: str,
+        sermon_id: str,
+        *,
+        segment_updates: List[Dict[str, Any]],
+        expected_updated_at: datetime,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        from app.sermon_review.models import (
+            SermonConflictError,
+            SermonNotFoundError,
+        )
+
+        ref = self._review_sermon_ref(org_id, sermon_id)
+        transaction = self._db.transaction()
+
+        @gcf_firestore.transactional
+        def _apply(txn) -> Dict[str, Any]:
+            snap = ref.get(transaction=txn)
+            if not snap.exists:
+                raise SermonNotFoundError(
+                    f"Sermon {sermon_id} not found in org {org_id}"
+                )
+            data = snap.to_dict() or {}
+            stored_updated = data.get("updatedAt")
+            if stored_updated != expected_updated_at:
+                raise SermonConflictError(
+                    "Sermon was modified by another writer since you "
+                    "downloaded the Review File."
+                )
+
+            updates_by_id = {
+                str(u.get("segmentId") or ""): u for u in segment_updates
+            }
+            new_segments: List[Dict[str, Any]] = []
+            for seg in data.get("segments") or []:
+                seg_copy = dict(seg)
+                sid = str(seg_copy.get("segmentId") or "")
+                upd = updates_by_id.get(sid)
+                if upd:
+                    reviewed = (upd.get("reviewedTranslation") or "").strip()
+                    seg_copy["reviewedTranslation"] = (
+                        reviewed
+                        if reviewed
+                        else seg_copy.get("appTranslation", "")
+                    )
+                    if "notes" in upd:
+                        seg_copy["notes"] = str(upd.get("notes") or "")
+                    if "status" in upd:
+                        seg_copy["status"] = str(upd.get("status") or "Draft")
+                new_segments.append(seg_copy)
+
+            new_updated = now or _utcnow()
+            txn.update(
+                ref,
+                {"segments": new_segments, "updatedAt": new_updated},
+            )
+            data["segments"] = new_segments
+            data["updatedAt"] = new_updated
+            return data
+
+        return _apply(transaction)
+
+    def link_review_sermon_to_service(
+        self,
+        org_id: str,
+        service_key: str,
+        sermon_id: Optional[str],
+        *,
+        replace: bool = False,
+    ) -> Dict[str, Any]:
+        from app.sermon_review.models import (
+            ServiceAlreadyLinkedError,
+            SermonNotFoundError,
+        )
+
+        service_ref = (
+            self._db
+            .collection("organizations").document(org_id)
+            .collection("services").document(service_key)
+        )
+        service_snap = service_ref.get(timeout=_FS_TIMEOUT)
+        if not service_snap.exists:
+            raise LookupError(
+                f"Service {service_key!r} not found in org {org_id}"
+            )
+        service_data = service_snap.to_dict() or {}
+
+        if sermon_id is not None:
+            sermon_snap = self._review_sermon_ref(org_id, sermon_id).get(
+                timeout=_FS_TIMEOUT
+            )
+            if not sermon_snap.exists:
+                raise SermonNotFoundError(
+                    f"Sermon {sermon_id} not found in org {org_id}"
+                )
+            existing = service_data.get("linkedSermonId")
+            if existing and existing != sermon_id and not replace:
+                raise ServiceAlreadyLinkedError(
+                    f"Service {service_key!r} is already linked to "
+                    f"sermon {existing!r}"
+                )
+
+        service_ref.update(
+            {
+                "linkedSermonId": sermon_id,
+                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+            },
+            timeout=_FS_TIMEOUT,
+        )
+        return {
+            "orgId": org_id,
+            "serviceKey": service_key,
+            "linkedSermonId": sermon_id,
+        }
 
 
 def _build_store():

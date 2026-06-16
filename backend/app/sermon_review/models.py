@@ -70,3 +70,15 @@ class ValidationReport(BaseModel):
     @property
     def has_errors(self) -> bool:
         return self.summary.errored > 0
+
+
+class SermonNotFoundError(LookupError):
+    """Raised by store when a sermon does not exist."""
+
+
+class SermonConflictError(RuntimeError):
+    """Raised by store when an updatedAt precondition fails (concurrent import)."""
+
+
+class ServiceAlreadyLinkedError(RuntimeError):
+    """Raised when linking would replace an existing link without replace=True."""

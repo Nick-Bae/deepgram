@@ -12,7 +12,7 @@ from app.services.google_tts import synthesize_async as synthesize_google_tts
 from app.services.gemini_flash_tts import synthesize_async as synthesize_gemini_tts
 from app.services.multichurch_store import multichurch_store
 from app.socket_manager import manager
-from app.utils.translate import translate_text
+from app.utils.translate import is_invalid_translation_output, translate_text
 
 logger = logging.getLogger("app.translate")
 
@@ -63,6 +63,7 @@ async def translate(
             service_prompt_override = ""
 
     t0 = perf_counter()
+    usage: dict = {}
     try:
         translated = await _resolve(
             translate_text(
@@ -71,6 +72,7 @@ async def translate(
                 target,
                 custom_prompt=custom_prompt_override,
                 service_prompt=service_prompt_override,
+                usage_out=usage,
             )
         )
     except Exception:
@@ -82,6 +84,10 @@ async def translate(
     if not isinstance(translated, str):
         logger.error("translator returned non-string", extra={"type": type(translated).__name__})
         raise HTTPException(status_code=500, detail="Translator returned non-string result")
+
+    if usage.get("failOpen") or is_invalid_translation_output(translated, source, target):
+        logger.error("translation failed target-language validation")
+        raise HTTPException(status_code=502, detail="translation_language_mismatch")
 
     if translated.strip() == "":
         logger.error("empty translation result")

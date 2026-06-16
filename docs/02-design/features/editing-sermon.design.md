@@ -341,22 +341,22 @@ IDs are generated once at ingest time and **never change**. Re-translation does 
 
 ## 4. API Specification
 
-All endpoints are mounted under `/api/sermons` and require `Authorization: Bearer <Firebase ID token>`. RBAC enforced server-side via `org_role_required(["owner","admin","host"])`.
+All endpoints are mounted under `/api/org/{orgId}/sermons` and require `Authorization: Bearer <Firebase ID token>`. RBAC enforced server-side via `org_role_required(["owner","admin","host"])`.
 
 ### 4.1 Endpoint List
 
 | Method | Path | Description | Auth |
 |--------|------|-------------|------|
-| `POST` | `/api/sermons/ingest` | Ingest source text from one of 4 paths → translate → persist Sermon | owner/admin/host |
-| `GET` | `/api/sermons` | List org's sermons (id, title, segment count, status summary, updatedAt) | owner/admin/host |
-| `GET` | `/api/sermons/{sermonId}` | Get sermon detail (segments inline) | owner/admin/host |
-| `GET` | `/api/sermons/{sermonId}/review-file.xlsx` | Download `.xlsx` Review File | owner/admin/host |
-| `POST` | `/api/sermons/{sermonId}/review-file` | Upload edited `.xlsx`; validate; persist reviews | owner/admin/host |
-| `POST` | `/api/sermons/{sermonId}/link` | Link sermon to a service (`{ serviceKey }` body, or `null` to unlink) | owner/admin |
+| `POST` | `/api/org/{orgId}/sermons/ingest` | Ingest source text from one of 4 paths → translate → persist Sermon | owner/admin/host |
+| `GET` | `/api/org/{orgId}/sermons` | List org's sermons (id, title, segment count, status summary, updatedAt) | owner/admin/host |
+| `GET` | `/api/org/{orgId}/sermons/{sermonId}` | Get sermon detail (segments inline) | owner/admin/host |
+| `GET` | `/api/org/{orgId}/sermons/{sermonId}/review-file.xlsx` | Download `.xlsx` Review File | owner/admin/host |
+| `POST` | `/api/org/{orgId}/sermons/{sermonId}/review-file` | Upload edited `.xlsx`; validate; persist reviews | owner/admin/host |
+| `POST` | `/api/org/{orgId}/sermons/{sermonId}/link` | Link sermon to a service (`{ serviceKey }` body, or `null` to unlink) | owner/admin |
 
 ### 4.2 Detailed Specification
 
-#### `POST /api/sermons/ingest`
+#### `POST /api/org/{orgId}/sermons/ingest`
 
 **Request (one of)**:
 ```json
@@ -384,7 +384,7 @@ For `file_txt` and `file_docx`, request is `multipart/form-data` with fields `so
 - `429 GOOGLE_RATE_LIMITED` — Google Docs API returned 429; client should retry with backoff
 - `507 SEGMENT_LIMIT_EXCEEDED` — would produce > `SERMON_MAX_SEGMENTS` segments
 
-#### `GET /api/sermons/{sermonId}/review-file.xlsx`
+#### `GET /api/org/{orgId}/sermons/{sermonId}/review-file.xlsx`
 
 **Response (200)**:
 - Content-Type: `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
@@ -394,7 +394,7 @@ For `file_txt` and `file_docx`, request is `multipart/form-data` with fields `so
 **Errors**:
 - `401`, `403`, `404 SERMON_NOT_FOUND`
 
-#### `POST /api/sermons/{sermonId}/review-file`
+#### `POST /api/org/{orgId}/sermons/{sermonId}/review-file`
 
 **Request**: `multipart/form-data` with field `file` (`.xlsx`, max 5 MB).
 
@@ -435,7 +435,7 @@ For `file_txt` and `file_docx`, request is `multipart/form-data` with fields `so
 
 **Other errors**: `401`, `403`, `404`, `409 SERMON_MODIFIED_CONCURRENTLY`, `413 PAYLOAD_TOO_LARGE`, `415 UNSUPPORTED_MEDIA_TYPE`.
 
-#### `POST /api/sermons/{sermonId}/link`
+#### `POST /api/org/{orgId}/sermons/{sermonId}/link`
 
 **Request**: `{ "serviceKey": "sunday-am" }` or `{ "serviceKey": null }` to unlink.
 
@@ -658,28 +658,28 @@ Project-standard shape, defined in §4.3.
 
 | # | Endpoint | Method | Test Description | Expected Status | Expected Response |
 |---|----------|--------|-----------------|:--------------:|-------------------|
-| 1 | `/api/sermons/ingest` | POST | Paste-source happy path | 201 | `data.sermonId` exists, `data.segmentCount` > 0 |
-| 2 | `/api/sermons/ingest` | POST | `.docx` upload happy path | 201 | `data.sermonId` exists |
-| 3 | `/api/sermons/ingest` | POST | Google Docs URL happy path (mocked) | 201 | `data.sermonId` exists |
-| 4 | `/api/sermons/ingest` | POST | Invalid `sourceType` | 400 | `error.code` == `INVALID_SOURCE` |
-| 5 | `/api/sermons/ingest` | POST | File over 1 MB | 413 | `error.code` == `PAYLOAD_TOO_LARGE` |
-| 6 | `/api/sermons/ingest` | POST | No auth header | 401 | `error.code` == `UNAUTHORIZED` |
-| 7 | `/api/sermons/ingest` | POST | Viewer role | 403 | `error.code` == `FORBIDDEN` |
-| 8 | `/api/sermons` | GET | List returns array sorted by updatedAt DESC | 200 | `data` is array, sorted |
-| 9 | `/api/sermons/{id}` | GET | Detail returns segments inline | 200 | `data.segments.length` matches stored |
-| 10 | `/api/sermons/{id}` | GET | Unknown id | 404 | `error.code` == `SERMON_NOT_FOUND` |
-| 11 | `/api/sermons/{id}/review-file.xlsx` | GET | Download returns valid `.xlsx` | 200 | Content-Type `vnd.openxml...`, body opens via openpyxl, contains all segments |
-| 12 | `/api/sermons/{id}/review-file` | POST | Unmodified round-trip imports clean | 200 | `summary.imported` == segment count, `errored` == 0 |
-| 13 | `/api/sermons/{id}/review-file` | POST | Deleted row → MISSING_SEGMENT error | 400 | `error.code` == `IMPORT_VALIDATION_FAILED` with `MISSING_SEGMENT` in rows |
-| 14 | `/api/sermons/{id}/review-file` | POST | Duplicated row → DUPLICATE_SEGMENT_ID | 400 | rows contain `DUPLICATE_SEGMENT_ID` |
-| 15 | `/api/sermons/{id}/review-file` | POST | Mutated Original Text → ORIGINAL_TEXT_MUTATED | 400 | rows contain `ORIGINAL_TEXT_MUTATED` |
-| 16 | `/api/sermons/{id}/review-file` | POST | Wrong sermon's file → WRONG_SERMON_ID | 400 | rows contain `WRONG_SERMON_ID`; sermon doc unchanged |
-| 17 | `/api/sermons/{id}/review-file` | POST | Empty Reviewed Translation → EMPTY_REVIEW warning, imports | 200 | `summary.warned` ≥ 1, `errored` == 0, stored `reviewedTranslation` == `appTranslation` |
-| 18 | `/api/sermons/{id}/review-file` | POST | Concurrent edit → 409 | 409 | `error.code` == `SERMON_MODIFIED_CONCURRENTLY` |
-| 19 | `/api/sermons/{id}/review-file` | POST | Non-xlsx file (e.g. csv) | 415 | `error.code` == `UNSUPPORTED_MEDIA_TYPE` |
-| 20 | `/api/sermons/{id}/link` | POST | Link to free service | 200 | service doc gains `linkedSermonId` |
-| 21 | `/api/sermons/{id}/link` | POST | Link service already linked (no `replace=true`) | 409 | `error.code` == `SERVICE_ALREADY_LINKED` |
-| 22 | `/api/sermons/{id}/link` | POST | Host role attempts link | 403 | linking is `owner`/`admin` only |
+| 1 | `/api/org/{orgId}/sermons/ingest` | POST | Paste-source happy path | 201 | `data.sermonId` exists, `data.segmentCount` > 0 |
+| 2 | `/api/org/{orgId}/sermons/ingest` | POST | `.docx` upload happy path | 201 | `data.sermonId` exists |
+| 3 | `/api/org/{orgId}/sermons/ingest` | POST | Google Docs URL happy path (mocked) | 201 | `data.sermonId` exists |
+| 4 | `/api/org/{orgId}/sermons/ingest` | POST | Invalid `sourceType` | 400 | `error.code` == `INVALID_SOURCE` |
+| 5 | `/api/org/{orgId}/sermons/ingest` | POST | File over 1 MB | 413 | `error.code` == `PAYLOAD_TOO_LARGE` |
+| 6 | `/api/org/{orgId}/sermons/ingest` | POST | No auth header | 401 | `error.code` == `UNAUTHORIZED` |
+| 7 | `/api/org/{orgId}/sermons/ingest` | POST | Viewer role | 403 | `error.code` == `FORBIDDEN` |
+| 8 | `/api/org/{orgId}/sermons` | GET | List returns array sorted by updatedAt DESC | 200 | `data` is array, sorted |
+| 9 | `/api/org/{orgId}/sermons/{id}` | GET | Detail returns segments inline | 200 | `data.segments.length` matches stored |
+| 10 | `/api/org/{orgId}/sermons/{id}` | GET | Unknown id | 404 | `error.code` == `SERMON_NOT_FOUND` |
+| 11 | `/api/org/{orgId}/sermons/{id}/review-file.xlsx` | GET | Download returns valid `.xlsx` | 200 | Content-Type `vnd.openxml...`, body opens via openpyxl, contains all segments |
+| 12 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Unmodified round-trip imports clean | 200 | `summary.imported` == segment count, `errored` == 0 |
+| 13 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Deleted row → MISSING_SEGMENT error | 400 | `error.code` == `IMPORT_VALIDATION_FAILED` with `MISSING_SEGMENT` in rows |
+| 14 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Duplicated row → DUPLICATE_SEGMENT_ID | 400 | rows contain `DUPLICATE_SEGMENT_ID` |
+| 15 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Mutated Original Text → ORIGINAL_TEXT_MUTATED | 400 | rows contain `ORIGINAL_TEXT_MUTATED` |
+| 16 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Wrong sermon's file → WRONG_SERMON_ID | 400 | rows contain `WRONG_SERMON_ID`; sermon doc unchanged |
+| 17 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Empty Reviewed Translation → EMPTY_REVIEW warning, imports | 200 | `summary.warned` ≥ 1, `errored` == 0, stored `reviewedTranslation` == `appTranslation` |
+| 18 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Concurrent edit → 409 | 409 | `error.code` == `SERMON_MODIFIED_CONCURRENTLY` |
+| 19 | `/api/org/{orgId}/sermons/{id}/review-file` | POST | Non-xlsx file (e.g. csv) | 415 | `error.code` == `UNSUPPORTED_MEDIA_TYPE` |
+| 20 | `/api/org/{orgId}/sermons/{id}/link` | POST | Link to free service | 200 | service doc gains `linkedSermonId` |
+| 21 | `/api/org/{orgId}/sermons/{id}/link` | POST | Link service already linked (no `replace=true`) | 409 | `error.code` == `SERVICE_ALREADY_LINKED` |
+| 22 | `/api/org/{orgId}/sermons/{id}/link` | POST | Host role attempts link | 403 | linking is `owner`/`admin` only |
 
 ### 8.3 L2: UI Action Test Scenarios
 
@@ -749,14 +749,14 @@ The project is FastAPI + Next.js (Pages Router), not the strict Presentation/App
 | **Presentation** | `frontend/pages/admin/sermons/*.tsx`, `frontend/components/SermonReviewControls.tsx`, `SermonIngestForm.tsx` |
 | **Application (hooks/services)** | inline within components for v1 — no premature abstraction |
 | **Domain (types)** | `frontend/lib/types/sermon.ts` (new TypeScript interfaces mirroring `models.py`) |
-| **Infrastructure (API client)** | `frontend/lib/api/sermons.ts` (new — thin fetch wrappers using existing auth context) |
+| **Infrastructure (API client)** | `frontend/lib/api/org/{orgId}/sermons.ts` (new — thin fetch wrappers using existing auth context) |
 
 ### 9.3 Dependency Rules
 
 - `routes/sermon_review.py` may import from `sermon_review/` and `services/multichurch_store`. It MUST NOT contain business logic.
 - `sermon_review/*.py` modules MUST NOT import from `routes/`. They MAY import each other; circular imports are forbidden.
 - `models.py` is the only file that defines `Segment`, `Sermon`, and enums. All other modules import from it.
-- Frontend `pages/` import from `components/` and `lib/`. `lib/api/sermons.ts` is the only place that calls fetch on sermon endpoints.
+- Frontend `pages/` import from `components/` and `lib/`. `lib/api/org/{orgId}/sermons.ts` is the only place that calls fetch on sermon endpoints.
 
 ---
 
@@ -871,7 +871,7 @@ frontend/
 4. [ ] **Backend — Firestore data layer**: extend `multichurch_store.py` with sermon CRUD; add Firestore rules
 5. [ ] **Backend — routes & RBAC**: `routes/sermon_review.py`; wire into `main.py`; integration tests with auth
 6. [ ] **Backend — translation hook**: `get_reviewed_text()` in `translate.py`; verify zero-regression test for "no sermon linked" path
-7. [ ] **Frontend — types & API client**: `lib/types/sermon.ts`, `lib/api/sermons.ts`
+7. [ ] **Frontend — types & API client**: `lib/types/sermon.ts`, `lib/api/org/{orgId}/sermons.ts`
 8. [ ] **Frontend — components**: `SermonIngestForm.tsx`, `SermonReviewControls.tsx`
 9. [ ] **Frontend — pages**: `/admin/sermons/index.tsx`, `new.tsx`, `[sermonId].tsx`
 10. [ ] **E2E**: Playwright spec covers full round-trip + broadcast assertion
@@ -887,7 +887,7 @@ frontend/
 | Backend domain & xlsx | `module-1` | `models.py`, `validation.py`, `xlsx_export.py`, `xlsx_import.py` + unit tests + fixtures | 30–35 |
 | Backend ingestion & store | `module-2` | `ingest.py` (4 source paths), `multichurch_store.py` extensions, Firestore rules, env vars | 25–30 |
 | Backend routes & translation hook | `module-3` | `routes/sermon_review.py`, RBAC, `main.py` wiring, `translate.py` hook + zero-regression tests | 25–30 |
-| Frontend types, API, components | `module-4` | `lib/types/sermon.ts`, `lib/api/sermons.ts`, `SermonIngestForm.tsx`, `SermonReviewControls.tsx` | 25–30 |
+| Frontend types, API, components | `module-4` | `lib/types/sermon.ts`, `lib/api/org/{orgId}/sermons.ts`, `SermonIngestForm.tsx`, `SermonReviewControls.tsx` | 25–30 |
 | Frontend pages & E2E | `module-5` | 3 new pages + Playwright spec for full round-trip | 25–30 |
 
 #### Recommended Session Plan

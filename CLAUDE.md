@@ -124,6 +124,7 @@ NEXT_PUBLIC_FIREBASE_APP_ID=
 NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=
 NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=
 NEXT_PUBLIC_BILLING_ADMIN_EMAILS=
+NEXT_PUBLIC_GOOGLE_API_KEY=         # Google Cloud API key with Picker API enabled (for sermon Google Doc picker)
 ```
 
 ---
@@ -143,11 +144,26 @@ NEXT_PUBLIC_BILLING_ADMIN_EMAILS=
 Host audio → Deepgram STT WebSocket (nova-3, Korean)
            → Korean transcript
            → KoChunker (streaming chunks)
-           → OpenAI GPT-4o (translation)
-           → ConnectionManager.broadcast_room()
+           → sermon_review.lookup.get_reviewed_text() ── hit ──┐
+           │      (if service has linkedSermonId; fuzzy ≥0.84) │
+           │                                                   │
+           → OpenAI GPT-4o (translation)                       │
+           → ConnectionManager.broadcast_room() ◄──────────────┘
            → Listener WebSocket connections
            → TranslationBox.tsx (live display)
 ```
+
+### Sermon Review (editing-sermon)
+Pastors can review and correct machine translations offline in Google Sheets, then re-import.
+- **Ingestion**: paste / `.txt` / `.docx` / Google Docs URL → translate via GPT-4o → segments stored in `organizations/{orgId}/sermons/{sermonId}` (single-doc, `segments[]` array).
+- **Google Docs OAuth**: Firebase Google sign-in requests `documents.readonly` + `drive.readonly` scopes. Frontend stashes the access token in sessionStorage and forwards it per-ingest as `X-Google-Access-Token`. Backend builds a per-request `googleapiclient` Docs client from that token.
+- **Email/password users + Google Docs**: `authContext.connectGoogleForDocs()` uses Firebase `linkWithPopup` (or `reauthenticateWithPopup` if Google is already linked) to attach a Google credential to the existing email/password account and capture an access token. `SermonIngestForm` shows "Connect Google to pick a Doc" → opens the popup → picker proceeds. Users keep their email/password login; Google becomes a second linked provider.
+- **Google Drive Picker**: `frontend/lib/googlePicker.ts` dynamically loads `apis.google.com/js/api.js` and opens a `DOCUMENTS`-filtered picker. Users browse and select a Doc instead of pasting a URL. Requires `NEXT_PUBLIC_GOOGLE_API_KEY` (Picker API enabled in Google Cloud).
+- **Review file**: `.xlsx` export (openpyxl) → edit in Sheets → re-upload. Import is atomic — any row error returns 400 with `IMPORT_VALIDATION_FAILED` and per-row details; nothing is written.
+- **Validation**: shifted rows, deleted Segment IDs, or wrong sermon attached are rejected. `updatedAt` precondition prevents concurrent overwrites.
+- **Broadcast hook**: when a service has `linkedSermonId`, `main.py:_translate_text_guarded` (broadcast branch only — not previews) consults `get_reviewed_text()` first. Hit → reviewed text (`mode=reviewed`); miss → fall back to GPT-4o. Segments with `status=Skip` are ignored (FR-15) so they fall through to machine translation.
+- **Routes**: mounted at `/api/org/{orgId}/sermons/*` — see `backend/app/routes/sermon_review.py`.
+- **Frontend**: admin pages at `frontend/pages/admin/sermons/` (list, new, detail).
 
 ### Key WebSocket Endpoints
 - `/ws/stt_deepgram` — Host audio input (requires auth)
