@@ -50,6 +50,20 @@ from app.routes import admin as admin_routes
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.env import ENV
+from app.gemini_live import (
+    GEMINI_INPUT_SAMPLE_RATE,
+    GEMINI_LIVE_TRANSLATE_MODEL,
+    GEMINI_OUTPUT_SAMPLE_RATE,
+    Pcm16Downsampler48To16,
+    PcmChunkBuffer,
+    api_key as gemini_api_key,
+    audio_message as gemini_audio_message,
+    merge_transcript as merge_gemini_transcript,
+    parse_server_content as parse_gemini_server_content,
+    setup_message as gemini_setup_message,
+    target_language_code as gemini_target_language_code,
+    websocket_url as gemini_websocket_url,
+)
 from app.security_log import security_event, client_ip as _security_client_ip
 
 
@@ -159,6 +173,7 @@ _tx_window_entries: dict[str, deque[dict[str, float]]] = {}
 # 16-bit PCM @ 48 kHz: 48000 samples/s × 2 bytes/sample = 96000 bytes/s
 _DEEPGRAM_BYTES_PER_SECOND = 96000
 _OPENAI_REALTIME_TRANSLATE_BYTES_PER_SECOND = 96000
+_GEMINI_LIVE_TRANSLATE_BYTES_PER_SECOND = 96000
 OPENAI_REALTIME_TRANSLATE_MODEL = os.getenv("OPENAI_REALTIME_TRANSLATE_MODEL", "gpt-realtime-translate")
 OPENAI_REALTIME_TRANSLATE_URL = (
     "wss://api.openai.com/v1/realtime/translations"
@@ -2555,6 +2570,385 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         _audio_secs = total_audio_bytes / _OPENAI_REALTIME_TRANSLATE_BYTES_PER_SECOND
         _usd = (_audio_secs / 60.0) * 0.034
         print(f"[OAI-RT][usage] org={org_id} room={room_id} audio_secs={_audio_secs:.1f} estimated_usd={_usd:.4f}")
+
+
+@app.websocket("/ws/stt/gemini-live-translate")
+async def ws_stt_gemini_live_translate(websocket: WebSocket):
+    src_lang_full = _clean_lang(websocket.query_params.get("source"), "ko")
+    tgt_lang_full = _clean_lang(websocket.query_params.get("target"), "en")
+    target_language = gemini_target_language_code(tgt_lang_full)
+    ctx = _context_from_query_params(websocket.query_params)
+    org_id, room_id = _resolve_room_context(
+        org_id=ctx.get("orgId"),
+        room_id=ctx.get("roomId"),
+        service_key=ctx.get("serviceKey"),
+        church_slug=ctx.get("churchSlug"),
+    )
+    service_key = ctx.get("serviceKey")
+    church_slug = ctx.get("churchSlug")
+    host_uid_claim = _uid_from_id_token(ctx.get("idToken"))
+    host_token_claim = ctx.get("hostToken")
+
+    if not org_id or not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+        security_event(
+            "ws_auth_rejected",
+            path="/ws/stt/gemini-live-translate",
+            org_id=org_id or "",
+            ip=_security_client_ip(websocket),
+            detail="host_auth_failed",
+        )
+        await websocket.close(code=1008)
+        return
+    if not room_id:
+        security_event(
+            "ws_auth_rejected",
+            path="/ws/stt/gemini-live-translate",
+            org_id=org_id,
+            ip=_security_client_ip(websocket),
+            detail="missing_room_id",
+        )
+        await websocket.close(code=1008)
+        return
+
+    api_key = gemini_api_key()
+    if not api_key:
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "GEMINI_API_KEY or GOOGLE_API_KEY is not configured",
+            }
+        )
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+
+    gemini = None
+    try:
+        gemini = await websockets.connect(
+            gemini_websocket_url(api_key),
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_size=16 * 1024 * 1024,
+        )
+        await gemini.send(gemini_setup_message(target_language))
+
+        setup_complete = False
+        while not setup_complete:
+            raw_setup = await asyncio.wait_for(gemini.recv(), timeout=20)
+            try:
+                setup_event = json.loads(raw_setup)
+            except Exception:
+                continue
+            if setup_event.get("setupComplete") is not None:
+                setup_complete = True
+                break
+            if setup_event.get("error"):
+                raise RuntimeError(str(setup_event.get("error")))
+    except Exception as exc:
+        if gemini is not None:
+            try:
+                await gemini.close()
+            except Exception:
+                pass
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": f"Gemini Live Translate connect failed: {str(exc)[:240]}",
+            }
+        )
+        await websocket.close(code=1011)
+        return
+
+    seq = 0
+    closed = asyncio.Event()
+    output_buffer = ""
+    source_buffer = ""
+    flush_task: asyncio.Task | None = None
+    last_audio_touch_ts = 0.0
+    total_audio_bytes = 0
+    downsampler = Pcm16Downsampler48To16()
+    chunk_buffer = PcmChunkBuffer()
+
+    async def _send_to_producer(message: dict[str, Any]) -> None:
+        if closed.is_set():
+            return
+        if websocket.application_state == WebSocketState.DISCONNECTED:
+            return
+        try:
+            await websocket.send_json(message)
+        except Exception:
+            pass
+
+    async def _broadcast_translation(text: str, *, partial: bool, src_text: str = "") -> None:
+        nonlocal seq
+        clean = " ".join((text or "").split())
+        clean_src = " ".join((src_text or "").split())
+        if not clean:
+            return
+        if not partial:
+            seq += 1
+        message_seq = seq + (1 if partial else 0)
+        meta_payload: dict[str, Any] = {
+            "mode": "gemini_live_translate",
+            "provider": "google",
+            "engine": GEMINI_LIVE_TRANSLATE_MODEL,
+            "partial": partial,
+            "segment_id": message_seq,
+            "rev": 0,
+            "seq": message_seq,
+            "is_final": not partial,
+        }
+        if org_id:
+            meta_payload["org_id"] = org_id
+        if room_id:
+            meta_payload["room_id"] = room_id
+        if service_key:
+            meta_payload["service_key"] = service_key
+        if church_slug:
+            meta_payload["church_slug"] = church_slug
+
+        live_msg_new = {
+            "mode": "realtime" if partial else "live",
+            "text": clean,
+            "seq": message_seq,
+            "src": {"text": clean_src, "lang": src_lang_full},
+            "tgt": {"lang": tgt_lang_full},
+            "meta": meta_payload.copy(),
+            "orgId": org_id,
+            "roomId": room_id,
+        }
+        live_msg_legacy = {
+            "type": "translation",
+            "payload": clean,
+            "lang": tgt_lang_full,
+            "meta": meta_payload.copy(),
+        }
+
+        await _send_to_producer(live_msg_new)
+        await _send_to_producer(live_msg_legacy)
+        try:
+            await asyncio.gather(
+                manager.broadcast_room(org_id, room_id, live_msg_new),
+                manager.broadcast_room(org_id, room_id, live_msg_legacy),
+            )
+        except Exception as exc:
+            print("[GEMINI-LIVE][broadcast][error]", exc)
+
+        if not partial and clean_src:
+            try:
+                await manager.broadcast_room(
+                    org_id,
+                    room_id,
+                    {"type": "final_kr", "text": clean_src},
+                )
+            except Exception:
+                pass
+
+        if not partial:
+            import datetime as _dt
+
+            segment_ts = _dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+            asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _safe_append_segment(
+                    org_id,
+                    room_id,
+                    seq,
+                    clean_src,
+                    clean,
+                    "gemini_live_translate",
+                    None,
+                    segment_ts,
+                ),
+            )
+
+    async def _broadcast_audio(data: str) -> None:
+        if not data:
+            return
+        message = {
+            "type": "translated_audio",
+            "provider": "google",
+            "engine": GEMINI_LIVE_TRANSLATE_MODEL,
+            "encoding": "pcm_s16le",
+            "sampleRate": GEMINI_OUTPUT_SAMPLE_RATE,
+            "channels": 1,
+            "data": data,
+        }
+        await _send_to_producer(message)
+        try:
+            await manager.broadcast_room(org_id, room_id, message)
+        except Exception as exc:
+            print("[GEMINI-LIVE][audio-broadcast][error]", exc)
+
+    async def _commit_output(reason: str) -> None:
+        nonlocal output_buffer, source_buffer, flush_task
+        text = output_buffer.strip()
+        if not text:
+            return
+        src_text = source_buffer.strip()
+        output_buffer = ""
+        source_buffer = ""
+        flush_task = None
+        print(f"[GEMINI-LIVE][commit][{reason}] '{text[:80]}'")
+        await _broadcast_translation(text, partial=False, src_text=src_text)
+
+    def _schedule_idle_flush(delay: float = 1.0) -> None:
+        nonlocal flush_task
+        if flush_task and not flush_task.done():
+            flush_task.cancel()
+        snapshot = output_buffer
+
+        async def _flush_if_idle() -> None:
+            try:
+                await asyncio.sleep(delay)
+                if output_buffer and output_buffer == snapshot:
+                    await _commit_output("idle")
+            except asyncio.CancelledError:
+                pass
+
+        flush_task = asyncio.create_task(_flush_if_idle())
+
+    async def _send_pcm16(pcm16: bytes) -> None:
+        if pcm16:
+            await gemini.send(gemini_audio_message(pcm16))
+
+    async def from_client_to_gemini() -> None:
+        nonlocal last_audio_touch_ts, total_audio_bytes
+        try:
+            while True:
+                msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                if (pcm48 := msg.get("bytes")):
+                    total_audio_bytes += len(pcm48)
+                    pcm16 = downsampler.push(pcm48)
+                    for chunk in chunk_buffer.push(pcm16):
+                        await _send_pcm16(chunk)
+                    now_ts = time.time()
+                    if (now_ts - last_audio_touch_ts) >= 20:
+                        last_audio_touch_ts = now_ts
+                        asyncio.get_running_loop().run_in_executor(
+                            None,
+                            multichurch_store.touch_audio,
+                            org_id,
+                            room_id,
+                        )
+                elif (text_msg := msg.get("text")):
+                    try:
+                        payload = json.loads(text_msg)
+                    except Exception:
+                        payload = {}
+                    if payload.get("type") in {"finalize", "stop"}:
+                        await _send_pcm16(chunk_buffer.flush())
+                        if payload.get("type") == "stop":
+                            break
+        except Exception as exc:
+            if not closed.is_set():
+                print("[GEMINI-LIVE][client->gemini][error]", exc)
+                await _send_to_producer(
+                    {
+                        "type": "error",
+                        "message": f"Gemini audio stream failed: {str(exc)[:180]}",
+                    }
+                )
+        finally:
+            closed.set()
+
+    async def from_gemini_to_server() -> None:
+        nonlocal output_buffer, source_buffer
+        try:
+            async for raw in gemini:
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    continue
+
+                if event.get("error"):
+                    error = event.get("error")
+                    message = error.get("message") if isinstance(error, dict) else str(error)
+                    await _send_to_producer(
+                        {
+                            "type": "error",
+                            "message": message or "Gemini Live Translate error",
+                        }
+                    )
+                    break
+
+                content = parse_gemini_server_content(event)
+                if content.interrupted:
+                    output_buffer = ""
+                    source_buffer = ""
+                    if flush_task and not flush_task.done():
+                        flush_task.cancel()
+
+                if content.input_transcript:
+                    source_buffer = merge_gemini_transcript(
+                        source_buffer,
+                        content.input_transcript,
+                    )
+                    await _send_to_producer(
+                        {"type": "stt.partial", "text": source_buffer.strip()}
+                    )
+
+                if content.output_transcript:
+                    output_buffer = merge_gemini_transcript(
+                        output_buffer,
+                        content.output_transcript,
+                    )
+                    await _broadcast_translation(
+                        output_buffer,
+                        partial=True,
+                        src_text=source_buffer,
+                    )
+                    _schedule_idle_flush()
+
+                for audio_data in content.audio_chunks:
+                    await _broadcast_audio(audio_data)
+
+                if content.turn_complete:
+                    await _commit_output("turn_complete")
+        except Exception as exc:
+            if not closed.is_set():
+                print("[GEMINI-LIVE][gemini->server][error]", exc)
+                await _send_to_producer(
+                    {
+                        "type": "error",
+                        "message": f"Gemini Live Translate disconnected: {str(exc)[:180]}",
+                    }
+                )
+        finally:
+            closed.set()
+
+    consumer = asyncio.create_task(from_client_to_gemini())
+    producer = asyncio.create_task(from_gemini_to_server())
+    await closed.wait()
+    consumer.cancel()
+    producer.cancel()
+    if flush_task and not flush_task.done():
+        flush_task.cancel()
+    try:
+        await asyncio.gather(consumer, producer, return_exceptions=True)
+    except Exception:
+        pass
+    try:
+        await _commit_output("shutdown")
+    except Exception:
+        pass
+    if gemini is not None:
+        try:
+            await gemini.close()
+        except Exception:
+            pass
+    if total_audio_bytes > 0:
+        audio_secs = total_audio_bytes / _GEMINI_LIVE_TRANSLATE_BYTES_PER_SECOND
+        print(
+            f"[GEMINI-LIVE][usage] org={org_id} room={room_id} "
+            f"audio_secs={audio_secs:.1f} input_rate={GEMINI_INPUT_SAMPLE_RATE}"
+        )
+
 
 DEFAULT_DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")
 

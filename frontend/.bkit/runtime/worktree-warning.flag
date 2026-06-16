@@ -1,0 +1,8 @@
+{
+  "detectedAt": "2026-06-16T12:46:34.777Z",
+  "toplevel": "/home/namju/projects/deepgram",
+  "gitDir": "/home/namju/projects/deepgram/.git",
+  "gitCommonDir": "/home/namju/projects/.git",
+  "issue": "https://github.com/anthropics/claude-code/issues/46808",
+  "message": "git worktree detected — Claude Code hooks may not fire (issue #46808). Run bkit from the primary repository if hook-driven automation is required."
+}

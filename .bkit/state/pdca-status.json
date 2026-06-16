@@ -1,7 +1,8 @@
 {
   "version": "3.0",
-  "lastUpdated": "2026-04-11T17:59:22.450Z",
+  "lastUpdated": "2026-06-16T00:00:00.000Z",
   "activeFeatures": [
+    "editing-sermon",
     "security-hardening",
     "billing",
     "admin",
@@ -22,8 +23,34 @@
     "config",
     "deepgram-keyterms"
   ],
-  "primaryFeature": "frontend",
+  "primaryFeature": "editing-sermon",
   "features": {
+    "editing-sermon": {
+      "phase": "do",
+      "phaseNumber": 3,
+      "matchRate": null,
+      "iterationCount": 0,
+      "startedAt": "2026-06-16T00:00:00.000Z",
+      "planDoc": "docs/01-plan/features/editing-sermon.plan.md",
+      "designDoc": "docs/02-design/features/editing-sermon.design.md",
+      "architectureOption": "C-Pragmatic",
+      "currentScope": "module-1",
+      "modulesCompleted": ["module-1"],
+      "implementationFiles": [
+        "backend/app/sermon_review/__init__.py",
+        "backend/app/sermon_review/models.py",
+        "backend/app/sermon_review/validation.py",
+        "backend/app/sermon_review/xlsx_export.py",
+        "backend/app/sermon_review/xlsx_import.py",
+        "backend/tests/test_sermon_review_validation.py",
+        "backend/tests/test_sermon_review_xlsx.py",
+        "backend/tests/fixtures/sermon_review/build_fixtures.py"
+      ],
+      "timestamps": {
+        "started": "2026-06-16T00:00:00.000Z",
+        "lastUpdated": "2026-06-16T00:00:00.000Z"
+      }
+    },
     "security-hardening": {
       "phase": "check",
       "matchRate": 100,

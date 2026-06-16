@@ -210,3 +210,18 @@ Re-running bootstrap now reuses the existing org `hostToken` unless `--host-toke
 
 - Rules: `backend/firestore/firestore.rules`
 - Indexes: `backend/firestore/firestore.indexes.json`
+
+## Gemini Live Translate (optional)
+
+The existing Deepgram + GPT engine remains the default. To enable the optional
+Gemini 3.5 Live Translate preview engine, configure the backend:
+
+```bash
+GEMINI_API_KEY=your_google_ai_api_key
+GEMINI_LIVE_TRANSLATE_MODEL=gemini-3.5-live-translate-preview
+```
+
+Hosts can then select `Gemini 3.5 Live Translate (preview)` under Advanced
+Controls. The API key stays on the backend. Gemini transcripts reuse the
+existing room broadcast protocol, and supported listener pages play Gemini's
+translated PCM audio when their Audio control is enabled.
