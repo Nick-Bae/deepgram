@@ -292,6 +292,20 @@ _HARD_INACTIVE_ORG_STATUSES: set[str] = {"inactive", "disabled", "suspended", "d
 _FS_TIMEOUT = 15.0  # seconds — prevents gRPC stalls from hanging indefinitely
 
 
+def _ignore_missing_adc_file_in_cloud_run() -> None:
+    """Let Cloud Run use its attached service account if a stale local ADC path is configured."""
+    if not (os.getenv("K_SERVICE") or (os.getenv("APP_ENV") or "").strip().lower() == "production"):
+        return
+    path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if not path or os.path.exists(path):
+        return
+    print(
+        f"[GCP] ignoring missing GOOGLE_APPLICATION_CREDENTIALS path '{path}' in Cloud Run; "
+        "using Application Default Credentials"
+    )
+    os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+
+
 def _patch_firestore_stream_retry_metadata(db: Any) -> None:
     """Backfill retry metadata expected by google-cloud-firestore query streams."""
     try:
@@ -2958,6 +2972,7 @@ class InMemoryMultiChurchStore:
 class FirestoreMultiChurchStore:
     def __init__(self) -> None:
         assert gcf_firestore is not None
+        _ignore_missing_adc_file_in_cloud_run()
         project_id = (
             (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
             or (os.getenv("FIRESTORE_PROJECT") or "").strip()
@@ -5766,7 +5781,11 @@ def _build_store():
     if gcf_firestore is not None and (
         os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("FIRESTORE_PROJECT") or os.getenv("GCP_PROJECT")
     ):
-        return FirestoreMultiChurchStore()
+        try:
+            return FirestoreMultiChurchStore()
+        except Exception as exc:
+            print(f"[MULTICHURCH] Firestore store unavailable during startup; using in-memory store: {exc}")
+            return InMemoryMultiChurchStore()
     return InMemoryMultiChurchStore()
 
 

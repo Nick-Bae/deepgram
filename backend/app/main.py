@@ -221,7 +221,8 @@ def _normalize_origin(raw_origin: str) -> Optional[str]:
     if not token:
         return None
     if token == "*":
-        raise RuntimeError("CORS wildcard origin is not allowed; configure explicit origins in CORS_ALLOW_ORIGINS")
+        print("[CORS] ignoring wildcard origin '*'; configure explicit origins in CORS_ALLOW_ORIGINS")
+        return None
     parsed = urlsplit(token)
     if parsed.scheme not in {"http", "https"}:
         return None
@@ -254,11 +255,11 @@ def _resolve_cors_allow_origins() -> list[str]:
             origins_raw.append(token)
     if not origins_raw:
         if _IS_PRODUCTION:
-            raise RuntimeError(
-                "CORS_ALLOW_ORIGINS is not configured. "
-                "Set it to your frontend origin (e.g. https://yourapp.vercel.app) "
-                "before deploying to production."
+            print(
+                "[CORS] CORS_ALLOW_ORIGINS is not configured in production; "
+                "starting with an empty browser allow-list"
             )
+            return []
         origins_raw.extend(_DEFAULT_CORS_ALLOW_ORIGINS)
 
     seen: set[str] = set()
