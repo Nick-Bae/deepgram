@@ -235,10 +235,11 @@ def _normalize_origin(raw_origin: str) -> Optional[str]:
     # In development the default list only uses "localhost", so this only blocks
     # someone explicitly adding an IP to CORS_ALLOW_ORIGINS in production.
     if _IS_PRODUCTION and _IP_HOST_RE.match(parsed.netloc):
-        raise RuntimeError(
-            f"IP-address CORS origin '{token}' is not allowed in production. "
-            "Use a hostname instead."
+        print(
+            f"[CORS] ignoring IP-address origin '{token}' in production; "
+            "configure a hostname in CORS_ALLOW_ORIGINS"
         )
+        return None
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
@@ -269,6 +270,12 @@ def _resolve_cors_allow_origins() -> list[str]:
         seen.add(normalized)
         resolved.append(normalized)
     if not resolved:
+        if _IS_PRODUCTION:
+            print(
+                "[CORS] no valid production CORS origins configured; "
+                "starting with an empty browser allow-list"
+            )
+            return []
         raise RuntimeError("No valid CORS origins configured. Set CORS_ALLOW_ORIGINS to explicit http(s) origins.")
     return resolved
 
