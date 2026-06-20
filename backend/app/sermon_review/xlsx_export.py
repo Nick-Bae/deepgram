@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from io import BytesIO
 
 from openpyxl import Workbook
@@ -33,6 +34,13 @@ _EDITABLE_FILL = PatternFill(
 
 _WRAP = Alignment(wrap_text=True, vertical="top")
 
+# Excel workbooks use XML internally. These control characters are invalid in
+# XML 1.0 and cause openpyxl to reject the cell value. Preserve valid
+# whitespace such as tabs, newlines, and carriage returns.
+_ILLEGAL_XML_CONTROL_CHARACTERS = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F]"
+)
+
 _DEFAULT_COLUMN_WIDTH: dict[str, int] = {
     "Sermon ID": 18,
     "Segment ID": 10,
@@ -43,6 +51,12 @@ _DEFAULT_COLUMN_WIDTH: dict[str, int] = {
     "Notes": 30,
     "Status": 12,
 }
+
+
+def _xlsx_value(value: object) -> object:
+    if isinstance(value, str):
+        return _ILLEGAL_XML_CONTROL_CHARACTERS.sub("", value)
+    return value
 
 
 def build_xlsx(sermon: Sermon) -> bytes:
@@ -78,7 +92,11 @@ def build_xlsx(sermon: Sermon) -> bytes:
             "Status": segment.status,
         }
         for col_idx, name in enumerate(COLUMNS, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=values[name])
+            cell = ws.cell(
+                row=row_idx,
+                column=col_idx,
+                value=_xlsx_value(values[name]),
+            )
             cell.alignment = _WRAP
             cell.fill = (
                 _PROTECTED_FILL if name in _PROTECTED_COLUMNS else _EDITABLE_FILL
