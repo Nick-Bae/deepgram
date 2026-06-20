@@ -124,6 +124,32 @@ class ListTests(unittest.TestCase):
         self.assertEqual(listed[1]["sermonId"], "srm_old")
 
 
+class DeleteTests(unittest.TestCase):
+    def test_delete_removes_sermon_and_unlinks_services(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(store)
+        store.create_review_sermon(_sermon(org_id))
+        service_key = list(store._services.keys())[0][1]
+        store.link_review_sermon_to_service(
+            org_id, service_key, "srm_test_001"
+        )
+
+        result = store.delete_review_sermon(org_id, "srm_test_001")
+
+        self.assertIsNone(store.get_review_sermon(org_id, "srm_test_001"))
+        self.assertIsNone(
+            store._services[(org_id, service_key)]["linkedSermonId"]
+        )
+        self.assertEqual(result["unlinkedServiceKeys"], [service_key])
+
+    def test_delete_missing_sermon_raises(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(store)
+
+        with self.assertRaises(SermonNotFoundError):
+            store.delete_review_sermon(org_id, "missing")
+
+
 class UpdateSegmentsTests(unittest.TestCase):
     def test_update_with_matching_precondition(self) -> None:
         store = InMemoryMultiChurchStore()

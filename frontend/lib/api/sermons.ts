@@ -192,6 +192,26 @@ export async function getSermon(
   }
 }
 
+export async function deleteSermon(
+  orgId: string,
+  sermonId: string,
+  options: FetchOptions
+): Promise<void> {
+  const { signal, cleanup } = withTimeout(
+    options.signal,
+    options.timeoutMs ?? REQUEST_TIMEOUT_MS
+  );
+  try {
+    const res = await fetch(
+      `${API_URL}/api/org/${encodeURIComponent(orgId)}/sermons/${encodeURIComponent(sermonId)}`,
+      { method: "DELETE", headers: authHeaders(options.idToken), signal }
+    );
+    if (!res.ok) throw await parseError(res);
+  } finally {
+    cleanup();
+  }
+}
+
 export type ExportReviewFileResult = {
   blob: Blob;
   filename: string;

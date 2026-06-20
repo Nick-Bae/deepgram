@@ -414,6 +414,75 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("%EC%9D%80%ED%98%9C", disposition)
 
 
+class DeleteTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.store = InMemoryMultiChurchStore()
+        _Patches(self, self.store).start()
+        self.org_id = _bootstrap_owner(self.store)
+
+    async def _seed(self) -> str:
+        result = await sermon_review_routes.ingest_sermon(
+            org_id=self.org_id,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            google_docs_service=None,
+            sourceType="paste",
+            title="Delete Test",
+            text="오늘 우리는 은혜를 봅니다.",
+            url=None,
+            file=None,
+        )
+        return result["data"]["sermonId"]
+
+    async def test_owner_can_delete_sermon(self) -> None:
+        sid = await self._seed()
+
+        result = sermon_review_routes.delete_sermon(
+            org_id=self.org_id,
+            sermon_id=sid,
+            request=_FakeRequest(
+                "DELETE", f"/api/org/{self.org_id}/sermons/{sid}"
+            ),
+            user=_user("uid_owner"),
+        )
+
+        self.assertEqual(result["data"]["sermonId"], sid)
+        self.assertIsNone(self.store.get_review_sermon(self.org_id, sid))
+
+    async def test_host_cannot_delete_sermon(self) -> None:
+        _add_member(self.store, self.org_id, "uid_host", "host")
+        sid = await self._seed()
+
+        with self.assertRaises(HTTPException) as ctx:
+            sermon_review_routes.delete_sermon(
+                org_id=self.org_id,
+                sermon_id=sid,
+                request=_FakeRequest(
+                    "DELETE", f"/api/org/{self.org_id}/sermons/{sid}"
+                ),
+                user=_user("uid_host"),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertIsNotNone(self.store.get_review_sermon(self.org_id, sid))
+
+    async def test_delete_missing_sermon_404(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            sermon_review_routes.delete_sermon(
+                org_id=self.org_id,
+                sermon_id="missing",
+                request=_FakeRequest(
+                    "DELETE", f"/api/org/{self.org_id}/sermons/missing"
+                ),
+                user=_user("uid_owner"),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(
+            ctx.exception.detail["error"]["code"], "SERMON_NOT_FOUND"
+        )
+
+
 class ImportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.store = InMemoryMultiChurchStore()

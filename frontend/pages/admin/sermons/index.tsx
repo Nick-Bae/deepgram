@@ -9,10 +9,11 @@ import { useEffect, useMemo, useState } from "react";
 
 import { useAuth } from "../../../lib/authContext";
 import { fetchAuthMe, type OrgMembership } from "../../../lib/backendAuth";
-import { listSermons } from "../../../lib/api/sermons";
+import { deleteSermon, listSermons } from "../../../lib/api/sermons";
 import { SermonApiError, SermonSummary } from "../../../lib/types/sermon";
 
 const VIEWER_ROLE = "viewer";
+const DELETE_ROLES = new Set(["owner", "admin"]);
 
 export default function AdminSermonsListPage() {
   const router = useRouter();
@@ -26,6 +27,7 @@ export default function AdminSermonsListPage() {
   const [error, setError] = useState<string | null>(null);
   const [sermons, setSermons] = useState<SermonSummary[]>([]);
   const [loadingSermons, setLoadingSermons] = useState(false);
+  const [deletingSermonId, setDeletingSermonId] = useState("");
 
   const selectedMembership = useMemo(
     () => memberships.find((row) => row.orgId === selectedOrgId) || null,
@@ -33,6 +35,37 @@ export default function AdminSermonsListPage() {
   );
   const isViewer =
     (selectedMembership?.role || "").trim().toLowerCase() === VIEWER_ROLE;
+  const canDelete = DELETE_ROLES.has(
+    (selectedMembership?.role || "").trim().toLowerCase()
+  );
+
+  const handleDelete = async (sermon: SermonSummary) => {
+    if (!canDelete || deletingSermonId) return;
+    const confirmed = window.confirm(
+      `Delete "${sermon.title || "(untitled)"}"? This permanently removes the transcript and its reviewed translations.`
+    );
+    if (!confirmed) return;
+
+    setDeletingSermonId(sermon.sermonId);
+    setError(null);
+    try {
+      const idToken = await getIdToken();
+      if (!idToken) {
+        setError("You are signed out. Please sign in again.");
+        return;
+      }
+      await deleteSermon(selectedOrgId, sermon.sermonId, { idToken });
+      setSermons((current) =>
+        current.filter((row) => row.sermonId !== sermon.sermonId)
+      );
+    } catch (err: unknown) {
+      if (err instanceof SermonApiError) setError(err.message);
+      else if (err instanceof Error) setError(err.message);
+      else setError("Failed to delete sermon.");
+    } finally {
+      setDeletingSermonId("");
+    }
+  };
 
   useEffect(() => {
     if (authLoading) return;
@@ -215,7 +248,13 @@ export default function AdminSermonsListPage() {
           ) : sermons.length === 0 ? (
             <EmptyState orgId={selectedOrgId} />
           ) : (
-            <SermonTable orgId={selectedOrgId} sermons={sermons} />
+            <SermonTable
+              orgId={selectedOrgId}
+              sermons={sermons}
+              canDelete={canDelete}
+              deletingSermonId={deletingSermonId}
+              onDelete={handleDelete}
+            />
           )}
         </div>
       </main>
@@ -246,9 +285,15 @@ function EmptyState({ orgId }: { orgId: string }) {
 function SermonTable({
   orgId,
   sermons,
+  canDelete,
+  deletingSermonId,
+  onDelete,
 }: {
   orgId: string;
   sermons: SermonSummary[];
+  canDelete: boolean;
+  deletingSermonId: string;
+  onDelete: (sermon: SermonSummary) => void;
 }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
@@ -259,6 +304,7 @@ function SermonTable({
             <th className="px-4 py-3 text-left">Segments</th>
             <th className="px-4 py-3 text-left">Status</th>
             <th className="px-4 py-3 text-left">Updated</th>
+            {canDelete && <th className="px-4 py-3 text-right">Actions</th>}
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
@@ -282,6 +328,18 @@ function SermonTable({
               <td className="px-4 py-3 text-slate-600">
                 {formatRelative(s.updatedAt)}
               </td>
+              {canDelete && (
+                <td className="px-4 py-3 text-right">
+                  <button
+                    type="button"
+                    onClick={() => onDelete(s)}
+                    disabled={Boolean(deletingSermonId)}
+                    className="rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {deletingSermonId === s.sermonId ? "Deleting…" : "Delete"}
+                  </button>
+                </td>
+              )}
             </tr>
           ))}
         </tbody>

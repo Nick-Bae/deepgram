@@ -53,6 +53,7 @@ router = APIRouter(tags=["sermon-review"])
 READ_ROLES = frozenset({"owner", "admin", "host"})
 WRITE_ROLES = frozenset({"owner", "admin", "host"})
 LINK_ROLES = frozenset({"owner", "admin"})
+DELETE_ROLES = frozenset({"owner", "admin"})
 
 
 # The frontend uses Firebase Google sign-in with the `documents.readonly`
@@ -338,6 +339,36 @@ def get_sermon(
     if sermon is None:
         raise _err("SERMON_NOT_FOUND", "Sermon not found.", status=404)
     return _ok(sermon)
+
+
+# -- DELETE /org/{org_id}/sermons/{sermon_id} ---------------------------------
+
+
+@router.delete("/org/{org_id}/sermons/{sermon_id}")
+def delete_sermon(
+    org_id: str,
+    sermon_id: str,
+    request: Request,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    require_org_role(
+        org_id=org_id, user=user, roles=DELETE_ROLES, store=multichurch_store
+    )
+    try:
+        result = multichurch_store.delete_review_sermon(org_id, sermon_id)
+    except SermonNotFoundError as exc:
+        raise _err("SERMON_NOT_FOUND", str(exc), status=404)
+
+    security_event(
+        "sermon_review_deleted",
+        severity="INFO",
+        uid=user.uid,
+        org_id=org_id,
+        **_request_meta(request),
+        sermon_id=sermon_id,
+        unlinked_service_count=len(result.get("unlinkedServiceKeys") or []),
+    )
+    return _ok(result)
 
 
 # -- GET /org/{org_id}/sermons/{sermon_id}/review-file.xlsx -------------------

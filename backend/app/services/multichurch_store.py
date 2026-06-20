@@ -2864,6 +2864,31 @@ class InMemoryMultiChurchStore:
         )
         return items
 
+    def delete_review_sermon(self, org_id: str, sermon_id: str) -> Dict[str, Any]:
+        from app.sermon_review.models import SermonNotFoundError
+
+        self._ensure_review_sermons()
+        with self._lock:
+            deleted = self._review_sermons.pop((org_id, sermon_id), None)
+            if deleted is None:
+                raise SermonNotFoundError(
+                    f"Sermon {sermon_id} not found in org {org_id}"
+                )
+
+            unlinked_service_keys: List[str] = []
+            for (oid, service_key), service in self._services.items():
+                if oid != org_id or service.get("linkedSermonId") != sermon_id:
+                    continue
+                service["linkedSermonId"] = None
+                service["updatedAt"] = _utcnow()
+                unlinked_service_keys.append(service_key)
+
+            return {
+                "orgId": org_id,
+                "sermonId": sermon_id,
+                "unlinkedServiceKeys": unlinked_service_keys,
+            }
+
     def update_review_sermon_segments(
         self,
         org_id: str,
@@ -5649,6 +5674,41 @@ class FirestoreMultiChurchStore:
             return [d.to_dict() for d in docs if d.exists]
         except Exception:
             return []
+
+    def delete_review_sermon(self, org_id: str, sermon_id: str) -> Dict[str, Any]:
+        from app.sermon_review.models import SermonNotFoundError
+
+        sermon_ref = self._review_sermon_ref(org_id, sermon_id)
+        sermon_snap = sermon_ref.get(timeout=_FS_TIMEOUT)
+        if not sermon_snap.exists:
+            raise SermonNotFoundError(
+                f"Sermon {sermon_id} not found in org {org_id}"
+            )
+
+        linked_services = (
+            self._db
+            .collection("organizations").document(org_id)
+            .collection("services")
+            .where("linkedSermonId", "==", sermon_id)
+            .get(timeout=_FS_TIMEOUT)
+        )
+        batch = self._db.batch()
+        for service_snap in linked_services:
+            batch.update(
+                service_snap.reference,
+                {
+                    "linkedSermonId": None,
+                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+            )
+        batch.delete(sermon_ref)
+        batch.commit()
+
+        return {
+            "orgId": org_id,
+            "sermonId": sermon_id,
+            "unlinkedServiceKeys": [snap.id for snap in linked_services],
+        }
 
     def update_review_sermon_segments(
         self,
