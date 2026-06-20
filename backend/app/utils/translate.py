@@ -1583,6 +1583,7 @@ async def translate_text(
     max_tokens: Optional[int] = None,
     model_override: Optional[str] = None,
     usage_out: Optional[Dict[str, Any]] = None,
+    strict_target_only: bool = False,
 ) -> str:
     """
     Async translator. Returns ONLY the translated text (no quotes/explanations).
@@ -1633,6 +1634,14 @@ async def translate_text(
         org_id=org_id,
     )
     user_content = _build_user_content_block(masked_text, ctx_for_prompt, text, had_established_context, update_ctx, source_lang=source, target_lang=target)
+    if strict_target_only:
+        target_label = _language_name(target)
+        user_content = (
+            f"{user_content}\n\n"
+            f"RETRY REQUIREMENT: Output only fluent {target_label}. "
+            "Do not copy any source-language words or characters. "
+            "Return only the translation, with no notes or quotation marks."
+        )
 
     try:
         model_name = ENV.resolve_translation_model(model_override)

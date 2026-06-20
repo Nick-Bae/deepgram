@@ -425,10 +425,15 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
       };
     };
 
-    connect();
+    // Defer the initial socket until after the current effect turn. In React
+    // Strict Mode, the first development-only mount is immediately cleaned up;
+    // opening synchronously causes the browser warning "closed before the
+    // connection is established" even though the replacement socket succeeds.
+    const initialConnectTimer = setTimeout(connect, 0);
 
     return () => {
       aliveRef.current = false;
+      clearTimeout(initialConnectTimer)
       clearHeartbeatTimer()
       clearReconnectingStateTimer()
       clearDisconnectStateTimer()

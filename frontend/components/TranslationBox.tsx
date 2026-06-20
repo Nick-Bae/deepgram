@@ -785,7 +785,14 @@ export default function TranslationBox({
         }
       }
     } else if (isFinal) {
-      console.log('[FE][WS][in][suppressed-target]', { seq, src: clip(committedSrc || '(none)') });
+      console.warn('[FE][WS][in][empty-target]', {
+        seq,
+        src: clip(committedSrc || '(none)'),
+        reason: lastMeta?.reason || 'unknown',
+        code: lastMeta?.code || 'unknown',
+        provider: lastMeta?.provider || 'unknown',
+        message: lastMeta?.message || '',
+      });
     }
 
     if (isFinal) {

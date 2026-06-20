@@ -525,6 +525,7 @@ async def _translate_text_guarded(
         )
         return "", _rate_limit_meta(blocked)
     usage: dict[str, Any] = {}
+    retry_usage: dict[str, Any] = {}
     try:
         translated = await translate_text(
             source_text,
@@ -542,6 +543,45 @@ async def _translate_text_guarded(
             usage_out=usage,
             model_override=model_override,
         )
+        source_primary = _normalize_lang(source_lang, "ko")
+        target_primary = _normalize_lang(target_lang, "en")
+        mismatch = (
+            source_primary != target_primary
+            and bool(usage.get("failOpen"))
+            and str(usage.get("errorMessage") or "") == "target_language_mismatch"
+        )
+        if mismatch:
+            print(
+                "[TX][target-language-retry]",
+                f"source={source_primary}",
+                f"target={target_primary}",
+                f"text={source_text[:120]!r}",
+            )
+            translated = await translate_text(
+                source_text,
+                source_lang,
+                target_lang,
+                ctx=ctx,
+                update_ctx=update_ctx,
+                custom_prompt=custom_prompt,
+                service_prompt=service_prompt,
+                compact_prompt=True,
+                script_examples=script_examples,
+                script_glossary=script_glossary,
+                org_id=org_id,
+                max_tokens=max_tokens,
+                usage_out=retry_usage,
+                model_override=model_override,
+                strict_target_only=True,
+            )
+            for key in ("promptTokens", "completionTokens", "totalTokens"):
+                usage[key] = int(usage.get(key) or 0) + int(retry_usage.get(key) or 0)
+            usage.pop("failOpen", None)
+            usage.pop("errorMessage", None)
+            for key, value in retry_usage.items():
+                if key not in {"promptTokens", "completionTokens", "totalTokens"}:
+                    usage[key] = value
+            usage["targetLanguageRetry"] = True
     finally:
         _settle_translation_budget(reservations, actual_tokens=int(usage.get("totalTokens") or 0))
     source_primary = _normalize_lang(source_lang, "ko")
@@ -1241,6 +1281,14 @@ async def ws_translate(ws: WebSocket):
                 except Exception:
                     reviewed_text = None
             if reviewed_text:
+                reviewed_text = _reject_invalid_curated_translation(
+                    reviewed_text,
+                    src_lang_full,
+                    tgt_lang_full,
+                    source_kind="sermon-review",
+                    source_text=src_text,
+                )
+            if reviewed_text:
                 translated = reviewed_text
                 live_mode = "reviewed"
                 meta_payload.update(
@@ -1297,6 +1345,14 @@ async def ws_translate(ws: WebSocket):
             tgt_lang_full,
             meta_payload,
         )
+        if meta_payload.get("reason") == "target_language_mismatch":
+            print(
+                "[WS translate][suppressed-target]",
+                f"seq={seq}",
+                f"source={src_lang_full}",
+                f"target={tgt_lang_full}",
+                f"text={src_text[:160]!r}",
+            )
 
         live_msg_new = {
             "mode": live_mode if not is_partial else "realtime",
@@ -1571,6 +1627,30 @@ def _suppress_invalid_translation_output(
     return ""
 
 
+def _reject_invalid_curated_translation(
+    translated: Optional[str],
+    source_lang: str,
+    target_lang: str,
+    *,
+    source_kind: str,
+    source_text: str,
+) -> Optional[str]:
+    clean = (translated or "").strip()
+    if not clean:
+        return None
+    if not is_invalid_translation_output(clean, source_lang, target_lang):
+        return clean
+    print(
+        "[TX][curated-target-rejected]",
+        f"kind={source_kind}",
+        f"source={source_lang}",
+        f"target={target_lang}",
+        f"text={source_text[:160]!r}",
+        f"curated={clean[:160]!r}",
+    )
+    return None
+
+
 def _format_duration_label(seconds: int) -> str:
     total = max(1, int(seconds))
     minutes, remainder = divmod(total, 60)
@@ -1826,6 +1906,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
         pending_speech_final = False
         pending_task: asyncio.Task | None = None
         last_preview_norm: str = ""
+        latest_partial: str = ""
+        latest_partial_at: float = 0.0
 
         def ends_like_sentence(t: str) -> bool:
             t = (t or "").rstrip()
@@ -1956,6 +2038,14 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     except Exception as exc:
                         print("[SERMON_REVIEW][lookup-error]", exc)
 
+                if reviewed_text:
+                    reviewed_text = _reject_invalid_curated_translation(
+                        reviewed_text,
+                        src_lang_full,
+                        tgt_lang_full,
+                        source_kind="sermon-review",
+                        source_text=clean_src,
+                    )
                 if reviewed_text:
                     translated = reviewed_text
                     live_mode = "reviewed"
@@ -2158,7 +2248,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             await send_translation(src_text_raw, partial=True, live_mode_hint="realtime", update_ctx=False)
 
         async def commit_now(src_text_raw: str):
-            nonlocal pending_src, pending_task, pending_speech_final, last_preview_norm
+            nonlocal pending_src, pending_task, pending_speech_final, last_preview_norm, latest_partial, latest_partial_at
             if not src_text_raw or not src_text_raw.strip():
                 return
 
@@ -2195,6 +2285,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
             await send_translation(src_text_raw, partial=False, live_mode_hint="live", update_ctx=True)
 
             last_preview_norm = ""
+            latest_partial = ""
+            latest_partial_at = 0.0
             pending_src = None
             pending_speech_final = False
             if pending_task and not pending_task.done():
@@ -2226,6 +2318,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             pending_task = asyncio.create_task(_wait_and_commit(snap, wait_ms))
 
         async def flush_on_finalize():
+            nonlocal latest_partial, latest_partial_at
             while True:
                 try:
                     await finalize_event.wait()
@@ -2241,17 +2334,32 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     except Exception as exc:
                         print("[EARLY][finalize][error]", exc)
 
-                if pending_src:
+                finalize_src = pending_src
+                used_latest_partial_fallback = False
+                if (
+                    not finalize_src
+                    and latest_partial
+                    and (time.monotonic() - latest_partial_at) <= 2.0
+                    and ends_like_sentence(latest_partial)
+                ):
+                    finalize_src = latest_partial
+                    used_latest_partial_fallback = True
+                    print("[A][finalize][latest-partial-fallback]", finalize_src)
+
+                if finalize_src:
                     try:
                         if (
                             src_lang.startswith("ko")
-                            and is_strongly_incomplete_korean_segment(pending_src)
+                            and is_strongly_incomplete_korean_segment(finalize_src)
                         ):
-                            print("[A][hold][finalize-incomplete-ko]", pending_src)
-                        elif should_hold_short_korean(pending_src, pending_speech_final):
+                            print("[A][hold][finalize-incomplete-ko]", finalize_src)
+                        elif (
+                            not used_latest_partial_fallback
+                            and should_hold_short_korean(finalize_src, pending_speech_final)
+                        ):
                             await arm_timer(CJK_PENDING_HOLD_MS)
                         else:
-                            await commit_now(pending_src)
+                            await commit_now(finalize_src)
                     except Exception:
                         pass
 
@@ -2295,6 +2403,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 # show partial text in the UI; optionally emit early preview translations
                 if transcript and not is_final:
+                    latest_partial = transcript
+                    latest_partial_at = time.monotonic()
                     try:
                         await _send_to_producer({"type": "stt.partial", "text": transcript})
                     except:
@@ -2319,6 +2429,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     continue
 
                 if transcript:
+                    latest_partial = transcript
+                    latest_partial_at = time.monotonic()
                     if (
                         pending_src
                         and src_lang.startswith("ko")
