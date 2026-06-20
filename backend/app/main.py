@@ -58,6 +58,10 @@ from app.sermon_review.lookup import get_reviewed_text
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.env import ENV
+from app.utils.korean_segments import (
+    is_strongly_incomplete_korean_segment,
+    join_korean_stt_segments,
+)
 from app.gemini_live import (
     GEMINI_INPUT_SAMPLE_RATE,
     GEMINI_LIVE_TRANSLATE_MODEL,
@@ -1850,13 +1854,14 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 return
 
             seq += 1
+            assigned_seq = seq
             live_mode = live_mode_hint or ("realtime" if partial else "live")
             meta_payload: dict[str, Any] = {
                 "mode": "realtime" if partial else "realtime",
                 "partial": partial,
-                "segment_id": seq,
+                "segment_id": assigned_seq,
                 "rev": 0,
-                "seq": seq,
+                "seq": assigned_seq,
                 "is_final": not partial,
             }
             if meta_extra:
@@ -1899,7 +1904,37 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     except Exception as exc:
                         print("[SCRIPTURE][error]", exc)
 
-                if scripture_hit:
+                reviewed_text: Optional[str] = None
+                if org_id and service_key:
+                    try:
+                        reviewed_text = await _loop.run_in_executor(
+                            None,
+                            lambda: get_reviewed_text(
+                                store=multichurch_store,
+                                org_id=org_id,
+                                service_key=service_key,
+                                korean_text=clean_src,
+                            ),
+                        )
+                    except Exception as exc:
+                        print("[SERMON_REVIEW][lookup-error]", exc)
+
+                if reviewed_text:
+                    translated = reviewed_text
+                    live_mode = "reviewed"
+                    meta_payload.update(
+                        {
+                            "mode": "reviewed",
+                            "source_version": "sermon-review",
+                        }
+                    )
+                    if update_ctx:
+                        translation_ctx.remember(clean_src, translated)
+                    print(
+                        f"[SERMON_REVIEW][match] service={service_key} "
+                        f"seq={assigned_seq}"
+                    )
+                elif scripture_hit:
                     translated = scripture_hit.text
                     live_mode = "live"
                     meta_payload.update(
@@ -1936,51 +1971,51 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     )
                     if update_ctx:
                         translation_ctx.remember(clean_src, translated)
-                elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
-                    translated = clean_src
                 else:
-                    try:
-                        custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
-                        _stream_seq = seq
-                        _token_msg_base: dict[str, Any] = {
-                            "type": "translation_stream_token",
-                            "seq": _stream_seq,
-                        }
-                        if org_id:
-                            _token_msg_base["orgId"] = org_id
-                        if room_id:
-                            _token_msg_base["roomId"] = room_id
+                    if src_lang == tgt_lang and src_lang_full == tgt_lang_full:
+                        translated = clean_src
+                    else:
+                        try:
+                            custom_prompt, service_prompt = _cached_prompt_overrides(org_id)
+                            _token_msg_base: dict[str, Any] = {
+                                "type": "translation_stream_token",
+                                "seq": assigned_seq,
+                            }
+                            if org_id:
+                                _token_msg_base["orgId"] = org_id
+                            if room_id:
+                                _token_msg_base["roomId"] = room_id
 
-                        async def _on_token(token: str) -> None:
-                            msg = {**_token_msg_base, "token": token}
-                            try:
-                                if org_id and room_id:
-                                    await manager.broadcast_room(org_id, room_id, msg)
-                                else:
-                                    await manager.broadcast(msg)
-                            except Exception:
-                                pass
+                            async def _on_token(token: str) -> None:
+                                msg = {**_token_msg_base, "token": token}
+                                try:
+                                    if org_id and room_id:
+                                        await manager.broadcast_room(org_id, room_id, msg)
+                                    else:
+                                        await manager.broadcast(msg)
+                                except Exception:
+                                    pass
 
-                        translated, limit_meta = await _translate_streaming_guarded(
-                            clean_src,
-                            src_lang_full,
-                            tgt_lang_full,
-                            org_id=org_id,
-                            host_uid=host_uid_claim,
-                            ctx=translation_ctx,
-                            update_ctx=update_ctx,
-                            custom_prompt=custom_prompt,
-                            service_prompt=service_prompt,
-                            script_examples=_script_examples_dg,
-                            script_glossary=_cached_script_glossary_dg,
-                            on_token=_on_token,
-                        )
-                        if limit_meta:
-                            meta_payload.update(limit_meta)
-                    except Exception as e:
-                        print("[TX] error:", e)
-                        translated = ""
-                        meta_payload.update(_fail_open_meta(e))
+                            translated, limit_meta = await _translate_streaming_guarded(
+                                clean_src,
+                                src_lang_full,
+                                tgt_lang_full,
+                                org_id=org_id,
+                                host_uid=host_uid_claim,
+                                ctx=translation_ctx,
+                                update_ctx=update_ctx,
+                                custom_prompt=custom_prompt,
+                                service_prompt=service_prompt,
+                                script_examples=_script_examples_dg,
+                                script_glossary=_cached_script_glossary_dg,
+                                on_token=_on_token,
+                            )
+                            if limit_meta:
+                                meta_payload.update(limit_meta)
+                        except Exception as e:
+                            print("[TX] error:", e)
+                            translated = ""
+                            meta_payload.update(_fail_open_meta(e))
             else:
                 # previews: skip scripture/script matching for speed
                 if src_lang == tgt_lang and src_lang_full == tgt_lang_full:
@@ -2022,7 +2057,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             live_msg_new = {
                 "mode": live_mode,
                 "text": translated,
-                "seq": seq,
+                "seq": assigned_seq,
                 "src": {"text": clean_src, "lang": src_lang_full},
                 "tgt": {"lang": tgt_lang_full},
                 "meta": meta_payload.copy(),
@@ -2057,7 +2092,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         manager.broadcast(live_msg_new),
                         manager.broadcast(live_msg_legacy),
                     )
-                print(f"[BROADCAST] seq={seq} '{translated[:60]}'")
+                print(f"[BROADCAST] seq={assigned_seq} '{translated[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
 
@@ -2068,7 +2103,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: _safe_append_segment(
-                        org_id, room_id, seq, clean_src, translated, live_mode,
+                        org_id, room_id, assigned_seq, clean_src, translated, live_mode,
                         _seg_score, _seg_ts,
                     ),
                 )
@@ -2141,6 +2176,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 try:
                     await asyncio.sleep(delay_ms / 1000.0)
                     if pending_src and norm_ws(pending_src) == norm_ws(snap):
+                        if (
+                            src_lang.startswith("ko")
+                            and is_strongly_incomplete_korean_segment(pending_src)
+                        ):
+                            print("[A][hold][incomplete-ko]", pending_src)
+                            return
                         await commit_now(pending_src)
                 except asyncio.CancelledError:
                     pass
@@ -2165,7 +2206,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 if pending_src:
                     try:
-                        if should_hold_short_korean(pending_src, pending_speech_final):
+                        if (
+                            src_lang.startswith("ko")
+                            and is_strongly_incomplete_korean_segment(pending_src)
+                        ):
+                            print("[A][hold][finalize-incomplete-ko]", pending_src)
+                        elif should_hold_short_korean(pending_src, pending_speech_final):
                             await arm_timer(CJK_PENDING_HOLD_MS)
                         else:
                             await commit_now(pending_src)
@@ -2236,6 +2282,13 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     continue
 
                 if transcript:
+                    if (
+                        pending_src
+                        and src_lang.startswith("ko")
+                        and is_strongly_incomplete_korean_segment(pending_src)
+                    ):
+                        transcript = join_korean_stt_segments(pending_src, transcript)
+                        print(f"[A][join][incomplete-ko] src='{transcript}'")
                     pending_src = transcript
                     pending_speech_final = speech_final
                     if early_commit and chunker:

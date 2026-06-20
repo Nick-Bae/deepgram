@@ -101,6 +101,44 @@ class ScriptRouteTests(unittest.TestCase):
         self.assertIsNotNone(hit_c)
         self.assertGreaterEqual(score_c, 0.8)
 
+    def test_short_fragment_does_not_expand_to_full_script_sentence(self) -> None:
+        org_id = _bootstrap_owner(self.members, owner_uid="owner-script-short", slug="script-short", name="Script Short")
+        self.scripts.load(
+            [
+                {
+                    "source": "그 문제를 다루시는 하나님 앞에 오래 서는 것입니다.",
+                    "target": "It is to stand for a long time before God, who deals with that problem.",
+                }
+            ],
+            org_id=org_id,
+        )
+
+        hit, score, _, _, examples = self.scripts.match_with_examples(
+            "계시는",
+            org_id=org_id,
+            target_lang="en",
+        )
+
+        self.assertIsNone(hit)
+        self.assertGreater(score, 0.9)
+        self.assertEqual(examples, [])
+
+    def test_short_complete_script_sentence_can_still_match(self) -> None:
+        org_id = _bootstrap_owner(self.members, owner_uid="owner-script-exact", slug="script-exact", name="Script Exact")
+        self.scripts.load(
+            [{"source": "예수님은 오십니다.", "target": "Jesus is coming."}],
+            org_id=org_id,
+        )
+
+        hit, score, _, _, _ = self.scripts.match_with_examples(
+            "예수님은 오십니다",
+            org_id=org_id,
+            target_lang="en",
+        )
+
+        self.assertIsNotNone(hit)
+        self.assertGreater(score, 0.99)
+
     def test_script_upload_requires_membership_and_role(self) -> None:
         org_a = _bootstrap_owner(self.members, owner_uid="owner-script-c", slug="script-org-c", name="Script Org C")
         _bootstrap_owner(self.members, owner_uid="owner-script-d", slug="script-org-d", name="Script Org D")

@@ -768,6 +768,11 @@ export default function TranslationBox({
 
     if (!incoming && !committedSrc) return;
 
+    if (isFinal && seq && seq <= lastHandledSeqRef.current) {
+      console.log('[FE][WS][final][skip-already-handled]', seq);
+      return;
+    }
+
     if (incoming) {
       console.log('[FE][WS][in]', { seq, isFinal, out: clip(incoming) });
       if (isFinal) {
@@ -785,10 +790,6 @@ export default function TranslationBox({
     }
 
     if (isFinal) {
-      if (seq && seq <= lastHandledSeqRef.current) {
-        console.log('[FE][WS][final][skip-already-handled]', seq);
-        return;
-      }
       if (seq) lastHandledSeqRef.current = seq;
 
       const isDuplicateKR =

@@ -224,6 +224,7 @@ export default function AdminSermonDetailPage() {
           <SermonReviewControls
             orgId={selectedOrgId}
             sermonId={sermon.sermonId}
+            sermonTitle={sermon.title}
             onImportSuccess={() => void loadAll()}
           />
 
@@ -354,4 +355,3 @@ function SegmentStatusBadge({ status }: { status: SegmentStatus }) {
     </span>
   );
 }
-

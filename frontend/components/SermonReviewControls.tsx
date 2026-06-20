@@ -21,6 +21,7 @@ import {
 type Props = {
   orgId: string;
   sermonId: string;
+  sermonTitle: string;
   onImportSuccess?: (report: ValidationReport) => void;
 };
 
@@ -31,6 +32,7 @@ type ImportOutcome =
 export default function SermonReviewControls({
   orgId,
   sermonId,
+  sermonTitle,
   onImportSuccess,
 }: Props) {
   const { getIdToken } = useAuth();
@@ -52,7 +54,10 @@ export default function SermonReviewControls({
         return;
       }
       const result = await exportReviewFile(orgId, sermonId, { idToken });
-      triggerBlobDownload(result.blob, result.filename);
+      triggerBlobDownload(
+        result.blob,
+        reviewFilenameFromTitle(sermonTitle, result.filename)
+      );
     } catch (err: unknown) {
       if (err instanceof SermonApiError) {
         setExportError(err.message);
@@ -64,7 +69,7 @@ export default function SermonReviewControls({
     } finally {
       setExporting(false);
     }
-  }, [getIdToken, orgId, sermonId]);
+  }, [getIdToken, orgId, sermonId, sermonTitle]);
 
   const handleImport = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -186,6 +191,18 @@ export default function SermonReviewControls({
       )}
     </section>
   );
+}
+
+export function reviewFilenameFromTitle(
+  sermonTitle: string,
+  fallback = "sermon-review.xlsx"
+): string {
+  const safeTitle = (sermonTitle || "")
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-")
+    .replace(/[.\s]+$/g, "")
+    .slice(0, 120);
+  return safeTitle ? `${safeTitle}.xlsx` : fallback;
 }
 
 function resolveReport(outcome: ImportOutcome): ValidationReport | null {

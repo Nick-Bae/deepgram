@@ -409,7 +409,7 @@ export default function ChurchServiceListenerPage() {
         >
           <div
             style={{
-              width: "min(1000px, 90vw)",
+              width: "min(1800px, 90vw)",
               display: "flex",
               flexDirection: "column",
               alignItems: "center",

@@ -88,6 +88,20 @@ def _similarity(a: str, b: str) -> float:
     return max(raw_ratio, compact_ratio, containment, partial_raw * 0.98, partial_compact * 0.98)
 
 
+def _short_query_can_match(query: str, candidate: str) -> bool:
+    """Prevent tiny STT fragments from expanding into full scripted sentences."""
+    compact_query = _norm_compact(query)
+    compact_candidate = _norm_compact(candidate)
+    if len(compact_query) < 6 or not compact_candidate:
+        return False
+    if len(compact_query) >= 15:
+        return True
+    length_ratio = min(len(compact_query), len(compact_candidate)) / max(
+        len(compact_query), len(compact_candidate)
+    )
+    return length_ratio >= 0.65
+
+
 @dataclass
 class ScriptPair:
     source: str
@@ -300,13 +314,21 @@ class ScriptStore:
             if score >= example_min_score:
                 scored.append((score, pair))
 
-        # Adaptive threshold for short fragments
+        # Short STT fragments can be exact substrings of a much longer sermon
+        # sentence. Do not let partial-ratio matching expand them into content
+        # the speaker has not said.
         compact_query = _norm_compact(query)
         effective_threshold = threshold
         if len(compact_query) < 15:
-            effective_threshold = min(threshold, 0.72)
+            effective_threshold = max(threshold, 0.90)
 
-        matched = best if best and best_score >= effective_threshold else None
+        matched = (
+            best
+            if best
+            and best_score >= effective_threshold
+            and _short_query_can_match(query, best.source)
+            else None
+        )
 
         # Build examples list: candidates below threshold (excluding the matched pair)
         scored.sort(key=lambda x: -x[0])
@@ -321,7 +343,7 @@ class ScriptStore:
                 break
 
         # Style anchor fallback
-        if not examples and pairs_snapshot:
+        if not examples and pairs_snapshot and len(compact_query) >= 15:
             examples = [p for p in pairs_snapshot[:2] if not matched or p.index != matched.index]
 
         return matched, best_score, version, threshold, examples
@@ -358,9 +380,13 @@ class ScriptStore:
                 best = pair
 
         compact_query = _norm_compact(query)
-        effective_threshold = min(threshold, 0.72) if len(compact_query) < 15 else threshold
+        effective_threshold = max(threshold, 0.90) if len(compact_query) < 15 else threshold
 
-        if best and best_score >= effective_threshold:
+        if (
+            best
+            and best_score >= effective_threshold
+            and _short_query_can_match(query, best.source)
+        ):
             return best, best_score, version, threshold
         return None, best_score, version, threshold
 

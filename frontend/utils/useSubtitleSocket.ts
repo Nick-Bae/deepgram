@@ -109,6 +109,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const lastEnArrivalRef = useRef<number | null>(null);
   const avgEnIntervalRef = useRef<number | null>(null);
   const displaySpeedRef = useRef(1);
+  const highestFinalSeqRef = useRef(0);
 
   function pushLine(setter: React.Dispatch<React.SetStateAction<string[]>>, text: string) {
     setter((prev) => prev.concat(text).slice(-maxLines));
@@ -227,6 +228,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     lastEnArrivalRef.current = null;
     avgEnIntervalRef.current = null;
     displaySpeedRef.current = 1;
+    highestFinalSeqRef.current = 0;
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
@@ -307,6 +309,12 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
                   : null;
               if (msg.meta?.partial || seq === null) {
                 return; // ignore previews lacking a final sequence id
+              }
+              if (seq < highestFinalSeqRef.current) {
+                return; // discard a translation that completed after a newer segment
+              }
+              if (seq > highestFinalSeqRef.current) {
+                highestFinalSeqRef.current = seq;
               }
               const text =
                 (typeof msg.payload === "string" && msg.payload) ||

@@ -48,7 +48,7 @@ export default function Display() {
     justifyContent: isSubtitleMode ? "flex-end" : "center",
     alignItems: isSubtitleMode ? "stretch" : "center",
     color: "#fff",
-    padding: isSubtitleMode ? "2.4rem 6vw 1.8rem" : "5vh 6vw",
+    padding: isSubtitleMode ? "2.4rem 2vw 1.8rem" : "5vh 3vw",
     boxSizing: "border-box",
     overflow: "hidden",
     fontFamily: "Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
@@ -161,7 +161,7 @@ export default function Display() {
               background: "linear-gradient(to right, rgba(0,0,0,0.78), rgba(0,0,0,0.62))",
               backdropFilter: "blur(10px)",
               borderLeft: connected ? "3px solid rgba(52,211,153,0.6)" : "3px solid rgba(255,255,255,0.1)",
-              padding: "1.1rem 1.6rem 1.1rem 1.4rem",
+              padding: "1.1rem clamp(1rem, 2vw, 2rem)",
               boxShadow: "0 -4px 40px rgba(0,0,0,0.5)",
               transition: "border-color 400ms ease",
             }}
@@ -188,7 +188,7 @@ export default function Display() {
                     <div
                       key={`${i}-${line.slice(0, 12)}`}
                       style={{
-                        fontSize: isCurrent ? "clamp(28px, 6.5vw, 88px)" : "clamp(24px, 5.8vw, 78px)",
+                        fontSize: isCurrent ? "clamp(28px, 5vw, 72px)" : "clamp(24px, 4.4vw, 64px)",
                         fontWeight: isCurrent ? 800 : 500,
                         wordBreak: "break-word",
                         opacity: isCurrent ? 1 : 0.55,
@@ -244,7 +244,7 @@ export default function Display() {
 
             <div
               style={{
-                fontSize: "clamp(52px, 12vw, 164px)",
+                fontSize: "clamp(48px, 8.5vw, 128px)",
                 fontWeight: enLines.length > 0 ? 800 : 300,
                 lineHeight: 1.04,
                 letterSpacing: "-0.01em",

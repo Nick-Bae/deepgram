@@ -84,6 +84,33 @@ class NoLinkedSermonTests(unittest.TestCase):
             )
         )
 
+    def test_uses_public_service_getter_for_firestore_style_store(self) -> None:
+        sermon = _sermon("org-firestore")
+
+        class FirestoreStyleStore:
+            def get_service(self, org_id: str, service_key: str) -> dict:
+                self.requested_service = (org_id, service_key)
+                return {"linkedSermonId": "srm_lookup"}
+
+            def get_review_sermon(self, org_id: str, sermon_id: str) -> dict:
+                self.requested_sermon = (org_id, sermon_id)
+                return sermon
+
+        store = FirestoreStyleStore()
+        result = get_reviewed_text(
+            store=store,
+            org_id="org-firestore",
+            service_key="sun-11am",
+            korean_text="오늘 우리는 하나님의 은혜를 보려고 합니다.",
+        )
+
+        self.assertEqual(
+            result,
+            "Today, we will look together at the grace of God.",
+        )
+        self.assertEqual(store.requested_service, ("org-firestore", "sun-11am"))
+        self.assertEqual(store.requested_sermon, ("org-firestore", "srm_lookup"))
+
     def test_returns_none_when_service_has_no_linked_sermon(self) -> None:
         store = InMemoryMultiChurchStore()
         org_id, service_key = _bootstrap(store)

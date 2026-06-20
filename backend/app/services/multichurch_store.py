@@ -915,6 +915,11 @@ class InMemoryMultiChurchStore:
                 },
             }
 
+    def get_service(self, org_id: str, service_key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            service = self._services.get((org_id, service_key))
+            return dict(service) if service else None
+
     def list_services(self, slug: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             org_id = self._slug_to_org.get((slug or "").strip().lower())
@@ -3278,6 +3283,14 @@ class FirestoreMultiChurchStore:
                 "rrule": service.get("rrule"),
             },
         }
+
+    def get_service(self, org_id: str, service_key: str) -> Optional[Dict[str, Any]]:
+        service_snap = self._service_ref(org_id, service_key).get(timeout=_FS_TIMEOUT)
+        if not service_snap.exists:
+            return None
+        service = service_snap.to_dict() or {}
+        service.setdefault("serviceKey", service_key)
+        return service
 
     def list_services(self, slug: str) -> Optional[Dict[str, Any]]:
         org_id = self._resolve_org_id_by_slug(slug)
