@@ -296,8 +296,14 @@ export function useDeepgramProducer(): DeepgramProducerController {
         } catch {}
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (wsRef.current === ws) wsRef.current = null;
+        console.warn("[FE][DG][socket-closed]", {
+          code: event.code,
+          reason: event.reason || "",
+          wasClean: event.wasClean,
+          reconnecting: shouldRunRef.current && !terminalErrorRef.current,
+        });
         if (terminalErrorRef.current) {
           setStatus("error");
           return;

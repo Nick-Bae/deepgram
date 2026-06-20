@@ -605,7 +605,29 @@ async def _translate_streaming_guarded(
             reservations, actual_tokens=int(usage.get("totalTokens") or 0)
         )
     if usage.get("failOpen"):
-        return "", _fail_open_meta(RuntimeError(str(usage.get("errorMessage") or "translation_failed")))
+        first_error = str(usage.get("errorMessage") or "translation_failed")
+        print(f"[TX][stream][retry] reason={first_error[:120]}")
+        retry_text, retry_meta = await _translate_text_guarded(
+            source_text,
+            source_lang,
+            target_lang,
+            org_id=org_id,
+            host_uid=host_uid,
+            ctx=ctx,
+            update_ctx=update_ctx,
+            custom_prompt=custom_prompt,
+            service_prompt=service_prompt,
+            compact_prompt=False,
+            script_examples=script_examples,
+            script_glossary=script_glossary,
+        )
+        if retry_text:
+            await on_token(retry_text)
+            print("[TX][stream][retry-success]")
+            return retry_text, None
+        meta = retry_meta or _fail_open_meta(RuntimeError(first_error))
+        meta["retry_attempted"] = True
+        return "", meta
     # Use the post-processed text (unmasked glossary, guardrails applied) that
     # translate_text_streaming stores in usage_out after the loop completes.
     translated = usage.get("finalText") or assembled
@@ -1703,6 +1725,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     last_audio_touch_ts = 0.0
     last_speech_activity_ts = time.monotonic()
     total_audio_bytes = 0
+    session_end_reason = "unknown"
     prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
 
     def _cached_prompt_overrides(active_org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -1733,11 +1756,16 @@ async def ws_stt_deepgram(websocket: WebSocket):
             return False
 
     async def from_client_to_deepgram():
-        nonlocal last_audio_touch_ts, total_audio_bytes
+        nonlocal last_audio_touch_ts, total_audio_bytes, session_end_reason
         try:
             while True:
                 msg = await websocket.receive()
                 if msg.get("type") == "websocket.disconnect":
+                    session_end_reason = "browser_disconnect"
+                    print(
+                        f"[DG][session-end] reason=browser_disconnect "
+                        f"org={org_id} room={room_id}"
+                    )
                     try:
                         await dg.close()
                     except:
@@ -1763,11 +1791,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             continue
                     except:
                         pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            session_end_reason = "audio_forward_error"
+            print(
+                f"[DG][session-end] reason=audio_forward_error "
+                f"org={org_id} room={room_id} "
+                f"error={type(exc).__name__}: {exc}"
+            )
         finally:
             closed.set()
 
     async def from_deepgram_to_server():
-        nonlocal last_audio_touch_ts, last_speech_activity_ts
+        nonlocal last_audio_touch_ts, last_speech_activity_ts, session_end_reason
         """
         Option A: translate only when a sentence is complete.
         Commit rules:
@@ -2320,7 +2357,28 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     hold_ms = CJK_PENDING_HOLD_MS if should_apply_cjk_hold(pending_src) else None
                     await arm_timer(hold_ms)
 
+            if not closed.is_set():
+                session_end_reason = "deepgram_eof"
+                print(
+                    f"[DG][session-end] reason=deepgram_eof "
+                    f"org={org_id} room={room_id} "
+                    f"code={getattr(dg, 'close_code', None)} "
+                    f"detail={getattr(dg, 'close_reason', None)}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not closed.is_set():
+                session_end_reason = "deepgram_receive_error"
+                print(
+                    f"[DG][session-end] reason=deepgram_receive_error "
+                    f"org={org_id} room={room_id} "
+                    f"code={getattr(exc, 'code', None)} "
+                    f"detail={getattr(exc, 'reason', None)} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
         finally:
+            closed.set()
             finalize_task.cancel()
             try:
                 await finalize_task
@@ -2354,6 +2412,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
         await asyncio.gather(consumer, producer, idle_watchdog, return_exceptions=True)
     except Exception:
         pass
+    print(
+        f"[DG][session-closed] reason={session_end_reason} "
+        f"org={org_id} room={room_id} audio_bytes={total_audio_bytes}"
+    )
     try:
         await dg.close()
     except Exception:

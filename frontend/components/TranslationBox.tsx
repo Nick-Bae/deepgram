@@ -786,7 +786,6 @@ export default function TranslationBox({
       }
     } else if (isFinal) {
       console.log('[FE][WS][in][suppressed-target]', { seq, src: clip(committedSrc || '(none)') });
-      setTranslated('');
     }
 
     if (isFinal) {
