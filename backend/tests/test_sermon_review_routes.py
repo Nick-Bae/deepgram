@@ -384,6 +384,35 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(ctx.exception.status_code, 404)
 
+    async def test_export_supports_korean_title_filename(self) -> None:
+        result = await sermon_review_routes.ingest_sermon(
+            org_id=self.org_id,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            google_docs_service=None,
+            sourceType="paste",
+            title="은혜에 대한 설교",
+            text="오늘 우리는 은혜를 봅니다.",
+            url=None,
+            file=None,
+        )
+        sid = result["data"]["sermonId"]
+
+        response = sermon_review_routes.export_review_file(
+            org_id=self.org_id,
+            sermon_id=sid,
+            request=_FakeRequest(
+                "GET",
+                f"/api/org/{self.org_id}/sermons/{sid}/review-file.xlsx",
+            ),
+            user=_user("uid_owner"),
+        )
+
+        disposition = response.headers["content-disposition"]
+        self.assertIn('filename="sermon-', disposition)
+        self.assertIn("filename*=UTF-8''", disposition)
+        self.assertIn("%EC%9D%80%ED%98%9C", disposition)
+
 
 class ImportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

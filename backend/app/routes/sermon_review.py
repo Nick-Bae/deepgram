@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import secrets
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -365,6 +366,7 @@ def export_review_file(
     safe_title = _slugify(sermon.title or "sermon")
     short_id = sermon_id.split("_", 1)[-1][:8]
     filename = f"{safe_title}-{short_id}-review.xlsx"
+    utf8_filename = f"{_unicode_filename_stem(sermon.title)}-{short_id}-review.xlsx"
 
     security_event(
         "sermon_review_exported",
@@ -382,16 +384,30 @@ def export_review_file(
         media_type=(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"; '
+                f"filename*=UTF-8''{quote(utf8_filename)}"
+            )
+        },
     )
 
 
 def _slugify(text: str) -> str:
     cleaned = "".join(
-        c if c.isalnum() or c in {"-", "_"} else "-" for c in text.strip()
+        c if c.isascii() and (c.isalnum() or c in {"-", "_"}) else "-"
+        for c in text.strip()
     )
     cleaned = "-".join(part for part in cleaned.split("-") if part)
     return (cleaned or "sermon").lower()[:50]
+
+
+def _unicode_filename_stem(text: str) -> str:
+    cleaned = "".join(
+        c if c.isalnum() or c in {"-", "_"} else "-" for c in (text or "").strip()
+    )
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return (cleaned or "sermon")[:50]
 
 
 # -- POST /org/{org_id}/sermons/{sermon_id}/review-file -----------------------

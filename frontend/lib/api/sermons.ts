@@ -222,6 +222,14 @@ export async function exportReviewFile(
 
 function extractFilename(contentDisposition: string | null): string {
   if (!contentDisposition) return "sermon-review.xlsx";
+  const encodedMatch = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition);
+  if (encodedMatch?.[1]) {
+    try {
+      return decodeURIComponent(encodedMatch[1]);
+    } catch {
+      // Fall back to the ASCII filename below.
+    }
+  }
   const match = /filename="([^"]+)"/.exec(contentDisposition);
   return match?.[1] ?? "sermon-review.xlsx";
 }
