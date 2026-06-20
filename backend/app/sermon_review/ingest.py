@@ -18,10 +18,11 @@ class IngestError(ValueError):
     """Raised when source ingestion or sermon assembly fails."""
 
 
-# Matches the existing host-console sermon prep splitter
-# (backend/app/routes/script.py::SENTENCE_SPLIT_RE) so users get the same
-# segmentation behavior regardless of which entry point they use.
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+|(?<=[다요죠습니다])\s+")
+# Match the existing host-console sermon prep splitter
+# (backend/app/routes/script.py::SENTENCE_SPLIT_RE). Do not infer a sentence
+# boundary from Korean ending syllables such as "다": they also occur in
+# wrapped phrases like "오래 하다 보면" and sentences like "다 맞는 말입니다."
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。？！…])\s+|\n{2,}")
 
 _GOOGLE_DOC_ID_RE = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
 

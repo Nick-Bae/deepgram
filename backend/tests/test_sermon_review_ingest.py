@@ -61,6 +61,32 @@ class SplitKoreanTextTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIn("은혜를", result[0])
 
+    def test_does_not_split_on_da_inside_wrapped_phrases(self) -> None:
+        text = (
+            "성도 여러분, 신앙생활을 오래 하다\n"
+            "보면 어떤 말들은 너무 익숙해집니다.\n"
+            "예수님이 우리를 위해 오셨다.\n"
+            "예수님이 우리 죄를 위해 죽으셨다.\n"
+            "예수님이 지금도 우리를 도우신다.\n"
+            "다\n"
+            "맞는 말입니다.\n"
+            "너무나 귀한 복음입니다."
+        )
+
+        result = split_korean_text(text)
+
+        self.assertEqual(
+            result,
+            [
+                "성도 여러분, 신앙생활을 오래 하다 보면 어떤 말들은 너무 익숙해집니다.",
+                "예수님이 우리를 위해 오셨다.",
+                "예수님이 우리 죄를 위해 죽으셨다.",
+                "예수님이 지금도 우리를 도우신다.",
+                "다 맞는 말입니다.",
+                "너무나 귀한 복음입니다.",
+            ],
+        )
+
     def test_auto_split_false_uses_lines(self) -> None:
         text = "라인 1\n라인 2\n라인 3"
         result = split_korean_text(text, auto_split=False)
