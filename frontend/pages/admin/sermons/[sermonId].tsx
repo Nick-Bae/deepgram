@@ -13,6 +13,7 @@ import {
   fetchAuthMe,
   fetchOrgServices,
   type OrgMembership,
+  type OrgServiceSummary,
 } from "../../../lib/backendAuth";
 import { getSermon, linkSermon } from "../../../lib/api/sermons";
 import {
@@ -34,7 +35,7 @@ export default function AdminSermonDetailPage() {
 
   const [memberships, setMemberships] = useState<OrgMembership[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState("");
-  const [services, setServices] = useState<Array<{ serviceKey: string; title: string }>>([]);
+  const [services, setServices] = useState<OrgServiceSummary[]>([]);
   const [sermon, setSermon] = useState<Sermon | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -51,6 +52,14 @@ export default function AdminSermonDetailPage() {
   }, [memberships, selectedOrgId]);
   const canLink = ADMIN_ROLES.has(role);
   const isViewer = role === "viewer";
+  const selectedLinkService = useMemo(
+    () => services.find((service) => service.serviceKey === linkServiceKey) || null,
+    [linkServiceKey, services]
+  );
+  const selectedLinkedSermonId = selectedLinkService?.linkedSermonId || "";
+  const selectedServiceLinkedToOther = Boolean(
+    selectedLinkedSermonId && selectedLinkedSermonId !== sermonId
+  );
 
   useEffect(() => {
     if (authLoading) return;
@@ -100,14 +109,15 @@ export default function AdminSermonDetailPage() {
       const [s, svcResult] = await Promise.all([
         getSermon(selectedOrgId, sermonId, { idToken }),
         fetchOrgServices(idToken, selectedOrgId).catch(
-          () => ({ services: [] as Array<{ serviceKey: string; title: string }> })
+          () => ({ services: [] as OrgServiceSummary[] })
         ),
       ]);
       setSermon(s);
       setServices(svcResult.services);
-      // Initial link state isn't surfaced by fetchOrgServices; the UI
-      // updates currentLinkedServiceKey optimistically when the user links
-      // via the dropdown below.
+      setCurrentLinkedServiceKey(
+        svcResult.services.find((service) => service.linkedSermonId === sermonId)
+          ?.serviceKey || null
+      );
     } catch (err: unknown) {
       if (err instanceof SermonApiError) setError(err.message);
       else if (err instanceof Error) setError(err.message);
@@ -134,6 +144,15 @@ export default function AdminSermonDetailPage() {
           { idToken }
         );
         setCurrentLinkedServiceKey(linkServiceKey);
+        setServices((prev) =>
+          prev.map((service) =>
+            service.serviceKey === linkServiceKey
+              ? { ...service, linkedSermonId: sermonId }
+              : service.linkedSermonId === sermonId
+                ? { ...service, linkedSermonId: null }
+                : service
+          )
+        );
       } catch (err: unknown) {
         if (err instanceof SermonApiError && err.code === "SERVICE_ALREADY_LINKED") {
           if (window.confirm(`That service is already linked to another sermon. Replace the existing link?`)) {
@@ -225,6 +244,7 @@ export default function AdminSermonDetailPage() {
             orgId={selectedOrgId}
             sermonId={sermon.sermonId}
             sermonTitle={sermon.title}
+            reviewMode={sermon.reviewMode}
             onImportSuccess={() => void loadAll()}
           />
 
@@ -260,13 +280,23 @@ export default function AdminSermonDetailPage() {
                 </select>
                 <button
                   type="button"
-                  onClick={() => void handleLink(false)}
+                  onClick={() => void handleLink(selectedServiceLinkedToOther)}
                   disabled={!linkServiceKey || linking}
                   className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
                 >
-                  {linking ? "Linking…" : "Link"}
+                  {linking
+                    ? "Linking…"
+                    : selectedServiceLinkedToOther
+                      ? "Replace Link"
+                      : "Link"}
                 </button>
               </div>
+              {selectedServiceLinkedToOther && (
+                <p className="mt-2 text-sm text-amber-700">
+                  This service is already linked to another sermon. Replacing
+                  it will make this sermon the live sermon for that service.
+                </p>
+              )}
               {linkError && (
                 <p className="mt-2 text-sm text-red-700">{linkError}</p>
               )}
@@ -316,9 +346,11 @@ export default function AdminSermonDetailPage() {
                       <SegmentStatusBadge status={seg.status} />
                     </div>
                     <p className="text-sm text-slate-700">{seg.original}</p>
-                    <p className="text-sm text-slate-500">
-                      App: {seg.appTranslation || "—"}
-                    </p>
+                    {sermon.reviewMode !== "pre_translated" && (
+                      <p className="text-sm text-slate-500">
+                        App: {seg.appTranslation || "—"}
+                      </p>
+                    )}
                     <p className="text-sm text-slate-900">
                       Reviewed: {seg.reviewedTranslation || "—"}
                     </p>

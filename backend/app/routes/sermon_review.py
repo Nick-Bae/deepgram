@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import secrets
+from collections import Counter
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -40,7 +41,9 @@ from app.sermon_review import (
     ingest_from_google_docs,
     ingest_from_paste,
     ingest_from_txt,
+    is_pre_translated_workbook,
     read_workbook,
+    validate_pre_translated_replacement_workbook,
     validate_workbook,
 )
 from app.utils.translate import translate_text
@@ -155,6 +158,28 @@ def _ok(data: Any) -> dict[str, Any]:
     return {"data": data}
 
 
+def _segment_id_for_import(
+    raw_segment_id: str | None,
+    *,
+    row_index: int,
+    total_rows: int,
+    used_ids: set[str],
+) -> str:
+    candidate = (raw_segment_id or "").strip()
+    if candidate and candidate not in used_ids:
+        used_ids.add(candidate)
+        return candidate
+
+    width = max(3, len(str(total_rows)))
+    next_index = max(1, row_index)
+    while True:
+        generated = f"S{next_index:0{width}d}"
+        if generated not in used_ids:
+            used_ids.add(generated)
+            return generated
+        next_index += 1
+
+
 def _request_meta(request: Request) -> dict[str, Optional[str]]:
     client = request.client
     return {
@@ -183,13 +208,21 @@ async def ingest_sermon(
     text: Optional[str] = Form(None),
     url: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
+    reviewMode: str = Form("app_assisted"),
 ):
     require_org_role(
         org_id=org_id, user=user, roles=WRITE_ROLES, store=multichurch_store
     )
 
+    review_mode = reviewMode if isinstance(reviewMode, str) else "app_assisted"
+
     if not title.strip():
         raise _err("INVALID_SOURCE", "title is required.")
+    if review_mode not in {"app_assisted", "pre_translated"}:
+        raise _err(
+            "INVALID_SOURCE",
+            "reviewMode must be app_assisted or pre_translated.",
+        )
 
     source_ref: Optional[str] = None
     raw_text: str
@@ -246,6 +279,7 @@ async def ingest_sermon(
             text=raw_text,
             creatorUid=user.uid,
             translator=translator,
+            reviewMode=review_mode,  # type: ignore[arg-type]
             max_segments=ENV.SERMON_MAX_SEGMENTS,
         )
     except IngestError as exc:
@@ -264,6 +298,7 @@ async def ingest_sermon(
         **_request_meta(request),
         sermon_id=sermon_id,
         source_type=sourceType,
+        review_mode=review_mode,
         segment_count=len(sermon.segments),
     )
 
@@ -271,6 +306,7 @@ async def ingest_sermon(
         {
             "sermonId": sermon_id,
             "title": sermon.title,
+            "reviewMode": sermon.reviewMode,
             "segmentCount": len(sermon.segments),
         }
     )
@@ -310,6 +346,7 @@ def list_sermons(
             "sermonId": s.get("sermonId"),
             "title": s.get("title"),
             "sourceType": s.get("sourceType"),
+            "reviewMode": s.get("reviewMode") or "app_assisted",
             "segmentCount": len(s.get("segments") or []),
             "reviewedCount": sum(
                 1
@@ -338,7 +375,7 @@ def get_sermon(
     sermon = multichurch_store.get_review_sermon(org_id, sermon_id)
     if sermon is None:
         raise _err("SERMON_NOT_FOUND", "Sermon not found.", status=404)
-    return _ok(sermon)
+    return _ok(Sermon.model_validate(sermon).model_dump())
 
 
 # -- DELETE /org/{org_id}/sermons/{sermon_id} ---------------------------------
@@ -392,12 +429,16 @@ def export_review_file(
         raise _err("SERMON_NOT_FOUND", "Sermon not found.", status=404)
 
     sermon = Sermon.model_validate(raw)
-    data = build_xlsx(sermon)
+    template = (
+        "pre_translated" if sermon.reviewMode == "pre_translated" else "full"
+    )
+    data = build_xlsx(sermon, template=template)
 
     safe_title = _slugify(sermon.title or "sermon")
     short_id = sermon_id.split("_", 1)[-1][:8]
-    filename = f"{safe_title}-{short_id}-review.xlsx"
-    utf8_filename = f"{_unicode_filename_stem(sermon.title)}-{short_id}-review.xlsx"
+    suffix = "translation-template" if template == "pre_translated" else "review"
+    filename = f"{safe_title}-{short_id}-{suffix}.xlsx"
+    utf8_filename = f"{_unicode_filename_stem(sermon.title)}-{short_id}-{suffix}.xlsx"
 
     security_event(
         "sermon_review_exported",
@@ -408,6 +449,7 @@ def export_review_file(
         sermon_id=sermon_id,
         byte_size=len(data),
         segment_count=len(sermon.segments),
+        template=template,
     )
 
     return Response(
@@ -476,9 +518,17 @@ async def import_review_file(
     except ImportReadError as exc:
         raise _err("UNSUPPORTED_MEDIA_TYPE", str(exc), status=415)
 
-    report = validate_workbook(rows, sermon, headers=headers)
+    template = "pre_translated" if is_pre_translated_workbook(headers) else "full"
+    if template == "pre_translated":
+        report = validate_pre_translated_replacement_workbook(
+            rows,
+            headers=headers,
+        )
+    else:
+        report = validate_workbook(rows, sermon, headers=headers, template="full")
 
     if report.has_errors:
+        code_counts = Counter(row.code for row in report.rows)
         security_event(
             "sermon_review_import_rejected",
             severity="WARNING",
@@ -488,6 +538,9 @@ async def import_review_file(
             sermon_id=sermon_id,
             errored=report.summary.errored,
             warned=report.summary.warned,
+            template=template,
+            headers=[str(h).strip() for h in headers if str(h).strip()],
+            code_counts=dict(code_counts),
         )
         raise _err(
             "IMPORT_VALIDATION_FAILED",
@@ -495,28 +548,62 @@ async def import_review_file(
             details=report.model_dump(),
         )
 
-    updates = [
-        {
-            "segmentId": row.get("Segment ID"),
-            "reviewedTranslation": row.get("Reviewed Translation"),
-            "notes": row.get("Notes") or "",
-            "status": row.get("Status") or "Draft",
-        }
-        for row in rows
-        if row.get("Segment ID")
-    ]
-
-    try:
-        multichurch_store.update_review_sermon_segments(
-            org_id,
-            sermon_id,
-            segment_updates=updates,
-            expected_updated_at=sermon.updatedAt,
-        )
-    except SermonConflictError as exc:
-        raise _err("SERMON_MODIFIED_CONCURRENTLY", str(exc), status=409)
-    except SermonNotFoundError as exc:
-        raise _err("SERMON_NOT_FOUND", str(exc), status=404)
+    if template == "pre_translated":
+        used_segment_ids: set[str] = set()
+        replacement_segments = []
+        for idx, row in enumerate(rows, start=1):
+            replacement_segments.append(
+                {
+                    "segmentId": _segment_id_for_import(
+                        row.get("Segment ID"),
+                        row_index=idx,
+                        total_rows=len(rows),
+                        used_ids=used_segment_ids,
+                    ),
+                    "order": idx,
+                    "original": (row.get("Original Text") or "").strip(),
+                    "appTranslation": "",
+                    "reviewedTranslation": (
+                        row.get("Reviewed Translation") or ""
+                    ).strip(),
+                    "notes": "",
+                    "status": "Reviewed",
+                }
+            )
+        try:
+            multichurch_store.replace_review_sermon_segments(
+                org_id,
+                sermon_id,
+                replacement_segments=replacement_segments,
+                expected_updated_at=sermon.updatedAt,
+                review_mode="pre_translated",
+            )
+        except SermonConflictError as exc:
+            raise _err("SERMON_MODIFIED_CONCURRENTLY", str(exc), status=409)
+        except SermonNotFoundError as exc:
+            raise _err("SERMON_NOT_FOUND", str(exc), status=404)
+    else:
+        updates = [
+            {
+                "segmentId": row.get("Segment ID"),
+                "reviewedTranslation": row.get("Reviewed Translation"),
+                "notes": row.get("Notes") or "",
+                "status": row.get("Status") or "Draft",
+            }
+            for row in rows
+            if row.get("Segment ID")
+        ]
+        try:
+            multichurch_store.update_review_sermon_segments(
+                org_id,
+                sermon_id,
+                segment_updates=updates,
+                expected_updated_at=sermon.updatedAt,
+            )
+        except SermonConflictError as exc:
+            raise _err("SERMON_MODIFIED_CONCURRENTLY", str(exc), status=409)
+        except SermonNotFoundError as exc:
+            raise _err("SERMON_NOT_FOUND", str(exc), status=404)
 
     security_event(
         "sermon_review_imported",
@@ -527,6 +614,7 @@ async def import_review_file(
         sermon_id=sermon_id,
         imported=report.summary.imported,
         warned=report.summary.warned,
+        template=template,
     )
 
     return _ok(report.model_dump())

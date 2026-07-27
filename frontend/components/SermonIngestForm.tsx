@@ -9,7 +9,7 @@ import { FormEvent, useCallback, useId, useMemo, useState } from "react";
 import { useAuth } from "../lib/authContext";
 import { ingestSermonFile, ingestSermonJson } from "../lib/api/sermons";
 import { openGoogleDocsPicker } from "../lib/googlePicker";
-import { IngestResult, SermonApiError } from "../lib/types/sermon";
+import { IngestResult, ReviewMode, SermonApiError } from "../lib/types/sermon";
 
 const GOOGLE_PICKER_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_API_KEY ?? "";
 
@@ -37,6 +37,7 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
   const fileId = useId();
 
   const [tab, setTab] = useState<Tab>("paste");
+  const [reviewMode, setReviewMode] = useState<ReviewMode>("app_assisted");
   const [title, setTitle] = useState("");
   const [pasteText, setPasteText] = useState("");
   const [docUrl, setDocUrl] = useState("");
@@ -156,6 +157,7 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
               orgId,
               title: title.trim(),
               sourceType: "paste",
+              reviewMode,
               text: pasteText,
             },
             { idToken }
@@ -173,6 +175,7 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
               orgId,
               title: title.trim(),
               sourceType: "google_docs",
+              reviewMode,
               url: docUrl.trim(),
               googleAccessToken,
             },
@@ -189,7 +192,7 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
             return;
           }
           result = await ingestSermonFile(
-            { orgId, title: title.trim(), sourceType, file },
+            { orgId, title: title.trim(), sourceType, reviewMode, file },
             { idToken }
           );
         }
@@ -221,6 +224,7 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
       getIdToken,
       getGoogleAccessToken,
       tab,
+      reviewMode,
       title,
       pasteText,
       docUrl,
@@ -238,8 +242,8 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
       <header className="space-y-1">
         <h2 className="text-xl font-semibold text-slate-900">New Sermon</h2>
         <p className="text-sm text-slate-600">
-          Choose a source. The app will segment and translate it; you&rsquo;ll
-          be able to review and edit afterward.
+          Choose a source, then decide whether the app should translate it now
+          or create a blank template for your own translation.
         </p>
       </header>
 
@@ -257,6 +261,51 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
           className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-slate-900 shadow-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500"
           placeholder="e.g. Easter Sermon — Romans 8"
         />
+      </div>
+
+      <div>
+        <span className="block text-sm font-medium text-slate-700">
+          Translation workflow
+        </span>
+        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+          {(
+            [
+              {
+                id: "app_assisted",
+                title: "App translates first",
+                description: "Create a review file with app translations prefilled.",
+              },
+              {
+                id: "pre_translated",
+                title: "I have my own translation",
+                description: "Create a three-column file with blank translation cells.",
+              },
+            ] as const
+          ).map((option) => {
+            const selected = reviewMode === option.id;
+            return (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => setReviewMode(option.id)}
+                className={
+                  "rounded-lg border p-3 text-left transition " +
+                  (selected
+                    ? "border-slate-900 bg-slate-50"
+                    : "border-slate-200 bg-white hover:border-slate-300")
+                }
+                aria-pressed={selected}
+              >
+                <span className="block text-sm font-medium text-slate-900">
+                  {option.title}
+                </span>
+                <span className="mt-1 block text-xs text-slate-500">
+                  {option.description}
+                </span>
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       <div role="tablist" aria-label="Sermon source" className="flex gap-2 border-b border-slate-200">
@@ -394,7 +443,13 @@ export default function SermonIngestForm({ orgId, onSuccess, onCancel }: Props) 
           disabled={!canSubmit}
           className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
         >
-          {busy ? "Translating…" : "Translate"}
+          {busy
+            ? reviewMode === "pre_translated"
+              ? "Creating…"
+              : "Translating…"
+            : reviewMode === "pre_translated"
+              ? "Create Template"
+              : "Translate"}
         </button>
       </div>
     </form>

@@ -5,6 +5,7 @@
 export type SegmentStatus = "Draft" | "Reviewed" | "Skip";
 
 export type SourceType = "google_docs" | "file_txt" | "file_docx" | "paste";
+export type ReviewMode = "app_assisted" | "pre_translated";
 
 export type ValidationLevel = "ok" | "warn" | "error";
 
@@ -18,6 +19,7 @@ export type ValidationCode =
   | "INVALID_STATUS"
   | "ORIGINAL_TEXT_MUTATED"
   | "APP_TRANSLATION_MUTATED"
+  | "EMPTY_ORIGINAL"
   | "EMPTY_REVIEW"
   | "EXCESSIVE_LENGTH";
 
@@ -52,6 +54,7 @@ export type Sermon = {
   orgId: string;
   title: string;
   sourceType: SourceType;
+  reviewMode: ReviewMode;
   sourceRef: string | null;
   segments: Segment[];
   createdBy: string;
@@ -63,6 +66,7 @@ export type SermonSummary = {
   sermonId: string;
   title: string;
   sourceType: SourceType;
+  reviewMode: ReviewMode;
   segmentCount: number;
   reviewedCount: number;
   updatedAt: string; // ISO-8601
@@ -71,6 +75,7 @@ export type SermonSummary = {
 export type IngestResult = {
   sermonId: string;
   title: string;
+  reviewMode: ReviewMode;
   segmentCount: number;
 };
 

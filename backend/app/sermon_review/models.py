@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 SegmentStatus = Literal["Draft", "Reviewed", "Skip"]
 SourceType = Literal["google_docs", "file_txt", "file_docx", "paste"]
+ReviewMode = Literal["app_assisted", "pre_translated"]
 ValidationLevel = Literal["ok", "warn", "error"]
 
 ValidationCode = Literal[
@@ -21,6 +22,7 @@ ValidationCode = Literal[
     "INVALID_STATUS",
     "ORIGINAL_TEXT_MUTATED",
     "APP_TRANSLATION_MUTATED",
+    "EMPTY_ORIGINAL",
     "EMPTY_REVIEW",
     "EXCESSIVE_LENGTH",
 ]
@@ -41,6 +43,7 @@ class Sermon(BaseModel):
     orgId: str
     title: str
     sourceType: SourceType
+    reviewMode: ReviewMode = "app_assisted"
     sourceRef: str | None = None
     segments: list[Segment]
     createdBy: str

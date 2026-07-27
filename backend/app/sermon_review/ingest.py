@@ -11,45 +11,27 @@ from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Awaitable, Callable
 
-from .models import Segment, Sermon, SourceType
+from app.utils.korean_segments import (
+    normalize_sermon_text_for_segmentation,
+    split_sermon_korean_text,
+)
+
+from .models import ReviewMode, Segment, Sermon, SourceType
 
 
 class IngestError(ValueError):
     """Raised when source ingestion or sermon assembly fails."""
 
 
-# Match the existing host-console sermon prep splitter
-# (backend/app/routes/script.py::SENTENCE_SPLIT_RE). Do not infer a sentence
-# boundary from Korean ending syllables such as "다": they also occur in
-# wrapped phrases like "오래 하다 보면" and sentences like "다 맞는 말입니다."
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。？！…])\s+|\n{2,}")
-
 _GOOGLE_DOC_ID_RE = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
 
 
 def _normalize_text(raw: str) -> str:
-    text = (raw or "").strip()
-    if not text:
-        return ""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Treat single newlines as soft wraps (paragraphs from pasted docs) but
-    # keep double newlines as hard breaks.
-    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n[ \t]+", "\n", text)
-    return text
+    return normalize_sermon_text_for_segmentation(raw)
 
 
 def split_korean_text(raw: str, *, auto_split: bool = True) -> list[str]:
-    text = (raw or "").strip()
-    if not text:
-        return []
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not auto_split:
-        # Treat each non-empty line as a segment; do NOT collapse soft wraps.
-        return [line.strip() for line in text.splitlines() if line.strip()]
-    text = _normalize_text(text)
-    return [part.strip() for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()]
+    return split_sermon_korean_text(raw, auto_split=auto_split)
 
 
 def generate_segment_id(index: int, total: int) -> str:
@@ -176,6 +158,7 @@ async def build_sermon(
     text: str,
     creatorUid: str,
     translator: Translator,
+    reviewMode: ReviewMode = "app_assisted",
     now: datetime | None = None,
     max_segments: int = 1000,
     concurrency: int = 5,
@@ -197,6 +180,7 @@ async def build_sermon(
             f"of {max_segments}."
         )
 
+    translate_segments = reviewMode != "pre_translated"
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def _translate_one(index: int, source: str) -> str:
@@ -211,8 +195,12 @@ async def build_sermon(
                 return ""
             return (result or "").strip()
 
-    translations = await asyncio.gather(
-        *[_translate_one(i, src) for i, src in enumerate(raw_segments)]
+    translations = (
+        await asyncio.gather(
+            *[_translate_one(i, src) for i, src in enumerate(raw_segments)]
+        )
+        if translate_segments
+        else [""] * len(raw_segments)
     )
 
     total = len(raw_segments)
@@ -223,7 +211,7 @@ async def build_sermon(
             order=i + 1,
             original=src,
             appTranslation=trans,
-            reviewedTranslation=trans,  # pre-filled per Design §5.4 / FR-07
+            reviewedTranslation=trans if translate_segments else "",
             notes="",
             status="Draft",
         )
@@ -235,6 +223,7 @@ async def build_sermon(
         orgId=orgId,
         title=title,
         sourceType=sourceType,
+        reviewMode=reviewMode,
         sourceRef=sourceRef,
         segments=segments,
         createdBy=creatorUid,

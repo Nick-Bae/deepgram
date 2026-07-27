@@ -17,6 +17,7 @@ from .ingest import (
 )
 from .lookup import DEFAULT_THRESHOLD, get_reviewed_text
 from .models import (
+    ReviewMode,
     Segment,
     SegmentStatus,
     Sermon,
@@ -30,7 +31,13 @@ from .models import (
     ValidationRow,
     ValidationSummary,
 )
-from .validation import COLUMNS, validate_workbook
+from .validation import (
+    COLUMNS,
+    PRE_TRANSLATED_COLUMNS,
+    is_pre_translated_workbook,
+    validate_pre_translated_replacement_workbook,
+    validate_workbook,
+)
 from .xlsx_export import build_xlsx
 from .xlsx_import import ImportReadError, read_workbook
 
@@ -39,6 +46,8 @@ __all__ = [
     "DEFAULT_THRESHOLD",
     "ImportReadError",
     "IngestError",
+    "PRE_TRANSLATED_COLUMNS",
+    "ReviewMode",
     "Segment",
     "SegmentStatus",
     "Sermon",
@@ -60,7 +69,9 @@ __all__ = [
     "ingest_from_google_docs",
     "ingest_from_paste",
     "ingest_from_txt",
+    "is_pre_translated_workbook",
     "read_workbook",
     "split_korean_text",
     "validate_workbook",
+    "validate_pre_translated_replacement_workbook",
 ]

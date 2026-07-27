@@ -114,6 +114,7 @@ const INTRO_HOLD_RE = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말�
 const EOS_PUNCT_RE = /[.!?。！？…]$/
 const STRIP_EOS_PUNCT_RE = /[.!?。！？…]+$/
 const KOREAN_EOS_RE = /(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요|다|아요|어요|에요)$/
+const KOREAN_STANDALONE_DA_RE = /(?:^|\s)다$/
 const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
@@ -376,6 +377,7 @@ export default function TranslationBox({
     if (base === 'ko') {
       const withoutPunct = trimmed.replace(STRIP_EOS_PUNCT_RE, '')
       if (!withoutPunct) return false
+      if (KOREAN_STANDALONE_DA_RE.test(withoutPunct)) return false
       return KOREAN_EOS_RE.test(withoutPunct)
     }
     return EOS_PUNCT_RE.test(trimmed)

@@ -11,7 +11,7 @@ from app.sermon_review import (
     Sermon,
     validate_workbook,
 )
-from app.sermon_review.validation import COLUMNS
+from app.sermon_review.validation import COLUMNS, PRE_TRANSLATED_COLUMNS
 
 from tests.fixtures.sermon_review.build_fixtures import make_golden_sermon
 
@@ -43,6 +43,29 @@ class HappyPathTests(unittest.TestCase):
         report = validate_workbook(rows, sermon, headers=list(COLUMNS))
 
         self.assertEqual(report.summary.total, len(sermon.segments))
+        self.assertEqual(report.summary.errored, 0)
+        self.assertEqual(report.summary.warned, 0)
+        self.assertEqual(report.summary.imported, len(sermon.segments))
+
+    def test_pre_translated_three_column_imports_clean(self) -> None:
+        sermon = make_golden_sermon()
+        sermon.reviewMode = "pre_translated"
+        rows = [
+            {
+                "Segment ID": s.segmentId,
+                "Original Text": s.original,
+                "Reviewed Translation": f"Reviewed {s.order}",
+            }
+            for s in sermon.segments
+        ]
+
+        report = validate_workbook(
+            rows,
+            sermon,
+            headers=list(PRE_TRANSLATED_COLUMNS),
+            template="pre_translated",
+        )
+
         self.assertEqual(report.summary.errored, 0)
         self.assertEqual(report.summary.warned, 0)
         self.assertEqual(report.summary.imported, len(sermon.segments))
@@ -160,6 +183,30 @@ class WarningLevelTests(unittest.TestCase):
         self.assertEqual(report.summary.errored, 0)
         self.assertEqual(report.summary.warned, 1)
         self.assertEqual(report.summary.imported, len(sermon.segments))
+
+    def test_empty_pre_translated_review_is_error(self) -> None:
+        sermon = make_golden_sermon()
+        sermon.reviewMode = "pre_translated"
+        rows = [
+            {
+                "Segment ID": s.segmentId,
+                "Original Text": s.original,
+                "Reviewed Translation": "Filled",
+            }
+            for s in sermon.segments
+        ]
+        rows[0]["Reviewed Translation"] = ""
+
+        report = validate_workbook(
+            rows,
+            sermon,
+            headers=list(PRE_TRANSLATED_COLUMNS),
+            template="pre_translated",
+        )
+
+        self.assertIn("EMPTY_REVIEW", _codes(report))
+        self.assertTrue(report.has_errors)
+        self.assertEqual(report.summary.imported, 0)
 
     def test_whitespace_only_review_is_warning(self) -> None:
         sermon = make_golden_sermon()

@@ -11,7 +11,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .models import Sermon
-from .validation import COLUMNS
+from .validation import COLUMNS, PRE_TRANSLATED_COLUMNS
 
 _PROTECTED_COLUMNS: frozenset[str] = frozenset({
     "Sermon ID",
@@ -52,6 +52,8 @@ _DEFAULT_COLUMN_WIDTH: dict[str, int] = {
     "Status": 12,
 }
 
+TemplateKind = str
+
 
 def _xlsx_value(value: object) -> object:
     if isinstance(value, str):
@@ -59,7 +61,7 @@ def _xlsx_value(value: object) -> object:
     return value
 
 
-def build_xlsx(sermon: Sermon) -> bytes:
+def build_xlsx(sermon: Sermon, *, template: TemplateKind = "full") -> bytes:
     """Render a Sermon to a Review File .xlsx as bytes.
 
     The output is deterministic for a fixed sermon, so an unmodified
@@ -69,9 +71,10 @@ def build_xlsx(sermon: Sermon) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "Sermon Review"
+    columns = PRE_TRANSLATED_COLUMNS if template == "pre_translated" else COLUMNS
 
     # Header row
-    for col_idx, name in enumerate(COLUMNS, start=1):
+    for col_idx, name in enumerate(columns, start=1):
         cell = ws.cell(row=1, column=col_idx, value=name)
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
@@ -91,7 +94,7 @@ def build_xlsx(sermon: Sermon) -> bytes:
             "Notes": segment.notes,
             "Status": segment.status,
         }
-        for col_idx, name in enumerate(COLUMNS, start=1):
+        for col_idx, name in enumerate(columns, start=1):
             cell = ws.cell(
                 row=row_idx,
                 column=col_idx,

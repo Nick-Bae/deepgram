@@ -81,6 +81,45 @@ class TranslationContextTests(unittest.TestCase):
             )
         )
 
+    def test_should_include_prompt_context_for_subjectless_clause_with_recent_he_context(self) -> None:
+        ctx = translate_module.TranslationContext(
+            subject="He may not have been someone who easily took an optimistic view of the situation",
+            pronoun="he",
+        )
+        ctx.remember(
+            "그는 상황을 쉽게 낙관하는 사람은 아니었을 수 있습니다.",
+            "He may not have been someone who easily took an optimistic view of the situation.",
+        )
+
+        source = "분명히 적어도 주님을 아주 가볍고 편한 마음으로 따르던 사람은 아니었습니다."
+
+        self.assertFalse(translate_module._needs_recent_context(source))
+        self.assertTrue(
+            translate_module._should_include_prompt_context(
+                source,
+                update_ctx=True,
+                ctx=ctx,
+            )
+        )
+        self.assertTrue(translate_module._should_inherit_recent_subject(source, ctx))
+
+    def test_should_not_inherit_recent_subject_for_clear_audience_application(self) -> None:
+        ctx = translate_module.TranslationContext(
+            subject="He may not have been someone who easily took an optimistic view of the situation",
+            pronoun="he",
+        )
+        ctx.remember(
+            "그는 상황을 쉽게 낙관하는 사람은 아니었을 수 있습니다.",
+            "He may not have been someone who easily took an optimistic view of the situation.",
+        )
+
+        self.assertFalse(
+            translate_module._should_inherit_recent_subject("성도 여러분, 기억해야 합니다.", ctx)
+        )
+        self.assertFalse(
+            translate_module._should_inherit_recent_subject("우리는 믿어야 합니다.", ctx)
+        )
+
     def test_mask_hard_glossary_does_not_mask_bare_genitive_marker(self) -> None:
         masked, mapping = translate_module._mask_hard_glossary("순종의 자리", "ko")
         self.assertEqual(masked, "순종의 자리")
@@ -155,6 +194,21 @@ class TranslationContextTests(unittest.TestCase):
         self.assertEqual(subject, "Nehemiah")
         self.assertEqual(pronoun, "he")
 
+    def test_infer_subject_from_context_history_uses_prior_he_clause(self) -> None:
+        ctx = translate_module.TranslationContext(subject="the congregation", pronoun="we")
+        ctx.remember(
+            "그는 상황을 쉽게 낙관하는 사람은 아니었을 수 있습니다.",
+            "He may not have been someone who easily took an optimistic view of the situation.",
+        )
+
+        subject, pronoun = translate_module._infer_subject_from_context_history(ctx)
+
+        self.assertEqual(
+            subject,
+            "He may not have been someone who easily took an optimistic view of the situation",
+        )
+        self.assertEqual(pronoun, "he")
+
     def test_user_content_keeps_named_subject_for_short_subjectless_continuation(self) -> None:
         ctx = translate_module.TranslationContext(subject="Nehemiah", pronoun="he")
         ctx.remember("느헤미야는 토비아의 세간을 밖으로 내던집니다.", "Nehemiah throws Tobiah's belongings outside.")
@@ -169,6 +223,76 @@ class TranslationContextTests(unittest.TestCase):
 
         self.assertIn('The subject of this clause is "Nehemiah" (he)', block)
         self.assertNotIn('The subject of this clause is "the congregation" (we)', block)
+
+    def test_however_continuation_keeps_prior_he_subject(self) -> None:
+        ctx = translate_module.TranslationContext(subject="the congregation", pronoun="we")
+        ctx.remember(
+            "그는 상황을 쉽게 낙관하는 사람은 아니었을 수 있습니다.",
+            "He may not have been someone who easily took an optimistic view of the situation.",
+        )
+        subject, pronoun = translate_module._infer_subject_from_context_history(ctx)
+        ctx.subject = subject
+        ctx.pronoun = pronoun
+
+        source = "그러나, 적어도 주님을 가볍게 따르던 사람은 아니었습니다."
+        self.assertTrue(translate_module._needs_recent_context(source))
+
+        block = translate_module._build_user_content_block(
+            source,
+            ctx,
+            source,
+            had_established_context=True,
+            update_ctx=True,
+        )
+
+        self.assertIn('The subject of this clause is "', block)
+        self.assertIn('" (he)', block)
+        self.assertNotIn('"the congregation" (we)', block)
+
+        guarded = translate_module._enforce_subject_guardrails(
+            "However, we was not someone who followed the Lord lightly.",
+            source,
+            ctx,
+        )
+        guarded = translate_module._enforce_we_guardrails(guarded, source, ctx)
+
+        self.assertIn("he was not someone", guarded.lower())
+        self.assertNotIn("we was", guarded.lower())
+
+    def test_subjectless_continuation_without_connector_keeps_prior_he_subject(self) -> None:
+        ctx = translate_module.TranslationContext(subject="the congregation", pronoun="we")
+        ctx.remember(
+            "그는 상황을 쉽게 낙관하는 사람은 아니었을 수 있습니다.",
+            "He may not have been someone who easily took an optimistic view of the situation.",
+        )
+        subject, pronoun = translate_module._infer_subject_from_context_history(ctx)
+        ctx.subject = subject
+        ctx.pronoun = pronoun
+
+        source = "분명히 적어도 주님을 아주 가볍고 편한 마음으로 따르던 사람은 아니었습니다."
+        self.assertFalse(translate_module._needs_recent_context(source))
+        self.assertTrue(translate_module._should_inherit_recent_subject(source, ctx))
+
+        block = translate_module._build_user_content_block(
+            source,
+            ctx,
+            source,
+            had_established_context=True,
+            update_ctx=True,
+        )
+
+        self.assertIn('" (he)', block)
+        self.assertNotIn('"the congregation" (we)', block)
+
+        guarded = translate_module._enforce_subject_guardrails(
+            "At least, we was not someone who followed the Lord lightly.",
+            source,
+            ctx,
+        )
+        guarded = translate_module._enforce_we_guardrails(guarded, source, ctx)
+
+        self.assertIn("he was not someone", guarded.lower())
+        self.assertNotIn("we was", guarded.lower())
 
     def test_enforce_subject_guardrails_keeps_divine_third_person_without_honorific(self) -> None:
         ctx = translate_module.TranslationContext(

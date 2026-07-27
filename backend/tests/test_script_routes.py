@@ -229,6 +229,27 @@ class ScriptRouteTests(unittest.TestCase):
             ],
         )
 
+    def test_split_korean_text_uses_sermon_breath_rules(self) -> None:
+        parts = script_routes._split_korean_text(
+            (
+                "나를 위해 자신을 내어 주시고, "
+                "나를 버려 두지 않고 찾아오시며, "
+                "내가 들어갈 수 없던 문 안으로 나를 데리고 들어가시는 "
+                "왕이시기 때문입니다."
+            ),
+            True,
+        )
+
+        self.assertEqual(
+            parts,
+            [
+                "나를 위해 자신을 내어 주시고,",
+                "나를 버려 두지 않고 찾아오시며,",
+                "내가 들어갈 수 없던 문 안으로 나를 데리고 들어가시는 "
+                "왕이시기 때문입니다.",
+            ],
+        )
+
     def test_sermon_translation_concurrency_scales_for_long_drafts(self) -> None:
         with patch.object(script_routes, "SERMON_TRANSLATION_CONCURRENCY", 2):
             self.assertEqual(script_routes._resolve_sermon_translation_concurrency(0), 2)

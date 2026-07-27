@@ -12,7 +12,9 @@ import {
   triggerBlobDownload,
 } from "../lib/api/sermons";
 import {
+  ReviewMode,
   SermonApiError,
+  ValidationCode,
   ValidationReport,
   ValidationRow,
   isImportValidationError,
@@ -22,6 +24,7 @@ type Props = {
   orgId: string;
   sermonId: string;
   sermonTitle: string;
+  reviewMode?: ReviewMode;
   onImportSuccess?: (report: ValidationReport) => void;
 };
 
@@ -29,10 +32,26 @@ type ImportOutcome =
   | { kind: "success"; report: ValidationReport }
   | { kind: "failure"; status: number; code: string; report: ValidationReport | null; message: string };
 
+const VALIDATION_HELP: Record<ValidationCode, string> = {
+  OK: "This row is ready.",
+  WRONG_SERMON_ID: "Upload the review file exported from this sermon, or export a fresh file and copy your translations into it.",
+  MISSING_REQUIRED_COLUMN: "Keep the required header columns exactly as exported.",
+  UNKNOWN_SEGMENT_ID: "Fill the Segment ID cell, or leave it blank only in a three-column translation template so the app can generate one.",
+  DUPLICATE_SEGMENT_ID: "Make each Segment ID unique.",
+  MISSING_SEGMENT: "A row from the exported full review file is missing. Re-export and copy your edits back in.",
+  INVALID_STATUS: "Use Draft, Reviewed, or Skip.",
+  ORIGINAL_TEXT_MUTATED: "For full review files, do not edit Original Text. For edited segmentation, use the three-column template.",
+  APP_TRANSLATION_MUTATED: "Leave App Translation unchanged, or move your edit into Reviewed Translation.",
+  EMPTY_ORIGINAL: "Fill Original Text for this row or delete the row.",
+  EMPTY_REVIEW: "Fill Reviewed Translation for this row.",
+  EXCESSIVE_LENGTH: "Shorten this translation if it was pasted into the wrong row.",
+};
+
 export default function SermonReviewControls({
   orgId,
   sermonId,
   sermonTitle,
+  reviewMode = "app_assisted",
   onImportSuccess,
 }: Props) {
   const { getIdToken } = useAuth();
@@ -142,10 +161,14 @@ export default function SermonReviewControls({
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-base font-semibold text-slate-900">
-            Review File
+            {reviewMode === "pre_translated"
+              ? "Translation Template"
+              : "Review File"}
           </h3>
           <p className="text-xs text-slate-500">
-            Export to Excel / Google Sheets, edit, and re-upload.
+            {reviewMode === "pre_translated"
+              ? "Export the three-column template, add translations, and re-upload."
+              : "Export to Excel / Google Sheets, edit, and re-upload."}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -155,7 +178,11 @@ export default function SermonReviewControls({
             disabled={exporting}
             className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
-            {exporting ? "Preparing…" : "Export Review File"}
+            {exporting
+              ? "Preparing…"
+              : reviewMode === "pre_translated"
+                ? "Export Template"
+                : "Export Review File"}
           </button>
 
           <label
@@ -185,6 +212,10 @@ export default function SermonReviewControls({
       )}
 
       {outcome && <OutcomeBanner outcome={outcome} onToggle={() => setReportOpen((o) => !o)} open={reportOpen} />}
+
+      {outcome?.kind === "failure" && outcome.report && (
+        <ValidationSummaryPanel report={outcome.report} />
+      )}
 
       {outcome && reportOpen && (
         <ReportTable report={resolveReport(outcome)} />
@@ -239,6 +270,7 @@ function OutcomeBanner({
     );
   }
   const errored = outcome.report?.summary.errored ?? 0;
+  const topIssue = outcome.report ? summarizeTopIssue(outcome.report) : "";
   return (
     <div className="space-y-1 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
       <div className="flex items-center justify-between">
@@ -257,13 +289,56 @@ function OutcomeBanner({
           </button>
         )}
       </div>
+      {topIssue ? <p className="text-xs font-medium text-red-800">{topIssue}</p> : null}
       <p className="text-xs text-red-700">{outcome.message}</p>
     </div>
   );
 }
 
+function ValidationSummaryPanel({ report }: { report: ValidationReport }) {
+  const issues = summarizeValidationCodes(report).filter(([code]) => code !== "OK");
+  if (!issues.length) return null;
+  return (
+    <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+      <p className="font-medium">Fix these spreadsheet issues, then upload again.</p>
+      <ul className="mt-2 space-y-1">
+        {issues.map(([code, count]) => (
+          <li key={code}>
+            <span className="font-mono text-xs">{code}</span>
+            <span> ({count}) - {VALIDATION_HELP[code]}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function summarizeTopIssue(report: ValidationReport): string {
+  const issue = summarizeValidationCodes(report).find(([code]) => code !== "OK");
+  if (!issue) return "";
+  const [code, count] = issue;
+  return `${count} row${count === 1 ? "" : "s"} need attention: ${VALIDATION_HELP[code]}`;
+}
+
+function summarizeValidationCodes(report: ValidationReport): Array<[ValidationCode, number]> {
+  const counts = new Map<ValidationCode, number>();
+  for (const row of report.rows) {
+    counts.set(row.code, (counts.get(row.code) ?? 0) + 1);
+  }
+  return Array.from(counts.entries()).sort((a, b) => {
+    if (a[0] === "OK") return 1;
+    if (b[0] === "OK") return -1;
+    return b[1] - a[1];
+  });
+}
+
 function ReportTable({ report }: { report: ValidationReport | null }) {
   if (!report || report.rows.length === 0) return null;
+  const rows =
+    report.summary.errored > 0
+      ? report.rows.filter((row) => row.level !== "ok")
+      : report.rows;
+  if (!rows.length) return null;
   return (
     <div className="overflow-hidden rounded-lg border border-slate-200">
       <table className="min-w-full divide-y divide-slate-200 text-sm">
@@ -277,7 +352,7 @@ function ReportTable({ report }: { report: ValidationReport | null }) {
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100 bg-white">
-          {report.rows.map((row, i) => (
+          {rows.map((row, i) => (
             <ReportRow key={`${row.row}-${row.code}-${i}`} row={row} />
           ))}
         </tbody>

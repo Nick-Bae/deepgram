@@ -30,6 +30,7 @@ class ENV:
     SILENCE_COMMIT_MS: int = int(os.getenv("SILENCE_COMMIT_MS", "450"))
     COMMIT_WAIT_MS: int = int(os.getenv("COMMIT_WAIT_MS", "100"))
     CJK_PENDING_HOLD_MS: int = int(os.getenv("CJK_PENDING_HOLD_MS", "300"))
+    CJK_UNPUNCTUATED_COMMIT_HOLD_MS: int = int(os.getenv("CJK_UNPUNCTUATED_COMMIT_HOLD_MS", "1200"))
     PARTIAL_TRANSLATION_MODEL: str = _env_str("OPENAI_PARTIAL_MODEL", default="gpt-4o-mini")
     MAX_PRECOMMIT_TOKENS: int = int(os.getenv("MAX_PRECOMMIT_TOKENS", "14"))
     WAITK_LO: int = int(os.getenv("WAITK_LO", "4"))

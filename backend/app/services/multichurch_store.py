@@ -2901,6 +2901,7 @@ class InMemoryMultiChurchStore:
         *,
         segment_updates: List[Dict[str, Any]],
         expected_updated_at: datetime,
+        review_mode: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Apply per-segment reviews atomically with an updatedAt precondition.
@@ -2949,6 +2950,42 @@ class InMemoryMultiChurchStore:
                 new_segments.append(seg_copy)
 
             stored["segments"] = new_segments
+            if review_mode:
+                stored["reviewMode"] = review_mode
+            stored["updatedAt"] = now or _utcnow()
+            self._review_sermons[(org_id, sermon_id)] = stored
+            return dict(stored)
+
+    def replace_review_sermon_segments(
+        self,
+        org_id: str,
+        sermon_id: str,
+        *,
+        replacement_segments: List[Dict[str, Any]],
+        expected_updated_at: datetime,
+        review_mode: str = "pre_translated",
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        from app.sermon_review.models import (
+            SermonConflictError,
+            SermonNotFoundError,
+        )
+
+        self._ensure_review_sermons()
+        with self._lock:
+            stored = self._review_sermons.get((org_id, sermon_id))
+            if stored is None:
+                raise SermonNotFoundError(
+                    f"Sermon {sermon_id} not found in org {org_id}"
+                )
+            if stored.get("updatedAt") != expected_updated_at:
+                raise SermonConflictError(
+                    "Sermon was modified by another writer since you "
+                    "downloaded the Review File."
+                )
+
+            stored["segments"] = [dict(seg) for seg in replacement_segments]
+            stored["reviewMode"] = review_mode
             stored["updatedAt"] = now or _utcnow()
             self._review_sermons[(org_id, sermon_id)] = stored
             return dict(stored)
@@ -3342,6 +3379,7 @@ class FirestoreMultiChurchStore:
                     "serviceKey": snap.id,
                     "title": service.get("title") or snap.id,
                     "publishedSermonDate": service.get("publishedSermonDate"),
+                    "linkedSermonId": service.get("linkedSermonId"),
                     "activeRoomId": active_room_id,
                     "lastRoomId": service.get("lastRoomId"),
                     "roomStatus": room_status,
@@ -5730,6 +5768,7 @@ class FirestoreMultiChurchStore:
         *,
         segment_updates: List[Dict[str, Any]],
         expected_updated_at: datetime,
+        review_mode: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         from app.sermon_review.models import (
@@ -5777,15 +5816,64 @@ class FirestoreMultiChurchStore:
                 new_segments.append(seg_copy)
 
             new_updated = now or _utcnow()
+            update_payload: Dict[str, Any] = {
+                "segments": new_segments,
+                "updatedAt": new_updated,
+            }
+            if review_mode:
+                update_payload["reviewMode"] = review_mode
             txn.update(
                 ref,
-                {"segments": new_segments, "updatedAt": new_updated},
+                update_payload,
             )
             data["segments"] = new_segments
+            if review_mode:
+                data["reviewMode"] = review_mode
             data["updatedAt"] = new_updated
             return data
 
         return _apply(transaction)
+
+    def replace_review_sermon_segments(
+        self,
+        org_id: str,
+        sermon_id: str,
+        *,
+        replacement_segments: List[Dict[str, Any]],
+        expected_updated_at: datetime,
+        review_mode: str = "pre_translated",
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        from app.sermon_review.models import (
+            SermonConflictError,
+            SermonNotFoundError,
+        )
+
+        ref = self._review_sermon_ref(org_id, sermon_id)
+        snap = ref.get(timeout=_FS_TIMEOUT)
+        if not snap.exists:
+            raise SermonNotFoundError(
+                f"Sermon {sermon_id} not found in org {org_id}"
+            )
+
+        data = snap.to_dict() or {}
+        stored_updated = data.get("updatedAt")
+        if stored_updated != expected_updated_at:
+            raise SermonConflictError(
+                "Sermon was modified by another writer since you "
+                "downloaded the Review File."
+            )
+
+        new_updated = now or _utcnow()
+        new_segments = [dict(seg) for seg in replacement_segments]
+        update_payload = {
+            "segments": new_segments,
+            "reviewMode": review_mode,
+            "updatedAt": new_updated,
+        }
+        ref.update(update_payload, timeout=_FS_TIMEOUT)
+        data.update(update_payload)
+        return data
 
     def link_review_sermon_to_service(
         self,

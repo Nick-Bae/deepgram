@@ -8,6 +8,7 @@ import {
   ApiErrorPayload,
   IngestResult,
   LinkResult,
+  ReviewMode,
   Sermon,
   SermonApiError,
   SermonSummary,
@@ -66,6 +67,7 @@ export type IngestJsonInput = {
   orgId: string;
   title: string;
   sourceType: Extract<SourceType, "paste" | "google_docs">;
+  reviewMode?: ReviewMode;
   text?: string;
   url?: string;
   /** Google OAuth access token (from Firebase Google sign-in) for sourceType=google_docs. */
@@ -79,6 +81,7 @@ export async function ingestSermonJson(
   const form = new FormData();
   form.set("sourceType", input.sourceType);
   form.set("title", input.title);
+  if (input.reviewMode) form.set("reviewMode", input.reviewMode);
   if (input.text !== undefined) form.set("text", input.text);
   if (input.url !== undefined) form.set("url", input.url);
 
@@ -115,6 +118,7 @@ export type IngestFileInput = {
   orgId: string;
   title: string;
   sourceType: Extract<SourceType, "file_txt" | "file_docx">;
+  reviewMode?: ReviewMode;
   file: File;
 };
 
@@ -125,6 +129,7 @@ export async function ingestSermonFile(
   const form = new FormData();
   form.set("sourceType", input.sourceType);
   form.set("title", input.title);
+  if (input.reviewMode) form.set("reviewMode", input.reviewMode);
   form.set("file", input.file);
 
   const { signal, cleanup } = withTimeout(

@@ -3,12 +3,21 @@ from __future__ import annotations
 import unittest
 
 from app.utils.korean_segments import (
+    ends_with_standalone_da,
     is_strongly_incomplete_korean_segment,
     join_korean_stt_segments,
+    split_sermon_korean_text,
 )
 
 
 class KoreanSegmentTests(unittest.TestCase):
+    def test_detects_standalone_da_stt_fragment(self) -> None:
+        self.assertTrue(ends_with_standalone_da("자자 빨리 사자 다"))
+        self.assertTrue(ends_with_standalone_da("자자 빨리 사자 다."))
+
+    def test_formal_da_ending_is_not_standalone_da(self) -> None:
+        self.assertFalse(ends_with_standalone_da("늘 중요한 일이 있어서 일찍 가야 합니다"))
+
     def test_holds_location_particle_until_predicate_arrives(self) -> None:
         self.assertTrue(
             is_strongly_incomplete_korean_segment("예수님은 내가 설 수 없는 자리에")
@@ -61,4 +70,47 @@ class KoreanSegmentTests(unittest.TestCase):
                 "예수님은 내가 설 수 없는 자리에 서시는 분입니다.",
             ),
             "예수님은 내가 설 수 없는 자리에 서시는 분입니다.",
+        )
+
+    def test_splits_scripture_quote_from_sermon_explanation(self) -> None:
+        text = (
+            "“땅과 거기 충만한 것과 세계와 그 가운데 사는 자들은 "
+            "다 여호와의 것이로다.” 성도 여러분, 시편 24편은 질문으로 "
+            "시작하지 않습니다."
+        )
+
+        self.assertEqual(
+            split_sermon_korean_text(text),
+            [
+                "“땅과 거기 충만한 것과 세계와 그 가운데 사는 자들은 "
+                "다 여호와의 것이로다.”",
+                "성도 여러분, 시편 24편은 질문으로 시작하지 않습니다.",
+            ],
+        )
+
+    def test_splits_long_parallel_sermon_clause_at_breath_points(self) -> None:
+        text = (
+            "나를 위해 자신을 내어 주시고, 나를 버려 두지 않고 찾아오시며, "
+            "내가 들어갈 수 없던 문 안으로 나를 데리고 들어가시는 "
+            "왕이시기 때문입니다."
+        )
+
+        self.assertEqual(
+            split_sermon_korean_text(text),
+            [
+                "나를 위해 자신을 내어 주시고,",
+                "나를 버려 두지 않고 찾아오시며,",
+                "내가 들어갈 수 없던 문 안으로 나를 데리고 들어가시는 "
+                "왕이시기 때문입니다.",
+            ],
+        )
+
+    def test_splits_stage_direction_from_sermon_text(self) -> None:
+        self.assertEqual(
+            split_sermon_korean_text("여기서 우리는 멈춰야 합니다. (잠시 멈춤) 다음을 보겠습니다."),
+            [
+                "여기서 우리는 멈춰야 합니다.",
+                "(잠시 멈춤)",
+                "다음을 보겠습니다.",
+            ],
         )

@@ -801,7 +801,7 @@ def _has_named_third_person_context(ctx: Optional[TranslationContext]) -> bool:
     if not ctx:
         return False
     pronoun = _normalize_pronoun(ctx)
-    if pronoun not in ("he", "she"):
+    if pronoun not in ("he", "she", "they"):
         return False
     subject = " ".join((ctx.subject or "").split()).strip()
     if not subject:
@@ -820,11 +820,42 @@ def _has_named_third_person_context(ctx: Optional[TranslationContext]) -> bool:
     return True
 
 
+_AUDIENCE_APPLICATION_RE = re.compile(
+    r"(?:"
+    r"성도여러분|여러분|"
+    r"생각해보(?:십시오|세요)|기억해야합니다|믿어야합니다|"
+    r"해야합니다|합시다|하십시오|하세요|주시기바랍니다"
+    r")"
+)
+
+
+def _is_clear_audience_application(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    if _contains_we_markers(compact):
+        return True
+    return bool(_AUDIENCE_APPLICATION_RE.search(compact))
+
+
+def _should_inherit_recent_subject(text: str, ctx: Optional[TranslationContext]) -> bool:
+    if not ctx:
+        return False
+    if _contains_first_person_markers(text) or _contains_we_markers(text) or _detect_third_person_pronoun(text):
+        return False
+    if not _has_named_third_person_context(ctx):
+        return False
+    if _is_clear_audience_application(text):
+        return False
+    return True
+
+
 _CONTEXTUAL_KO_PREFIXES = (
     "그리고",
     "그런데",
     "근데",
     "그래서",
+    "그러나",
     "그러니까",
     "그러면",
     "그러면서",
@@ -854,8 +885,13 @@ def _needs_recent_context(text: str) -> bool:
     return len(compact) <= 24
 
 
-def _should_include_prompt_context(text: str, *, update_ctx: bool) -> bool:
-    return (not update_ctx) or _needs_recent_context(text)
+def _should_include_prompt_context(
+    text: str,
+    *,
+    update_ctx: bool,
+    ctx: Optional[TranslationContext] = None,
+) -> bool:
+    return (not update_ctx) or _needs_recent_context(text) or _should_inherit_recent_subject(text, ctx)
 
 
 def _build_script_examples_block(examples: list, source: str, target: str) -> str:
@@ -1356,7 +1392,7 @@ def _enforce_subject_guardrails(en: str, source_text: str, ctx: Optional[Transla
         and not explicit_pronoun
         and not _has_ko_honorific_verb(source_text)
         and not _has_divine_subject_context(ctx)
-        and not (_has_named_third_person_context(ctx) and _needs_recent_context(source_text))
+        and not _should_inherit_recent_subject(source_text, ctx)
     ):
         return en
 
@@ -1513,12 +1549,12 @@ def _build_user_content_block(
         pronoun_hint in ("he", "she")
         and not _has_ko_honorific_verb(text)
         and not _detect_third_person_pronoun(text)
-        and not (_has_named_third_person_context(ctx_for_prompt) and _needs_recent_context(text))
+        and not _should_inherit_recent_subject(text, ctx_for_prompt)
     ):
         subject_hint = ENV.CONTEXT_SUBJECT
         pronoun_hint = ENV.CONTEXT_PRONOUN
 
-    if _should_include_prompt_context(text, update_ctx=update_ctx):
+    if _should_include_prompt_context(text, update_ctx=update_ctx, ctx=ctx_for_prompt):
         recent_context_block = _build_recent_context_block(
             ctx_for_prompt, current_source_text=text,
             source_lang=source_lang, target_lang=target_lang,

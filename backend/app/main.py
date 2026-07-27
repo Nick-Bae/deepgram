@@ -59,6 +59,7 @@ from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.env import ENV
 from app.utils.korean_segments import (
+    ends_with_standalone_da,
     is_strongly_incomplete_korean_segment,
     join_korean_stt_segments,
 )
@@ -1896,6 +1897,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         SENTENCE_PUNCT_CHARS = "".join(SENTENCE_PUNCT)
         COMMIT_WAIT_MS = ENV.COMMIT_WAIT_MS
         CJK_PENDING_HOLD_MS = ENV.CJK_PENDING_HOLD_MS
+        CJK_UNPUNCTUATED_COMMIT_HOLD_MS = ENV.CJK_UNPUNCTUATED_COMMIT_HOLD_MS
         MIN_CONFIDENT_CHARS = 10
         KOREAN_SHORT_MIN_CHARS = 14
         KOREAN_EOS_RE = re.compile(
@@ -1916,6 +1918,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
             if src_lang.startswith("ko"):
                 stripped = t.rstrip(SENTENCE_PUNCT_CHARS)
                 if not stripped:
+                    return False
+                if ends_with_standalone_da(stripped):
                     return False
                 return bool(KOREAN_EOS_RE.search(stripped))
             last_char = t[-1]
@@ -1948,6 +1952,11 @@ async def ws_stt_deepgram(websocket: WebSocket):
             if not src_lang.startswith(CJK_NO_SPACE_PREFIXES):
                 return False
             return not ends_like_sentence(text)
+
+        def cjk_hold_ms(text: str) -> int:
+            if src_lang.startswith("ko") and not ends_like_sentence(text):
+                return max(CJK_PENDING_HOLD_MS, CJK_UNPUNCTUATED_COMMIT_HOLD_MS)
+            return CJK_PENDING_HOLD_MS
 
         def should_hold_short_korean(text: str, speech_final_flag: bool) -> bool:
             if speech_final_flag:
@@ -2357,7 +2366,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             not used_latest_partial_fallback
                             and should_hold_short_korean(finalize_src, pending_speech_final)
                         ):
-                            await arm_timer(CJK_PENDING_HOLD_MS)
+                            await arm_timer(cjk_hold_ms(finalize_src))
                         else:
                             await commit_now(finalize_src)
                     except Exception:
@@ -2454,19 +2463,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     if looks_complete(pending_src):
                         await commit_now(pending_src)
                     else:
-                        hold_ms = CJK_PENDING_HOLD_MS if should_apply_cjk_hold(pending_src) else None
+                        hold_ms = cjk_hold_ms(pending_src) if should_apply_cjk_hold(pending_src) else None
                         await arm_timer(hold_ms)
                     continue
 
                 if pending_src and ends_like_sentence(pending_src):
                     if should_hold_short_korean(pending_src, speech_final):
-                        await arm_timer(CJK_PENDING_HOLD_MS)
+                        await arm_timer(cjk_hold_ms(pending_src))
                     else:
                         await commit_now(pending_src)
                     continue
 
                 if pending_src:
-                    hold_ms = CJK_PENDING_HOLD_MS if should_apply_cjk_hold(pending_src) else None
+                    hold_ms = cjk_hold_ms(pending_src) if should_apply_cjk_hold(pending_src) else None
                     await arm_timer(hold_ms)
 
             if not closed.is_set():

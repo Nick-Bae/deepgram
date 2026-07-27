@@ -92,6 +92,29 @@ class SplitKoreanTextTests(unittest.TestCase):
         result = split_korean_text(text, auto_split=False)
         self.assertEqual(result, ["라인 1", "라인 2", "라인 3"])
 
+    def test_splits_quote_and_long_parallel_clause_for_review_templates(self) -> None:
+        text = (
+            "“땅과 거기 충만한 것과 세계와 그 가운데 사는 자들은 "
+            "다 여호와의 것이로다.” 성도 여러분, 시편 24편은 질문으로 "
+            "시작하지 않습니다. "
+            "나를 위해 자신을 내어 주시고, 나를 버려 두지 않고 찾아오시며, "
+            "내가 들어갈 수 없던 문 안으로 나를 데리고 들어가시는 "
+            "왕이시기 때문입니다."
+        )
+
+        self.assertEqual(
+            split_korean_text(text),
+            [
+                "“땅과 거기 충만한 것과 세계와 그 가운데 사는 자들은 "
+                "다 여호와의 것이로다.”",
+                "성도 여러분, 시편 24편은 질문으로 시작하지 않습니다.",
+                "나를 위해 자신을 내어 주시고,",
+                "나를 버려 두지 않고 찾아오시며,",
+                "내가 들어갈 수 없던 문 안으로 나를 데리고 들어가시는 "
+                "왕이시기 때문입니다.",
+            ],
+        )
+
 
 class IngestFromPasteTests(unittest.TestCase):
     def test_normalizes_and_returns_text(self) -> None:
@@ -298,6 +321,27 @@ class BuildSermonTests(unittest.IsolatedAsyncioTestCase):
         for seg in sermon.segments:
             self.assertEqual(seg.reviewedTranslation, seg.appTranslation)
             self.assertTrue(seg.appTranslation.startswith("[t]"))
+            self.assertEqual(seg.status, "Draft")
+
+    async def test_pre_translated_mode_skips_app_translation(self) -> None:
+        translator = _StubTranslator()
+        sermon = await build_sermon(
+            sermonId="srm_abc",
+            orgId="org_xyz",
+            title="Test",
+            sourceType="paste",
+            sourceRef=None,
+            text=KOREAN_SAMPLE,
+            creatorUid="uid",
+            translator=translator,
+            reviewMode="pre_translated",
+        )
+
+        self.assertEqual(sermon.reviewMode, "pre_translated")
+        self.assertEqual(translator.calls, [])
+        for seg in sermon.segments:
+            self.assertEqual(seg.appTranslation, "")
+            self.assertEqual(seg.reviewedTranslation, "")
             self.assertEqual(seg.status, "Draft")
 
     async def test_translation_failure_degrades_to_empty(self) -> None:

@@ -1,6 +1,5 @@
 import asyncio
 import os
-import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,11 +11,11 @@ from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.env import ENV
 from app.services.multichurch_store import multichurch_store
 from app.services.script_store import script_store
+from app.utils.korean_segments import split_sermon_korean_text
 from app.utils.translate import translate_text
 
 router = APIRouter(tags=["script"])
 SCRIPT_EDITOR_ROLES = {"owner", "admin", "host"}
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。？！…])\s+|\n{2,}")
 SERMON_TRANSLATION_MODEL = ENV.SERMON_TRANSLATION_MODEL
 
 
@@ -100,17 +99,7 @@ class ServiceSermonSaveRequest(BaseModel):
 
 
 def _split_korean_text(raw: str, auto_split: bool) -> list[str]:
-    text = (raw or "").strip()
-    if not text:
-        return []
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not auto_split:
-        return [line.strip() for line in text.splitlines() if line.strip()]
-    # Treat single newlines as soft wraps from pasted documents, not sentence breaks.
-    normalized = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
-    normalized = re.sub(r"\n[ \t]+", "\n", normalized)
-    return [part.strip() for part in SENTENCE_SPLIT_RE.split(normalized) if part.strip()]
+    return split_sermon_korean_text(raw, auto_split=auto_split)
 
 
 def _resolve_org_prompt_overrides(org_id: str) -> tuple[str | None, str | None]:

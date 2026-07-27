@@ -12,7 +12,7 @@ from app.sermon_review import (
     read_workbook,
     validate_workbook,
 )
-from app.sermon_review.validation import COLUMNS
+from app.sermon_review.validation import COLUMNS, PRE_TRANSLATED_COLUMNS
 
 from tests.fixtures.sermon_review.build_fixtures import (
     bad_csv_bytes,
@@ -48,6 +48,21 @@ class ExportTests(unittest.TestCase):
         rows2, headers2 = read_workbook(data2)
         self.assertEqual(rows1, rows2)
         self.assertEqual(headers1, headers2)
+
+    def test_pre_translated_export_uses_three_columns(self) -> None:
+        sermon = make_golden_sermon()
+        sermon.reviewMode = "pre_translated"
+        data = build_xlsx(sermon, template="pre_translated")
+        rows, headers = read_workbook(data)
+
+        self.assertEqual(list(headers), list(PRE_TRANSLATED_COLUMNS))
+        self.assertEqual(len(rows), len(sermon.segments))
+        self.assertEqual(rows[0]["Segment ID"], sermon.segments[0].segmentId)
+        self.assertEqual(rows[0]["Original Text"], sermon.segments[0].original)
+        self.assertEqual(
+            rows[0]["Reviewed Translation"],
+            sermon.segments[0].reviewedTranslation,
+        )
 
 
 class RoundTripTests(unittest.TestCase):

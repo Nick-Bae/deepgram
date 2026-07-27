@@ -88,10 +88,12 @@ export type ListOrgInvitesResponse = {
 };
 
 export type OrgServiceSummary = {
-  orgId: string;
+  orgId?: string;
   serviceKey: string;
   title: string;
   timezone?: string;
+  publishedSermonDate?: string;
+  linkedSermonId?: string | null;
   activeRoomId?: string | null;
   roomStatus?: string;
   defaultLanguagePair?: { source?: string; target?: string };
@@ -857,7 +859,7 @@ export function publishServiceSermon(
 export function fetchOrgServices(
   idToken: string,
   orgId: string,
-): Promise<{ services: Array<{ serviceKey: string; title: string; publishedSermonDate?: string }> }> {
+): Promise<{ services: OrgServiceSummary[] }> {
   return authFetch(`/api/org/${encodeURIComponent(orgId)}/services`, idToken);
 }
 

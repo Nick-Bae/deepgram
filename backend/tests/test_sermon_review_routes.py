@@ -13,7 +13,7 @@ from fastapi import HTTPException, UploadFile
 from app.auth.firebase_auth import AuthenticatedUser
 from app.routes import sermon_review as sermon_review_routes
 from app.services.multichurch_store import InMemoryMultiChurchStore
-from app.sermon_review import build_xlsx, Sermon
+from app.sermon_review import build_xlsx, read_workbook, Sermon
 
 
 def _user(uid: str) -> AuthenticatedUser:
@@ -55,6 +55,15 @@ def _fake_upload(data: bytes, filename: str = "test.txt") -> UploadFile:
     return UploadFile(filename=filename, file=BytesIO(data))
 
 
+class _AsyncBytesUpload:
+    def __init__(self, data: bytes, filename: str = "test.xlsx") -> None:
+        self._data = data
+        self.filename = filename
+
+    async def read(self) -> bytes:
+        return self._data
+
+
 class _Patches:
     """Helper to patch multichurch_store + translate_text per test class."""
     def __init__(self, test: unittest.TestCase, store: InMemoryMultiChurchStore) -> None:
@@ -76,7 +85,8 @@ class _Patches:
 class IngestRouteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.store = InMemoryMultiChurchStore()
-        _Patches(self, self.store).start()
+        self.patches = _Patches(self, self.store)
+        self.patches.start()
         self.org_id = _bootstrap_owner(self.store)
 
     async def test_paste_happy_path(self) -> None:
@@ -287,6 +297,30 @@ class IngestRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["data"]["title"], "Host Sermon")
 
+    async def test_pre_translated_ingest_skips_translator(self) -> None:
+        result = await sermon_review_routes.ingest_sermon(
+            org_id=self.org_id,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            google_docs_service=None,
+            sourceType="paste",
+            reviewMode="pre_translated",
+            title="Pretranslated",
+            text="오늘 우리는 은혜를 봅니다.",
+            url=None,
+            file=None,
+        )
+
+        self.assertEqual(result["data"]["reviewMode"], "pre_translated")
+        self.patches.translator.assert_not_awaited()
+        sermon = self.store.get_review_sermon(
+            self.org_id, result["data"]["sermonId"]
+        )
+        assert sermon is not None
+        self.assertEqual(sermon["reviewMode"], "pre_translated")
+        self.assertEqual(sermon["segments"][0]["appTranslation"], "")
+        self.assertEqual(sermon["segments"][0]["reviewedTranslation"], "")
+
 
 class ListAndGetTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -412,6 +446,39 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('filename="sermon-', disposition)
         self.assertIn("filename*=UTF-8''", disposition)
         self.assertIn("%EC%9D%80%ED%98%9C", disposition)
+
+    async def test_pre_translated_export_uses_three_column_template(self) -> None:
+        result = await sermon_review_routes.ingest_sermon(
+            org_id=self.org_id,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            google_docs_service=None,
+            sourceType="paste",
+            reviewMode="pre_translated",
+            title="Template Test",
+            text="오늘 우리는 은혜를 봅니다.",
+            url=None,
+            file=None,
+        )
+        sid = result["data"]["sermonId"]
+
+        response = sermon_review_routes.export_review_file(
+            org_id=self.org_id,
+            sermon_id=sid,
+            request=_FakeRequest("GET"),
+            user=_user("uid_owner"),
+        )
+        rows, headers = read_workbook(response.body)
+
+        self.assertEqual(
+            list(headers),
+            ["Segment ID", "Original Text", "Reviewed Translation"],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertIn(
+            "translation-template",
+            response.headers["content-disposition"],
+        )
 
 
 class DeleteTests(unittest.IsolatedAsyncioTestCase):
@@ -581,6 +648,159 @@ class ImportTests(unittest.IsolatedAsyncioTestCase):
             r["code"] for r in ctx.exception.detail["error"]["details"]["rows"]
         }
         self.assertIn("WRONG_SERMON_ID", codes)
+
+    async def test_pre_translated_import_updates_reviewed_text(self) -> None:
+        result = await sermon_review_routes.ingest_sermon(
+            org_id=self.org_id,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            google_docs_service=None,
+            sourceType="paste",
+            reviewMode="pre_translated",
+            title="Pretranslated Import",
+            text="오늘 우리는 하나님의 은혜를 보려고 합니다. 기도합시다.",
+            url=None,
+            file=None,
+        )
+        sid = result["data"]["sermonId"]
+        sermon = Sermon.model_validate(
+            self.store.get_review_sermon(self.org_id, sid)
+        )
+        xlsx_bytes = build_xlsx(sermon, template="pre_translated")
+
+        from openpyxl import load_workbook
+        from io import BytesIO
+        wb = load_workbook(BytesIO(xlsx_bytes))
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2):
+            row[2].value = f"Reviewed English for {row[0].value}"
+        buf = BytesIO()
+        wb.save(buf)
+
+        upload = _AsyncBytesUpload(buf.getvalue(), "translation-template.xlsx")
+        import_result = await sermon_review_routes.import_review_file(
+            org_id=self.org_id,
+            sermon_id=sid,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            file=upload,
+        )
+
+        self.assertEqual(import_result["data"]["summary"]["errored"], 0)
+        stored = self.store.get_review_sermon(self.org_id, sid)
+        assert stored is not None
+        for segment in stored["segments"]:
+            self.assertTrue(
+                segment["reviewedTranslation"].startswith("Reviewed English")
+            )
+            self.assertEqual(segment["status"], "Reviewed")
+
+    async def test_three_column_import_switches_existing_sermon_to_pre_translated(self) -> None:
+        sid = await self._seed()
+        sermon = Sermon.model_validate(self.store.get_review_sermon(self.org_id, sid))
+        self.assertEqual(sermon.reviewMode, "app_assisted")
+        xlsx_bytes = build_xlsx(sermon, template="pre_translated")
+
+        from openpyxl import load_workbook
+        from io import BytesIO
+
+        wb = load_workbook(BytesIO(xlsx_bytes))
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2):
+            row[2].value = f"Manual translation for {row[0].value}"
+        buf = BytesIO()
+        wb.save(buf)
+
+        upload = _AsyncBytesUpload(buf.getvalue(), "manual-translation.xlsx")
+        result = await sermon_review_routes.import_review_file(
+            org_id=self.org_id,
+            sermon_id=sid,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            file=upload,
+        )
+
+        self.assertEqual(result["data"]["summary"]["errored"], 0)
+        stored = self.store.get_review_sermon(self.org_id, sid)
+        assert stored is not None
+        self.assertEqual(stored["reviewMode"], "pre_translated")
+        for segment in stored["segments"]:
+            self.assertTrue(
+                segment["reviewedTranslation"].startswith("Manual translation")
+            )
+            self.assertEqual(segment["status"], "Reviewed")
+
+    async def test_three_column_import_replaces_changed_originals_and_new_ids(self) -> None:
+        sid = await self._seed()
+
+        from openpyxl import Workbook
+        from io import BytesIO
+
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Segment ID", "Original Text", "Reviewed Translation"])
+        ws.append(["M001", "새롭게 나눈 첫 번째 원문입니다.", "New first translation."])
+        ws.append(["M002", "새롭게 나눈 두 번째 원문입니다.", "New second translation."])
+        buf = BytesIO()
+        wb.save(buf)
+
+        upload = _AsyncBytesUpload(buf.getvalue(), "manual-translation.xlsx")
+        result = await sermon_review_routes.import_review_file(
+            org_id=self.org_id,
+            sermon_id=sid,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            file=upload,
+        )
+
+        self.assertEqual(result["data"]["summary"]["errored"], 0)
+        stored = self.store.get_review_sermon(self.org_id, sid)
+        assert stored is not None
+        self.assertEqual(stored["reviewMode"], "pre_translated")
+        self.assertEqual(
+            [seg["segmentId"] for seg in stored["segments"]],
+            ["M001", "M002"],
+        )
+        self.assertEqual(
+            [seg["original"] for seg in stored["segments"]],
+            ["새롭게 나눈 첫 번째 원문입니다.", "새롭게 나눈 두 번째 원문입니다."],
+        )
+        self.assertEqual(
+            [seg["reviewedTranslation"] for seg in stored["segments"]],
+            ["New first translation.", "New second translation."],
+        )
+
+    async def test_three_column_import_generates_missing_segment_id(self) -> None:
+        sid = await self._seed()
+
+        from openpyxl import Workbook
+        from io import BytesIO
+
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Segment ID", "Original Text", "Reviewed Translation"])
+        ws.append(["M001", "직접 나눈 첫 번째 원문입니다.", "First manual translation."])
+        ws.append([None, "직접 나눈 두 번째 원문입니다.", "Second manual translation."])
+        buf = BytesIO()
+        wb.save(buf)
+
+        upload = _AsyncBytesUpload(buf.getvalue(), "manual-translation.xlsx")
+        result = await sermon_review_routes.import_review_file(
+            org_id=self.org_id,
+            sermon_id=sid,
+            request=_FakeRequest(),
+            user=_user("uid_owner"),
+            file=upload,
+        )
+
+        self.assertEqual(result["data"]["summary"]["errored"], 0)
+        stored = self.store.get_review_sermon(self.org_id, sid)
+        assert stored is not None
+        self.assertEqual(
+            [seg["segmentId"] for seg in stored["segments"]],
+            ["M001", "S002"],
+        )
+        self.assertEqual(stored["segments"][1]["order"], 2)
 
 
 class LinkTests(unittest.IsolatedAsyncioTestCase):

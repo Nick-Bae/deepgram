@@ -234,6 +234,53 @@ class UpdateSegmentsTests(unittest.TestCase):
             )
 
 
+class ReplaceSegmentsTests(unittest.TestCase):
+    def test_replace_with_matching_precondition(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(store)
+        t0 = datetime(2026, 6, 16, tzinfo=timezone.utc)
+        store.create_review_sermon(_sermon(org_id, now=t0))
+
+        t1 = t0 + timedelta(minutes=10)
+        result = store.replace_review_sermon_segments(
+            org_id,
+            "srm_test_001",
+            replacement_segments=[
+                {
+                    "segmentId": "M001",
+                    "order": 1,
+                    "original": "새 원문입니다.",
+                    "appTranslation": "",
+                    "reviewedTranslation": "New translation.",
+                    "notes": "",
+                    "status": "Reviewed",
+                }
+            ],
+            expected_updated_at=t0,
+            now=t1,
+        )
+
+        self.assertEqual(result["reviewMode"], "pre_translated")
+        self.assertEqual(result["updatedAt"], t1)
+        self.assertEqual(len(result["segments"]), 1)
+        self.assertEqual(result["segments"][0]["segmentId"], "M001")
+        self.assertEqual(result["segments"][0]["original"], "새 원문입니다.")
+
+    def test_replace_mismatched_precondition_raises_conflict(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(store)
+        t0 = datetime(2026, 6, 16, tzinfo=timezone.utc)
+        store.create_review_sermon(_sermon(org_id, now=t0))
+
+        with self.assertRaises(SermonConflictError):
+            store.replace_review_sermon_segments(
+                org_id,
+                "srm_test_001",
+                replacement_segments=[],
+                expected_updated_at=t0 - timedelta(minutes=1),
+            )
+
+
 class LinkTests(unittest.TestCase):
     def test_link_to_free_service(self) -> None:
         store = InMemoryMultiChurchStore()
