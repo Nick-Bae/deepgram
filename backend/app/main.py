@@ -54,7 +54,7 @@ from app.routes import auth as auth_routes
 from app.routes import billing as billing_routes
 from app.routes import admin as admin_routes
 from app.routes import sermon_review as sermon_review_routes
-from app.sermon_review.lookup import get_reviewed_text
+from app.sermon_review.lookup import get_reviewed_matches, get_reviewed_text
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.env import ENV
@@ -1250,7 +1250,24 @@ async def ws_translate(ws: WebSocket):
         _cached_script_examples_producer = _script_examples_producer
         live_mode = "live"
 
-        if script_match:
+        reviewed_text = await _reviewed_text_for_live(
+            org_id=target_org_id,
+            service_key=payload_service_key,
+            source_text=src_text,
+            source_lang=src_lang_full,
+            target_lang=tgt_lang_full,
+        )
+        if reviewed_text:
+            translated = reviewed_text
+            live_mode = "reviewed"
+            meta_payload.update(
+                {
+                    "mode": "reviewed",
+                    "source_version": "sermon-review",
+                }
+            )
+            translation_ctx.remember(src_text, translated)
+        elif script_match:
             translated = script_match.target
             live_mode = "pre"
             meta_payload.update(
@@ -1267,78 +1284,45 @@ async def ws_translate(ws: WebSocket):
         elif src_lang == tgt_lang and src_lang_full == tgt_lang_full:
             translated = src_text
         else:
-            reviewed_text: Optional[str] = None
-            if target_org_id and payload_service_key:
-                try:
-                    reviewed_text = await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        lambda: get_reviewed_text(
-                            store=multichurch_store,
-                            org_id=target_org_id,
-                            service_key=payload_service_key,
-                            korean_text=src_text,
-                        ),
-                    )
-                except Exception:
-                    reviewed_text = None
-            if reviewed_text:
-                reviewed_text = _reject_invalid_curated_translation(
-                    reviewed_text,
+            try:
+                custom_prompt, service_prompt = _cached_prompt_overrides(target_org_id)
+                _tx_usage: dict[str, Any] = {}
+                translated, limit_meta = await _translate_text_guarded(
+                    src_text,
                     src_lang_full,
                     tgt_lang_full,
-                    source_kind="sermon-review",
-                    source_text=src_text,
+                    org_id=target_org_id,
+                    host_uid=host_uid_claim,
+                    ctx=translation_ctx,
+                    update_ctx=True,
+                    custom_prompt=custom_prompt,
+                    service_prompt=service_prompt,
+                    script_examples=_cached_script_examples_producer,
+                    script_glossary=_cached_script_glossary_producer,
+                    out_usage=_tx_usage,
                 )
-            if reviewed_text:
-                translated = reviewed_text
-                live_mode = "reviewed"
-                meta_payload.update(
-                    {
-                        "mode": "reviewed",
-                        "source_version": "sermon-review",
-                    }
-                )
-                translation_ctx.remember(src_text, translated)
-            else:
-                try:
-                    custom_prompt, service_prompt = _cached_prompt_overrides(target_org_id)
-                    _tx_usage: dict[str, Any] = {}
-                    translated, limit_meta = await _translate_text_guarded(
-                        src_text,
-                        src_lang_full,
-                        tgt_lang_full,
-                        org_id=target_org_id,
-                        host_uid=host_uid_claim,
-                        ctx=translation_ctx,
-                        update_ctx=True,
-                        custom_prompt=custom_prompt,
-                        service_prompt=service_prompt,
-                        script_examples=_cached_script_examples_producer,
-                        script_glossary=_cached_script_glossary_producer,
-                        out_usage=_tx_usage,
-                    )
-                    if limit_meta:
-                        meta_payload.update(limit_meta)
-                    if target_org_id and _tx_usage.get("totalTokens"):
-                        _p = int(_tx_usage.get("promptTokens") or 0)
-                        _c = int(_tx_usage.get("completionTokens") or 0)
-                        _t = int(_tx_usage.get("totalTokens") or 0)
-                        _cfg = multichurch_store.get_platform_config()
-                        _usd = (_p * _cfg["liveTranslationInputCostPerMillion"] + _c * _cfg["liveTranslationOutputCostPerMillion"]) / 1_000_000
-                        try:
-                            multichurch_store.record_live_translation_usage(
-                                org_id=target_org_id,
-                                prompt_tokens=_p,
-                                completion_tokens=_c,
-                                total_tokens=_t,
-                                estimated_usd=_usd,
-                            )
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    print("[WS translate][producer_commit][error]", exc)
-                    translated = ""
-                    meta_payload.update(_fail_open_meta(exc))
+                if limit_meta:
+                    meta_payload.update(limit_meta)
+                if target_org_id and _tx_usage.get("totalTokens"):
+                    _p = int(_tx_usage.get("promptTokens") or 0)
+                    _c = int(_tx_usage.get("completionTokens") or 0)
+                    _t = int(_tx_usage.get("totalTokens") or 0)
+                    _cfg = multichurch_store.get_platform_config()
+                    _usd = (_p * _cfg["liveTranslationInputCostPerMillion"] + _c * _cfg["liveTranslationOutputCostPerMillion"]) / 1_000_000
+                    try:
+                        multichurch_store.record_live_translation_usage(
+                            org_id=target_org_id,
+                            prompt_tokens=_p,
+                            completion_tokens=_c,
+                            total_tokens=_t,
+                            estimated_usd=_usd,
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                print("[WS translate][producer_commit][error]", exc)
+                translated = ""
+                meta_payload.update(_fail_open_meta(exc))
 
         translated = _suppress_invalid_translation_output(
             translated,
@@ -1652,6 +1636,38 @@ def _reject_invalid_curated_translation(
     return None
 
 
+async def _reviewed_text_for_live(
+    *,
+    org_id: Optional[str],
+    service_key: Optional[str],
+    source_text: str,
+    source_lang: str,
+    target_lang: str,
+) -> Optional[str]:
+    if not org_id or not service_key or not source_text:
+        return None
+    try:
+        reviewed_text = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: get_reviewed_text(
+                store=multichurch_store,
+                org_id=org_id,
+                service_key=service_key,
+                korean_text=source_text,
+            ),
+        )
+    except Exception as exc:
+        print("[SERMON_REVIEW][lookup-error]", exc)
+        return None
+    return _reject_invalid_curated_translation(
+        reviewed_text,
+        source_lang,
+        target_lang,
+        source_kind="sermon-review",
+        source_text=source_text,
+    )
+
+
 def _format_duration_label(seconds: int) -> str:
     total = max(1, int(seconds))
     minutes, remainder = divmod(total, 60)
@@ -1907,6 +1923,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         pending_src: str | None = None
         pending_speech_final = False
         pending_task: asyncio.Task | None = None
+        emitted_review_segment_ids: set[str] = set()
         last_preview_norm: str = ""
         latest_partial: str = ""
         latest_partial_at: float = 0.0
@@ -1966,6 +1983,146 @@ async def ws_stt_deepgram(websocket: WebSocket):
         SUBSET_SUPPRESS_WINDOW_SEC = 4.0
         MIN_SUBSET_DELTA = 6
         CJK_NO_SPACE_PREFIXES = ("ko", "zh", "ja")
+
+        async def _reviewed_matches_for_source(src_text_raw: str) -> list[dict[str, Any]]:
+            clean_live_src = norm_ws(_preprocess_source_text(src_text_raw, src_lang_full))
+            if not clean_live_src or not org_id or not service_key:
+                return []
+            try:
+                return await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: get_reviewed_matches(
+                        store=multichurch_store,
+                        org_id=org_id,
+                        service_key=service_key,
+                        korean_text=clean_live_src,
+                    ),
+                )
+            except Exception as exc:
+                print("[SERMON_REVIEW][progress-error]", exc)
+                return []
+
+        async def emit_reviewed_segment_matches(src_text_raw: str) -> int:
+            nonlocal seq
+            matches = await _reviewed_matches_for_source(src_text_raw)
+            if not matches:
+                return 0
+
+            emitted = 0
+            for match in matches:
+                segment_id = str(match.get("segmentId") or "").strip()
+                if segment_id and segment_id in emitted_review_segment_ids:
+                    continue
+                source_text = norm_ws(
+                    _preprocess_source_text(
+                        str(match.get("original") or src_text_raw),
+                        src_lang_full,
+                    )
+                )
+                reviewed_text = _reject_invalid_curated_translation(
+                    str(match.get("reviewedText") or ""),
+                    src_lang_full,
+                    tgt_lang_full,
+                    source_kind="sermon-review",
+                    source_text=source_text,
+                )
+                if not reviewed_text:
+                    continue
+
+                seq += 1
+                assigned_seq = seq
+                meta_payload: dict[str, Any] = {
+                    "mode": "reviewed",
+                    "partial": False,
+                    "segment_id": assigned_seq,
+                    "reviewed_segment_id": segment_id,
+                    "rev": 0,
+                    "seq": assigned_seq,
+                    "is_final": True,
+                    "source_text": source_text,
+                    "source_version": "sermon-review",
+                }
+                if org_id:
+                    meta_payload["org_id"] = org_id
+                if room_id:
+                    meta_payload["room_id"] = room_id
+                if service_key:
+                    meta_payload["service_key"] = service_key
+                if church_slug:
+                    meta_payload["church_slug"] = church_slug
+
+                live_msg_new = {
+                    "mode": "reviewed",
+                    "text": reviewed_text,
+                    "seq": assigned_seq,
+                    "src": {"text": source_text, "lang": src_lang_full},
+                    "tgt": {"lang": tgt_lang_full},
+                    "meta": meta_payload.copy(),
+                }
+                if org_id:
+                    live_msg_new["orgId"] = org_id
+                if room_id:
+                    live_msg_new["roomId"] = room_id
+                live_msg_legacy = {
+                    "type": "translation",
+                    "payload": reviewed_text,
+                    "lang": tgt_lang_full,
+                    "meta": meta_payload.copy(),
+                }
+
+                try:
+                    await _send_to_producer(live_msg_new)
+                    await _send_to_producer(live_msg_legacy)
+                    if org_id and room_id:
+                        await asyncio.gather(
+                            manager.broadcast_room(org_id, room_id, live_msg_new),
+                            manager.broadcast_room(org_id, room_id, live_msg_legacy),
+                        )
+                    else:
+                        await asyncio.gather(
+                            manager.broadcast(live_msg_new),
+                            manager.broadcast(live_msg_legacy),
+                        )
+                except Exception as exc:
+                    print("[SERMON_REVIEW][progress-broadcast-error]", exc)
+                    continue
+
+                if segment_id:
+                    emitted_review_segment_ids.add(segment_id)
+                translation_ctx.remember(source_text, reviewed_text)
+                emitted += 1
+                print(
+                    f"[SERMON_REVIEW][progress] service={service_key} "
+                    f"segment={segment_id or '?'} seq={assigned_seq}"
+                )
+
+                if org_id and room_id:
+                    import datetime as _dt
+
+                    _seg_ts = (
+                        _dt.datetime.utcnow().isoformat(timespec="milliseconds")
+                        + "Z"
+                    )
+                    asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda _org_id=org_id,
+                        _room_id=room_id,
+                        _seq=assigned_seq,
+                        _source=source_text,
+                        _reviewed=reviewed_text,
+                        _ts=_seg_ts: _safe_append_segment(
+                            _org_id,
+                            _room_id,
+                            _seq,
+                            _source,
+                            _reviewed,
+                            "reviewed",
+                            None,
+                            _ts,
+                        ),
+                    )
+
+            return emitted
 
         async def send_translation(
             src_text_raw: str,
@@ -2290,8 +2447,16 @@ async def ws_stt_deepgram(websocket: WebSocket):
             setattr(commit_now, "_last_commit_ts", time.time())
             setattr(commit_now, "_last_src", src_text_raw)
 
-            print(f"[A] FINAL {src_lang_full}->{tgt_lang_full} src='{src_text_raw}'")
-            await send_translation(src_text_raw, partial=False, live_mode_hint="live", update_ctx=True)
+            reviewed_matches = await _reviewed_matches_for_source(src_text_raw)
+            if reviewed_matches:
+                emitted = await emit_reviewed_segment_matches(src_text_raw)
+                print(
+                    f"[SERMON_REVIEW][final-skip-combined] "
+                    f"matches={len(reviewed_matches)} emitted={emitted}"
+                )
+            else:
+                print(f"[A] FINAL {src_lang_full}->{tgt_lang_full} src='{src_text_raw}'")
+                await send_translation(src_text_raw, partial=False, live_mode_hint="live", update_ctx=True)
 
             last_preview_norm = ""
             latest_partial = ""
@@ -2418,6 +2583,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         await _send_to_producer({"type": "stt.partial", "text": transcript})
                     except:
                         pass
+
+                    await emit_reviewed_segment_matches(transcript)
 
                     if early_commit:
                         now_ms = int(time.time() * 1000)
@@ -2695,6 +2862,18 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
     async def _broadcast_translation(text: str, *, partial: bool, src_text: str = "") -> None:
         nonlocal seq
         clean = " ".join((text or "").split())
+        clean_src = " ".join((src_text or "").split())
+        reviewed_text: Optional[str] = None
+        if not partial and clean_src:
+            reviewed_text = await _reviewed_text_for_live(
+                org_id=org_id,
+                service_key=service_key,
+                source_text=clean_src,
+                source_lang=src_lang_full,
+                target_lang=tgt_lang_full,
+            )
+            if reviewed_text:
+                clean = reviewed_text
         if not clean:
             return
         if not partial:
@@ -2709,6 +2888,13 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
             "seq": seq + (1 if partial else 0),
             "is_final": not partial,
         }
+        if not partial and clean_src and clean == reviewed_text:
+            meta_payload.update(
+                {
+                    "mode": "reviewed",
+                    "source_version": "sermon-review",
+                }
+            )
         if org_id:
             meta_payload["org_id"] = org_id
         if room_id:
@@ -2722,7 +2908,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
             "mode": "realtime" if partial else "live",
             "text": clean,
             "seq": meta_payload["seq"],
-            "src": {"text": src_text, "lang": src_lang_full},
+            "src": {"text": clean_src, "lang": src_lang_full},
             "tgt": {"lang": tgt_lang_full},
             "meta": meta_payload.copy(),
         }
@@ -2752,9 +2938,9 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
             print("[OAI-RT][broadcast][error]", exc)
 
         if not partial and org_id and room_id and clean:
-            if src_text:
+            if clean_src:
                 try:
-                    await manager.broadcast_room(org_id, room_id, {"type": "final_kr", "text": src_text})
+                    await manager.broadcast_room(org_id, room_id, {"type": "final_kr", "text": clean_src})
                 except Exception:
                     pass
             import datetime as _dt
@@ -2762,7 +2948,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
             asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: _safe_append_segment(
-                    org_id, room_id, seq, src_text, clean, "openai_realtime_translate", None, _seg_ts,
+                    org_id, room_id, seq, clean_src, clean, meta_payload["mode"], None, _seg_ts,
                 ),
             )
 
@@ -3008,6 +3194,17 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         nonlocal seq
         clean = " ".join((text or "").split())
         clean_src = " ".join((src_text or "").split())
+        reviewed_text: Optional[str] = None
+        if not partial and clean_src:
+            reviewed_text = await _reviewed_text_for_live(
+                org_id=org_id,
+                service_key=service_key,
+                source_text=clean_src,
+                source_lang=src_lang_full,
+                target_lang=tgt_lang_full,
+            )
+            if reviewed_text:
+                clean = reviewed_text
         if not clean:
             return
         if not partial:
@@ -3023,6 +3220,13 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
             "seq": message_seq,
             "is_final": not partial,
         }
+        if not partial and reviewed_text:
+            meta_payload.update(
+                {
+                    "mode": "reviewed",
+                    "source_version": "sermon-review",
+                }
+            )
         if org_id:
             meta_payload["org_id"] = org_id
         if room_id:
@@ -3081,7 +3285,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
                     seq,
                     clean_src,
                     clean,
-                    "gemini_live_translate",
+                    meta_payload["mode"],
                     None,
                     segment_ts,
                 ),

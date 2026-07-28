@@ -15,7 +15,7 @@ from .ingest import (
     ingest_from_txt,
     split_korean_text,
 )
-from .lookup import DEFAULT_THRESHOLD, get_reviewed_text
+from .lookup import DEFAULT_THRESHOLD, get_reviewed_matches, get_reviewed_text
 from .models import (
     ReviewMode,
     Segment,
@@ -64,6 +64,7 @@ __all__ = [
     "build_sermon",
     "build_xlsx",
     "generate_segment_id",
+    "get_reviewed_matches",
     "get_reviewed_text",
     "ingest_from_docx",
     "ingest_from_google_docs",
