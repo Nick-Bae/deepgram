@@ -64,6 +64,7 @@ type StartResponse = {
 
 const POLL_MS = 12000;
 const ROOM_SYNC_GRACE_MS = 30000;
+const ACTIVE_ROOM_STALE_GRACE_MS = 60000;
 const DEFAULT_SERVICE_KEY = "sun-11am";
 const BILLING_ADMIN_EMAILS = new Set(
   `${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAILS || ""},${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAIL || ""}`
@@ -323,6 +324,7 @@ export default function HostChurchPage() {
   const roomStartTimeRef = useRef<number | null>(null);
   const autoStartRoomRef = useRef<{ roomId: string; rollbackOnFailure: boolean } | null>(null);
   const pendingRoomSyncRef = useRef<{ roomId: string; serviceKey: string; expiresAt: number } | null>(null);
+  const activeRoomMissingSinceRef = useRef<number | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [autoStartMicSignal, setAutoStartMicSignal] = useState(0);
   const [autoStartMicPending, setAutoStartMicPending] = useState(false);
@@ -736,6 +738,7 @@ export default function HostChurchPage() {
       // Preserve a newly-started room only until the services payload catches up.
       if (backendRoomId) {
         if (pendingRoomSync?.roomId === backendRoomId) pendingRoomSyncRef.current = null;
+        activeRoomMissingSinceRef.current = null;
       } else if (
         pendingRoomSync &&
         pendingRoomSync.roomId === localRoomId &&
@@ -744,6 +747,18 @@ export default function HostChurchPage() {
         rowRoomId = localRoomId || null;
       } else if (pendingRoomSync?.roomId === localRoomId) {
         pendingRoomSyncRef.current = null;
+      } else if (localRoomId && selectedKey === serviceKey) {
+        const missingSince = activeRoomMissingSinceRef.current ?? Date.now();
+        activeRoomMissingSinceRef.current = missingSince;
+        if (Date.now() - missingSince < ACTIVE_ROOM_STALE_GRACE_MS) {
+          rowRoomId = localRoomId;
+          console.warn("[HOST][room-sync][preserve-local-room]", {
+            serviceKey: selectedKey,
+            roomId: localRoomId,
+          });
+        }
+      } else {
+        activeRoomMissingSinceRef.current = null;
       }
 
       setActiveRoomId(rowRoomId);
