@@ -1821,6 +1821,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     finalize_event = asyncio.Event()
     last_audio_touch_ts = 0.0
     last_speech_activity_ts = time.monotonic()
+    session_started_ts = time.monotonic()
     total_audio_bytes = 0
     session_end_reason = "unknown"
     prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
@@ -1859,9 +1860,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 msg = await websocket.receive()
                 if msg.get("type") == "websocket.disconnect":
                     session_end_reason = "browser_disconnect"
+                    code = msg.get("code")
+                    reason = msg.get("reason") or ""
+                    duration_sec = max(0.0, time.monotonic() - session_started_ts)
                     print(
                         f"[DG][session-end] reason=browser_disconnect "
-                        f"org={org_id} room={room_id}"
+                        f"org={org_id} room={room_id} "
+                        f"code={code} close_reason={reason!r} "
+                        f"duration_sec={duration_sec:.1f} "
+                        f"audio_bytes={total_audio_bytes}"
                     )
                     try:
                         await dg.close()

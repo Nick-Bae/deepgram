@@ -225,13 +225,17 @@ export function useDeepgramProducer(): DeepgramProducerController {
     resetInputLevel(updateState);
   }
 
-  function shutdownProducer(updateState = true) {
+  function shutdownProducer(updateState = true, reason = "shutdown") {
     shouldRunRef.current = false;
     terminalErrorRef.current = false;
     startOptionsRef.current = undefined;
     streamContextRef.current = {};
     clearReconnectTimer();
-    try { wsRef.current?.close(); } catch {}
+    try {
+      const closeReason = reason.slice(0, 120);
+      wsRef.current?.close(1000, closeReason);
+      console.warn("[FE][DG][shutdown]", { reason: closeReason, updateState });
+    } catch {}
     wsRef.current = null;
     releaseMediaPipeline(updateState);
     applyInputMuted(false, updateState);
@@ -357,7 +361,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
         // Recover from stale error states where shouldRunRef stayed true.
         shouldRunRef.current = false;
         clearReconnectTimer();
-        try { wsRef.current?.close(); } catch {}
+        try { wsRef.current?.close(1000, "restart_stale_socket"); } catch {}
         wsRef.current = null;
         releaseMediaPipeline();
       }
@@ -434,7 +438,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
       connectWebSocket();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      shutdownProducer(false);
+      shutdownProducer(false, "start_error");
       applyInputMuted(false);
       setErrorMsg(message);
       setStatus("error");
@@ -443,7 +447,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
   }
 
   function stop() {
-    shutdownProducer(true);
+    shutdownProducer(true, "manual_stop");
   }
 
   function setInputMuted(muted: boolean) {
@@ -462,13 +466,13 @@ export function useDeepgramProducer(): DeepgramProducerController {
     if (typeof window === "undefined") return;
 
     const handlePageHide = () => {
-      shutdownProducer(true);
+      shutdownProducer(true, "pagehide");
     };
 
     window.addEventListener("pagehide", handlePageHide);
     return () => {
       window.removeEventListener("pagehide", handlePageHide);
-      shutdownProducer(false);
+      shutdownProducer(false, "component_unmount");
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
