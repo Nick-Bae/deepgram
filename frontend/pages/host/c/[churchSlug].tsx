@@ -705,8 +705,12 @@ export default function HostChurchPage() {
   }, [queryHostToken]);
 
   const refreshServices = useCallback(
-    async (preferredServiceKey?: string) => {
+    async (
+      preferredServiceKey?: string,
+      options?: { preserveLocalActiveRoom?: boolean },
+    ) => {
       if (!slug) return;
+      const preserveLocalActiveRoom = options?.preserveLocalActiveRoom !== false;
       const res = await fetch(`${API_URL}/api/c/${encodeURIComponent(slug)}/services`);
       if (!res.ok) {
         const msg = await readErrorMessage(res, "load_services");
@@ -736,6 +740,7 @@ export default function HostChurchPage() {
       if (backendRoomId) {
         if (pendingRoomSync?.roomId === backendRoomId) pendingRoomSyncRef.current = null;
       } else if (
+        preserveLocalActiveRoom &&
         pendingRoomSync &&
         pendingRoomSync.roomId === localRoomId &&
         Date.now() < pendingRoomSync.expiresAt
@@ -743,7 +748,7 @@ export default function HostChurchPage() {
         rowRoomId = localRoomId || null;
       } else if (pendingRoomSync?.roomId === localRoomId) {
         pendingRoomSyncRef.current = null;
-      } else if (localRoomId) {
+      } else if (preserveLocalActiveRoom && localRoomId) {
         rowRoomId = localRoomId;
         console.warn("[HOST][room-sync][preserve-local-active-room]", {
           serviceKey: selectedKey || serviceKey,
@@ -1619,7 +1624,7 @@ export default function HostChurchPage() {
     }
 
     clearLiveRoomState();
-    await refreshServices(normalizedServiceKey || undefined);
+    await refreshServices(normalizedServiceKey || undefined, { preserveLocalActiveRoom: false });
     void loadBillingProfile({ refresh: true });
   }, [clearLiveRoomState, getIdToken, loadBillingProfile, normalizedServiceKey, refreshServices, resolvedOrgId]);
 
