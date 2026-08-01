@@ -357,6 +357,7 @@ def root():
         "ok": True,
         "msg": "server is live",
         "revision": os.getenv("K_REVISION") or "",
+        "deploymentConfigVersion": "live-viewer-capacity-v1",
         "roomConfig": {
             "idleTimeoutSec": ROOM_IDLE_TIMEOUT_SEC,
             "maxDurationSec": ROOM_MAX_DURATION_SEC,

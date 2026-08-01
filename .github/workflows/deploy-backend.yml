@@ -1,11 +1,13 @@
 name: Deploy Backend to Cloud Run
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
     paths:
       - 'backend/**'
+      - '.github/workflows/deploy-backend.yml'
 
 jobs:
   deploy:
