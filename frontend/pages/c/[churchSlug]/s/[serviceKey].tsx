@@ -73,7 +73,6 @@ export default function ChurchServiceListenerPage() {
   const [resolveData, setResolveData] = useState<ResolveResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [displayMode, setDisplayMode] = useState<DisplayMode>("subtitle");
-  const [fallbackKrLines, setFallbackKrLines] = useState<string[]>([]);
   const [fallbackEnLines, setFallbackEnLines] = useState<string[]>([]);
   const fallbackSeqRef = useRef(0);
 
@@ -155,9 +154,9 @@ export default function ChurchServiceListenerPage() {
     }
   }, [enqueuePcmAudio]);
 
-  const { connected, krLines, enLines } = useSubtitleSocket(scopedWsUrl, {
+  const { connected, enLines } = useSubtitleSocket(scopedWsUrl, {
     maxLines: 4,
-    track: "both",
+    track: "en",
     enabled: socketEnabled,
     onTranslatedAudio: handleTranslatedAudio,
   });
@@ -166,7 +165,6 @@ export default function ChurchServiceListenerPage() {
 
   useEffect(() => {
     fallbackSeqRef.current = 0;
-    setFallbackKrLines([]);
     setFallbackEnLines([]);
   }, [resolveData?.activeRoomId]);
 
@@ -189,14 +187,12 @@ export default function ChurchServiceListenerPage() {
         const rows = (data.segments || [])
           .map((row) => ({
             seq: Number(row.seq || 0),
-            ko: String(row.koreanText || "").trim(),
             en: String(row.englishText || "").trim(),
           }))
           .filter((row) => row.seq > fallbackSeqRef.current && row.en);
         if (!rows.length) return;
         fallbackSeqRef.current = Math.max(fallbackSeqRef.current, ...rows.map((row) => row.seq));
         setFallbackEnLines((prev) => prev.concat(rows.map((row) => row.en)).slice(-4));
-        setFallbackKrLines((prev) => prev.concat(rows.map((row) => row.ko).filter(Boolean)).slice(-4));
       } catch {
         // WebSocket remains primary; polling is a recovery path.
       }
@@ -229,9 +225,7 @@ export default function ChurchServiceListenerPage() {
   }, [ttsEnabled]);
 
   const serviceTitle = resolveData?.service?.title || serviceKey || "Service";
-  const displayKrLines = fallbackKrLines.length ? fallbackKrLines : krLines;
   const displayEnLines = fallbackEnLines.length ? fallbackEnLines : enLines;
-  const lastKr = displayKrLines[displayKrLines.length - 1] || "";
   const lastEn = displayEnLines[displayEnLines.length - 1] || "";
   const waitingMessage = loading
     ? `Loading ${serviceTitle}…`
@@ -503,31 +497,6 @@ export default function ChurchServiceListenerPage() {
               textAlign: "center",
             }}
           >
-            {lastKr && (
-              <div
-                style={{
-                  fontSize: "clamp(12px, 1.4vw, 20px)",
-                  color: "rgba(167,118,147,0.75)",
-                  letterSpacing: "0.12em",
-                  lineHeight: 1.4,
-                  fontWeight: 300,
-                  fontStyle: "italic",
-                }}
-              >
-                {lastKr}
-              </div>
-            )}
-
-            {lastKr && enLines.length > 0 && (
-              <div style={{
-                width: 32,
-                height: 1,
-                background: "rgba(167,118,147,0.3)",
-                borderRadius: 1,
-                margin: "0.1em 0",
-              }} />
-            )}
-
             {enLines.length > 0 ? (
               enLines.map((line, i) => {
                 const isCurrent = i === enLines.length - 1;
@@ -582,21 +551,6 @@ export default function ChurchServiceListenerPage() {
             zIndex: 8,
           }}
         >
-          {lastKr && (
-            <div
-              style={{
-                fontSize: "clamp(15px, 2.2vw, 36px)",
-                fontWeight: 300,
-                fontStyle: "italic",
-                letterSpacing: "0.1em",
-                color: "rgba(167,118,147,0.7)",
-                marginBottom: "1.2rem",
-              }}
-            >
-              {lastKr}
-            </div>
-          )}
-
           <div
             style={{
               maxWidth: "min(1400px, 92vw)",
