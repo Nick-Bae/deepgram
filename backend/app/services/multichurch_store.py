@@ -899,12 +899,17 @@ class InMemoryMultiChurchStore:
             room_doc = self._rooms.get((org_id, active_room_id)) if active_room_id else None
             if room_doc and room_doc.get("status") != "live":
                 active_room_id = None
+            last_room_id = service.get("lastRoomId")
+            last_room_doc = self._rooms.get((org_id, last_room_id)) if last_room_id else None
             return {
                 "orgId": org_id,
                 "slug": self._orgs[org_id]["slug"],
                 "serviceKey": service_key,
                 "activeRoomId": active_room_id,
                 "roomStatus": self._serialize_room_status(room_doc),
+                "lastRoomId": last_room_id,
+                "lastRoomStatus": self._serialize_room_status(last_room_doc),
+                "lastEndReason": (last_room_doc or {}).get("endReason"),
                 "languagePair": (room_doc or {}).get("languagePair")
                 or service.get("defaultLanguagePair")
                 or {"source": "ko", "target": "en"},
@@ -2598,7 +2603,7 @@ class InMemoryMultiChurchStore:
                 org["billing"] = billing
                 billing_limits_enabled = _org_billing_limits_enabled(org)
                 has_monthly_cap = billing_limits_enabled and int(org.get("maxMinutesPerMonth") or 0) > 0
-                has_trial_cap = _billing_trial_seconds_limit(billing) > 0
+                has_trial_cap = billing_limits_enabled and _billing_trial_seconds_limit(billing) > 0
                 remainder_seconds = _room_unbilled_elapsed_seconds(room, now=now)
                 if remainder_seconds > 0 and (has_monthly_cap or has_trial_cap):
                     delta_minutes = _ceil_minutes_from_seconds(remainder_seconds)
@@ -3317,12 +3322,24 @@ class FirestoreMultiChurchStore:
                 room_status = str(room_doc.get("status") or "waiting")
                 if room_status != "live":
                     active_room_id = None
+        last_room_id = service.get("lastRoomId")
+        last_room_status = "waiting"
+        last_end_reason = None
+        if last_room_id:
+            last_room_snap = self._room_ref(org_id, str(last_room_id)).get(timeout=_FS_TIMEOUT)
+            if last_room_snap.exists:
+                last_room_doc = last_room_snap.to_dict() or {}
+                last_room_status = str(last_room_doc.get("status") or "waiting")
+                last_end_reason = last_room_doc.get("endReason")
         return {
             "orgId": org_id,
             "slug": slug,
             "serviceKey": service_key,
             "activeRoomId": active_room_id,
             "roomStatus": room_status,
+            "lastRoomId": last_room_id,
+            "lastRoomStatus": last_room_status,
+            "lastEndReason": last_end_reason,
             "languagePair": (room_doc or {}).get("languagePair")
             or service.get("defaultLanguagePair")
             or {"source": "ko", "target": "en"},
@@ -5236,7 +5253,7 @@ class FirestoreMultiChurchStore:
             billing = _normalize_org_billing(org, now=now) if org_snap.exists else {}
             billing_limits_enabled = _org_billing_limits_enabled(org) if org_snap.exists else False
             has_monthly_cap = billing_limits_enabled and int(org.get("maxMinutesPerMonth") or 0) > 0
-            has_trial_cap = _billing_trial_seconds_limit(billing) > 0 if org_snap.exists else False
+            has_trial_cap = billing_limits_enabled and _billing_trial_seconds_limit(billing) > 0 if org_snap.exists else False
             remainder_seconds = _room_unbilled_elapsed_seconds(room, now=now)
             translated_delta_minutes = 0
             if remainder_seconds > 0 and (has_monthly_cap or has_trial_cap):

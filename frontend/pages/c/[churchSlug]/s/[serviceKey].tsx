@@ -15,6 +15,9 @@ type ResolveResponse = {
   serviceKey: string;
   activeRoomId: string | null;
   roomStatus: string;
+  lastRoomId?: string | null;
+  lastRoomStatus?: string | null;
+  lastEndReason?: string | null;
   languagePair?: { source?: string; target?: string };
   service?: { title?: string; timezone?: string };
 };
@@ -40,6 +43,25 @@ function friendlyError(msg: string): string {
   if (msg.includes("500") || msg.includes("502") || msg.includes("503")) return "Server error. Will retry automatically.";
   if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) return "Network error. Check your connection.";
   return "Could not connect. Will retry automatically.";
+}
+
+function roomEndMessage(reason?: string | null): string | null {
+  switch ((reason || "").trim()) {
+    case "trial_expired":
+      return "Broadcast stopped: trial minutes exhausted.";
+    case "monthly_limit_reached":
+      return "Broadcast stopped: monthly limit reached.";
+    case "host_absent":
+      return "Broadcast stopped: host connection was lost.";
+    case "idle_timeout":
+      return "Broadcast stopped: no audio was detected.";
+    case "max_duration":
+      return "Broadcast stopped: maximum broadcast duration reached.";
+    case "host_end":
+      return "Broadcast ended.";
+    default:
+      return null;
+  }
 }
 
 export default function ChurchServiceListenerPage() {
@@ -213,8 +235,10 @@ export default function ChurchServiceListenerPage() {
   const lastEn = displayEnLines[displayEnLines.length - 1] || "";
   const waitingMessage = loading
     ? `Loading ${serviceTitle}…`
-    : !resolveData || !resolveData.activeRoomId || resolveData.roomStatus !== "live"
+    : !resolveData
       ? `Waiting for ${serviceTitle} to begin…`
+      : !resolveData.activeRoomId || resolveData.roomStatus !== "live"
+        ? roomEndMessage(resolveData.lastEndReason) || `Waiting for ${serviceTitle} to begin…`
       : connected
         ? "Live — waiting for speech…"
         : "Connecting…";

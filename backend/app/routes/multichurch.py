@@ -113,6 +113,9 @@ def latest_service_segments(
             "serviceKey": data.get("serviceKey") or service_key,
             "activeRoomId": None,
             "roomStatus": data.get("roomStatus") or "waiting",
+            "lastRoomId": data.get("lastRoomId"),
+            "lastRoomStatus": data.get("lastRoomStatus"),
+            "lastEndReason": data.get("lastEndReason"),
             "segments": [],
         }
     segments = multichurch_store.latest_room_segments(
@@ -127,6 +130,9 @@ def latest_service_segments(
         "serviceKey": data.get("serviceKey") or service_key,
         "activeRoomId": room_id,
         "roomStatus": data.get("roomStatus") or "live",
+        "lastRoomId": data.get("lastRoomId"),
+        "lastRoomStatus": data.get("lastRoomStatus"),
+        "lastEndReason": data.get("lastEndReason"),
         "segments": segments,
     }
 

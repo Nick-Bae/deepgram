@@ -205,6 +205,55 @@ class BillingEntitlementTests(unittest.TestCase):
         billing = self.store.get_org_billing_profile(org_id=self.org_id)
         self.assertEqual(int(billing.get("trialSecondsUsed") or 0), 19 * 60)
 
+    def test_disabled_billing_limits_skip_trial_usage_on_end_room(self) -> None:
+        self.store._orgs[self.org_id]["billingLimitsEnabled"] = False
+        self._set_billing(
+            status="trialing",
+            planKey="trial",
+            trialMinutesLimit=20,
+            trialMinutesUsed=19,
+            trialSecondsUsed=19 * 60,
+            trialEndsAt=datetime.now(timezone.utc) + timedelta(days=7),
+            graceEndsAt=None,
+        )
+        started_at = datetime(2026, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+        with patch.object(multichurch_store_module, "_utcnow", return_value=started_at):
+            started = self.store.start_service(
+                self.org_id,
+                "sun-11am",
+                host_uid="owner-billing-entitlements",
+                source="ko",
+                target="en",
+            )
+        room_id = str(started.get("roomId") or "")
+        self.assertTrue(room_id)
+        self.store._rooms[(self.org_id, room_id)]["lastUsageTickAt"] = started_at
+
+        with patch.object(multichurch_store_module, "_utcnow", return_value=started_at + timedelta(seconds=300)):
+            self.store.end_room(self.org_id, room_id, reason="host_end")
+
+        billing = self.store.get_org_billing_profile(org_id=self.org_id)
+        self.assertEqual(int(billing.get("trialSecondsUsed") or 0), 19 * 60)
+
+    def test_resolve_service_reports_last_end_reason(self) -> None:
+        self._set_billing(status="active", trialEndsAt=None, graceEndsAt=None)
+        started = self.store.start_service(
+            self.org_id,
+            "sun-11am",
+            host_uid="owner-billing-entitlements",
+            source="ko",
+            target="en",
+        )
+        room_id = str(started.get("roomId") or "")
+        self.store.end_room(self.org_id, room_id, reason="trial_expired")
+
+        resolved = self.store.resolve_service("billing-entitlements", "sun-11am")
+        self.assertIsNotNone(resolved)
+        self.assertIsNone(resolved.get("activeRoomId"))
+        self.assertEqual(resolved.get("lastRoomId"), room_id)
+        self.assertEqual(resolved.get("lastRoomStatus"), "ended")
+        self.assertEqual(resolved.get("lastEndReason"), "trial_expired")
+
     def test_end_room_persists_partial_trial_seconds(self) -> None:
         self._set_billing(
             status="trialing",
