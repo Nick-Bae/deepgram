@@ -116,6 +116,8 @@ const EOS_PUNCT_RE = /[.!?。！？…]$/
 const STRIP_EOS_PUNCT_RE = /[.!?。！？…]+$/
 const KOREAN_EOS_RE = /(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요|다|아요|어요|에요)$/
 const KOREAN_STANDALONE_DA_RE = /(?:^|\s)다$/
+const KOREAN_DANGLING_PARTICLE_RE = /(?:이|가|은|는|을|를|의|께서|에서|에게|께|으로|로|와|과|도|만|부터|까지|보다|처럼)$/
+const KOREAN_DANGLING_MODIFIER_RE = /(?:하는|되는|있는|없는|하신|하셨는|생겨난|만드신|주신|보는|붙든|붙들고\s+있는)$/
 const CLIENT_DRIVEN = false
 const MIN_PREVIEW_CHARS = 10
 const PREVIEW_THROTTLE_MS = 400
@@ -385,6 +387,20 @@ export default function TranslationBox({
     return EOS_PUNCT_RE.test(trimmed)
   }, [sourceLang])
 
+  const looksLikeIncompleteKoreanClause = useCallback((raw: string) => {
+    const trimmed = (raw || '').trim()
+    if (!trimmed) return true
+    const base = (sourceLang || '').split('-')[0].toLowerCase()
+    if (base !== 'ko') return false
+    if (endsWithSentenceBoundary(trimmed)) return false
+    const withoutPunct = trimmed.replace(STRIP_EOS_PUNCT_RE, '').trim()
+    if (!withoutPunct) return true
+    return (
+      KOREAN_DANGLING_PARTICLE_RE.test(withoutPunct) ||
+      KOREAN_DANGLING_MODIFIER_RE.test(withoutPunct)
+    )
+  }, [endsWithSentenceBoundary, sourceLang])
+
 
   const triggerFinalize = useCallback(
     (reason?: string) => {
@@ -478,6 +494,10 @@ export default function TranslationBox({
     (s: string) => {
       const clean = (s || '').trim();
       if (!clean) return;
+      if (!endsWithSentenceBoundary(clean) && looksLikeIncompleteKoreanClause(clean)) {
+        if (DEBUG) console.log('[FE][final][clause][hold-incomplete-ko]', clip(clean));
+        return;
+      }
       if (!shouldEmitClause(clean)) return;
 
       sendPreview.cancel();
@@ -495,7 +515,7 @@ export default function TranslationBox({
         triggerFinalize('clause complete');
       }
     },
-    [endsWithSentenceBoundary, postTranslate, sendPreview, shouldEmitClause, triggerFinalize]
+    [endsWithSentenceBoundary, looksLikeIncompleteKoreanClause, postTranslate, sendPreview, shouldEmitClause, triggerFinalize]
   );
 
   const scheduleFinal = useCallback(() => {
@@ -805,7 +825,6 @@ export default function TranslationBox({
       console.log('[FE][WS][in]', { seq, isFinal, out: clip(incoming) });
       if (isFinal) {
         lastFinalTranslatedAtRef.current = Date.now();
-        setTranslated(incoming);
       } else {
         const dwellElapsed = Date.now() - lastFinalTranslatedAtRef.current;
         if (dwellElapsed >= 1500 || incoming.length >= 30) {
@@ -837,6 +856,9 @@ export default function TranslationBox({
       } else {
         if (committedSrc) {
           lastKRFromServerRef.current = committedSrc;
+        }
+        if (incoming) {
+          setTranslated(incoming);
         }
         if (incoming && !isMuted && incoming !== currentSpokenRef.current) {
           enqueueFinalTTS(incoming);
@@ -982,6 +1004,7 @@ export default function TranslationBox({
     const interval = setInterval(() => {
       const clause = clauseRef.current.trim()
       if (!clause) return
+      if (looksLikeIncompleteKoreanClause(clause)) return
       if (clause.length < MIN_FORCE_FINALIZE_CHARS && !endsWithSentenceBoundary(clause)) return
 
       const now = Date.now()
@@ -991,7 +1014,7 @@ export default function TranslationBox({
     }, FINALIZE_PULSE_MS)
 
     return () => clearInterval(interval)
-  }, [endsWithSentenceBoundary, status, triggerFinalize])
+  }, [endsWithSentenceBoundary, looksLikeIncompleteKoreanClause, status, triggerFinalize])
 
   // ---------- Start/Stop mic ----------
   const handleStartListening = useCallback(async (options?: { suppressAlert?: boolean; onError?: (message: string) => void }) => {
