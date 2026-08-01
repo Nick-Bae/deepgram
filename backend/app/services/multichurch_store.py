@@ -963,6 +963,16 @@ class InMemoryMultiChurchStore:
     ) -> None:
         pass  # In-memory store does not persist segments
 
+    def latest_room_segments(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        return []
+
     def export_room_segments(
         self,
         org_id: str,
@@ -5318,6 +5328,35 @@ class FirestoreMultiChurchStore:
         if match_score is not None:
             doc["matchScore"] = match_score
         self._room_ref(org_id, room_id).collection("segments").document(str(seq)).set(doc)
+
+    def latest_room_segments(
+        self,
+        org_id: str,
+        room_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        clean_org_id = _clean_token(org_id)
+        clean_room_id = _clean_token(room_id)
+        if not clean_org_id or not clean_room_id:
+            return []
+        safe_after = max(0, int(after_seq or 0))
+        safe_limit = max(1, min(50, int(limit or 20)))
+        query = (
+            self._room_ref(clean_org_id, clean_room_id)
+            .collection("segments")
+            .where("seq", ">", safe_after)
+            .order_by("seq")
+            .limit(safe_limit)
+        )
+        out: List[Dict[str, Any]] = []
+        for snap in query.stream(timeout=_FS_TIMEOUT):
+            row = snap.to_dict() or {}
+            if not row:
+                continue
+            out.append(row)
+        return out
 
     def export_room_segments(
         self,

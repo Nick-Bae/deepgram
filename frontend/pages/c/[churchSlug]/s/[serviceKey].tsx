@@ -19,7 +19,18 @@ type ResolveResponse = {
   service?: { title?: string; timezone?: string };
 };
 
+type LatestSegmentsResponse = {
+  activeRoomId: string | null;
+  roomStatus: string;
+  segments?: Array<{
+    seq?: number;
+    koreanText?: string;
+    englishText?: string;
+  }>;
+};
+
 const RESOLVE_POLL_MS = 8000;
+const SEGMENT_FALLBACK_POLL_MS = 2000;
 const DISPLAY_TOGGLE_KEY = "f";
 type DisplayMode = "subtitle" | "fullScreen";
 
@@ -40,6 +51,9 @@ export default function ChurchServiceListenerPage() {
   const [resolveData, setResolveData] = useState<ResolveResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [displayMode, setDisplayMode] = useState<DisplayMode>("subtitle");
+  const [fallbackKrLines, setFallbackKrLines] = useState<string[]>([]);
+  const [fallbackEnLines, setFallbackEnLines] = useState<string[]>([]);
+  const fallbackSeqRef = useRef(0);
 
   const toggleDisplayMode = useCallback(() => {
     setDisplayMode((prev) => (prev === "subtitle" ? "fullScreen" : "subtitle"));
@@ -129,12 +143,58 @@ export default function ChurchServiceListenerPage() {
   const lastSpokenLineRef = useRef("");
 
   useEffect(() => {
-    const lastLine = enLines[enLines.length - 1];
+    fallbackSeqRef.current = 0;
+    setFallbackKrLines([]);
+    setFallbackEnLines([]);
+  }, [resolveData?.activeRoomId]);
+
+  useEffect(() => {
+    if (!slug || !serviceKey || !socketEnabled) return;
+    let disposed = false;
+    const pollSegments = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      try {
+        const params = new URLSearchParams({
+          after_seq: String(fallbackSeqRef.current || 0),
+          limit: "10",
+        });
+        const res = await fetch(
+          `${API_URL}/api/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(serviceKey)}/segments/latest?${params.toString()}`,
+        );
+        if (!res.ok) return;
+        const data: LatestSegmentsResponse = await res.json();
+        if (disposed || data.activeRoomId !== resolveData?.activeRoomId || data.roomStatus !== "live") return;
+        const rows = (data.segments || [])
+          .map((row) => ({
+            seq: Number(row.seq || 0),
+            ko: String(row.koreanText || "").trim(),
+            en: String(row.englishText || "").trim(),
+          }))
+          .filter((row) => row.seq > fallbackSeqRef.current && row.en);
+        if (!rows.length) return;
+        fallbackSeqRef.current = Math.max(fallbackSeqRef.current, ...rows.map((row) => row.seq));
+        setFallbackEnLines((prev) => prev.concat(rows.map((row) => row.en)).slice(-4));
+        setFallbackKrLines((prev) => prev.concat(rows.map((row) => row.ko).filter(Boolean)).slice(-4));
+      } catch {
+        // WebSocket remains primary; polling is a recovery path.
+      }
+    };
+    void pollSegments();
+    const timer = window.setInterval(pollSegments, SEGMENT_FALLBACK_POLL_MS);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [resolveData?.activeRoomId, serviceKey, slug, socketEnabled]);
+
+  useEffect(() => {
+    const displayLines = fallbackEnLines.length ? fallbackEnLines : enLines;
+    const lastLine = displayLines[displayLines.length - 1];
     if (!lastLine || lastLine === lastSpokenLineRef.current) return;
     lastSpokenLineRef.current = lastLine;
     if (Date.now() - lastNativeAudioAtRef.current < 2500) return;
     speak(lastLine);
-  }, [enLines, speak]);
+  }, [enLines, fallbackEnLines, speak]);
 
   // iOS Safari: speechSynthesis stalls after ~30s. Resume it on a timer while audio is enabled.
   useEffect(() => {
@@ -147,8 +207,10 @@ export default function ChurchServiceListenerPage() {
   }, [ttsEnabled]);
 
   const serviceTitle = resolveData?.service?.title || serviceKey || "Service";
-  const lastKr = krLines[krLines.length - 1] || "";
-  const lastEn = enLines[enLines.length - 1] || "";
+  const displayKrLines = fallbackKrLines.length ? fallbackKrLines : krLines;
+  const displayEnLines = fallbackEnLines.length ? fallbackEnLines : enLines;
+  const lastKr = displayKrLines[displayKrLines.length - 1] || "";
+  const lastEn = displayEnLines[displayEnLines.length - 1] || "";
   const waitingMessage = loading
     ? `Loading ${serviceTitle}…`
     : !resolveData || !resolveData.activeRoomId || resolveData.roomStatus !== "live"
@@ -157,7 +219,7 @@ export default function ChurchServiceListenerPage() {
         ? "Live — waiting for speech…"
         : "Connecting…";
   const currentEn = lastEn || waitingMessage;
-  const recentEn = enLines.slice(0, -1).slice(-2);
+  const recentEn = displayEnLines.slice(0, -1).slice(-2);
 
   const isLive = connected;
   const isConnecting = socketEnabled && !connected;

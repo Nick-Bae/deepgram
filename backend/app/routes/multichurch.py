@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import io
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -93,6 +93,42 @@ def resolve_service(
     if not data:
         raise HTTPException(status_code=404, detail="service_not_found")
     return data
+
+
+@router.get("/c/{slug}/s/{service_key}/segments/latest")
+def latest_service_segments(
+    slug: str = Path(pattern=validators.CHURCH_SLUG),
+    service_key: str = Path(pattern=validators.SERVICE_KEY),
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=10, ge=1, le=50),
+):
+    data = multichurch_store.resolve_service(slug=slug, service_key=service_key)
+    if not data:
+        raise HTTPException(status_code=404, detail="service_not_found")
+    room_id = (data.get("activeRoomId") or "").strip()
+    if not room_id or data.get("roomStatus") != "live":
+        return {
+            "orgId": data.get("orgId"),
+            "slug": data.get("slug") or slug,
+            "serviceKey": data.get("serviceKey") or service_key,
+            "activeRoomId": None,
+            "roomStatus": data.get("roomStatus") or "waiting",
+            "segments": [],
+        }
+    segments = multichurch_store.latest_room_segments(
+        str(data["orgId"]),
+        room_id,
+        after_seq=after_seq,
+        limit=limit,
+    )
+    return {
+        "orgId": data["orgId"],
+        "slug": data.get("slug") or slug,
+        "serviceKey": data.get("serviceKey") or service_key,
+        "activeRoomId": room_id,
+        "roomStatus": data.get("roomStatus") or "live",
+        "segments": segments,
+    }
 
 
 @router.get("/c/{slug}/services")
