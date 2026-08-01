@@ -24,6 +24,7 @@ export type DeepgramProducerController = {
   status: "idle" | "starting" | "streaming" | "stopped" | "error";
   partial: string;
   lastCommit: string;
+  lastTranslation: DeepgramTranslationEvent | null;
   errorMsg: string | null;
   inputLevel: number;
   inputMuted: boolean;
@@ -31,6 +32,15 @@ export type DeepgramProducerController = {
   setInputMuted: (muted: boolean) => void;
   stop: () => void;
   finalize: () => void;
+};
+
+export type DeepgramTranslationEvent = {
+  text: string;
+  lang: string;
+  seq: number;
+  srcText?: string;
+  srcLang?: string;
+  meta?: Record<string, unknown>;
 };
 
 const INPUT_LEVEL_NOISE_FLOOR = 0.012;
@@ -149,6 +159,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
   const [status, setStatus] = useState<"idle" | "starting" | "streaming" | "stopped" | "error">("idle");
   const [partial, setPartial] = useState("");
   const [lastCommit, setLastCommit] = useState("");
+  const [lastTranslation, setLastTranslation] = useState<DeepgramTranslationEvent | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [inputLevel, setInputLevel] = useState(0);
   const [inputMuted, setInputMutedState] = useState(false);
@@ -166,6 +177,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
   const inputLevelRef = useRef(0);
   const inputMutedRef = useRef(false);
   const lastInputLevelEmitRef = useRef(0);
+  const fallbackSeqRef = useRef(0);
 
   function resetInputLevel(updateState = true) {
     inputLevelRef.current = 0;
@@ -341,7 +353,37 @@ export function useDeepgramProducer(): DeepgramProducerController {
             return;
           }
           if (msg.type === "stt.partial") setPartial(msg.text || "");
-          if (msg.type === "translation") setLastCommit(msg.payload || "");
+          if (typeof msg.text === "string" && msg.mode) {
+            const meta = msg.meta && typeof msg.meta === "object" ? msg.meta as Record<string, unknown> : {};
+            const seq = typeof msg.seq === "number" ? msg.seq : ++fallbackSeqRef.current;
+            const text = msg.text || "";
+            setLastCommit(text);
+            setLastTranslation({
+              text,
+              lang: typeof msg?.tgt?.lang === "string" ? msg.tgt.lang : "en",
+              seq,
+              srcText: typeof msg?.src?.text === "string" ? msg.src.text : undefined,
+              srcLang: typeof msg?.src?.lang === "string" ? msg.src.lang : undefined,
+              meta: {
+                ...meta,
+                is_final: typeof meta.is_final === "boolean" ? meta.is_final : msg.mode === "live",
+              },
+            });
+          }
+          if (msg.type === "translation") {
+            const meta = msg.meta && typeof msg.meta === "object" ? msg.meta as Record<string, unknown> : {};
+            const text = msg.payload || "";
+            const seq = typeof meta.seq === "number" ? meta.seq : ++fallbackSeqRef.current;
+            setLastCommit(text);
+            setLastTranslation({
+              text,
+              lang: typeof msg.lang === "string" ? msg.lang : "en",
+              seq,
+              srcText: typeof meta.source_text === "string" ? meta.source_text : undefined,
+              srcLang: typeof meta.source_lang === "string" ? meta.source_lang : undefined,
+              meta,
+            });
+          }
         } catch {}
       };
     } catch (err: unknown) {
@@ -481,6 +523,7 @@ export function useDeepgramProducer(): DeepgramProducerController {
     status,
     partial,
     lastCommit,
+    lastTranslation,
     errorMsg,
     inputLevel,
     inputMuted,

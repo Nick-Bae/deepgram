@@ -257,7 +257,7 @@ export default function TranslationBox({
 
   // Deepgram mic producer
   const dgController: DeepgramProducerController = useDeepgramProducer()
-  const { start: dgStart, stop: dgStop, status, partial, errorMsg, inputLevel, inputMuted, setInputMuted, finalize } = dgController
+  const { start: dgStart, stop: dgStop, status, partial, errorMsg, inputLevel, inputMuted, setInputMuted, finalize, lastTranslation } = dgController
   const engineLabel =
     translationEngine === 'openai-realtime-translate'
       ? 'OpenAI Realtime Translate'
@@ -762,11 +762,29 @@ export default function TranslationBox({
 
   // ---------- WS: consume broadcasts (single effect, with soft-final fallback) ----------
   useEffect(() => {
-    const seq = last.seq ?? 0;
-    const incoming = (last.text || '').trim();
-    const lastMeta = (last as typeof last & { meta?: { is_final?: boolean } }).meta;
+    const directSeq = lastTranslation?.seq ?? 0;
+    const wsSeq = last.seq ?? 0;
+    const incomingLast = lastTranslation && directSeq >= wsSeq
+      ? {
+          text: lastTranslation.text,
+          seq: directSeq,
+          srcText: lastTranslation.srcText,
+          meta: lastTranslation.meta as { is_final?: boolean } | undefined,
+        }
+      : last;
+    const seq = incomingLast.seq ?? 0;
+    const incoming = (incomingLast.text || '').trim();
+    const lastMeta = (incomingLast as typeof incomingLast & {
+      meta?: {
+        is_final?: boolean
+        reason?: string
+        code?: string
+        provider?: string
+        message?: string
+      }
+    }).meta;
     const isFinal = !!lastMeta?.is_final;
-    const committedSrc = typeof last.srcText === 'string' ? last.srcText.trim() : '';
+    const committedSrc = typeof incomingLast.srcText === 'string' ? incomingLast.srcText.trim() : '';
 
     if (!incoming && !committedSrc) return;
 
@@ -879,7 +897,7 @@ export default function TranslationBox({
         }
       }
     }
-  }, [enqueueFinalTTS, endsWithSentenceBoundary, formatSourceForDisplay, isMuted, last]);
+  }, [enqueueFinalTTS, endsWithSentenceBoundary, formatSourceForDisplay, isMuted, last, lastTranslation]);
 
   // ---------- Deepgram partials → clause buffer ----------
   useEffect(() => {
