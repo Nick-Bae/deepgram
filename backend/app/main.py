@@ -123,6 +123,7 @@ ROOM_MAX_DURATION_SEC = int(os.getenv("ROOM_MAX_DURATION_SEC", "10800"))  # 3 ho
 ROOM_SWEEPER_INTERVAL_SEC = int(os.getenv("ROOM_SWEEPER_INTERVAL_SEC", "60"))
 ROOM_USAGE_TICK_SEC = int(os.getenv("ROOM_USAGE_TICK_SEC", "300"))  # 5 min
 ROOM_HOST_PRESENCE_GRACE_SEC = _env_int("ROOM_HOST_PRESENCE_GRACE_SEC", 300, min_value=0, max_value=3600)
+ROOM_HOST_PRESENCE_END_ROOMS = _env_bool("ROOM_HOST_PRESENCE_END_ROOMS", False)
 STT_NO_SPEECH_TIMEOUT_SEC = _env_int("STT_NO_SPEECH_TIMEOUT_SEC", 120, min_value=30, max_value=3600)
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
@@ -943,7 +944,7 @@ async def _room_sweeper_loop() -> None:
                 (_clean_token(room.get("orgId")) or "", _clean_token(room.get("roomId")) or "")
                 for room in candidate_rooms
             }
-            if ROOM_HOST_PRESENCE_GRACE_SEC > 0:
+            if ROOM_HOST_PRESENCE_GRACE_SEC > 0 and ROOM_HOST_PRESENCE_END_ROOMS:
                 live = await asyncio.get_running_loop().run_in_executor(
                     None, multichurch_store.live_rooms
                 )
