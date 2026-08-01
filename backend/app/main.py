@@ -353,7 +353,18 @@ app.include_router(sermon_review_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
-    return {"ok": True, "msg": "server is live"}
+    return {
+        "ok": True,
+        "msg": "server is live",
+        "revision": os.getenv("K_REVISION") or "",
+        "roomConfig": {
+            "idleTimeoutSec": ROOM_IDLE_TIMEOUT_SEC,
+            "maxDurationSec": ROOM_MAX_DURATION_SEC,
+            "usageTickSec": ROOM_USAGE_TICK_SEC,
+            "hostPresenceGraceSec": ROOM_HOST_PRESENCE_GRACE_SEC,
+            "hostPresenceEndRooms": ROOM_HOST_PRESENCE_END_ROOMS,
+        },
+    }
 
 
 def _clean_token(raw: Any) -> Optional[str]:
@@ -975,6 +986,13 @@ async def _room_sweeper_loop() -> None:
                 room_id = _clean_token(room.get("roomId"))
                 reason = _clean_token(room.get("reason")) or "idle_timeout"
                 if not org_id or not room_id:
+                    continue
+                if reason == "host_absent":
+                    print(
+                        f"[ROOM_SWEEPER] skipped host_absent cleanup "
+                        f"org={org_id} room={room_id}"
+                    )
+                    manager.note_room_host_activity(org_id, room_id)
                     continue
                 host_count = manager.room_host_count(org_id, room_id)
                 print(
