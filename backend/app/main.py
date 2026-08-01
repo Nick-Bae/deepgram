@@ -123,7 +123,9 @@ ROOM_MAX_DURATION_SEC = int(os.getenv("ROOM_MAX_DURATION_SEC", "10800"))  # 3 ho
 ROOM_SWEEPER_INTERVAL_SEC = int(os.getenv("ROOM_SWEEPER_INTERVAL_SEC", "60"))
 ROOM_USAGE_TICK_SEC = int(os.getenv("ROOM_USAGE_TICK_SEC", "300"))  # 5 min
 ROOM_HOST_PRESENCE_GRACE_SEC = _env_int("ROOM_HOST_PRESENCE_GRACE_SEC", 300, min_value=0, max_value=3600)
-ROOM_HOST_PRESENCE_END_ROOMS = _env_bool("ROOM_HOST_PRESENCE_END_ROOMS", False)
+# Host WebSocket presence is process-local. In Cloud Run, another instance or
+# revision can incorrectly see zero hosts while the real producer is active.
+ROOM_HOST_PRESENCE_END_ROOMS = False
 STT_NO_SPEECH_TIMEOUT_SEC = _env_int("STT_NO_SPEECH_TIMEOUT_SEC", 120, min_value=30, max_value=3600)
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
@@ -1047,6 +1049,14 @@ async def _cleanup_live_rooms_on_startup() -> None:
 async def _on_startup():
     global _room_sweeper_task
     print(f"[MULTICHURCH] store={type(multichurch_store).__name__}")
+    print(
+        "[ROOM_CONFIG] "
+        f"idle={ROOM_IDLE_TIMEOUT_SEC}s "
+        f"max_duration={ROOM_MAX_DURATION_SEC}s "
+        f"usage_tick={ROOM_USAGE_TICK_SEC}s "
+        f"host_presence_grace={ROOM_HOST_PRESENCE_GRACE_SEC}s "
+        f"host_presence_end_rooms={ROOM_HOST_PRESENCE_END_ROOMS}"
+    )
     asyncio.create_task(_cleanup_live_rooms_on_startup())
     if _room_sweeper_task is None or _room_sweeper_task.done():
         _room_sweeper_task = asyncio.create_task(_room_sweeper_loop())
