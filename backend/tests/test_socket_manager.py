@@ -49,6 +49,17 @@ class ConnectionManagerTests(unittest.TestCase):
         self.assertEqual(manager.room_host_count("org-c", "room-c"), 0)
         self.assertIn(("org-c", "room-c"), manager.hostless_since_by_room)
 
+    def test_host_activity_clears_host_absence_tracking(self) -> None:
+        manager = ConnectionManager()
+        ws_listener = object()
+
+        with patch("app.socket_manager.time.monotonic", return_value=300.0):
+            manager.join_room(ws_listener, "org-d", "room-d", "listener")
+
+        self.assertIn(("org-d", "room-d"), manager.hostless_since_by_room)
+        manager.note_room_host_activity("org-d", "room-d")
+        self.assertNotIn(("org-d", "room-d"), manager.hostless_since_by_room)
+
 
 if __name__ == "__main__":
     unittest.main()

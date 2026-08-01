@@ -917,6 +917,16 @@ def _check_spend_alerts() -> None:
 
 
 async def _room_sweeper_loop() -> None:
+    def _timestamp_age_seconds(value: Any) -> Optional[float]:
+        try:
+            import datetime as _dt
+            if not isinstance(value, _dt.datetime):
+                return None
+            now = _dt.datetime.now(tz=value.tzinfo) if value.tzinfo else _dt.datetime.utcnow()
+            return max(0.0, (now - value).total_seconds())
+        except Exception:
+            return None
+
     while True:
         try:
             await asyncio.sleep(max(15, ROOM_SWEEPER_INTERVAL_SEC))
@@ -942,6 +952,14 @@ async def _room_sweeper_loop() -> None:
                     room_id = _clean_token(room.get("roomId"))
                     if not org_id or not room_id:
                         continue
+                    audio_age = _timestamp_age_seconds(room.get("lastAudioAt") or room.get("startedAt"))
+                    # Cloud Run can run multiple backend instances. Host WebSocket presence
+                    # is in-memory per instance, while lastAudioAt is shared in Firestore.
+                    # Do not let an instance without the producer socket end a room that
+                    # another instance is actively receiving audio for.
+                    if audio_age is not None and audio_age < max(ROOM_HOST_PRESENCE_GRACE_SEC, ROOM_IDLE_TIMEOUT_SEC):
+                        manager.note_room_host_activity(org_id, room_id)
+                        continue
                     elapsed = manager.note_room_host_absence(org_id, room_id)
                     room_key = (org_id, room_id)
                     if room_key in seen_room_keys:
@@ -955,6 +973,11 @@ async def _room_sweeper_loop() -> None:
                 reason = _clean_token(room.get("reason")) or "idle_timeout"
                 if not org_id or not room_id:
                     continue
+                host_count = manager.room_host_count(org_id, room_id)
+                print(
+                    f"[ROOM_SWEEPER] ending room org={org_id} room={room_id} "
+                    f"reason={reason} host_count={host_count}"
+                )
                 try:
                     result = multichurch_store.end_room(org_id, room_id, reason=reason)
                     if result.get("alreadyEnded"):

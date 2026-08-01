@@ -129,6 +129,12 @@ class ConnectionManager:
         started_at = self.hostless_since_by_room.setdefault(key, time.monotonic())
         return max(0.0, time.monotonic() - started_at)
 
+    def note_room_host_activity(self, org_id: str, room_id: str) -> None:
+        key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        if not key[0] or not key[1]:
+            return
+        self.hostless_since_by_room.pop(key, None)
+
     def forget_room(self, org_id: str, room_id: str) -> None:
         key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
         if not key[0] or not key[1]:

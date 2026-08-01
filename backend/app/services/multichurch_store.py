@@ -2654,6 +2654,8 @@ class InMemoryMultiChurchStore:
                         "orgId": org_id,
                         "roomId": room_id,
                         "serviceKey": room.get("serviceKey"),
+                        "startedAt": room.get("startedAt"),
+                        "lastAudioAt": room.get("lastAudioAt"),
                     }
                 )
         return out
@@ -5378,6 +5380,8 @@ class FirestoreMultiChurchStore:
                         "orgId": org_id,
                         "roomId": room_snap.id,
                         "serviceKey": room.get("serviceKey"),
+                        "startedAt": room.get("startedAt"),
+                        "lastAudioAt": room.get("lastAudioAt"),
                     }
                 )
         return out
