@@ -115,6 +115,11 @@ class BillingRouteTests(unittest.TestCase):
                     "growth": "price_growth",
                     "premium": "price_premium",
                 },
+                stripe_price_ids_annual={
+                    "starter": "price_starter_annual",
+                    "growth": "price_growth_annual",
+                    "premium": "price_premium_annual",
+                },
                 trial_days=30,
                 trial_minutes=20,
                 grace_days=3,

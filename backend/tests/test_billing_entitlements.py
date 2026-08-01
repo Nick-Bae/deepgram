@@ -38,6 +38,7 @@ class BillingEntitlementTests(unittest.TestCase):
                 stripe_secret_key="",
                 stripe_webhook_secret="",
                 stripe_price_ids={"starter": "", "growth": "", "premium": ""},
+                stripe_price_ids_annual={"starter": "", "growth": "", "premium": ""},
                 trial_days=30,
                 trial_minutes=20,
                 grace_days=3,
@@ -175,6 +176,34 @@ class BillingEntitlementTests(unittest.TestCase):
                 source="ko",
                 target="en",
             )
+
+    def test_disabled_billing_limits_skip_trial_usage_cap(self) -> None:
+        self.store._orgs[self.org_id]["billingLimitsEnabled"] = False
+        self._set_billing(
+            status="trialing",
+            planKey="trial",
+            trialMinutesLimit=20,
+            trialMinutesUsed=19,
+            trialSecondsUsed=19 * 60,
+            trialEndsAt=datetime.now(timezone.utc) + timedelta(days=7),
+            graceEndsAt=None,
+        )
+        started = self.store.start_service(
+            self.org_id,
+            "sun-11am",
+            host_uid="owner-billing-entitlements",
+            source="ko",
+            target="en",
+        )
+        room_id = str(started.get("roomId") or "")
+        self.assertTrue(room_id)
+        self.store._rooms[(self.org_id, room_id)]["lastUsageTickAt"] = datetime.now(timezone.utc) - timedelta(seconds=300)
+
+        flagged = self.store.enforce_live_usage_caps(tick_seconds=300)
+        self.assertEqual(flagged, [])
+
+        billing = self.store.get_org_billing_profile(org_id=self.org_id)
+        self.assertEqual(int(billing.get("trialSecondsUsed") or 0), 19 * 60)
 
     def test_end_room_persists_partial_trial_seconds(self) -> None:
         self._set_billing(

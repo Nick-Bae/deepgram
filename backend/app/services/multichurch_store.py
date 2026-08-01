@@ -1066,7 +1066,7 @@ class InMemoryMultiChurchStore:
             now = _utcnow()
             billing = _normalize_org_billing(org, now=now)
             org["billing"] = billing
-            if _billing_trial_minutes_exhausted(billing):
+            if _org_billing_limits_enabled(org) and _billing_trial_minutes_exhausted(billing):
                 raise PermissionError("trial_expired")
             if _entitlements_v2_effective(org):
                 denial = _billing_start_denial_reason(billing=billing, now=now)
@@ -1338,7 +1338,7 @@ class InMemoryMultiChurchStore:
                 raise PermissionError("hard_cap_reached")
             billing = _normalize_org_billing(org, now=now)
             org["billing"] = billing
-            if _billing_trial_minutes_exhausted(billing):
+            if _org_billing_limits_enabled(org) and _billing_trial_minutes_exhausted(billing):
                 raise PermissionError("trial_expired")
             if _entitlements_v2_effective(org):
                 denial = _billing_start_denial_reason(billing=billing, now=now)
@@ -2492,7 +2492,7 @@ class InMemoryMultiChurchStore:
                 raise PermissionError("hard_cap_reached")
             billing = _normalize_org_billing(org, now=now)
             org["billing"] = billing
-            if _billing_trial_minutes_exhausted(billing):
+            if _org_billing_limits_enabled(org) and _billing_trial_minutes_exhausted(billing):
                 raise PermissionError("trial_expired")
             if _entitlements_v2_effective(org):
                 denial = _billing_start_denial_reason(billing=billing, now=now)
@@ -2699,11 +2699,11 @@ class InMemoryMultiChurchStore:
                 billing_limits_enabled = _org_billing_limits_enabled(org)
                 billing = _normalize_org_billing(org, now=now)
                 org["billing"] = billing
-                has_trial_cap = _billing_trial_seconds_limit(billing) > 0
+                has_trial_cap = billing_limits_enabled and _billing_trial_seconds_limit(billing) > 0
                 if not billing_limits_enabled and not has_trial_cap:
                     continue
                 monthly_reached = bool(org.get("hardCapReached")) if billing_limits_enabled else False
-                trial_reached = _billing_trial_minutes_exhausted(billing)
+                trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(billing)
                 if monthly_reached or trial_reached:
                     reason = "trial_expired" if trial_reached else "monthly_limit_reached"
                     for (room_org_id, room_id), room in self._rooms.items():
@@ -2725,12 +2725,12 @@ class InMemoryMultiChurchStore:
 
                 max_minutes = int(org.get("maxMinutesPerMonth") or 0)
                 has_monthly_cap = billing_limits_enabled and max_minutes > 0
-                has_trial_cap = _billing_trial_seconds_limit(billing) > 0
+                has_trial_cap = billing_limits_enabled and _billing_trial_seconds_limit(billing) > 0
                 if not has_monthly_cap and not has_trial_cap:
                     continue
 
                 monthly_reached_now = has_monthly_cap and bool(org.get("hardCapReached"))
-                trial_reached_now = _billing_trial_minutes_exhausted(billing)
+                trial_reached_now = has_trial_cap and _billing_trial_minutes_exhausted(billing)
                 if monthly_reached_now or trial_reached_now:
                     flagged[(org_id, room_id)] = "trial_expired" if trial_reached_now else "monthly_limit_reached"
                     continue
@@ -3494,7 +3494,7 @@ class FirestoreMultiChurchStore:
 
         now = _utcnow()
         billing = _normalize_org_billing(org, now=now)
-        if _billing_trial_minutes_exhausted(billing):
+        if _org_billing_limits_enabled(org) and _billing_trial_minutes_exhausted(billing):
             raise PermissionError("trial_expired")
         if _entitlements_v2_effective(org):
             denial = _billing_start_denial_reason(billing=billing, now=now)
@@ -3885,7 +3885,7 @@ class FirestoreMultiChurchStore:
         if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
             raise PermissionError("hard_cap_reached")
         billing = _normalize_org_billing(org, now=now)
-        if _billing_trial_minutes_exhausted(billing):
+        if _org_billing_limits_enabled(org) and _billing_trial_minutes_exhausted(billing):
             raise PermissionError("trial_expired")
         if _entitlements_v2_effective(org):
             denial = _billing_start_denial_reason(billing=billing, now=now)
@@ -5135,7 +5135,7 @@ class FirestoreMultiChurchStore:
             if _org_billing_limits_enabled(org) and bool(org.get("hardCapReached")):
                 raise PermissionError("hard_cap_reached")
             billing = _normalize_org_billing(org, now=now)
-            if _billing_trial_minutes_exhausted(billing):
+            if _org_billing_limits_enabled(org) and _billing_trial_minutes_exhausted(billing):
                 raise PermissionError("trial_expired")
             if _entitlements_v2_effective(org):
                 denial = _billing_start_denial_reason(billing=billing, now=now)
@@ -5460,7 +5460,7 @@ class FirestoreMultiChurchStore:
             has_monthly_cap = billing_limits_enabled and max_minutes > 0
             trial_limit = _billing_trial_minutes_limit(billing)
             trial_limit_seconds = _billing_trial_seconds_limit(billing)
-            has_trial_cap = trial_limit_seconds > 0
+            has_trial_cap = billing_limits_enabled and trial_limit_seconds > 0
             if not has_monthly_cap and not has_trial_cap:
                 continue
 
