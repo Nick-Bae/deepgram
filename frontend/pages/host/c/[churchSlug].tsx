@@ -64,7 +64,6 @@ type StartResponse = {
 
 const POLL_MS = 12000;
 const ROOM_SYNC_GRACE_MS = 30000;
-const ACTIVE_ROOM_STALE_GRACE_MS = 60000;
 const DEFAULT_SERVICE_KEY = "sun-11am";
 const BILLING_ADMIN_EMAILS = new Set(
   `${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAILS || ""},${process.env.NEXT_PUBLIC_BILLING_ADMIN_EMAIL || ""}`
@@ -324,7 +323,6 @@ export default function HostChurchPage() {
   const roomStartTimeRef = useRef<number | null>(null);
   const autoStartRoomRef = useRef<{ roomId: string; rollbackOnFailure: boolean } | null>(null);
   const pendingRoomSyncRef = useRef<{ roomId: string; serviceKey: string; expiresAt: number } | null>(null);
-  const activeRoomMissingSinceRef = useRef<number | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [autoStartMicSignal, setAutoStartMicSignal] = useState(0);
   const [autoStartMicPending, setAutoStartMicPending] = useState(false);
@@ -735,10 +733,8 @@ export default function HostChurchPage() {
       const localRoomId = (activeRoomId || "").trim();
       let rowRoomId = backendRoomId || null;
 
-      // Preserve a newly-started room only until the services payload catches up.
       if (backendRoomId) {
         if (pendingRoomSync?.roomId === backendRoomId) pendingRoomSyncRef.current = null;
-        activeRoomMissingSinceRef.current = null;
       } else if (
         pendingRoomSync &&
         pendingRoomSync.roomId === localRoomId &&
@@ -747,18 +743,12 @@ export default function HostChurchPage() {
         rowRoomId = localRoomId || null;
       } else if (pendingRoomSync?.roomId === localRoomId) {
         pendingRoomSyncRef.current = null;
-      } else if (localRoomId && selectedKey === serviceKey) {
-        const missingSince = activeRoomMissingSinceRef.current ?? Date.now();
-        activeRoomMissingSinceRef.current = missingSince;
-        if (Date.now() - missingSince < ACTIVE_ROOM_STALE_GRACE_MS) {
-          rowRoomId = localRoomId;
-          console.warn("[HOST][room-sync][preserve-local-room]", {
-            serviceKey: selectedKey,
-            roomId: localRoomId,
-          });
-        }
-      } else {
-        activeRoomMissingSinceRef.current = null;
+      } else if (localRoomId) {
+        rowRoomId = localRoomId;
+        console.warn("[HOST][room-sync][preserve-local-active-room]", {
+          serviceKey: selectedKey || serviceKey,
+          roomId: localRoomId,
+        });
       }
 
       setActiveRoomId(rowRoomId);
@@ -2652,53 +2642,47 @@ export default function HostChurchPage() {
 
               {/* ── Translation feed (hero) ── */}
               {activeRoomId ? (
-                isTrialExpired ? (
-                  <section style={{ marginTop: 14, borderRadius: 20, background: "rgba(243,166,176,0.12)", boxShadow: "inset 0 0 0 1px rgba(243,166,176,0.28)", padding: 20, color: "#fecdd3", fontSize: 13, fontWeight: 600 }}>
-                    Your trial has ended. Broadcasting is blocked until billing is added.
-                  </section>
-                ) : (
-                  <section ref={controlPanelRef} style={{ marginTop: 14, position: "relative", overflow: "hidden", ...(isBroadcastTab ? broadcastGlassPanelStyle : { background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)" }), borderRadius: 36, padding: "20px 24px 24px" }}>
-                    <div style={{ display: "grid", gap: 16 }}>
-                      {/* Feed header: label + QR */}
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" as const }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                          <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: BC.blush }}>Translation Feed</span>
-                          <span style={{ fontSize: 12, color: BC.mist }}>· {(sourceLang || "ko").toUpperCase()} → {(targetLang || "en").toUpperCase()} · {selectedService?.title || ""}</span>
-                        </div>
-                        {qrDataUrl && displayUrl ? (
-                          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 18, ...broadcastAccentCardStyle }}>
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img src={qrDataUrl} alt="Listener QR code" width={60} height={60} style={{ borderRadius: 10, background: "#ffffff", padding: 6, flexShrink: 0 }} />
-                            <div style={{ minWidth: 0 }}>
-                              <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.16em", textTransform: "uppercase" as const, color: BC.blush }}>Listener QR</div>
-                              <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" as const }}>
-                                <button type="button" onClick={() => { void copyListenerUrl(); }} disabled={copyUrlBusy} style={{ ...broadcastMutedChipStyle, borderRadius: 999, border: "none", padding: "5px 11px", fontSize: 11, fontWeight: 700, cursor: copyUrlBusy ? "default" : "pointer", whiteSpace: "nowrap" as const }}>
-                                  {copyUrlBusy ? "Copied" : "Copy URL"}
-                                </button>
-                                <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", ...broadcastMutedChipStyle, borderRadius: 999, padding: "5px 11px", fontSize: 11, fontWeight: 700, textDecoration: "none", whiteSpace: "nowrap" as const }}>
-                                  Open ↗
-                                </a>
-                              </div>
+                <section ref={controlPanelRef} style={{ marginTop: 14, position: "relative", overflow: "hidden", ...(isBroadcastTab ? broadcastGlassPanelStyle : { background: "linear-gradient(180deg, rgba(255,255,255,0.18), rgba(255,255,255,0.10))", border: "1px solid rgba(255,255,255,0.68)", boxShadow: "0 28px 64px rgba(122,101,79,0.18), inset 0 1px 0 rgba(255,255,255,0.90)", backdropFilter: "blur(40px)", WebkitBackdropFilter: "blur(40px)" }), borderRadius: 36, padding: "20px 24px 24px" }}>
+                  <div style={{ display: "grid", gap: 16 }}>
+                    {/* Feed header: label + QR */}
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" as const }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: BC.blush }}>Translation Feed</span>
+                        <span style={{ fontSize: 12, color: BC.mist }}>· {(sourceLang || "ko").toUpperCase()} → {(targetLang || "en").toUpperCase()} · {selectedService?.title || ""}</span>
+                      </div>
+                      {qrDataUrl && displayUrl ? (
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 18, ...broadcastAccentCardStyle }}>
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img src={qrDataUrl} alt="Listener QR code" width={60} height={60} style={{ borderRadius: 10, background: "#ffffff", padding: 6, flexShrink: 0 }} />
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.16em", textTransform: "uppercase" as const, color: BC.blush }}>Listener QR</div>
+                            <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" as const }}>
+                              <button type="button" onClick={() => { void copyListenerUrl(); }} disabled={copyUrlBusy} style={{ ...broadcastMutedChipStyle, borderRadius: 999, border: "none", padding: "5px 11px", fontSize: 11, fontWeight: 700, cursor: copyUrlBusy ? "default" : "pointer", whiteSpace: "nowrap" as const }}>
+                                {copyUrlBusy ? "Copied" : "Copy URL"}
+                              </button>
+                              <a href={displayUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", ...broadcastMutedChipStyle, borderRadius: 999, padding: "5px 11px", fontSize: 11, fontWeight: 700, textDecoration: "none", whiteSpace: "nowrap" as const }}>
+                                Open ↗
+                              </a>
                             </div>
                           </div>
-                        ) : null}
-                      </div>
-                      {/* TranslationBox hero */}
-                      <div style={{ borderRadius: 28, overflow: "hidden", boxShadow: "none" }}>
-                        <TranslationBox
-                          autoStartSignal={autoStartMicSignal}
-                          roomId={activeRoomId}
-                          sourceLang={sourceLang}
-                          targetLang={targetLang}
-                          onAutoStartComplete={handleAutoStartComplete}
-                          onAutoStartFailed={handleAutoStartFailed}
-                          onSourceLangChange={setSourceLang}
-                          onTargetLangChange={setTargetLang}
-                        />
-                      </div>
+                        </div>
+                      ) : null}
                     </div>
-                  </section>
-                )
+                    {/* TranslationBox hero */}
+                    <div style={{ borderRadius: 28, overflow: "hidden", boxShadow: "none" }}>
+                      <TranslationBox
+                        autoStartSignal={autoStartMicSignal}
+                        roomId={activeRoomId}
+                        sourceLang={sourceLang}
+                        targetLang={targetLang}
+                        onAutoStartComplete={handleAutoStartComplete}
+                        onAutoStartFailed={handleAutoStartFailed}
+                        onSourceLangChange={setSourceLang}
+                        onTargetLangChange={setTargetLang}
+                      />
+                    </div>
+                  </div>
+                </section>
               ) : null}
             </>
           ) : null}

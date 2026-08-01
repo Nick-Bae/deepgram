@@ -36,6 +36,9 @@ type Options = {
   onTranslatedAudio?: (data: string, sampleRate: number, provider?: string) => void;
 };
 
+const VIEWER_STALE_SOCKET_MS = 90000;
+const VIEWER_STALE_SOCKET_CHECK_MS = 15000;
+
 export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const maxLines = Math.max(1, opts.maxLines ?? 3);
   const track = opts.track ?? "en";
@@ -64,6 +67,8 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const backoff = useRef(0);
   const stopFlag = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const staleSocketTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastSocketMessageAtRef = useRef(0);
   const contextRef = useRef<StreamContext>({});
 
   useEffect(() => {
@@ -229,9 +234,14 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     avgEnIntervalRef.current = null;
     displaySpeedRef.current = 1;
     highestFinalSeqRef.current = 0;
+    lastSocketMessageAtRef.current = Date.now();
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
+    }
+    if (staleSocketTimerRef.current !== null) {
+      clearInterval(staleSocketTimerRef.current);
+      staleSocketTimerRef.current = null;
     }
     setEnLines([]);
     setKrLines([]);
@@ -251,6 +261,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
         wsRef.current = ws;
 
         ws.onopen = () => {
+          lastSocketMessageAtRef.current = Date.now();
           setConnected(true);
           backoff.current = 0;
           if (reconnectTimerRef.current) {
@@ -275,6 +286,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
         ws.onerror = () => { /* close will follow */ };
 
         ws.onmessage = (e) => {
+          lastSocketMessageAtRef.current = Date.now();
           try {
             const raw = typeof e.data === "string" ? e.data : new TextDecoder().decode(e.data);
             const msg: unknown = JSON.parse(raw);
@@ -354,6 +366,15 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
       }
     }
 
+    staleSocketTimerRef.current = setInterval(() => {
+      const ws = wsRef.current;
+      if (stopFlag.current || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const idleMs = Date.now() - lastSocketMessageAtRef.current;
+      if (idleMs < VIEWER_STALE_SOCKET_MS) return;
+      console.warn("[VIEWER][WS][stale-reconnect]", { idleMs });
+      try { ws.close(4000, "stale_viewer_socket"); } catch {}
+    }, VIEWER_STALE_SOCKET_CHECK_MS);
+
     connect();
     return () => {
       stopFlag.current = true;
@@ -366,6 +387,10 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
+      }
+      if (staleSocketTimerRef.current !== null) {
+        clearInterval(staleSocketTimerRef.current);
+        staleSocketTimerRef.current = null;
       }
       try { wsRef.current?.close(); } catch {}
       wsRef.current = null;
