@@ -110,6 +110,7 @@ const MIN_FINAL_CHARS = 10
 const FINALIZE_PULSE_MS = 2600
 const MANUAL_FINALIZE_MIN_GAP_MS = 1400
 const MIN_FORCE_FINALIZE_CHARS = 8
+const DUPLICATE_CLAUSE_SUPPRESS_MS = 8000
 const INTRO_HOLD_RE = /(한마디로\s*요약(을)?\s*하면|결론부터\s*말하자면)$/
 const EOS_PUNCT_RE = /[.!?。！？…]$/
 const STRIP_EOS_PUNCT_RE = /[.!?。！？…]+$/
@@ -286,6 +287,7 @@ export default function TranslationBox({
   const ttsEffectBootRef = useRef(false)
   const autoStartHandledRef = useRef(0)
   const lastClauseSentRef = useRef('')
+  const lastClauseSentAtRef = useRef(0)
   const lastKRFromServerRef = useRef('')
 
   // Clause buffer + timing
@@ -458,11 +460,17 @@ export default function TranslationBox({
 
   const shouldEmitClause = useCallback((clean: string) => {
     const prev = lastClauseSentRef.current
+    const now = Date.now()
+    if (prev === clean && now - lastClauseSentAtRef.current < DUPLICATE_CLAUSE_SUPPRESS_MS) {
+      if (DEBUG) console.log('[FE][final][clause][skip-duplicate]', clip(clean))
+      return false
+    }
     if (prev && prev.length > clean.length && prev.endsWith(clean)) {
       if (DEBUG) console.log('[FE][final][clause][skip-suffix]', clip(clean))
       return false
     }
     lastClauseSentRef.current = clean
+    lastClauseSentAtRef.current = now
     return true
   }, [])
 
@@ -990,6 +998,7 @@ export default function TranslationBox({
     lastInterimRef.current = ''
     clauseRef.current = ''
     lastClauseSentRef.current = ''
+    lastClauseSentAtRef.current = 0
     lastKRFromServerRef.current = ''
     lastFinalTranslatedAtRef.current = 0
     setText('')

@@ -37,6 +37,10 @@ const SEGMENT_FALLBACK_POLL_MS = 5000;
 const DISPLAY_TOGGLE_KEY = "f";
 type DisplayMode = "subtitle" | "fullScreen";
 
+function normalizeDisplayLine(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
 function friendlyError(msg: string): string {
   if (msg.includes("404")) return "Service not found. Check your link and try again.";
   if (msg.includes("403")) return "Access denied.";
@@ -192,7 +196,17 @@ export default function ChurchServiceListenerPage() {
           .filter((row) => row.seq > fallbackSeqRef.current && row.en);
         if (!rows.length) return;
         fallbackSeqRef.current = Math.max(fallbackSeqRef.current, ...rows.map((row) => row.seq));
-        setFallbackEnLines((prev) => prev.concat(rows.map((row) => row.en)).slice(-4));
+        setFallbackEnLines((prev) => {
+          const seen = new Set([...prev, ...enLines].map(normalizeDisplayLine).filter(Boolean));
+          const nextRows = rows.filter((row) => {
+            const normalized = normalizeDisplayLine(row.en);
+            if (!normalized || seen.has(normalized)) return false;
+            seen.add(normalized);
+            return true;
+          });
+          if (!nextRows.length) return prev;
+          return prev.concat(nextRows.map((row) => row.en)).slice(-4);
+        });
       } catch {
         // WebSocket remains primary; polling is a recovery path.
       }
@@ -203,7 +217,7 @@ export default function ChurchServiceListenerPage() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [resolveData?.activeRoomId, serviceKey, slug, socketEnabled]);
+  }, [enLines, resolveData?.activeRoomId, serviceKey, slug, socketEnabled]);
 
   useEffect(() => {
     const displayLines = fallbackEnLines.length ? fallbackEnLines : enLines;

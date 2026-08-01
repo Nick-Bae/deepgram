@@ -38,6 +38,14 @@ type Options = {
 
 const VIEWER_STALE_SOCKET_MS = 90000;
 const VIEWER_STALE_SOCKET_CHECK_MS = 15000;
+const EN_DUPLICATE_SUPPRESS_MS = 45000;
+
+function normalizeDisplayText(text: string) {
+  return text
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
 
 export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const maxLines = Math.max(1, opts.maxLines ?? 3);
@@ -115,6 +123,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const avgEnIntervalRef = useRef<number | null>(null);
   const displaySpeedRef = useRef(1);
   const highestFinalSeqRef = useRef(0);
+  const recentEnTextRef = useRef<Map<string, number>>(new Map());
 
   function pushLine(setter: React.Dispatch<React.SetStateAction<string[]>>, text: string) {
     setter((prev) => prev.concat(text).slice(-maxLines));
@@ -197,6 +206,8 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
 
     const entry = { ...next, addedAt: now };
     enDisplayRef.current = enDisplayRef.current.concat(entry).slice(-maxLines);
+    const normalized = normalizeDisplayText(entry.text);
+    if (normalized) recentEnTextRef.current.set(normalized, now);
     setEnLines(enDisplayRef.current.map((e) => e.text));
 
     const dwell = computeLingerMs(entry.text);
@@ -206,8 +217,23 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
 
   function enqueueEnglish(seq: number | null, lines: string[]) {
     if (!lines.length) return;
-    updateEnglishPace(Date.now());
-    const entries = lines.map((text) => ({
+    const now = Date.now();
+    for (const [text, seenAt] of recentEnTextRef.current) {
+      if (now - seenAt > EN_DUPLICATE_SUPPRESS_MS) recentEnTextRef.current.delete(text);
+    }
+    const filteredLines = lines.filter((line) => {
+      const normalized = normalizeDisplayText(line);
+      if (!normalized) return false;
+      const recentlyShownAt = recentEnTextRef.current.get(normalized);
+      if (recentlyShownAt && now - recentlyShownAt < EN_DUPLICATE_SUPPRESS_MS) return false;
+      const queued = enQueueRef.current.some((entry) => normalizeDisplayText(entry.text) === normalized);
+      if (queued) return false;
+      const displayed = enDisplayRef.current.some((entry) => normalizeDisplayText(entry.text) === normalized);
+      return !displayed;
+    });
+    if (!filteredLines.length) return;
+    updateEnglishPace(now);
+    const entries = filteredLines.map((text) => ({
       id: idCounterRef.current++,
       seq,
       text,
@@ -234,6 +260,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     avgEnIntervalRef.current = null;
     displaySpeedRef.current = 1;
     highestFinalSeqRef.current = 0;
+    recentEnTextRef.current = new Map();
     lastSocketMessageAtRef.current = Date.now();
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current);
