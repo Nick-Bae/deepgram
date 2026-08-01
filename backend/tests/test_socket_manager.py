@@ -33,6 +33,22 @@ class ConnectionManagerTests(unittest.TestCase):
         manager.forget_room("org-b", "room-b")
         self.assertNotIn(("org-b", "room-b"), manager.hostless_since_by_room)
 
+    def test_producer_host_presence_counts_without_joining_broadcast_room(self) -> None:
+        manager = ConnectionManager()
+        ws_producer = object()
+
+        manager.note_host_connected(ws_producer, "org-c", "room-c")
+
+        self.assertEqual(manager.room_host_count("org-c", "room-c"), 1)
+        self.assertEqual(manager.note_room_host_absence("org-c", "room-c"), 0.0)
+        self.assertNotIn(("org-c", "room-c"), manager.connections_by_room)
+
+        with patch("app.socket_manager.time.monotonic", return_value=200.0):
+            manager.note_host_disconnected(ws_producer)
+
+        self.assertEqual(manager.room_host_count("org-c", "room-c"), 0)
+        self.assertIn(("org-c", "room-c"), manager.hostless_since_by_room)
+
 
 if __name__ == "__main__":
     unittest.main()

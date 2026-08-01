@@ -1815,6 +1815,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         await websocket.send_json({"type": "error", "message": f"Deepgram connect failed: {e}"})
         await websocket.close()
         return
+    manager.note_host_connected(websocket, org_id, room_id)
 
     seq = 0
     closed = asyncio.Event()
@@ -2715,6 +2716,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
         await dg.close()
     except Exception:
         pass
+    manager.note_host_disconnected(websocket)
     if org_id and total_audio_bytes > 0:
         _audio_secs = total_audio_bytes / _DEEPGRAM_BYTES_PER_SECOND
         _cfg = multichurch_store.get_platform_config()
@@ -2832,6 +2834,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         await websocket.send_json({"type": "error", "message": f"OpenAI realtime translate connect failed: {exc}"})
         await websocket.close(code=1011)
         return
+    manager.note_host_connected(websocket, org_id, room_id)
 
     await oai.send(json.dumps({
         "type": "session.update",
@@ -3081,6 +3084,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         await oai.close()
     except Exception:
         pass
+    manager.note_host_disconnected(websocket)
     if org_id and total_audio_bytes > 0:
         _audio_secs = total_audio_bytes / _OPENAI_REALTIME_TRANSLATE_BYTES_PER_SECOND
         _usd = (_audio_secs / 60.0) * 0.034
@@ -3176,6 +3180,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         )
         await websocket.close(code=1011)
         return
+    manager.note_host_connected(websocket, org_id, room_id)
 
     seq = 0
     closed = asyncio.Event()
@@ -3475,6 +3480,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
             await gemini.close()
         except Exception:
             pass
+    manager.note_host_disconnected(websocket)
     if total_audio_bytes > 0:
         audio_secs = total_audio_bytes / _GEMINI_LIVE_TRANSLATE_BYTES_PER_SECOND
         print(

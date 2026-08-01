@@ -17,6 +17,8 @@ class ConnectionManager:
         self.room_by_ws: Dict[WebSocket, RoomKey] = {}
         self.role_by_ws: Dict[WebSocket, str] = {}
         self.hostless_since_by_room: Dict[RoomKey, float] = {}
+        self.host_presence_by_ws: Dict[WebSocket, RoomKey] = {}
+        self.host_presence_counts_by_room: Dict[RoomKey, int] = {}
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -52,7 +54,37 @@ class ConnectionManager:
     def get_role(self, ws: WebSocket) -> str:
         return self.role_by_ws.get(ws, "listener")
 
+    def note_host_connected(self, ws: WebSocket, org_id: str, room_id: str) -> None:
+        key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        if not key[0] or not key[1]:
+            return
+        prev_key = self.host_presence_by_ws.get(ws)
+        if prev_key == key:
+            self.hostless_since_by_room.pop(key, None)
+            return
+        if prev_key:
+            self._decrement_host_presence(prev_key)
+        self.host_presence_by_ws[ws] = key
+        self.host_presence_counts_by_room[key] = self.host_presence_counts_by_room.get(key, 0) + 1
+        self.hostless_since_by_room.pop(key, None)
+
+    def note_host_disconnected(self, ws: WebSocket) -> None:
+        key = self.host_presence_by_ws.pop(ws, None)
+        if not key:
+            return
+        self._decrement_host_presence(key)
+        if self.room_host_count(key[0], key[1]) == 0:
+            self.hostless_since_by_room.setdefault(key, time.monotonic())
+
+    def _decrement_host_presence(self, key: RoomKey) -> None:
+        count = self.host_presence_counts_by_room.get(key, 0) - 1
+        if count > 0:
+            self.host_presence_counts_by_room[key] = count
+        else:
+            self.host_presence_counts_by_room.pop(key, None)
+
     def disconnect(self, ws: WebSocket):
+        self.note_host_disconnected(ws)
         self.active.discard(ws)
         key = self.room_by_ws.pop(ws, None)
         self.role_by_ws.pop(ws, None)
@@ -80,7 +112,7 @@ class ConnectionManager:
     def room_host_count(self, org_id: str, room_id: str) -> int:
         key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
         bucket = self.connections_by_room.get(key) or set()
-        count = 0
+        count = self.host_presence_counts_by_room.get(key, 0)
         for ws in bucket:
             role = self.role_by_ws.get(ws, "listener")
             if role == "host":
@@ -102,6 +134,10 @@ class ConnectionManager:
         if not key[0] or not key[1]:
             return
         self.hostless_since_by_room.pop(key, None)
+        self.host_presence_counts_by_room.pop(key, None)
+        for ws, ws_key in list(self.host_presence_by_ws.items()):
+            if ws_key == key:
+                self.host_presence_by_ws.pop(ws, None)
 
     async def broadcast(self, message):
         dead = []
