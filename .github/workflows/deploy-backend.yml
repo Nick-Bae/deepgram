@@ -41,8 +41,8 @@ jobs:
             --image "$IMAGE" \
             --region ${{ secrets.CLOUD_RUN_REGION }} \
             --platform managed \
-            --min-instances=0 \
-            --max-instances=1 \
+            --min-instances=1 \
+            --max-instances=5 \
             --concurrency=80 \
             --cpu=1 \
             --memory=1Gi \

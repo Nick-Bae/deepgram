@@ -32,8 +32,8 @@ type LatestSegmentsResponse = {
   }>;
 };
 
-const RESOLVE_POLL_MS = 8000;
-const SEGMENT_FALLBACK_POLL_MS = 2000;
+const RESOLVE_POLL_MS = 15000;
+const SEGMENT_FALLBACK_POLL_MS = 5000;
 const DISPLAY_TOGGLE_KEY = "f";
 type DisplayMode = "subtitle" | "fullScreen";
 
