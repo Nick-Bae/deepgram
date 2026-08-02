@@ -183,6 +183,7 @@ WS_TRANSLATION_PROMPT_TOKEN_OVERHEAD = _env_int(
     min_value=0,
     max_value=10_000,
 )
+ORG_PROMPT_WS_CACHE_TTL_SEC = _env_int("ORG_PROMPT_WS_CACHE_TTL_SEC", 10, min_value=0, max_value=300)
 _tx_window_lock = Lock()
 _tx_window_entries: dict[str, deque[dict[str, float]]] = {}
 
@@ -1148,7 +1149,7 @@ async def ws_translate(ws: WebSocket):
     host_token_claim = qctx.get("hostToken")
     joined_service_key = qctx.get("serviceKey")
     joined_church_slug = qctx.get("churchSlug")
-    prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    prompt_overrides_cache: dict[str, tuple[float, tuple[Optional[str], Optional[str]]]] = {}
     _last_display_config_ts: float = 0.0
 
     # Verify host credentials before granting the role — never trust the role param alone.
@@ -1164,11 +1165,14 @@ async def ws_translate(ws: WebSocket):
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             return None, None
+        now = time.monotonic()
         cached = prompt_overrides_cache.get(clean_org_id)
         if cached is not None:
-            return cached
+            expires_at, value = cached
+            if ORG_PROMPT_WS_CACHE_TTL_SEC > 0 and expires_at > now:
+                return value
         resolved = _prompt_overrides_for_org(clean_org_id)
-        prompt_overrides_cache[clean_org_id] = resolved
+        prompt_overrides_cache[clean_org_id] = (now + ORG_PROMPT_WS_CACHE_TTL_SEC, resolved)
         return resolved
 
     async def _broadcast_status_for_joined_room() -> None:
@@ -1878,21 +1882,27 @@ async def ws_stt_deepgram(websocket: WebSocket):
     session_started_ts = time.monotonic()
     total_audio_bytes = 0
     session_end_reason = "unknown"
-    prompt_overrides_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    prompt_overrides_cache: dict[str, tuple[float, tuple[Optional[str], Optional[str]]]] = {}
 
     def _cached_prompt_overrides(active_org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         clean_org_id = _clean_token(active_org_id)
         if not clean_org_id:
             return None, None
+        now = time.monotonic()
         cached = prompt_overrides_cache.get(clean_org_id)
         if cached is not None:
-            return cached
+            expires_at, value = cached
+            if ORG_PROMPT_WS_CACHE_TTL_SEC > 0 and expires_at > now:
+                return value
         resolved = _prompt_overrides_for_org(clean_org_id)
-        prompt_overrides_cache[clean_org_id] = resolved
+        prompt_overrides_cache[clean_org_id] = (now + ORG_PROMPT_WS_CACHE_TTL_SEC, resolved)
         return resolved
 
     if org_id:
-        prompt_overrides_cache[org_id] = _prompt_overrides_for_org(org_id)
+        prompt_overrides_cache[org_id] = (
+            time.monotonic() + ORG_PROMPT_WS_CACHE_TTL_SEC,
+            _prompt_overrides_for_org(org_id),
+        )
 
     async def _send_to_producer(message: dict[str, Any]) -> bool:
         if closed.is_set():
