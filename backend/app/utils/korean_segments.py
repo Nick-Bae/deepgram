@@ -29,6 +29,11 @@ _STRONGLY_INCOMPLETE_ENDING_RE = re.compile(
     r"있는|없는|하는|되는|된|할|한|될|일"
     r")$"
 )
+# Korean interrogative endings. Must be checked BEFORE dangling-particle detection
+# so that a final 가 in 하는가/-인가/-은가/etc. is not misread as the subject particle.
+KOREAN_QUESTION_END_RE = re.compile(
+    r"(?:겠는가|는가|인가|은가|한가|던가|ㄴ가|할까|을까|ㄹ까)$"
+)
 _STANDALONE_DA_ENDING_RE = re.compile(r"(?:^|\s)다$")
 _LONG_PARALLEL_SPLIT_MIN_CHARS = 55
 _PARALLEL_CLAUSE_MIN_CHARS = 10
@@ -46,6 +51,8 @@ def is_strongly_incomplete_korean_segment(text: str) -> bool:
     """Return True when a Korean STT segment clearly needs a continuation."""
     clean = _TRAILING_PUNCTUATION_RE.sub("", (text or "").strip())
     if not clean:
+        return False
+    if KOREAN_QUESTION_END_RE.search(clean):
         return False
     return bool(
         _INCOMPLETE_AUXILIARY_RE.search(clean)

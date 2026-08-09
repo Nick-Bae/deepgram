@@ -1988,12 +1988,17 @@ async def ws_stt_deepgram(websocket: WebSocket):
         MIN_CONFIDENT_CHARS = 10
         KOREAN_SHORT_MIN_CHARS = 14
         KOREAN_EOS_RE = re.compile(
-            r"(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요|다|아요|어요|에요)$"
+            r"(?:습니다|입니다|합니다|했습니다|할까요|했어요|했지요|했네요|예요|이에요|에요|일까요|였어요|였습니까|입니까|됩니까|나요|군요|지요|래요|랍니다|라네요|다|아요|어요|에요"
+            r"|겠는가|는가|인가|은가|한가|던가|ㄴ가|할까|을까|ㄹ까)$"
         )
 
         pending_src: str | None = None
         pending_speech_final = False
         pending_task: asyncio.Task | None = None
+        # Snapshot of pending_src taken when speech_final arrived on a grammatically
+        # incomplete Korean fragment. Deepgram UtteranceEnd (long silence after final
+        # words) can force-commit it only if pending_src still equals this snapshot.
+        held_src: str | None = None
         emitted_review_segment_ids: set[str] = set()
         last_preview_norm: str = ""
         latest_partial: str = ""
@@ -2485,7 +2490,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             await send_translation(src_text_raw, partial=True, live_mode_hint="realtime", update_ctx=False)
 
         async def commit_now(src_text_raw: str):
-            nonlocal pending_src, pending_task, pending_speech_final, last_preview_norm, latest_partial, latest_partial_at
+            nonlocal pending_src, pending_task, pending_speech_final, last_preview_norm, latest_partial, latest_partial_at, held_src
             if not src_text_raw or not src_text_raw.strip():
                 return
 
@@ -2509,6 +2514,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         print("[A][skip][subset]", normalized)
                         pending_src = None
                         pending_speech_final = False
+                        held_src = None
                         if pending_task and not pending_task.done():
                             pending_task.cancel()
                         pending_task = None
@@ -2534,6 +2540,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             latest_partial_at = 0.0
             pending_src = None
             pending_speech_final = False
+            held_src = None
             if pending_task and not pending_task.done():
                 pending_task.cancel()
             pending_task = None
@@ -2616,7 +2623,41 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     evt = json.loads(raw)
                 except Exception:
                     continue
-                if evt.get("type") != "Results":
+
+                evt_type = evt.get("type")
+
+                if evt_type == "UtteranceEnd":
+                    if (
+                        held_src
+                        and pending_src
+                        and norm_ws(held_src) == norm_ws(pending_src)
+                    ):
+                        print(
+                            f"[DG][utterance-end] held='{held_src}' "
+                            f"pending='{pending_src}' match=True"
+                        )
+                        print(f"[DG][commit][utterance-end] src='{pending_src}'")
+                        force_src = pending_src
+                        held_src = None
+                        await commit_now(force_src)
+                    else:
+                        print(
+                            f"[DG][utterance-end] held='{held_src or ''}' "
+                            f"pending='{pending_src or ''}' match=False"
+                        )
+                        held_src = None
+                    continue
+
+                if evt_type == "SpeechStarted":
+                    if held_src:
+                        print(
+                            f"[DG][speech-started] held='{held_src}' "
+                            f"pending='{pending_src or ''}' action=cancel-force-commit"
+                        )
+                    held_src = None
+                    continue
+
+                if evt_type != "Results":
                     continue
 
                 ch = evt.get("channel") or {}
@@ -2699,8 +2740,11 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 if speech_final and pending_src:
                     if looks_complete(pending_src):
+                        held_src = None
                         await commit_now(pending_src)
                     else:
+                        held_src = pending_src
+                        print(f"[DG][hold] src='{pending_src}' speech_final=True")
                         hold_ms = cjk_hold_ms(pending_src) if should_apply_cjk_hold(pending_src) else None
                         await arm_timer(hold_ms)
                     continue

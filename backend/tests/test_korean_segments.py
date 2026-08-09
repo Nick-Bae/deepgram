@@ -45,6 +45,45 @@ class KoreanSegmentTests(unittest.TestCase):
             is_strongly_incomplete_korean_segment("어쩌면 우리는 죽음을 두려워하지")
         )
 
+    def test_rhetorical_question_hanun_ga_is_complete(self) -> None:
+        # Final 가 in 하는가 is an interrogative ending, not the subject particle.
+        self.assertFalse(
+            is_strongly_incomplete_korean_segment("내가 무엇을 가장 의지하는가")
+        )
+        self.assertFalse(
+            is_strongly_incomplete_korean_segment("내가 무엇을 가장 의지하는가?")
+        )
+
+    def test_rhetorical_question_neukkinun_ga_is_complete(self) -> None:
+        self.assertFalse(
+            is_strongly_incomplete_korean_segment(
+                "무엇이 있어야 나는 안전하다고 느끼는가"
+            )
+        )
+        self.assertFalse(
+            is_strongly_incomplete_korean_segment(
+                "무엇이 흔들리면 내 인생도 함께 무너진 것처럼 느끼는가?"
+            )
+        )
+
+    def test_copular_question_in_ga_is_complete(self) -> None:
+        # -인가 / -은가 / -한가 / -ㄴ가 endings must not be flagged as dangling 가.
+        self.assertFalse(is_strongly_incomplete_korean_segment("이것이 무엇인가"))
+        self.assertFalse(is_strongly_incomplete_korean_segment("이것이 무엇인가?"))
+        self.assertFalse(is_strongly_incomplete_korean_segment("우리는 가난한가"))
+
+    def test_deliberative_question_ha_lkka_is_complete(self) -> None:
+        # -할까 / -을까 / -ㄹ까 endings are deliberative sentences, not fragments.
+        self.assertFalse(is_strongly_incomplete_korean_segment("우리는 어디로 갈까"))
+        self.assertFalse(is_strongly_incomplete_korean_segment("우리는 어디로 갈까?"))
+        self.assertFalse(is_strongly_incomplete_korean_segment("이제 어떻게 할까"))
+
+    def test_connective_myeo_remains_incomplete(self) -> None:
+        # The 는가 fix must not regress the -며/-고 connective hold behavior.
+        self.assertTrue(is_strongly_incomplete_korean_segment("마음이 청결하며"))
+        self.assertTrue(is_strongly_incomplete_korean_segment("하나님을 사랑하며"))
+        self.assertTrue(is_strongly_incomplete_korean_segment("하나님을 사랑하고"))
+
     def test_joins_negative_verb_stem_with_quoted_thought(self) -> None:
         self.assertEqual(
             join_korean_stt_segments(
