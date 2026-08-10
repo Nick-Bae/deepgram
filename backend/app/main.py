@@ -54,6 +54,7 @@ from app.routes import auth as auth_routes
 from app.routes import billing as billing_routes
 from app.routes import admin as admin_routes
 from app.routes import sermon_review as sermon_review_routes
+from app.routes import pipeline_trace as pipeline_trace_routes
 from app.sermon_review.lookup import get_reviewed_matches, get_reviewed_text
 from app.sermon_review.progressive_matcher import (
     CommitEvent as PMMCommitEvent,
@@ -366,6 +367,7 @@ app.include_router(auth_routes.router, prefix="/api")
 app.include_router(billing_routes.router, prefix="/api")
 app.include_router(admin_routes.router, prefix="/api")
 app.include_router(sermon_review_routes.router, prefix="/api")
+app.include_router(pipeline_trace_routes.router, prefix="/api")
 
 @app.get("/")
 def root():
