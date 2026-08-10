@@ -55,6 +55,21 @@ from app.routes import billing as billing_routes
 from app.routes import admin as admin_routes
 from app.routes import sermon_review as sermon_review_routes
 from app.sermon_review.lookup import get_reviewed_matches, get_reviewed_text
+from app.sermon_review.progressive_matcher import (
+    CommitEvent as PMMCommitEvent,
+    InterimEvent as PMMInterimEvent,
+    ClearPreview as PMMClearPreview,
+    ConfirmAndAdvanceCursor as PMMConfirmAndAdvanceCursor,
+    ReplacePreview as PMMReplacePreview,
+    RequestLiveTranslation as PMMRequestLiveTranslation,
+    ShowPreview as PMMShowPreview,
+    advance as pmm_advance,
+)
+from app.sermon_review.room_state import (
+    ProgressiveMatcherRoomState,
+    build_room_state as pmm_build_room_state,
+)
+from dataclasses import replace as _dc_replace
 from app.auth.firebase_auth import verify_id_token_value
 from app.chunker.ko_chunker import KoChunker
 from app.env import ENV
@@ -1839,6 +1854,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
             )
         )
 
+    pmm_room_state = pmm_build_room_state(
+        store=multichurch_store,
+        org_id=org_id,
+        room_id=room_id,
+        service_key=service_key,
+    )
+    if pmm_room_state.enabled:
+        print(
+            f"[PMM] enabled org={org_id} room={room_id} service={service_key} "
+            f"sermon={pmm_room_state.sermon_id} segments={len(pmm_room_state.segments)}"
+        )
+
     chunker = KoChunker(
         waitk_lo=ENV.WAITK_LO,
         waitk_hi=ENV.WAITK_HI,
@@ -2489,6 +2516,87 @@ async def ws_stt_deepgram(websocket: WebSocket):
             last_preview_norm = clean
             await send_translation(src_text_raw, partial=True, live_mode_hint="realtime", update_ctx=False)
 
+        async def pmm_broadcast_actions(actions: list) -> None:
+            """Handle progressive-matcher display actions by broadcasting
+            reviewed-mode messages to the listener room. ConfirmAndAdvanceCursor
+            and RequestLiveTranslation are handled by the commit path, not here."""
+            if not (org_id and room_id and pmm_room_state.enabled):
+                return
+            for action in actions:
+                now_ms = int(time.time() * 1000)
+                trace = pmm_room_state.trace
+                payload: Optional[dict] = None
+                if isinstance(action, PMMShowPreview):
+                    pmm_room_state.preview_shown_at_ms = now_ms
+                    if trace:
+                        trace.mark_preview(
+                            seg_id=action.seg_id,
+                            lock_score=pmm_room_state.state.lock_score,
+                            prefix_len=pmm_room_state.state.confirmations,
+                        )
+                    payload = {
+                        "type": "translation",
+                        "text": action.reviewed_text,
+                        "payload": action.reviewed_text,
+                        "lang": tgt_lang_full,
+                        "meta": {
+                            "mode": "reviewed",
+                            "kind": "preview",
+                            "seg_id": action.seg_id,
+                            "utterance_id": trace.utterance_id if trace else None,
+                        },
+                        "orgId": org_id,
+                        "roomId": room_id,
+                        "pipelineTrace": trace.to_broadcast_payload() if trace else None,
+                    }
+                elif isinstance(action, PMMReplacePreview):
+                    pmm_room_state.preview_shown_at_ms = now_ms
+                    if trace:
+                        trace.mark_corrective_replacement(
+                            from_seg_id=action.from_seg_id, to_seg_id=action.to_seg_id
+                        )
+                    payload = {
+                        "type": "translation",
+                        "text": action.reviewed_text,
+                        "payload": action.reviewed_text,
+                        "lang": tgt_lang_full,
+                        "meta": {
+                            "mode": "reviewed",
+                            "kind": "preview_replace",
+                            "from_seg_id": action.from_seg_id,
+                            "seg_id": action.to_seg_id,
+                            "utterance_id": trace.utterance_id if trace else None,
+                        },
+                        "orgId": org_id,
+                        "roomId": room_id,
+                        "pipelineTrace": trace.to_broadcast_payload() if trace else None,
+                    }
+                elif isinstance(action, PMMClearPreview):
+                    pmm_room_state.preview_shown_at_ms = None
+                    if trace:
+                        trace.mark_deviation()
+                    payload = {
+                        "type": "translation",
+                        "text": "",
+                        "payload": "",
+                        "lang": tgt_lang_full,
+                        "meta": {
+                            "mode": "reviewed",
+                            "kind": "preview_clear",
+                            "utterance_id": trace.utterance_id if trace else None,
+                        },
+                        "orgId": org_id,
+                        "roomId": room_id,
+                    }
+                if payload is None:
+                    continue
+                try:
+                    await manager.broadcast_room(org_id, room_id, payload)
+                    if trace:
+                        trace.mark_broadcast_sent()
+                except Exception as exc:
+                    print("[PMM][broadcast-error]", exc)
+
         async def commit_now(src_text_raw: str):
             nonlocal pending_src, pending_task, pending_speech_final, last_preview_norm, latest_partial, latest_partial_at, held_src
             if not src_text_raw or not src_text_raw.strip():
@@ -2524,6 +2632,64 @@ async def ws_stt_deepgram(websocket: WebSocket):
             setattr(commit_now, "_last_commit_ts", time.time())
             setattr(commit_now, "_last_src", src_text_raw)
 
+            pmm_confirmed = False
+            if pmm_room_state.enabled:
+                trace = pmm_room_state.ensure_trace()
+                now_ms = int(time.time() * 1000)
+                current_state = pmm_room_state.state
+                if (
+                    current_state.kind == "PREVIEW"
+                    and pmm_room_state.preview_shown_at_ms is not None
+                    and current_state.preview_shown_at_ms != pmm_room_state.preview_shown_at_ms
+                ):
+                    current_state = _dc_replace(
+                        current_state,
+                        preview_shown_at_ms=pmm_room_state.preview_shown_at_ms,
+                    )
+                try:
+                    new_state, pmm_actions = pmm_advance(
+                        current_state,
+                        PMMCommitEvent(full_text=src_text_raw, now_ms=now_ms),
+                        cursor=pmm_room_state.cursor,
+                        segments=pmm_room_state.segments,
+                    )
+                    pmm_room_state.state = new_state
+                    for action in pmm_actions:
+                        if isinstance(action, PMMConfirmAndAdvanceCursor):
+                            pmm_room_state.advance_cursor_to(action.seg_id)
+                            trace.mark_committed(
+                                whole_sentence_score=None, source="reviewed"
+                            )
+                            trace.emit()
+                            pmm_room_state.reset_for_next_utterance()
+                            pmm_confirmed = True
+                            print(
+                                f"[PMM] confirmed seg={action.seg_id} "
+                                f"cursor→{pmm_room_state.cursor}"
+                            )
+                        elif isinstance(action, PMMRequestLiveTranslation):
+                            trace.mark_committed(
+                                whole_sentence_score=None, source="live"
+                            )
+                            trace.mark_live_requested()
+                            # fall through to normal commit path below
+                except Exception as exc:
+                    print("[PMM][commit-error]", exc)
+
+            if pmm_confirmed:
+                # Reviewed English already on screen from the preview; skip
+                # the normal commit-path re-broadcast.
+                last_preview_norm = ""
+                latest_partial = ""
+                latest_partial_at = 0.0
+                pending_src = None
+                pending_speech_final = False
+                held_src = None
+                if pending_task and not pending_task.done():
+                    pending_task.cancel()
+                pending_task = None
+                return
+
             reviewed_matches = await _reviewed_matches_for_source(src_text_raw)
             if reviewed_matches:
                 emitted = await emit_reviewed_segment_matches(src_text_raw)
@@ -2544,6 +2710,11 @@ async def ws_stt_deepgram(websocket: WebSocket):
             if pending_task and not pending_task.done():
                 pending_task.cancel()
             pending_task = None
+
+            if pmm_room_state.enabled and pmm_room_state.trace is not None:
+                pmm_room_state.trace.mark_live_arrived()
+                pmm_room_state.trace.emit()
+                pmm_room_state.reset_for_next_utterance()
 
         async def arm_timer(wait_override_ms: int | None = None):
             nonlocal pending_task
@@ -2697,6 +2868,33 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         pass
 
                     await emit_reviewed_segment_matches(transcript)
+
+                    if pmm_room_state.enabled:
+                        trace = pmm_room_state.ensure_trace()
+                        trace.mark_audio_first_partial()
+                        now_ms = int(time.time() * 1000)
+                        current_state = pmm_room_state.state
+                        if (
+                            current_state.kind == "PREVIEW"
+                            and pmm_room_state.preview_shown_at_ms is not None
+                            and current_state.preview_shown_at_ms != pmm_room_state.preview_shown_at_ms
+                        ):
+                            current_state = _dc_replace(
+                                current_state,
+                                preview_shown_at_ms=pmm_room_state.preview_shown_at_ms,
+                            )
+                        try:
+                            new_state, pmm_actions = pmm_advance(
+                                current_state,
+                                PMMInterimEvent(prefix=transcript, now_ms=now_ms),
+                                cursor=pmm_room_state.cursor,
+                                segments=pmm_room_state.segments,
+                            )
+                            pmm_room_state.state = new_state
+                            if pmm_actions:
+                                await pmm_broadcast_actions(pmm_actions)
+                        except Exception as exc:
+                            print("[PMM][interim-error]", exc)
 
                     if early_commit:
                         now_ms = int(time.time() * 1000)
