@@ -234,6 +234,13 @@ def _org_billing_limits_flag(org: Dict[str, Any]) -> bool:
     return bool(org.get("billingLimitsEnabled"))
 
 
+def _org_progressive_manuscript_matching_flag(org: Dict[str, Any]) -> bool:
+    """Feature flag for progressive manuscript matching. Defaults False so
+    ops must explicitly opt an org in before the state machine activates
+    on that org's live sessions."""
+    return bool(org.get("progressiveManuscriptMatching") or False)
+
+
 def _org_billing_limits_enabled(org: Dict[str, Any]) -> bool:
     return BILLING_LIMITS_ENABLED and _org_billing_limits_flag(org)
 
@@ -1890,6 +1897,18 @@ class InMemoryMultiChurchStore:
             if not org:
                 return []
             return list(org.get("sttKeyterms") or [])
+
+    def get_org_progressive_manuscript_matching_enabled(self, org_id: Optional[str]) -> bool:
+        """Session-start read of the progressive manuscript matching flag.
+        Defaults False so behavior is unchanged until an org opts in."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return False
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                return False
+            return _org_progressive_manuscript_matching_flag(org)
 
     def get_org_stt_replacements(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
@@ -4995,6 +5014,18 @@ class FirestoreMultiChurchStore:
             return []
         org = org_snap.to_dict() or {}
         return list(org.get("sttKeyterms") or [])
+
+    def get_org_progressive_manuscript_matching_enabled(self, org_id: Optional[str]) -> bool:
+        """Session-start read of the progressive manuscript matching flag.
+        Defaults False so behavior is unchanged until an org opts in."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            return False
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
+        if not org_snap.exists:
+            return False
+        org = org_snap.to_dict() or {}
+        return _org_progressive_manuscript_matching_flag(org)
 
     def get_org_stt_replacements(self, *, org_id: str, requested_by_uid: str) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)

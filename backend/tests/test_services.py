@@ -223,5 +223,37 @@ class ServiceManagementTests(unittest.TestCase):
         self.assertEqual(matching_after, [])
 
 
+class ProgressiveManuscriptMatchingFlagTests(unittest.TestCase):
+    def test_flag_defaults_false_for_new_org(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(
+            store,
+            owner_uid="owner-pmm-1",
+            slug="pmm-org",
+            name="PMM Org",
+        )
+        self.assertFalse(store.get_org_progressive_manuscript_matching_enabled(org_id))
+
+    def test_flag_reads_true_when_set(self) -> None:
+        store = InMemoryMultiChurchStore()
+        org_id = _bootstrap_owner(
+            store,
+            owner_uid="owner-pmm-2",
+            slug="pmm-org-2",
+            name="PMM Org 2",
+        )
+        # Direct write to simulate an ops-side toggle; API surface for
+        # toggling comes in a later step of the wiring plan.
+        with store._lock:
+            store._orgs[org_id]["progressiveManuscriptMatching"] = True
+        self.assertTrue(store.get_org_progressive_manuscript_matching_enabled(org_id))
+
+    def test_flag_false_for_unknown_org(self) -> None:
+        store = InMemoryMultiChurchStore()
+        self.assertFalse(store.get_org_progressive_manuscript_matching_enabled("no-such-org"))
+        self.assertFalse(store.get_org_progressive_manuscript_matching_enabled(None))
+        self.assertFalse(store.get_org_progressive_manuscript_matching_enabled(""))
+
+
 if __name__ == "__main__":
     unittest.main()
