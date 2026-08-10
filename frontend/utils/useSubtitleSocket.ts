@@ -291,6 +291,13 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
           lastSocketMessageAtRef.current = Date.now();
           setConnected(true);
           backoff.current = 0;
+          // Backend assigns seq starting at 0 for every new host session
+          // (main.py resets it at connection time). Without this reset, a
+          // stale highestFinalSeqRef from an earlier session silently
+          // discards every message from the new session — display freezes
+          // while backend/TTS keep working. Reset on every (re)connect so
+          // the out-of-order filter tracks only the current session.
+          highestFinalSeqRef.current = 0;
           if (reconnectTimerRef.current) {
             clearTimeout(reconnectTimerRef.current);
             reconnectTimerRef.current = null;
