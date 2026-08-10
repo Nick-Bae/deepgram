@@ -186,10 +186,6 @@ class ServiceManagementTests(unittest.TestCase):
         )
         self.assertEqual(started.get("status"), "live")
 
-    @unittest.skip(
-        "live_rooms() now returns extra startedAt/lastAudioAt fields; "
-        "test uses strict-dict assertIn. Update test to check subset. Track as follow-up."
-    )
     def test_live_rooms_lists_only_active_rooms(self) -> None:
         store = InMemoryMultiChurchStore()
         org_id = _bootstrap_owner(
@@ -210,17 +206,21 @@ class ServiceManagementTests(unittest.TestCase):
         self.assertTrue(room_id)
 
         live_rooms = store.live_rooms()
-        self.assertIn(
-            {"orgId": org_id, "roomId": room_id, "serviceKey": "sun-11am"},
-            live_rooms,
-        )
+        matching = [
+            row for row in live_rooms
+            if row.get("orgId") == org_id
+            and row.get("roomId") == room_id
+            and row.get("serviceKey") == "sun-11am"
+        ]
+        self.assertEqual(len(matching), 1)
 
         store.end_room(org_id, room_id, reason="host_end")
         live_rooms_after = store.live_rooms()
-        self.assertNotIn(
-            {"orgId": org_id, "roomId": room_id, "serviceKey": "sun-11am"},
-            live_rooms_after,
-        )
+        matching_after = [
+            row for row in live_rooms_after
+            if row.get("orgId") == org_id and row.get("roomId") == room_id
+        ]
+        self.assertEqual(matching_after, [])
 
 
 if __name__ == "__main__":
