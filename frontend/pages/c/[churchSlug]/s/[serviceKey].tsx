@@ -511,9 +511,9 @@ export default function ChurchServiceListenerPage() {
               textAlign: "center",
             }}
           >
-            {enLines.length > 0 ? (
-              enLines.map((line, i) => {
-                const isCurrent = i === enLines.length - 1;
+            {displayEnLines.length > 0 ? (
+              displayEnLines.map((line, i) => {
+                const isCurrent = i === displayEnLines.length - 1;
                 return (
                   <div
                     key={`${i}-${line.slice(0, 12)}`}
@@ -569,14 +569,14 @@ export default function ChurchServiceListenerPage() {
             style={{
               maxWidth: "min(1400px, 92vw)",
               fontSize: "clamp(52px, 11vw, 160px)",
-              fontWeight: enLines.length > 0 ? 700 : 200,
+              fontWeight: displayEnLines.length > 0 ? 700 : 200,
               lineHeight: 1.05,
-              letterSpacing: enLines.length > 0 ? "-0.02em" : "0.02em",
-              color: enLines.length > 0 ? "#F2F3F4" : "rgba(222,209,198,0.2)",
-              fontStyle: enLines.length > 0 ? "normal" : "italic",
-              textShadow: enLines.length > 0 ? "0 0 80px rgba(167,118,147,0.2), 0 4px 32px rgba(15,45,77,0.6)" : "none",
+              letterSpacing: displayEnLines.length > 0 ? "-0.02em" : "0.02em",
+              color: displayEnLines.length > 0 ? "#F2F3F4" : "rgba(222,209,198,0.2)",
+              fontStyle: displayEnLines.length > 0 ? "normal" : "italic",
+              textShadow: displayEnLines.length > 0 ? "0 0 80px rgba(167,118,147,0.2), 0 4px 32px rgba(15,45,77,0.6)" : "none",
               transition: "color 400ms ease, font-weight 400ms ease",
-              animation: enLines.length > 0 ? "text-in 300ms ease forwards" : "none",
+              animation: displayEnLines.length > 0 ? "text-in 300ms ease forwards" : "none",
             }}
           >
             {currentEn}
