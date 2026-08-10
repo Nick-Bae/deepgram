@@ -325,6 +325,11 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
             const raw = typeof e.data === "string" ? e.data : new TextDecoder().decode(e.data);
             const msg: unknown = JSON.parse(raw);
 
+            const dbgType = (msg as { type?: unknown })?.type ?? "?";
+            const dbgSeq = (msg as { meta?: { seq?: unknown } })?.meta?.seq ?? "-";
+            const dbgPartial = (msg as { meta?: { partial?: unknown } })?.meta?.partial ?? false;
+            console.log("[VIEWER][WS][in]", { type: dbgType, seq: dbgSeq, partial: dbgPartial });
+
             if (isInterim(msg)) {
               const txt = msg.text || "";
               pendingInterim.current = txt;
@@ -354,9 +359,11 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
                   ? Number((msg.meta as any).segment_id)
                   : null;
               if (msg.meta?.partial || seq === null) {
+                console.log("[VIEWER][WS][drop][partial-or-no-seq]", { seq, partial: msg.meta?.partial });
                 return; // ignore previews lacking a final sequence id
               }
               if (seq < highestFinalSeqRef.current) {
+                console.log("[VIEWER][WS][drop][seq-stale]", { seq, highest: highestFinalSeqRef.current });
                 return; // discard a translation that completed after a newer segment
               }
               if (seq > highestFinalSeqRef.current) {
