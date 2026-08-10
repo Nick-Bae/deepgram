@@ -9,7 +9,7 @@ import os
 import re
 import secrets
 import time
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -758,7 +758,7 @@ class RoomRef:
 
 class InMemoryMultiChurchStore:
     def __init__(self) -> None:
-        self._lock = Lock()
+        self._lock = RLock()
         self._global_host_token = (os.getenv("HOST_API_TOKEN") or "").strip()
         self._orgs: Dict[str, Dict[str, Any]] = {}
         self._slug_to_org: Dict[str, str] = {}
