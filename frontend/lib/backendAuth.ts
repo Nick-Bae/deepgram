@@ -15,6 +15,7 @@ export type AuthMeResponse = {
     email?: string | null;
     displayName?: string | null;
     isMaster?: boolean;
+    isSuper?: boolean;
   };
   currentOrgId?: string | null;
   memberships: OrgMembership[];
@@ -109,6 +110,7 @@ export type OrgProfileResponse = {
   orgId: string;
   slug: string;
   name: string;
+  progressiveManuscriptMatching?: boolean;
 };
 
 export type OrgPromptResponse = {
@@ -639,12 +641,17 @@ export function deleteOrgService(idToken: string, orgId: string, serviceKey: str
 export function saveOrgProfile(
   idToken: string,
   orgId: string,
-  payload: { name: string },
+  payload: { name?: string; progressiveManuscriptMatching?: boolean },
 ): Promise<OrgProfileResponse> {
+  const body: Record<string, unknown> = {};
+  if (typeof payload.name === "string") body.name = payload.name;
+  if (typeof payload.progressiveManuscriptMatching === "boolean") {
+    body.progressiveManuscriptMatching = payload.progressiveManuscriptMatching;
+  }
   return authFetch<OrgProfileResponse>(`/api/org/${encodeURIComponent(orgId)}/profile`, idToken, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: payload.name }),
+    body: JSON.stringify(body),
   }).then((result) => {
     invalidateAuthMeCache(idToken);
     return result;

@@ -44,7 +44,8 @@ class CreateServiceRequest(BaseModel):
 
 
 class UpdateOrgProfileRequest(BaseModel):
-    name: str = Field(..., min_length=2, max_length=120)
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    progressiveManuscriptMatching: bool | None = Field(default=None)
 
 
 def _start_service_for_org(
@@ -228,15 +229,18 @@ def update_org_profile(
     payload: UpdateOrgProfileRequest,
     current_user: AuthenticatedUser = Depends(get_current_user_required),
 ):
+    if payload.progressiveManuscriptMatching is not None and not current_user.isSuper:
+        raise HTTPException(status_code=403, detail="forbidden")
     try:
         return multichurch_store.update_org_profile(
             org_id=org_id,
             requested_by_uid=current_user.uid,
             name=payload.name,
+            progressive_manuscript_matching=payload.progressiveManuscriptMatching,
         )
     except ValueError as exc:
         detail = str(exc)
-        if detail in {"invalid_uid", "invalid_name"}:
+        if detail in {"invalid_uid", "invalid_name", "no_changes"}:
             raise HTTPException(status_code=400, detail=detail) from exc
         if detail == "org_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc

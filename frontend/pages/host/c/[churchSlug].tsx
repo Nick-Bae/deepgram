@@ -51,6 +51,7 @@ type ServicesResponse = {
   orgId: string;
   slug: string;
   name: string;
+  progressiveManuscriptMatching?: boolean;
   services: ServiceRow[];
 };
 
@@ -339,6 +340,11 @@ export default function HostChurchPage() {
   const [membershipRole, setMembershipRole] = useState("");
   const [settingsSection, setSettingsSection] = useState<"general" | "services" | "translation">("general");
   const [isMasterUser, setIsMasterUser] = useState(false);
+  const [isSuperUser, setIsSuperUser] = useState(false);
+  // Progressive Manuscript Matcher — super-admin only toggle.
+  const [progressiveMatching, setProgressiveMatching] = useState(false);
+  const [progressiveMatchingBusy, setProgressiveMatchingBusy] = useState(false);
+  const [progressiveMatchingError, setProgressiveMatchingError] = useState<string | null>(null);
   const [inviteRole, setInviteRole] = useState<InviteRoleChoice>("host");
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
@@ -652,6 +658,7 @@ export default function HostChurchPage() {
       const me = await fetchAuthMe(idToken);
       if (cancelled) return;
       setIsMasterUser(Boolean(me.user?.isMaster));
+      setIsSuperUser(Boolean(me.user?.isSuper));
       const preferredOrgId = (me.currentOrgId || "").trim();
       const rows = me.memberships || [];
       setMemberships(rows);
@@ -898,6 +905,7 @@ export default function HostChurchPage() {
         persistAuthToken(freshToken);
         const me = await fetchAuthMe(freshToken);
         setIsMasterUser(Boolean(me.user?.isMaster));
+        setIsSuperUser(Boolean(me.user?.isSuper));
         setMemberships(me.memberships || []);
       }
       setAccountProfileNotice("Display name updated.");
@@ -907,6 +915,36 @@ export default function HostChurchPage() {
       setAccountProfileBusy(false);
     }
   }, [accountDisplayNameInput, getIdToken, updateDisplayName]);
+
+  const toggleProgressiveMatching = useCallback(async (nextEnabled: boolean) => {
+    if (!resolvedOrgId) {
+      setProgressiveMatchingError("Church organization is missing.");
+      return;
+    }
+    // Optimistic update — snap back on failure so the checkbox reflects
+    // authoritative server state instead of the user's last intent.
+    const previous = progressiveMatching;
+    setProgressiveMatching(nextEnabled);
+    setProgressiveMatchingBusy(true);
+    setProgressiveMatchingError(null);
+    try {
+      const idToken = await getIdToken(true);
+      if (!idToken) throw new Error("Please sign in again.");
+      persistAuthToken(idToken);
+      const updated = await saveOrgProfile(idToken, resolvedOrgId, {
+        progressiveManuscriptMatching: nextEnabled,
+      });
+      setOrgData((current) => (current
+        ? { ...current, progressiveManuscriptMatching: updated.progressiveManuscriptMatching ?? nextEnabled }
+        : current));
+      setProgressiveMatching(Boolean(updated.progressiveManuscriptMatching ?? nextEnabled));
+    } catch (err) {
+      setProgressiveMatching(previous);
+      setProgressiveMatchingError(err instanceof Error ? err.message : "Failed to update setting.");
+    } finally {
+      setProgressiveMatchingBusy(false);
+    }
+  }, [getIdToken, progressiveMatching, resolvedOrgId]);
 
   const saveChurchProfile = useCallback(async () => {
     const nextName = churchNameInput.trim();
@@ -2076,6 +2114,11 @@ export default function HostChurchPage() {
     setChurchNameInput((orgData?.name || "").trim());
   }, [orgData?.name, orgData?.orgId]);
 
+  useEffect(() => {
+    setProgressiveMatching(Boolean(orgData?.progressiveManuscriptMatching));
+    setProgressiveMatchingError(null);
+  }, [orgData?.progressiveManuscriptMatching, orgData?.orgId]);
+
   if (!user && !authLoading) {
     return (
       <main style={{ ...hostPageStyle, display: "grid", placeItems: "center" }}>
@@ -2827,6 +2870,40 @@ export default function HostChurchPage() {
                             {churchProfileBusy ? "Saving..." : "Save Church Name"}
                           </button>
                         </div>
+                        {isSuperUser ? (
+                          <div
+                            style={{
+                              marginTop: 12,
+                              padding: 12,
+                              borderRadius: 8,
+                              background: "rgba(239,244,250,0.6)",
+                              border: "1px dashed rgba(90,110,140,0.35)",
+                              display: "grid",
+                              gap: 6,
+                            }}
+                          >
+                            <label style={{ display: "flex", alignItems: "flex-start", gap: 8, cursor: progressiveMatchingBusy ? "wait" : "pointer" }}>
+                              <input
+                                type="checkbox"
+                                checked={progressiveMatching}
+                                disabled={progressiveMatchingBusy || !resolvedOrgId}
+                                onChange={(e) => { void toggleProgressiveMatching(e.target.checked); }}
+                                style={{ marginTop: 3 }}
+                              />
+                              <span style={{ display: "grid", gap: 2 }}>
+                                <strong style={{ fontSize: 13 }}>
+                                  Progressive manuscript matching{progressiveMatchingBusy ? " (saving...)" : ""}
+                                </strong>
+                                <span style={{ fontSize: 12, color: DC.mid }}>
+                                  Show prepared English while the pastor is still speaking the Korean sentence, once a manuscript segment matches. Super-admin only.
+                                </span>
+                              </span>
+                            </label>
+                            {progressiveMatchingError ? (
+                              <p style={{ margin: 0, color: "#b95567", fontSize: 12 }}>Error: {progressiveMatchingError}</p>
+                            ) : null}
+                          </div>
+                        ) : null}
                       </section>
                     </div>
 

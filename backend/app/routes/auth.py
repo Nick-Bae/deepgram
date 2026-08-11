@@ -404,6 +404,7 @@ def auth_me(user: AuthenticatedUser = Depends(get_current_user_required)):
             "email": user.email,
             "displayName": user.displayName,
             "isMaster": is_master,
+            "isSuper": bool(getattr(user, "isSuper", False)),
         },
         "currentOrgId": current_org_id,
         "memberships": _sanitize_membership_payload(memberships),

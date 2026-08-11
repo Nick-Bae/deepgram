@@ -958,6 +958,7 @@ class InMemoryMultiChurchStore:
                 "orgId": org_id,
                 "slug": self._orgs[org_id]["slug"],
                 "name": self._orgs[org_id]["name"],
+                "progressiveManuscriptMatching": _org_progressive_manuscript_matching_flag(self._orgs[org_id]),
                 "services": rows,
             }
 
@@ -1000,17 +1001,22 @@ class InMemoryMultiChurchStore:
         *,
         org_id: str,
         requested_by_uid: str,
-        name: str,
+        name: Optional[str] = None,
+        progressive_manuscript_matching: Optional[bool] = None,
     ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
-        clean_name = _clean_token(name)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
             raise ValueError("invalid_uid")
-        if len(clean_name) < 2:
-            raise ValueError("invalid_name")
+        clean_name: Optional[str] = None
+        if name is not None:
+            clean_name = _clean_token(name)
+            if len(clean_name) < 2:
+                raise ValueError("invalid_name")
+        if clean_name is None and progressive_manuscript_matching is None:
+            raise ValueError("no_changes")
 
         with self._lock:
             org = self._orgs.get(clean_org_id)
@@ -1019,12 +1025,16 @@ class InMemoryMultiChurchStore:
             role = self._member_role(clean_org_id, clean_uid)
             if role not in {"owner", "admin"}:
                 raise PermissionError("forbidden")
-            org["name"] = clean_name
+            if clean_name is not None:
+                org["name"] = clean_name
+            if progressive_manuscript_matching is not None:
+                org["progressiveManuscriptMatching"] = bool(progressive_manuscript_matching)
             org["updatedAt"] = _utcnow()
             return {
                 "orgId": clean_org_id,
                 "slug": str(org.get("slug") or clean_org_id),
-                "name": clean_name,
+                "name": str(org.get("name") or clean_org_id),
+                "progressiveManuscriptMatching": _org_progressive_manuscript_matching_flag(org),
             }
 
     def check_org_slug_availability(self, *, slug: str, max_suggestions: int = 3) -> Dict[str, Any]:
@@ -3407,7 +3417,13 @@ class FirestoreMultiChurchStore:
                 }
             )
         rows.sort(key=lambda r: r["serviceKey"])
-        return {"orgId": org_id, "slug": slug, "name": (org or {}).get("name", slug), "services": rows}
+        return {
+            "orgId": org_id,
+            "slug": slug,
+            "name": (org or {}).get("name", slug),
+            "progressiveManuscriptMatching": _org_progressive_manuscript_matching_flag(org or {}),
+            "services": rows,
+        }
 
     def list_services_by_org_id(self, org_id: str) -> List[Dict[str, Any]]:
         """List services for an org by orgId directly (no slug resolution needed)."""
@@ -3443,17 +3459,22 @@ class FirestoreMultiChurchStore:
         *,
         org_id: str,
         requested_by_uid: str,
-        name: str,
+        name: Optional[str] = None,
+        progressive_manuscript_matching: Optional[bool] = None,
     ) -> Dict[str, Any]:
         clean_org_id = _clean_token(org_id)
         clean_uid = _clean_token(requested_by_uid)
-        clean_name = _clean_token(name)
         if not clean_org_id:
             raise ValueError("org_not_found")
         if not clean_uid:
             raise ValueError("invalid_uid")
-        if len(clean_name) < 2:
-            raise ValueError("invalid_name")
+        clean_name: Optional[str] = None
+        if name is not None:
+            clean_name = _clean_token(name)
+            if len(clean_name) < 2:
+                raise ValueError("invalid_name")
+        if clean_name is None and progressive_manuscript_matching is None:
+            raise ValueError("no_changes")
 
         org_ref = self._org_ref(clean_org_id)
         org_snap = org_ref.get(timeout=_FS_TIMEOUT)
@@ -3463,20 +3484,20 @@ class FirestoreMultiChurchStore:
         if role not in {"owner", "admin"}:
             raise PermissionError("forbidden")
 
-        org_ref.set(
-            {
-                "name": clean_name,
-                "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-            timeout=_FS_TIMEOUT,
-        )
+        updates: Dict[str, Any] = {"updatedAt": gcf_firestore.SERVER_TIMESTAMP}
+        if clean_name is not None:
+            updates["name"] = clean_name
+        if progressive_manuscript_matching is not None:
+            updates["progressiveManuscriptMatching"] = bool(progressive_manuscript_matching)
+        org_ref.set(updates, merge=True, timeout=_FS_TIMEOUT)
         self._invalidate_membership_cache(clean_uid)
         org = org_snap.to_dict() or {}
+        merged = {**org, **{k: v for k, v in updates.items() if k != "updatedAt"}}
         return {
             "orgId": clean_org_id,
             "slug": str(org.get("slug") or clean_org_id),
-            "name": clean_name,
+            "name": str(merged.get("name") or clean_org_id),
+            "progressiveManuscriptMatching": _org_progressive_manuscript_matching_flag(merged),
         }
 
     def check_org_slug_availability(self, *, slug: str, max_suggestions: int = 3) -> Dict[str, Any]:
