@@ -296,6 +296,13 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     if (id == null) return;
     const idx = enDisplayRef.current.findIndex((e) => e.id === id);
     if (idx !== -1) {
+      // Purge from the 45s dedup set as well — otherwise the reviewed-mode
+      // final that follows a preview_clear (server-side deviation → live GPT
+      // OR OLD sermon-review commit-time match with the SAME English text)
+      // would be filtered out as a duplicate and never render on screen.
+      const clearedText = enDisplayRef.current[idx].text;
+      const normalized = normalizeDisplayText(clearedText);
+      if (normalized) recentEnTextRef.current.delete(normalized);
       enDisplayRef.current = enDisplayRef.current.slice(0, idx).concat(enDisplayRef.current.slice(idx + 1));
       setEnLines(enDisplayRef.current.map((e) => e.text));
     }
