@@ -58,12 +58,15 @@ from app.routes import pipeline_trace as pipeline_trace_routes
 from app.sermon_review.lookup import get_reviewed_matches, get_reviewed_text
 from app.sermon_review.progressive_matcher import (
     CommitEvent as PMMCommitEvent,
+    DEFAULT_CONFIG as PMM_CONFIG,
     InterimEvent as PMMInterimEvent,
     ClearPreview as PMMClearPreview,
     ConfirmAndAdvanceCursor as PMMConfirmAndAdvanceCursor,
     ReplacePreview as PMMReplacePreview,
     RequestLiveTranslation as PMMRequestLiveTranslation,
     ShowPreview as PMMShowPreview,
+    _score_all as _pmm_score_all,
+    _search_window as _pmm_search_window,
     advance as pmm_advance,
 )
 from app.sermon_review.room_state import (
@@ -2648,12 +2651,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         current_state,
                         preview_shown_at_ms=pmm_room_state.preview_shown_at_ms,
                     )
+                # Match the interim path's cold-start widening so a preview lit
+                # under the wide window can still be located at commit.
+                _pmm_effective_config = (
+                    _dc_replace(PMM_CONFIG, search_window_forward=max(len(pmm_room_state.segments), PMM_CONFIG.search_window_forward))
+                    if pmm_room_state.cursor == 0
+                    else PMM_CONFIG
+                )
                 try:
                     new_state, pmm_actions = pmm_advance(
                         current_state,
                         PMMCommitEvent(full_text=src_text_raw, now_ms=now_ms),
                         cursor=pmm_room_state.cursor,
                         segments=pmm_room_state.segments,
+                        config=_pmm_effective_config,
                     )
                     pmm_room_state.state = new_state
                     for action in pmm_actions:
@@ -2699,6 +2710,33 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     f"[SERMON_REVIEW][final-skip-combined] "
                     f"matches={len(reviewed_matches)} emitted={emitted}"
                 )
+                # Sync PMM cursor from OLD commit-time matches so the tight
+                # search window keeps tracking the pastor when PMM's own
+                # interim scoring misses (short/paraphrased sentences fall
+                # below SCORE_MIN=0.84 but still match at commit via the
+                # whole-sentence lookup in emit_reviewed_segment_matches).
+                if pmm_room_state.enabled and pmm_room_state.segments:
+                    seg_id_to_idx = {
+                        str(seg.get("segmentId") or ""): idx
+                        for idx, seg in enumerate(pmm_room_state.segments)
+                    }
+                    best_idx = -1
+                    best_seg_id = None
+                    for match in reviewed_matches:
+                        mid = str(match.get("segmentId") or "").strip()
+                        if not mid:
+                            continue
+                        idx = seg_id_to_idx.get(mid, -1)
+                        if idx > best_idx:
+                            best_idx = idx
+                            best_seg_id = mid
+                    if best_seg_id and best_idx + 1 > pmm_room_state.cursor:
+                        prev_cursor = pmm_room_state.cursor
+                        pmm_room_state.advance_cursor_to(best_seg_id)
+                        print(
+                            f"[PMM] cursor-sync {prev_cursor}→{pmm_room_state.cursor} "
+                            f"via commit-time reviewed match seg={best_seg_id}"
+                        )
             else:
                 print(f"[A] FINAL {src_lang_full}->{tgt_lang_full} src='{src_text_raw}'")
                 await send_translation(src_text_raw, partial=False, live_mode_hint="live", update_ctx=True)
@@ -2885,13 +2923,47 @@ async def ws_stt_deepgram(websocket: WebSocket):
                                 current_state,
                                 preview_shown_at_ms=pmm_room_state.preview_shown_at_ms,
                             )
+                        # Cold-start window widening: cursor stays at 0 until the
+                        # first successful PREVIEW→COMMIT confirms it. Until then,
+                        # score against ALL segments so the pastor can start
+                        # anywhere in the sermon (not just the first 6 segments).
+                        # Once cursor advances even once, revert to the tight
+                        # window from DEFAULT_CONFIG for cheap per-partial scoring.
+                        _pmm_effective_config = (
+                            _dc_replace(PMM_CONFIG, search_window_forward=max(len(pmm_room_state.segments), PMM_CONFIG.search_window_forward))
+                            if pmm_room_state.cursor == 0
+                            else PMM_CONFIG
+                        )
                         try:
                             new_state, pmm_actions = pmm_advance(
                                 current_state,
                                 PMMInterimEvent(prefix=transcript, now_ms=now_ms),
                                 cursor=pmm_room_state.cursor,
                                 segments=pmm_room_state.segments,
+                                config=_pmm_effective_config,
                             )
+                            # Diagnostic: throttled per-prefix log so we can see
+                            # WHY the matcher stays in IDLE (score below gate,
+                            # cursor window misses the segment, etc.). Log once
+                            # per prefix change to avoid Deepgram-partial spam.
+                            if transcript != getattr(pmm_broadcast_actions, "_last_logged_prefix", None):
+                                setattr(pmm_broadcast_actions, "_last_logged_prefix", transcript)
+                                try:
+                                    _window = _pmm_search_window(pmm_room_state.segments, pmm_room_state.cursor, _pmm_effective_config)
+                                    _scored = _pmm_score_all(transcript, _window)[:3]
+                                    _tops = ", ".join(
+                                        f"{str(s.get('segmentId') or '?')[:12]}={sc:.2f}"
+                                        for s, sc in _scored
+                                    ) or "(no candidates)"
+                                    _prefix_short = transcript if len(transcript) <= 40 else transcript[:37] + "..."
+                                    print(
+                                        f"[PMM][interim] cursor={pmm_room_state.cursor} "
+                                        f"window={len(_window)} state={new_state.kind} "
+                                        f"prefix='{_prefix_short}' top3=[{_tops}] "
+                                        f"actions={len(pmm_actions)}"
+                                    )
+                                except Exception as _log_exc:
+                                    print("[PMM][interim][log-error]", _log_exc)
                             pmm_room_state.state = new_state
                             if pmm_actions:
                                 await pmm_broadcast_actions(pmm_actions)
