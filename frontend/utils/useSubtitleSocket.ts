@@ -1,22 +1,47 @@
 // utils/useSubtitleSocket.ts
 import { useEffect, useMemo, useRef, useState } from "react";
 import { appendStreamContextToUrl, resolveStreamContext, type StreamContext } from "./streamContext";
-import { enforceSecureProtocol } from "./urls";
+import { API_URL, enforceSecureProtocol } from "./urls";
 
 type InterimKR = { type: "interim_kr"; text: string };
 type FinalKR   = { type: "final_kr";  text: string };
 type FastFinal = { type: "fast_final"; en: string; from?: string };
+type ReviewedMeta = {
+  mode: "reviewed";
+  kind: "preview" | "preview_replace" | "preview_clear";
+  utterance_id?: string | null;
+  seg_id?: string | number | null;
+  from_seg_id?: string | number | null;
+};
 type Translation = {
   type: "translation";
   payload?: string;
+  text?: string;
   lang?: string;
   meta?: {
     translated?: string;
     partial?: boolean;
     seq?: number;
+    mode?: string;
+    kind?: string;
+    utterance_id?: string | null;
+    seg_id?: string | number | null;
+    from_seg_id?: string | number | null;
     [key: string]: unknown;
   };
 };
+
+// Progressive Manuscript Matcher — client priority lane.
+// Reviewed captions bypass the live-translation pacing queue so pastors
+// see prepared English while the sentence is still being spoken. The
+// dwell floor matches the server-side state machine so a preview cannot
+// flicker off/replace itself before the audience has time to read it.
+const REVIEWED_MIN_DWELL_MS = 1200;
+
+function isReviewedMeta(meta: Translation["meta"]): meta is ReviewedMeta {
+  return !!meta && meta.mode === "reviewed" &&
+    (meta.kind === "preview" || meta.kind === "preview_replace" || meta.kind === "preview_clear");
+}
 type DisplayConfig = { type: "display_config"; speed?: number; speedFactor?: number };
 type TranslatedAudio = { type: "translated_audio"; data: string; sampleRate?: number; provider?: string };
 
@@ -124,6 +149,11 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const displaySpeedRef = useRef(1);
   const highestFinalSeqRef = useRef(0);
   const recentEnTextRef = useRef<Map<string, number>>(new Map());
+
+  // Reviewed preview state (Progressive Manuscript Matcher priority lane)
+  const previewShownAtRef = useRef<number | null>(null);
+  const previewLineIdRef = useRef<number | null>(null);
+  const previewUtteranceIdRef = useRef<string | null>(null);
 
   function pushLine(setter: React.Dispatch<React.SetStateAction<string[]>>, text: string) {
     setter((prev) => prev.concat(text).slice(-maxLines));
@@ -249,6 +279,86 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     scheduleDrain();
   }
 
+  function postPipelineTrace(utteranceId: string | null | undefined, receivedAt: number, renderedAt: number) {
+    if (!utteranceId) return;
+    try {
+      fetch(`${API_URL}/api/pipeline_trace`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ utteranceId, receivedAt, renderedAt }),
+        keepalive: true,
+      }).catch(() => { /* fire-and-forget */ });
+    } catch { /* fire-and-forget */ }
+  }
+
+  function clearPreviewFromDisplay() {
+    const id = previewLineIdRef.current;
+    if (id == null) return;
+    const idx = enDisplayRef.current.findIndex((e) => e.id === id);
+    if (idx !== -1) {
+      enDisplayRef.current = enDisplayRef.current.slice(0, idx).concat(enDisplayRef.current.slice(idx + 1));
+      setEnLines(enDisplayRef.current.map((e) => e.text));
+    }
+    previewLineIdRef.current = null;
+    previewShownAtRef.current = null;
+    previewUtteranceIdRef.current = null;
+  }
+
+  function showReviewedPreview(text: string, utteranceId: string | null | undefined, receivedAt: number) {
+    if (!text) return;
+    const now = Date.now();
+    const entry: DisplayEntry = { id: idCounterRef.current++, seq: null, text, addedAt: now };
+    enDisplayRef.current = enDisplayRef.current.concat(entry).slice(-maxLines);
+    const normalized = normalizeDisplayText(text);
+    if (normalized) recentEnTextRef.current.set(normalized, now);
+    setEnLines(enDisplayRef.current.map((e) => e.text));
+    setEnFinal(text);
+    previewLineIdRef.current = entry.id;
+    previewShownAtRef.current = now;
+    previewUtteranceIdRef.current = utteranceId ?? null;
+    postPipelineTrace(utteranceId, receivedAt, Date.now());
+  }
+
+  function replaceReviewedPreview(text: string, utteranceId: string | null | undefined, receivedAt: number) {
+    const shownAt = previewShownAtRef.current;
+    const now = Date.now();
+    // Dwell floor: server-side state machine already enforces this, but
+    // clock drift or reordered messages could slip through — belt-and-suspenders.
+    if (shownAt !== null && now - shownAt < REVIEWED_MIN_DWELL_MS) return;
+    const id = previewLineIdRef.current;
+    if (id == null) {
+      // No preview on screen — treat as a fresh preview.
+      showReviewedPreview(text, utteranceId, receivedAt);
+      return;
+    }
+    const idx = enDisplayRef.current.findIndex((e) => e.id === id);
+    if (idx === -1) {
+      showReviewedPreview(text, utteranceId, receivedAt);
+      return;
+    }
+    const replacement: DisplayEntry = { id: idCounterRef.current++, seq: null, text, addedAt: now };
+    enDisplayRef.current = enDisplayRef.current
+      .slice(0, idx)
+      .concat(replacement)
+      .concat(enDisplayRef.current.slice(idx + 1));
+    const normalized = normalizeDisplayText(text);
+    if (normalized) recentEnTextRef.current.set(normalized, now);
+    setEnLines(enDisplayRef.current.map((e) => e.text));
+    setEnFinal(text);
+    previewLineIdRef.current = replacement.id;
+    previewShownAtRef.current = now;
+    previewUtteranceIdRef.current = utteranceId ?? null;
+    postPipelineTrace(utteranceId, receivedAt, Date.now());
+  }
+
+  function clearReviewedPreview(utteranceId: string | null | undefined, receivedAt: number) {
+    const shownAt = previewShownAtRef.current;
+    const now = Date.now();
+    if (shownAt !== null && now - shownAt < REVIEWED_MIN_DWELL_MS) return;
+    clearPreviewFromDisplay();
+    postPipelineTrace(utteranceId, receivedAt, Date.now());
+  }
+
   useEffect(() => {
     contextRef.current = streamContext;
     if (!enabled || !resolvedUrl) return;
@@ -261,6 +371,9 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     displaySpeedRef.current = 1;
     highestFinalSeqRef.current = 0;
     recentEnTextRef.current = new Map();
+    previewShownAtRef.current = null;
+    previewLineIdRef.current = null;
+    previewUtteranceIdRef.current = null;
     lastSocketMessageAtRef.current = Date.now();
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current);
@@ -347,6 +460,29 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
             }
 
             if (isTranslation(msg)) {
+              const receivedAt = Date.now();
+
+              // Progressive Manuscript Matcher — priority lane.
+              // Reviewed-mode messages have no `seq` and would otherwise be
+              // dropped by the guard below. Render them immediately, bypassing
+              // the live-translation pacing queue.
+              if (isReviewedMeta(msg.meta)) {
+                if (track !== "en" && track !== "both") return;
+                const utteranceId = typeof msg.meta.utterance_id === "string" ? msg.meta.utterance_id : null;
+                const text =
+                  (typeof msg.payload === "string" && msg.payload) ||
+                  (typeof msg.text === "string" && msg.text) ||
+                  "";
+                if (msg.meta.kind === "preview") {
+                  showReviewedPreview(text.trim(), utteranceId, receivedAt);
+                } else if (msg.meta.kind === "preview_replace") {
+                  replaceReviewedPreview(text.trim(), utteranceId, receivedAt);
+                } else if (msg.meta.kind === "preview_clear") {
+                  clearReviewedPreview(utteranceId, receivedAt);
+                }
+                return;
+              }
+
               const seq =
                 typeof msg.meta?.seq === "number"
                   ? msg.meta.seq
@@ -368,6 +504,10 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
                 "";
               const t = text.trim();
               if (!t) return;
+              // Live translation arrived — drop any lingering reviewed preview
+              // so pacing shows only the authoritative live text (unconfirmed-
+              // commit path). If text matches the preview, dedup below skips it.
+              if (previewLineIdRef.current != null) clearPreviewFromDisplay();
               setEnFinal(t);
               if (track === "en" || track === "both") enqueueEnglish(seq, splitSentences(t));
               return;
