@@ -201,3 +201,12 @@ Do this last, in a separate PR, when ready to test in a browser.
 - [ ] Existing WebSocket-recovery tests still pass (`test_socket_manager*`)
 - [ ] Manual: run local server with flag on, feed synthetic Deepgram partials via a script, verify broadcast shapes match Step 5
 - [ ] Manual: verify pipeline_trace log lines land in stdout / Cloud Run logs
+
+---
+
+## Future work (post-rollout)
+
+- [ ] **Firestore persistence for pipeline_trace** — design doc calls for writing each trace to `organizations/{orgId}/pipeline_trace/{utteranceId}` with a 14-day TTL. Currently traces only go to stdout via `pipeline_trace.py:emit()`. Add when trend analysis across multiple services is needed (per-service dashboards, week-over-week comparisons). Cost is negligible (~$0.03/church/year in writes); complexity is low (~1 hour: add write hook, TTL rule, composite index on `orgId + committedAt`).
+- [ ] **Deepgram keyterms integration** — STT mis-transcriptions like `10001` for `만일` drag prefix similarity below `SCORE_MIN` even for real manuscript matches. Feeding the linked sermon's proper nouns/vocabulary to Deepgram would improve upstream accuracy. There's already a `feature/deepgram-keyterms` branch — evaluate if that work is applicable here (per-service keyterm derivation from `sermon.segments`).
+- [ ] **SCORE_MIN tuning from real data** — 0.84 is the design's starting value. Once `[PIPELINE_TRACE]` has data from ≥2 real Sundays, plot `previewLockScore` distribution vs. `committedSource` outcomes and pick a threshold that maximizes preview hits without introducing wrong-segment jumps.
+- [ ] **Korean-hold prefix continuity** — observed pattern: Deepgram issues `speech_final=True` mid-utterance for grammatically-incomplete Korean, then the next partial starts fresh (e.g., `내가 사랑하는 사람의 미래를` → hold → `이상 내 뜻`). PMM's 2-confirmation streak resets because the second prefix doesn't build on the first. The Korean-hold merge logic in `main.py` already joins these at the STT level; consider forwarding the joined prefix to `pmm_advance` instead of the raw Deepgram interim so the streak survives holds.
