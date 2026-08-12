@@ -292,20 +292,19 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   }
 
   function clearPreviewFromDisplay() {
-    const id = previewLineIdRef.current;
-    if (id == null) return;
-    const idx = enDisplayRef.current.findIndex((e) => e.id === id);
-    if (idx !== -1) {
-      // Purge from the 45s dedup set as well — otherwise the reviewed-mode
-      // final that follows a preview_clear (server-side deviation → live GPT
-      // OR OLD sermon-review commit-time match with the SAME English text)
-      // would be filtered out as a duplicate and never render on screen.
-      const clearedText = enDisplayRef.current[idx].text;
-      const normalized = normalizeDisplayText(clearedText);
-      if (normalized) recentEnTextRef.current.delete(normalized);
-      enDisplayRef.current = enDisplayRef.current.slice(0, idx).concat(enDisplayRef.current.slice(idx + 1));
-      setEnLines(enDisplayRef.current.map((e) => e.text));
-    }
+    // Deliberately NOT removing the DOM line. An earlier iteration did:
+    // preview_clear → wipe display slot → ~1s later the commit-time reviewed
+    // lookup or the live-GPT translation broadcast arrived → new line shown
+    // via the pacing queue → visible "appear → blank → same text re-appears"
+    // flicker. Keeping the line makes preview_clear a state-only reset:
+    // - If the follow-up broadcast has the SAME text as the preview, the
+    //   dedup check in enqueueEnglish (via enDisplayRef.some) suppresses
+    //   it — preview stays put, no duplicate line.
+    // - If the follow-up has DIFFERENT text (true deviation / live path
+    //   producing a fresh GPT translation), it renders next to the preview
+    //   and the maxLines slice rolls the stale preview off naturally.
+    // Design doc allows "dim last caption" as an alternative to clear; this
+    // is closer to that behavior without adding a dim styling code path.
     previewLineIdRef.current = null;
     previewShownAtRef.current = null;
     previewUtteranceIdRef.current = null;

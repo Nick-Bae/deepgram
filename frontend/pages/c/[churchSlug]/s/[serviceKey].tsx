@@ -239,7 +239,14 @@ export default function ChurchServiceListenerPage() {
   }, [ttsEnabled]);
 
   const serviceTitle = resolveData?.service?.title || serviceKey || "Service";
-  const displayEnLines = fallbackEnLines.length ? fallbackEnLines : enLines;
+  // Prefer WebSocket-delivered lines whenever the socket is live, so PMM
+  // previews and streaming translations aren't shadowed by the HTTP polling
+  // fallback (which locks in the first-poll content and blocks subsequent WS
+  // updates via dedup). Only fall back to polling when the WS is actually
+  // down, so recovery still works.
+  const displayEnLines = connected
+    ? (enLines.length ? enLines : fallbackEnLines)
+    : (fallbackEnLines.length ? fallbackEnLines : enLines);
   const lastEn = displayEnLines[displayEnLines.length - 1] || "";
   const waitingMessage = loading
     ? `Loading ${serviceTitle}…`
