@@ -240,11 +240,18 @@ def _qs(
     utter_end_ms: Optional[int],
     replacements: Optional[List[Tuple[str, str]]] = None,
 ) -> str:
+    # smart_format=true bundles Deepgram's numeric normalization, which
+    # converts Korean numerical morphemes (만/천/억/조) to digits when
+    # spoken standalone — e.g. "주일만" → "주일 10000", "바다조차" →
+    # "바다 1000000000000 차". Those wrecked broadcasts and dragged PMM
+    # prefix scores below SCORE_MIN in real sermon audio. Keep punctuate
+    # for periods/commas but disable smart_format so digits stay in
+    # their character form.
     params: List[Tuple[str, str]] = [
         ("model", model),
         ("language", language),
         ("punctuate", "true"),
-        ("smart_format", "true"),
+        ("smart_format", "false"),
         ("interim_results", "true"),
         ("encoding", "linear16"),
         ("sample_rate", str(sample_rate)),
