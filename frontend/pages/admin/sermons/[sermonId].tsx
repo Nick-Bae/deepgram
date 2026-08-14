@@ -15,11 +15,12 @@ import {
   type OrgMembership,
   type OrgServiceSummary,
 } from "../../../lib/backendAuth";
-import { getSermon, linkSermon } from "../../../lib/api/sermons";
+import { getSermon, lintSermon, linkSermon } from "../../../lib/api/sermons";
 import {
   SegmentStatus,
   Sermon,
   SermonApiError,
+  SermonLintReport,
 } from "../../../lib/types/sermon";
 
 const ADMIN_ROLES = new Set(["owner", "admin"]);
@@ -45,6 +46,10 @@ export default function AdminSermonDetailPage() {
   const [linking, setLinking] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
   const [currentLinkedServiceKey, setCurrentLinkedServiceKey] = useState<string | null>(null);
+
+  const [lintReport, setLintReport] = useState<SermonLintReport | null>(null);
+  const [linting_, setLintBusy] = useState(false);
+  const [lintError, setLintError] = useState<string | null>(null);
 
   const role = useMemo(() => {
     const m = memberships.find((row) => row.orgId === selectedOrgId);
@@ -130,6 +135,24 @@ export default function AdminSermonDetailPage() {
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
+
+  const handleLint = useCallback(async () => {
+    if (!selectedOrgId || !sermonId) return;
+    setLintBusy(true);
+    setLintError(null);
+    try {
+      const idToken = await getIdToken();
+      if (!idToken) return;
+      const report = await lintSermon(selectedOrgId, sermonId, { idToken });
+      setLintReport(report);
+    } catch (err: unknown) {
+      if (err instanceof SermonApiError) setLintError(err.message);
+      else if (err instanceof Error) setLintError(err.message);
+      else setLintError("Failed to lint sermon.");
+    } finally {
+      setLintBusy(false);
+    }
+  }, [selectedOrgId, sermonId, getIdToken]);
 
   const handleLink = useCallback(
     async (replace = false) => {
@@ -247,6 +270,84 @@ export default function AdminSermonDetailPage() {
             reviewMode={sermon.reviewMode}
             onImportSuccess={() => void loadAll()}
           />
+
+          <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Manuscript Analysis
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Scan for repeated phrases (scripture quotes, refrains) that
+                  can confuse the live matcher and delay previews.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleLint()}
+                disabled={linting_}
+                className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                {linting_ ? "Analyzing…" : "Analyze"}
+              </button>
+            </div>
+
+            {lintError && (
+              <p className="mt-2 text-sm text-red-700">{lintError}</p>
+            )}
+
+            {lintReport && (
+              <div className="mt-3">
+                {lintReport.collisions.length === 0 ? (
+                  <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+                    Scanned {lintReport.totalSegments} segments — no repeated-phrase
+                    collisions found. The live matcher should track cleanly.
+                  </p>
+                ) : (
+                  <>
+                    <p className="mb-2 text-sm text-slate-700">
+                      Scanned {lintReport.totalSegments} segments — found{" "}
+                      <strong>{lintReport.collisions.length}</strong> collision
+                      pair
+                      {lintReport.collisions.length === 1 ? "" : "s"}. The
+                      cursor-sync fix keeps these safe, but reviewing them
+                      helps you understand where the matcher has to work
+                      hardest.
+                    </p>
+                    <ul className="divide-y divide-slate-100">
+                      {lintReport.collisions.map((c, i) => {
+                        const isHigh = c.severity === "high";
+                        return (
+                          <li key={`${c.shorterSegmentId}-${c.longerSegmentId}-${i}`} className="py-2">
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              <span
+                                className={
+                                  isHigh
+                                    ? "rounded bg-amber-100 px-2 py-0.5 font-medium text-amber-800"
+                                    : "rounded bg-slate-100 px-2 py-0.5 font-medium text-slate-700"
+                                }
+                              >
+                                {isHigh ? "high" : "medium"}
+                              </span>
+                              <span className="font-mono text-slate-500">
+                                {c.shorterSegmentId} ⊂ {c.longerSegmentId}
+                              </span>
+                              <span className="text-slate-500">
+                                gap {c.gap} segments
+                              </span>
+                            </div>
+                            <p className="mt-1 text-sm text-slate-800">
+                              {c.matchedText}
+                            </p>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </>
+                )}
+              </div>
+            )}
+          </section>
 
           {canLink && (
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">

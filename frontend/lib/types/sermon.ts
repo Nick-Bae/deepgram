@@ -136,3 +136,19 @@ export function isImportValidationError(
     "rows" in err.details
   );
 }
+
+// Mirrors backend/app/sermon_review/lint.py output.
+export type SermonLintSeverity = "high" | "medium";
+
+export type SermonLintCollision = {
+  shorterSegmentId: string;
+  longerSegmentId: string;
+  gap: number;
+  matchedText: string;
+  severity: SermonLintSeverity;
+};
+
+export type SermonLintReport = {
+  totalSegments: number;
+  collisions: SermonLintCollision[];
+};

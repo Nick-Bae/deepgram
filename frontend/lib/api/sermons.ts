@@ -11,6 +11,7 @@ import {
   ReviewMode,
   Sermon,
   SermonApiError,
+  SermonLintReport,
   SermonSummary,
   SourceType,
   ValidationReport,
@@ -191,6 +192,28 @@ export async function getSermon(
     );
     if (!res.ok) throw await parseError(res);
     const json = (await res.json()) as { data: Sermon };
+    return json.data;
+  } finally {
+    cleanup();
+  }
+}
+
+export async function lintSermon(
+  orgId: string,
+  sermonId: string,
+  options: FetchOptions
+): Promise<SermonLintReport> {
+  const { signal, cleanup } = withTimeout(
+    options.signal,
+    options.timeoutMs ?? REQUEST_TIMEOUT_MS
+  );
+  try {
+    const res = await fetch(
+      `${API_URL}/api/org/${encodeURIComponent(orgId)}/sermons/${encodeURIComponent(sermonId)}/lint`,
+      { method: "GET", headers: authHeaders(options.idToken), signal }
+    );
+    if (!res.ok) throw await parseError(res);
+    const json = (await res.json()) as { data: SermonLintReport };
     return json.data;
   } finally {
     cleanup();

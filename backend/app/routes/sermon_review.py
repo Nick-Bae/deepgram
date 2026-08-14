@@ -46,6 +46,7 @@ from app.sermon_review import (
     validate_pre_translated_replacement_workbook,
     validate_workbook,
 )
+from app.sermon_review.lint import lint_sermon_segments
 from app.utils.translate import translate_text
 
 router = APIRouter(tags=["sermon-review"])
@@ -376,6 +377,29 @@ def get_sermon(
     if sermon is None:
         raise _err("SERMON_NOT_FOUND", "Sermon not found.", status=404)
     return _ok(Sermon.model_validate(sermon).model_dump())
+
+
+# -- GET /org/{org_id}/sermons/{sermon_id}/lint -------------------------------
+#
+# Scan the manuscript for repeated Korean phrases that could confuse PMM's
+# commit-time cursor-sync. Same read-role gate as get_sermon — this is a
+# static analysis of manuscript text, not a live broadcast operation.
+
+
+@router.get("/org/{org_id}/sermons/{sermon_id}/lint")
+def lint_sermon(
+    org_id: str,
+    sermon_id: str,
+    user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    require_org_role(
+        org_id=org_id, user=user, roles=READ_ROLES, store=multichurch_store
+    )
+    sermon = multichurch_store.get_review_sermon(org_id, sermon_id)
+    if sermon is None:
+        raise _err("SERMON_NOT_FOUND", "Sermon not found.", status=404)
+    report = lint_sermon_segments(sermon.get("segments") or [])
+    return _ok(report)
 
 
 # -- DELETE /org/{org_id}/sermons/{sermon_id} ---------------------------------
