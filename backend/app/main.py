@@ -2748,22 +2748,35 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 # interim scoring misses (short/paraphrased sentences fall
                 # below SCORE_MIN=0.84 but still match at commit via the
                 # whole-sentence lookup in emit_reviewed_segment_matches).
+                #
+                # Pick the NEAREST forward match, not the farthest. A repeated
+                # scripture quote (e.g., Genesis 17:1 appearing at both S013
+                # and S078) returns multiple matches; taking max_idx would
+                # leap the cursor past dozens of segments the pastor hasn't
+                # spoken yet, and PMM's ±window would then lock onto the
+                # wrong stretch of the sermon for the rest of the service.
+                # 2026-08-14 test log showed exactly this: a scripture quote
+                # near S013 caused a cursor-sync 12→78, after which every
+                # subsequent preview missed until the pastor finally caught
+                # up to S078+ near the end.
                 if pmm_room_state.enabled and pmm_room_state.segments:
                     seg_id_to_idx = {
                         str(seg.get("segmentId") or ""): idx
                         for idx, seg in enumerate(pmm_room_state.segments)
                     }
-                    best_idx = -1
+                    best_idx: int | None = None
                     best_seg_id = None
                     for match in reviewed_matches:
                         mid = str(match.get("segmentId") or "").strip()
                         if not mid:
                             continue
                         idx = seg_id_to_idx.get(mid, -1)
-                        if idx > best_idx:
+                        if idx < pmm_room_state.cursor:
+                            continue  # already past
+                        if best_idx is None or idx < best_idx:
                             best_idx = idx
                             best_seg_id = mid
-                    if best_seg_id and best_idx + 1 > pmm_room_state.cursor:
+                    if best_seg_id is not None and best_idx + 1 > pmm_room_state.cursor:
                         prev_cursor = pmm_room_state.cursor
                         pmm_room_state.advance_cursor_to(best_seg_id)
                         print(
