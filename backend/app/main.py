@@ -2923,6 +2923,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
                                 current_state,
                                 preview_shown_at_ms=pmm_room_state.preview_shown_at_ms,
                             )
+                        # Korean-hold prefix continuity: when Deepgram fired a
+                        # mid-sentence speech_final and we held the fragment,
+                        # feed PMM the joined prefix so its 2-partial
+                        # confirmation streak survives the boundary. Without
+                        # this, PMM restarts on the second half alone (e.g.
+                        # "안으로 들어오시는") and its top-1 score collapses,
+                        # delaying preview until the sentence is over.
+                        pmm_prefix = transcript
+                        if held_src and src_lang.startswith("ko"):
+                            joined = join_korean_stt_segments(held_src, transcript)
+                            if joined and joined != transcript:
+                                pmm_prefix = joined
                         # Cold-start window widening: cursor stays at 0 until the
                         # first successful PREVIEW→COMMIT confirms it. Until then,
                         # score against ALL segments so the pastor can start
@@ -2937,7 +2949,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         try:
                             new_state, pmm_actions = pmm_advance(
                                 current_state,
-                                PMMInterimEvent(prefix=transcript, now_ms=now_ms),
+                                PMMInterimEvent(prefix=pmm_prefix, now_ms=now_ms),
                                 cursor=pmm_room_state.cursor,
                                 segments=pmm_room_state.segments,
                                 config=_pmm_effective_config,
@@ -2946,21 +2958,22 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             # WHY the matcher stays in IDLE (score below gate,
                             # cursor window misses the segment, etc.). Log once
                             # per prefix change to avoid Deepgram-partial spam.
-                            if transcript != getattr(pmm_broadcast_actions, "_last_logged_prefix", None):
-                                setattr(pmm_broadcast_actions, "_last_logged_prefix", transcript)
+                            if pmm_prefix != getattr(pmm_broadcast_actions, "_last_logged_prefix", None):
+                                setattr(pmm_broadcast_actions, "_last_logged_prefix", pmm_prefix)
                                 try:
                                     _window = _pmm_search_window(pmm_room_state.segments, pmm_room_state.cursor, _pmm_effective_config)
-                                    _scored = _pmm_score_all(transcript, _window)[:3]
+                                    _scored = _pmm_score_all(pmm_prefix, _window)[:3]
                                     _tops = ", ".join(
                                         f"{str(s.get('segmentId') or '?')[:12]}={sc:.2f}"
                                         for s, sc in _scored
                                     ) or "(no candidates)"
-                                    _prefix_short = transcript if len(transcript) <= 40 else transcript[:37] + "..."
+                                    _prefix_short = pmm_prefix if len(pmm_prefix) <= 40 else pmm_prefix[:37] + "..."
+                                    _joined_tag = " joined" if pmm_prefix != transcript else ""
                                     print(
                                         f"[PMM][interim] cursor={pmm_room_state.cursor} "
                                         f"window={len(_window)} state={new_state.kind} "
-                                        f"prefix='{_prefix_short}' top3=[{_tops}] "
-                                        f"actions={len(pmm_actions)}"
+                                        f"prefix='{_prefix_short}'{_joined_tag} "
+                                        f"top3=[{_tops}] actions={len(pmm_actions)}"
                                     )
                                 except Exception as _log_exc:
                                     print("[PMM][interim][log-error]", _log_exc)
