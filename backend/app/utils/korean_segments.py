@@ -49,7 +49,17 @@ def ends_with_standalone_da(text: str) -> bool:
 
 def is_strongly_incomplete_korean_segment(text: str) -> bool:
     """Return True when a Korean STT segment clearly needs a continuation."""
-    clean = _TRAILING_PUNCTUATION_RE.sub("", (text or "").strip())
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    # A trailing comma from STT is almost always a mid-list continuation
+    # ("내 집, 내 시간, 내 돈,") rather than a legitimate sentence end.
+    # Holding lets the next Deepgram segment join instead of the fragment
+    # getting live-translated on its own and duplicating the reviewed match
+    # that arrives once the full sentence lands.
+    if raw.endswith(",") or raw.endswith("，"):
+        return True
+    clean = _TRAILING_PUNCTUATION_RE.sub("", raw)
     if not clean:
         return False
     if KOREAN_QUESTION_END_RE.search(clean):

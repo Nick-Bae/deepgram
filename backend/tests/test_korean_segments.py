@@ -78,6 +78,25 @@ class KoreanSegmentTests(unittest.TestCase):
         self.assertFalse(is_strongly_incomplete_korean_segment("우리는 어디로 갈까?"))
         self.assertFalse(is_strongly_incomplete_korean_segment("이제 어떻게 할까"))
 
+    def test_trailing_comma_is_incomplete_mid_list_fragment(self) -> None:
+        # STT fragments ending with a comma are almost always mid-list
+        # ("내 집, 내 시간, 내 돈,") — holding lets the next Deepgram segment
+        # join instead of the fragment getting its own live translation and
+        # duplicating the reviewed match once the full sentence lands.
+        self.assertTrue(
+            is_strongly_incomplete_korean_segment("내 집, 내 시간, 내 돈,")
+        )
+        # Full-width Korean comma also counts.
+        self.assertTrue(
+            is_strongly_incomplete_korean_segment("어떤 사람은，")
+        )
+        # A comma followed by a completed clause should still be complete.
+        self.assertFalse(
+            is_strongly_incomplete_korean_segment(
+                "내 집, 내 시간, 내 돈은 모두 하나님의 것입니다."
+            )
+        )
+
     def test_connective_myeo_remains_incomplete(self) -> None:
         # The 는가 fix must not regress the -며/-고 connective hold behavior.
         self.assertTrue(is_strongly_incomplete_korean_segment("마음이 청결하며"))
