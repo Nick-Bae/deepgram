@@ -2090,6 +2090,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
         SUBSET_SUPPRESS_WINDOW_SEC = 4.0
         MIN_SUBSET_DELTA = 6
+        # Minimum length for the tail of a prefix-extension commit to be
+        # broadcast as its own delta. Tiny tails (a stray period or "?")
+        # aren't worth a translation call and would add visual noise.
+        KOREAN_EXTENSION_MIN_DELTA_CHARS = 4
         CJK_NO_SPACE_PREFIXES = ("ko", "zh", "ja")
 
         async def _reviewed_matches_for_source(src_text_raw: str) -> list[dict[str, Any]]:
@@ -2615,6 +2619,35 @@ async def ws_stt_deepgram(websocket: WebSocket):
             last_ts = getattr(commit_now, "_last_commit_ts", 0.0)
             if normalized == last_norm:
                 return
+
+            # Extend-after-commit dedup: when the client-triggered finalize
+            # commits a sentence at a partial's sentence boundary and Deepgram
+            # then keeps extending the same utterance ("...않습니다." then
+            # "...않습니다. 왜 그렇습니까?"), the second commit would broadcast
+            # the whole thing again, overlapping the first line already on
+            # screen. Detect the prefix extension and reduce the payload to
+            # just the delta so the listener sees the new part as its own
+            # line (matching what would happen if Deepgram had cleanly split
+            # the utterance in the first place).
+            if (
+                last_norm
+                and normalized.startswith(last_norm)
+                and len(normalized) > len(last_norm)
+                and (time.time() - last_ts) < SUBSET_SUPPRESS_WINDOW_SEC
+            ):
+                delta_text = normalized[len(last_norm):].lstrip(" .,!?。？！…")
+                if len(delta_text) < KOREAN_EXTENSION_MIN_DELTA_CHARS:
+                    print(f"[A][skip][extension-too-short] delta='{delta_text}'")
+                    pending_src = None
+                    pending_speech_final = False
+                    held_src = None
+                    if pending_task and not pending_task.done():
+                        pending_task.cancel()
+                    pending_task = None
+                    return
+                print(f"[A][extension] prev='{last_norm[-40:]}' delta='{delta_text}'")
+                src_text_raw = delta_text
+                normalized = delta_text
 
             if last_norm and len(normalized) < len(last_norm):
                 delta = len(last_norm) - len(normalized)
