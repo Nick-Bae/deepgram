@@ -2963,11 +2963,29 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         # this, PMM restarts on the second half alone (e.g.
                         # "안으로 들어오시는") and its top-1 score collapses,
                         # delaying preview until the sentence is over.
+                        #
+                        # NOTE: held_src is cleared by Deepgram's SpeechStarted
+                        # event (line ~2895), which fires immediately when the
+                        # pastor keeps speaking through the split. That leaves
+                        # only pending_src carrying the accumulated fragment,
+                        # so we prefer pending_src (with the same "strongly
+                        # incomplete" gate the final-path join at ~3007 uses)
+                        # and fall back to held_src on the rare hold that
+                        # survived SpeechStarted.
                         pmm_prefix = transcript
-                        if held_src and src_lang.startswith("ko"):
-                            joined = join_korean_stt_segments(held_src, transcript)
-                            if joined and joined != transcript:
-                                pmm_prefix = joined
+                        if src_lang.startswith("ko"):
+                            fragment_ctx = None
+                            if (
+                                pending_src
+                                and is_strongly_incomplete_korean_segment(pending_src)
+                            ):
+                                fragment_ctx = pending_src
+                            elif held_src:
+                                fragment_ctx = held_src
+                            if fragment_ctx:
+                                joined = join_korean_stt_segments(fragment_ctx, transcript)
+                                if joined and joined != transcript:
+                                    pmm_prefix = joined
                         # Cold-start window widening: cursor stays at 0 until the
                         # first successful PREVIEW→COMMIT confirms it. Until then,
                         # score against ALL segments so the pastor can start
