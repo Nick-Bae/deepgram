@@ -2801,14 +2801,16 @@ class InMemoryMultiChurchStore:
 
                 monthly_reached = has_monthly_cap and int(org.get("currentMonthMinutes") or 0) >= max_minutes
                 trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(billing)
+                hard_monthly_reached = False
                 if monthly_reached:
                     plan_key_tick = str((billing or {}).get("planKey") or "trial")
                     if plan_key_tick == "trial":
                         org["hardCapReached"] = True
+                        hard_monthly_reached = True
                     elif not org.get("softCapReached"):
                         org["softCapReached"] = True
                         _dispatch_soft_cap_email(org_id, org)
-                if monthly_reached or trial_reached:
+                if hard_monthly_reached or trial_reached:
                     flagged[(org_id, room_id)] = "trial_expired" if trial_reached else "monthly_limit_reached"
 
             for (org_id, room_id), reason in sorted(flagged.items()):
@@ -5534,7 +5536,11 @@ class FirestoreMultiChurchStore:
                 continue
 
             current_minutes = int(org.get("currentMonthMinutes") or 0)
-            cap_reached = bool(org.get("hardCapReached")) if has_monthly_cap else False
+            plan_key_for_cap = str((billing or {}).get("planKey") or "trial")
+            hard_monthly_cap = has_monthly_cap and plan_key_for_cap == "trial"
+            soft_monthly_cap = has_monthly_cap and not hard_monthly_cap
+            cap_reached = bool(org.get("hardCapReached")) if hard_monthly_cap else False
+            soft_cap_reached = bool(org.get("softCapReached")) if soft_monthly_cap else False
             trial_billing_next = dict(billing)
             trial_reached = has_trial_cap and _billing_trial_minutes_exhausted(trial_billing_next)
 
@@ -5574,8 +5580,10 @@ class FirestoreMultiChurchStore:
                 next_tick_at = last_tick_at + timedelta(seconds=increments * tick_seconds)
                 self._room_ref(org_id, room_snap.id).set({"lastUsageTickAt": next_tick_at}, merge=True, timeout=_FS_TIMEOUT)
 
-                if has_monthly_cap and (current_minutes + org_delta) >= max_minutes:
+                if hard_monthly_cap and (current_minutes + org_delta) >= max_minutes:
                     cap_reached = True
+                if soft_monthly_cap and (current_minutes + org_delta) >= max_minutes:
+                    soft_cap_reached = True
                 if has_trial_cap and (trial_delta_seconds > 0):
                     _set_billing_trial_seconds_used(
                         trial_billing_next,
@@ -5585,17 +5593,15 @@ class FirestoreMultiChurchStore:
                     trial_reached = True
 
             trial_usage_changed = has_trial_cap and _billing_trial_seconds_used(trial_billing_next) != _billing_trial_seconds_used(billing)
-            plan_key_for_cap = str((billing or {}).get("planKey") or "trial")
-            if org_delta > 0 or cap_reached or trial_usage_changed:
+            if org_delta > 0 or cap_reached or soft_cap_reached or trial_usage_changed:
                 org_update: Dict[str, Any] = {}
                 if org_delta > 0:
                     org_update["currentMonthMinutes"] = gcf_firestore.Increment(org_delta)
                 if cap_reached:
-                    if plan_key_for_cap == "trial":
-                        org_update["hardCapReached"] = True
-                    elif not org.get("softCapReached"):
-                        org_update["softCapReached"] = True
-                        _dispatch_soft_cap_email(org_id, {**org, "billing": billing})
+                    org_update["hardCapReached"] = True
+                elif soft_cap_reached and not org.get("softCapReached"):
+                    org_update["softCapReached"] = True
+                    _dispatch_soft_cap_email(org_id, {**org, "billing": billing})
                 if has_trial_cap:
                     trial_billing_next["updatedAt"] = now
                     org_update["billing"] = dict(trial_billing_next)

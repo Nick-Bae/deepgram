@@ -3410,24 +3410,32 @@ export default function HostChurchPage() {
                 <div style={settingsGridStyle}>
                   <section style={settingsCardStyle}>
                     <p style={settingsSectionLabelStyle}>Policy Controls</p>
-                    <h3 style={settingsTitleStyle}>Billing Limits</h3>
+                    <h3 style={settingsTitleStyle}>Billing Limit Enforcement</h3>
                     <p style={settingsBodyTextStyle}>
-                      Toggle monthly hard-cap enforcement for this church only.
+                      Control whether this church follows billing usage stop rules.
                     </p>
                     {canManageBilling ? (
                       <>
                         <div style={{ border: `1px solid ${DC.border}`, background: DC.white, padding: "12px 14px", display: "grid", gap: 6 }}>
                           <p style={{ margin: 0, fontSize: 13, color: DC.mid }}>
-                            Status:{" "}
-                            <strong>{billingState ? (billingState.billingLimitsEnabled ? "Enabled" : "Disabled") : "Loading..."}</strong>
+                            Enforcement:{" "}
+                            <strong>{billingState ? (billingState.billingLimitsEnabled ? "On" : "Off") : "Loading..."}</strong>
                             {billingState && !billingState.globalBillingLimitsEnabled ? " · Global override currently disables all billing checks" : ""}
                           </p>
                           {billingState ? (
-                            <p style={{ margin: 0, fontSize: 12, color: DC.mid }}>
-                              Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
-                              {" · "}
-                              Hard cap: {billingState.hardCapReached ? "reached" : "not reached"}
-                            </p>
+                            <>
+                              <p style={{ margin: 0, fontSize: 12, color: DC.mid }}>
+                                Usage this month: {billingState.currentMonthMinutes} / {billingState.maxMinutesPerMonth > 0 ? billingState.maxMinutesPerMonth : "unlimited"} minutes
+                              </p>
+                              <p style={{ margin: 0, fontSize: 12, color: DC.mid }}>
+                                Broadcast blocking:{" "}
+                                {billingState.effectiveBillingLimitsEnabled
+                                  ? billingState.hardCapReached
+                                    ? "On because the hard cap is reached"
+                                    : "Off unless a true hard cap is reached"
+                                  : "Off; billing limits are ignored"}
+                              </p>
+                            </>
                           ) : null}
                         </div>
                         <div>
@@ -3443,8 +3451,8 @@ export default function HostChurchPage() {
                             {billingBusy
                               ? "Saving..."
                               : billingState?.billingLimitsEnabled
-                                ? "Disable Billing Limits"
-                                : "Enable Billing Limits"}
+                                ? "Turn Enforcement Off"
+                                : "Turn Enforcement On"}
                           </button>
                         </div>
                       </>

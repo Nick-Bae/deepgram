@@ -205,6 +205,44 @@ class BillingEntitlementTests(unittest.TestCase):
         billing = self.store.get_org_billing_profile(org_id=self.org_id)
         self.assertEqual(int(billing.get("trialSecondsUsed") or 0), 19 * 60)
 
+    def test_paid_monthly_cap_is_soft_and_does_not_flag_live_room(self) -> None:
+        self.store._orgs[self.org_id]["maxMinutesPerMonth"] = 500
+        self.store._orgs[self.org_id]["currentMonthMinutes"] = 499
+        self.store._orgs[self.org_id]["currentMonthKey"] = "202603"
+        self._set_billing(
+            status="active",
+            planKey="starter",
+            trialMinutesLimit=0,
+            trialMinutesUsed=0,
+            trialSecondsUsed=0,
+            trialEndsAt=None,
+            graceEndsAt=None,
+        )
+        started_at = datetime(2026, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+        with patch.object(multichurch_store_module, "_utcnow", return_value=started_at):
+            started = self.store.start_service(
+                self.org_id,
+                "sun-11am",
+                host_uid="owner-billing-entitlements",
+                source="ko",
+                target="en",
+            )
+        room_id = str(started.get("roomId") or "")
+        self.assertTrue(room_id)
+        self.store._rooms[(self.org_id, room_id)]["lastUsageTickAt"] = started_at
+
+        with (
+            patch.object(multichurch_store_module, "_utcnow", return_value=started_at + timedelta(seconds=60)),
+            patch.object(multichurch_store_module, "_dispatch_soft_cap_email") as dispatch_email,
+        ):
+            flagged = self.store.enforce_live_usage_caps(tick_seconds=60)
+
+        self.assertEqual(flagged, [])
+        self.assertEqual(int(self.store._orgs[self.org_id].get("currentMonthMinutes") or 0), 500)
+        self.assertTrue(bool(self.store._orgs[self.org_id].get("softCapReached")))
+        self.assertFalse(bool(self.store._orgs[self.org_id].get("hardCapReached")))
+        dispatch_email.assert_called_once()
+
     def test_disabled_billing_limits_skip_trial_usage_on_end_room(self) -> None:
         self.store._orgs[self.org_id]["billingLimitsEnabled"] = False
         self._set_billing(
