@@ -165,6 +165,9 @@ export default function ChurchServiceListenerPage() {
     onTranslatedAudio: handleTranslatedAudio,
   });
 
+  const enLinesRef = useRef<string[]>([]);
+  useEffect(() => { enLinesRef.current = enLines; }, [enLines]);
+
   const lastSpokenLineRef = useRef("");
 
   useEffect(() => {
@@ -197,7 +200,7 @@ export default function ChurchServiceListenerPage() {
         if (!rows.length) return;
         fallbackSeqRef.current = Math.max(fallbackSeqRef.current, ...rows.map((row) => row.seq));
         setFallbackEnLines((prev) => {
-          const seen = new Set([...prev, ...enLines].map(normalizeDisplayLine).filter(Boolean));
+          const seen = new Set([...prev, ...enLinesRef.current].map(normalizeDisplayLine).filter(Boolean));
           const nextRows = rows.filter((row) => {
             const normalized = normalizeDisplayLine(row.en);
             if (!normalized || seen.has(normalized)) return false;
@@ -213,11 +216,20 @@ export default function ChurchServiceListenerPage() {
     };
     void pollSegments();
     const timer = window.setInterval(pollSegments, SEGMENT_FALLBACK_POLL_MS);
+    // Force a catch-up poll the moment the tab returns to foreground —
+    // browsers throttle setTimeout/setInterval in background tabs, so the
+    // next scheduled tick could be seconds away, leaving the display frozen
+    // if the WS also died while backgrounded.
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void pollSegments();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       disposed = true;
       clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [enLines, resolveData?.activeRoomId, serviceKey, slug, socketEnabled]);
+  }, [resolveData?.activeRoomId, serviceKey, slug, socketEnabled]);
 
   useEffect(() => {
     const displayLines = fallbackEnLines.length ? fallbackEnLines : enLines;
