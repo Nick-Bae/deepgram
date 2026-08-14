@@ -27,7 +27,15 @@ class MatcherConfig:
     min_prefix_eojeol: int = 3
     partial_confirm_count: int = 2
     strong_confirm_count: int = 3
-    score_min: float = 0.84
+    # 2026-08-14: relaxed from 0.84 → 0.78. Real-sermon PIPELINE_TRACE
+    # analysis on the Genesis-17 test showed the ≥4s misses cluster in the
+    # 0.69-0.87 top-1-score band — capped by minor STT mis-transcriptions
+    # ("선대 여러분" vs "성도 여러분") and small paraphrase drift, not by
+    # PMM's matching logic itself. score_margin=0.10 stays as the anti-jump
+    # guard, so lowering the floor doesn't loosen the top-1-vs-top-2 gap.
+    # Watch deviationDetectedAt counts on the next real Sunday — if wrong
+    # segments start locking, revert to 0.82 or 0.84.
+    score_min: float = 0.78
     score_margin: float = 0.10
     old_score_collapse: float = 0.15
     deviation_streak: int = 4
