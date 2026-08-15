@@ -2356,6 +2356,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     # speaks one of its component sentences — visible in
                     # the 2026-08-15 log as "From now on, follow this
                     # plan…" broadcast 3× at seq=29/30/34.
+                    #
+                    # When this guard fires, SUPPRESS the broadcast entirely
+                    # (return without emitting). Earlier revision fell through
+                    # to live GPT translation — but that produced a
+                    # differently-worded LIVE English AFTER the same
+                    # sentence's REVIEWED English had already been shown via
+                    # the interim preview path. Listener saw the sentence
+                    # twice with different wording ("The first thing God
+                    # tells Abram is not what Abram must do," followed by
+                    # "The first thing God says is not what Abraham should
+                    # do, but who God Himself is."). Skipping the fallback
+                    # keeps the preview text as the only broadcast.
                     reviewed_dedup_key = norm_ws(reviewed_text).lower()
                     if (
                         reviewed_dedup_key
@@ -2363,9 +2375,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     ):
                         print(
                             f"[SERMON_REVIEW][skip-dup-text] path=send_translation "
-                            f"service={service_key} text-key={reviewed_dedup_key[:40]!r}"
+                            f"suppress-live=true service={service_key} "
+                            f"text-key={reviewed_dedup_key[:40]!r}"
                         )
-                        reviewed_text = ""  # fall through to live translation
+                        return
                 if reviewed_text:
                     translated = reviewed_text
                     live_mode = "reviewed"
