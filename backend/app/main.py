@@ -2776,13 +2776,33 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         if best_idx is None or idx < best_idx:
                             best_idx = idx
                             best_seg_id = mid
+                    # Max-jump guard. When the pastor reads a scripture that
+                    # appears only as short callbacks later in the manuscript
+                    # (e.g. "나는 전능한 하나님이라" verbatim at S051/S078 but
+                    # embedded inside the longer S015 verse), the fuzzy
+                    # matcher may not return S015 (length mismatch pulls its
+                    # similarity below threshold). The smallest forward match
+                    # is then a distant callback — jumping to it strands PMM
+                    # for the next 30+ segments. Cap the sync so a suspicious
+                    # jump is silently refused instead of cascading. Real
+                    # sequential misses recover in 1-4 segments; anything
+                    # >10 is almost certainly a wrong-scripture-callback match.
+                    PMM_CURSOR_SYNC_MAX_JUMP = 10
                     if best_seg_id is not None and best_idx + 1 > pmm_room_state.cursor:
                         prev_cursor = pmm_room_state.cursor
-                        pmm_room_state.advance_cursor_to(best_seg_id)
-                        print(
-                            f"[PMM] cursor-sync {prev_cursor}→{pmm_room_state.cursor} "
-                            f"via commit-time reviewed match seg={best_seg_id}"
-                        )
+                        jump = (best_idx + 1) - prev_cursor
+                        if jump > PMM_CURSOR_SYNC_MAX_JUMP:
+                            print(
+                                f"[PMM] cursor-sync-skip {prev_cursor}→{best_idx+1} "
+                                f"(jump={jump} > {PMM_CURSOR_SYNC_MAX_JUMP}) "
+                                f"via seg={best_seg_id} — likely wrong-scripture-callback"
+                            )
+                        else:
+                            pmm_room_state.advance_cursor_to(best_seg_id)
+                            print(
+                                f"[PMM] cursor-sync {prev_cursor}→{pmm_room_state.cursor} "
+                                f"via commit-time reviewed match seg={best_seg_id}"
+                            )
             else:
                 print(f"[A] FINAL {src_lang_full}->{tgt_lang_full} src='{src_text_raw}'")
                 await send_translation(src_text_raw, partial=False, live_mode_hint="live", update_ctx=True)
