@@ -36,6 +36,8 @@ import {
 } from "../../../lib/backendAuth";
 import { API_URL } from "../../../utils/urls";
 import { clearAuthToken, clearHostToken, clearRoomInSession, clearStreamContext, persistAuthToken, persistHostToken, persistStreamContext } from "../../../utils/streamContext";
+import { formatAbsoluteTime, formatRelativeTime } from "../../../utils/formatRelativeTime";
+import { getSermon } from "../../../lib/api/sermons";
 
 type ServiceRow = {
   serviceKey: string;
@@ -44,6 +46,7 @@ type ServiceRow = {
   activeRoomId?: string | null;
   lastRoomId?: string | null;
   roomStatus?: string;
+  linkedSermonId?: string | null;
   defaultLanguagePair?: { source?: string; target?: string };
 };
 
@@ -841,6 +844,46 @@ export default function HostChurchPage() {
     if (selectedService.defaultLanguagePair?.source) setSourceLang(selectedService.defaultLanguagePair.source);
     if (selectedService.defaultLanguagePair?.target) setTargetLang(selectedService.defaultLanguagePair.target);
   }, [selectedService?.serviceKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Linked-sermon version indicator: when a service has a linkedSermonId,
+  // pull its title/updatedAt/segment count so the host can confirm before
+  // pressing "Start Broadcast" that today's edits are the version loaded.
+  // Refetches on service change and on activeRoomId change so re-imports
+  // between service starts don't leave the panel stale.
+  const [linkedSermonInfo, setLinkedSermonInfo] = useState<{
+    sermonId: string;
+    title: string;
+    updatedAt: string;
+    segmentCount: number;
+  } | null>(null);
+  useEffect(() => {
+    const orgId = orgData?.orgId;
+    const linkedSermonId = selectedService?.linkedSermonId || null;
+    if (!orgId || !linkedSermonId) {
+      setLinkedSermonInfo(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const idToken = await getIdToken();
+        if (!idToken || cancelled) return;
+        const s = await getSermon(orgId, linkedSermonId, { idToken });
+        if (cancelled) return;
+        setLinkedSermonInfo({
+          sermonId: s.sermonId,
+          title: s.title,
+          updatedAt: s.updatedAt,
+          segmentCount: s.segments.length,
+        });
+      } catch {
+        if (!cancelled) setLinkedSermonInfo(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [orgData?.orgId, selectedService?.linkedSermonId, activeRoomId, getIdToken]);
 
   const displayUrl = useMemo(() => {
     const listenerServiceKey = (normalizedServiceKey || serviceKeyForStart).trim();
@@ -2568,6 +2611,33 @@ export default function HostChurchPage() {
                         <input value={serviceKey} onChange={(e) => { const k = e.target.value; setServiceKey(k); setActiveRoomId(null); persistStreamContext({ orgId: orgData?.orgId, serviceKey: k, churchSlug: slug }); }} placeholder={DEFAULT_SERVICE_KEY} style={{ width: "100%", ...broadcastFieldStyle, padding: "11px 14px", borderRadius: 16, fontSize: 14, outline: "none" }} />
                       )}
                       {!loading && orgData && !orgData.services?.length ? <div style={{ fontSize: 12, color: BC.mist }}>No services found. Create one in Church Settings.</div> : null}
+                      {linkedSermonInfo ? (
+                        <div
+                          title={`Sermon last modified: ${formatAbsoluteTime(linkedSermonInfo.updatedAt)}`}
+                          style={{
+                            marginTop: 6,
+                            fontSize: 12,
+                            color: BC.mist,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, color: BC.deep }}>📖 {linkedSermonInfo.title}</span>
+                          <span>·</span>
+                          <span>{linkedSermonInfo.segmentCount} segments</span>
+                          <span>·</span>
+                          <span>updated {formatRelativeTime(linkedSermonInfo.updatedAt)}</span>
+                          <span style={{ opacity: 0.6 }}>
+                            ({formatAbsoluteTime(linkedSermonInfo.updatedAt)})
+                          </span>
+                        </div>
+                      ) : selectedService && !selectedService.linkedSermonId ? (
+                        <div style={{ marginTop: 6, fontSize: 12, color: BC.mist, opacity: 0.7 }}>
+                          No sermon linked to this service.
+                        </div>
+                      ) : null}
                     </div>
                     {memberships.length > 1 ? (
                       <div className="broadcast-setup-field broadcast-church-field">

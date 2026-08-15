@@ -22,6 +22,7 @@ import {
   SermonApiError,
   SermonLintReport,
 } from "../../../lib/types/sermon";
+import { formatAbsoluteTime, formatRelativeTime } from "../../../utils/formatRelativeTime";
 
 const ADMIN_ROLES = new Set(["owner", "admin"]);
 const PAGE_SIZE = 50;
@@ -259,6 +260,20 @@ export default function AdminSermonDetailPage() {
                         ? "Draft"
                         : `${Math.round((reviewedCount / totalCount) * 100)}% reviewed`}
                 </p>
+                {sermon.updatedAt ? (
+                  <p
+                    className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700"
+                    title={`Last modified: ${formatAbsoluteTime(sermon.updatedAt)}`}
+                  >
+                    <span aria-hidden>●</span>
+                    <span>
+                      Version: updated {formatRelativeTime(sermon.updatedAt)}
+                    </span>
+                    <span className="text-slate-500">
+                      · {formatAbsoluteTime(sermon.updatedAt)}
+                    </span>
+                  </p>
+                ) : null}
               </div>
             </div>
           </header>
