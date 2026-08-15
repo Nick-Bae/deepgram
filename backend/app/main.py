@@ -3041,7 +3041,42 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             if fragment_ctx:
                                 joined = join_korean_stt_segments(fragment_ctx, transcript)
                                 if joined and joined != transcript:
-                                    pmm_prefix = joined
+                                    # Bias-guard: score BOTH forms and keep
+                                    # joined only if it produces a strictly
+                                    # better top-1 in the search window.
+                                    # When Deepgram fragmented one sentence,
+                                    # joined lets S010's score dominate as
+                                    # expected. But when the pastor moved
+                                    # to a new segment after a comma-ended
+                                    # segment (S010 ends "않았고,", S011
+                                    # begins "창세기…"), joining dilutes
+                                    # S011's score and PMM never previews
+                                    # S011. Try-both keeps both paths safe.
+                                    try:
+                                        _win = _pmm_search_window(
+                                            pmm_room_state.segments,
+                                            pmm_room_state.cursor,
+                                            PMM_CONFIG,
+                                        )
+                                        _top_alone = (
+                                            _pmm_score_all(transcript, _win)[:1] or [(None, 0.0)]
+                                        )[0][1]
+                                        _top_joined = (
+                                            _pmm_score_all(joined, _win)[:1] or [(None, 0.0)]
+                                        )[0][1]
+                                        # Require a meaningful margin — otherwise
+                                        # a tie goes to transcript-alone (predict
+                                        # what's happening now, not what came
+                                        # before). 0.05 is small enough to still
+                                        # win when the join is genuinely helpful.
+                                        if _top_joined > _top_alone + 0.05:
+                                            pmm_prefix = joined
+                                    except Exception:
+                                        # If scoring fails for any reason, fall
+                                        # back to the pre-guard behavior (use
+                                        # joined). Safer than crashing the
+                                        # interim path.
+                                        pmm_prefix = joined
                         # Cold-start window widening: cursor stays at 0 until the
                         # first successful PREVIEW→COMMIT confirms it. Until then,
                         # score against ALL segments so the pastor can start
