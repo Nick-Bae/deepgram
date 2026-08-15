@@ -2643,6 +2643,39 @@ async def ws_stt_deepgram(websocket: WebSocket):
             if normalized == last_norm:
                 return
 
+            # Punctuation-agnostic dedup: Deepgram sometimes emits the
+            # SAME sentence twice with only punctuation differing (e.g.
+            # "하나님 자신이 누구신가? 하는 것입니다." on one final and
+            # "하나님 자신이 누구신가 하는 것입니다." on the next). The
+            # exact-match check above misses these because norm_ws
+            # doesn't strip punctuation. If the punctuation-stripped
+            # forms match and the previous commit was recent, treat as
+            # a duplicate.
+            def _strip_dedup_punct(text: str) -> str:
+                # Strip ASCII + full-width punctuation and whitespace so
+                # `?`/`.`/`!` variations collapse to the same key.
+                out = []
+                for ch in text:
+                    if ch.isspace():
+                        continue
+                    if ch in '.,;:!?"\'()[]{}·-—…“”‘’「」『』〈〉《》?!.,':
+                        continue
+                    out.append(ch)
+                return "".join(out)
+            if (
+                last_norm
+                and _strip_dedup_punct(normalized) == _strip_dedup_punct(last_norm)
+                and (time.time() - last_ts) < SUBSET_SUPPRESS_WINDOW_SEC
+            ):
+                print(f"[A][skip][punct-dup] normalized='{normalized[:60]}'")
+                pending_src = None
+                pending_speech_final = False
+                held_src = None
+                if pending_task and not pending_task.done():
+                    pending_task.cancel()
+                pending_task = None
+                return
+
             # Extend-after-commit dedup: when the client-triggered finalize
             # commits a sentence at a partial's sentence boundary and Deepgram
             # then keeps extending the same utterance ("...않습니다." then
