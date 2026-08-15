@@ -2348,6 +2348,25 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         source_text=clean_src,
                     )
                 if reviewed_text:
+                    # Cross-path text-level dedup — mirrors the check in
+                    # emit_reviewed_segment_matches (b360e6e6). Without this,
+                    # a manuscript segment containing multiple sentences
+                    # ("...해라.' 그렇게 말씀하지 않으십니다.") gets its full
+                    # reviewed English rebroadcast each time the pastor
+                    # speaks one of its component sentences — visible in
+                    # the 2026-08-15 log as "From now on, follow this
+                    # plan…" broadcast 3× at seq=29/30/34.
+                    reviewed_dedup_key = norm_ws(reviewed_text).lower()
+                    if (
+                        reviewed_dedup_key
+                        and reviewed_dedup_key in emitted_review_text_keys
+                    ):
+                        print(
+                            f"[SERMON_REVIEW][skip-dup-text] path=send_translation "
+                            f"service={service_key} text-key={reviewed_dedup_key[:40]!r}"
+                        )
+                        reviewed_text = ""  # fall through to live translation
+                if reviewed_text:
                     translated = reviewed_text
                     live_mode = "reviewed"
                     meta_payload.update(
@@ -2358,6 +2377,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     )
                     if update_ctx:
                         translation_ctx.remember(clean_src, translated)
+                    emitted_review_text_keys.add(reviewed_dedup_key)
                     print(
                         f"[SERMON_REVIEW][match] service={service_key} "
                         f"seq={assigned_seq}"
