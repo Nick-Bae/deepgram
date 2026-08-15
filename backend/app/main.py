@@ -2032,6 +2032,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
         # words) can force-commit it only if pending_src still equals this snapshot.
         held_src: str | None = None
         emitted_review_segment_ids: set[str] = set()
+        # Parallel text-level dedup: normalized reviewed English already
+        # broadcast, so repeated scripture callbacks (S051 and S078 both
+        # = "I am God Almighty.") only fire once per session.
+        emitted_review_text_keys: set[str] = set()
         last_preview_norm: str = ""
         latest_partial: str = ""
         latest_partial_at: float = 0.0
@@ -2120,6 +2124,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
             if not matches:
                 return 0
 
+            # Text-level dedup: when the same reviewed English appears at
+            # multiple sermon segments (e.g., a scripture callback quoted
+            # at S051 AND S078 both = "I am God Almighty."), the fuzzy
+            # matcher returns all occurrences. Emitting each one produces
+            # duplicate identical broadcasts on the listener page. Track
+            # normalized reviewed text within this session and skip repeats.
             emitted = 0
             for match in matches:
                 segment_id = str(match.get("segmentId") or "").strip()
@@ -2139,6 +2149,17 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     source_text=source_text,
                 )
                 if not reviewed_text:
+                    continue
+                reviewed_dedup_key = norm_ws(reviewed_text).lower()
+                if reviewed_dedup_key and reviewed_dedup_key in emitted_review_text_keys:
+                    if segment_id:
+                        # Still mark the segment as emitted so future fuzzy
+                        # returns of it don't re-enter this loop.
+                        emitted_review_segment_ids.add(segment_id)
+                    print(
+                        f"[SERMON_REVIEW][skip-dup-text] service={service_key} "
+                        f"segment={segment_id or '?'} text-key={reviewed_dedup_key[:40]!r}"
+                    )
                     continue
 
                 seq += 1
@@ -2201,6 +2222,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 if segment_id:
                     emitted_review_segment_ids.add(segment_id)
+                if reviewed_dedup_key:
+                    emitted_review_text_keys.add(reviewed_dedup_key)
                 translation_ctx.remember(source_text, reviewed_text)
                 emitted += 1
                 print(
