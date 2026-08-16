@@ -2036,6 +2036,16 @@ async def ws_stt_deepgram(websocket: WebSocket):
         # broadcast, so repeated scripture callbacks (S051 and S078 both
         # = "I am God Almighty.") only fire once per session.
         emitted_review_text_keys: set[str] = set()
+        # Continuation-suppress: after PMM confirms a segment on a
+        # hold-bypass fragment, the REST of that segment (still being
+        # spoken) commits as its own utterance and falls through to live
+        # translation — producing a stray English broadcast alongside
+        # the already-shown reviewed English. Track (timestamp, korean)
+        # of recently confirmed segments; commit_now suppresses if the
+        # new Korean is a substring / significant overlap of one of
+        # these within a short window.
+        recent_confirmed_ko: list[tuple[float, str]] = []
+        _CONFIRMED_KO_WINDOW_SEC = 6.0
         last_preview_norm: str = ""
         latest_partial: str = ""
         latest_partial_at: float = 0.0
@@ -2708,6 +2718,42 @@ async def ws_stt_deepgram(websocket: WebSocket):
             if normalized == last_norm:
                 return
 
+            # Continuation-suppress: if the new commit's Korean is a
+            # substring of a recently PMM-confirmed segment's Korean
+            # (within CONFIRMED_KO_WINDOW_SEC), this is the rest of the
+            # sentence PMM already broadcast the reviewed English for.
+            # Skip the commit — otherwise we get the 2026-08-15
+            # screenshot dup: reviewed English shown via PREVIEW +
+            # live-translated continuation shown right after.
+            _now_ts = time.time()
+            recent_confirmed_ko[:] = [
+                (ts, ko) for ts, ko in recent_confirmed_ko
+                if _now_ts - ts <= _CONFIRMED_KO_WINDOW_SEC
+            ]
+            if src_lang.startswith("ko") and recent_confirmed_ko:
+                _new_stripped = norm_ws(src_text_raw).replace(" ", "")
+                for _ts, _ko in recent_confirmed_ko:
+                    _confirmed_stripped = norm_ws(_ko).replace(" ", "")
+                    if not _new_stripped or not _confirmed_stripped:
+                        continue
+                    # Skip if new is a substring of the confirmed segment's
+                    # Korean (the continuation case). Length gate prevents
+                    # tiny commits like "그" or "네" from matching every
+                    # confirmed segment.
+                    if len(_new_stripped) >= 4 and _new_stripped in _confirmed_stripped:
+                        print(
+                            f"[A][skip][continuation] "
+                            f"src='{src_text_raw[:50]}' "
+                            f"is-substring-of recent-confirmed='{_ko[:50]}'"
+                        )
+                        pending_src = None
+                        pending_speech_final = False
+                        held_src = None
+                        if pending_task and not pending_task.done():
+                            pending_task.cancel()
+                        pending_task = None
+                        return
+
             # Punctuation-agnostic dedup: Deepgram sometimes emits the
             # SAME sentence twice with only punctuation differing (e.g.
             # "하나님 자신이 누구신가? 하는 것입니다." on one final and
@@ -2891,6 +2937,22 @@ async def ws_stt_deepgram(websocket: WebSocket):
                                 f"[PMM] confirmed seg={action.seg_id} "
                                 f"cursor→{pmm_room_state.cursor}"
                             )
+                            # Track the confirmed segment's Korean so the
+                            # continuation-suppress check at commit_now
+                            # entry can suppress the rest-of-sentence
+                            # utterances that follow a hold-bypass confirm.
+                            try:
+                                _confirmed_seg = next(
+                                    (s for s in pmm_room_state.segments
+                                     if str(s.get("segmentId") or "") == action.seg_id),
+                                    None
+                                )
+                                if _confirmed_seg:
+                                    _confirmed_ko = str(_confirmed_seg.get("original") or "").strip()
+                                    if _confirmed_ko:
+                                        recent_confirmed_ko.append((time.time(), _confirmed_ko))
+                            except Exception:
+                                pass
                         elif isinstance(action, PMMRequestLiveTranslation):
                             trace.mark_committed(
                                 whole_sentence_score=None, source="live"
