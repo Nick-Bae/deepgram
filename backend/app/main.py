@@ -2145,6 +2145,49 @@ async def ws_stt_deepgram(websocket: WebSocket):
             state = pmm_room_state.state
             return getattr(state, "kind", None) == "PREVIEW"
 
+        def _pmm_preview_fragment_ratio(pending_text: str) -> float:
+            """Return fragment_length / previewed_segment_length as a ratio.
+
+            When the ratio is small (fragment much shorter than segment),
+            hold-bypass would cause PMM to confirm on a short prefix,
+            advance cursor, and orphan the rest of the sentence — the
+            2026-08-15 dup pattern. Use this to gate hold-bypass so it
+            only fires when the fragment is close to the full segment
+            (i.e., the pastor genuinely finished the segment even though
+            it ends grammatically incomplete, like scripture quotes
+            ending in 이르시되).
+
+            Returns 0.0 if PMM isn't previewing or the segment can't be
+            found — callers should treat that as "don't bypass".
+            """
+            if not pmm_room_state.enabled or not pending_text:
+                return 0.0
+            state = pmm_room_state.state
+            if getattr(state, "kind", None) != "PREVIEW":
+                return 0.0
+            seg_id = getattr(state, "seg_id", None)
+            if not seg_id:
+                return 0.0
+            seg = next(
+                (s for s in pmm_room_state.segments
+                 if str(s.get("segmentId") or "") == seg_id),
+                None,
+            )
+            if not seg:
+                return 0.0
+            seg_ko = str(seg.get("original") or "")
+            seg_stripped = "".join(seg_ko.split())
+            frag_stripped = "".join(pending_text.split())
+            if not seg_stripped:
+                return 0.0
+            return len(frag_stripped) / len(seg_stripped)
+
+        # Only bypass the incomplete-Korean hold when the fragment is
+        # substantially the whole segment. Below this ratio, holding
+        # (and letting subsequent partials join) is safer than force-
+        # committing a fragment PMM would then confirm on prematurely.
+        _PMM_BYPASS_MIN_RATIO = 0.60
+
         async def emit_reviewed_segment_matches(src_text_raw: str) -> int:
             nonlocal seq
             matches = await _reviewed_matches_for_source(src_text_raw)
@@ -3104,13 +3147,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             src_lang.startswith("ko")
                             and is_strongly_incomplete_korean_segment(pending_src)
                         ):
-                            if _pmm_previewing_now():
+                            _ratio = _pmm_preview_fragment_ratio(pending_src)
+                            if _pmm_previewing_now() and _ratio >= _PMM_BYPASS_MIN_RATIO:
                                 print(
                                     f"[A][hold-bypass][pmm-preview] "
                                     f"seg={pmm_room_state.state.seg_id} "
+                                    f"ratio={_ratio:.2f} "
                                     f"src='{pending_src[:60]}'"
                                 )
                             else:
+                                # Either PMM isn't previewing OR the fragment
+                                # is too short to trust as "the whole
+                                # segment" — hold so next partial can join.
                                 print("[A][hold][incomplete-ko]", pending_src)
                                 return
                         await commit_now(pending_src)
@@ -3165,11 +3213,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 if finalize_src:
                     try:
+                        _fin_ratio = _pmm_preview_fragment_ratio(finalize_src)
+                        _fin_bypass_ok = (
+                            _pmm_previewing_now() and _fin_ratio >= _PMM_BYPASS_MIN_RATIO
+                        )
                         if (
                             src_lang.startswith("ko")
                             and is_strongly_incomplete_korean_segment(finalize_src)
-                            and not _pmm_previewing_now()
+                            and not _fin_bypass_ok
                         ):
+                            # Hold if PMM is NOT confident OR the fragment
+                            # is too short vs its previewed segment. Same
+                            # ratio gate as the DG speech_final branch.
                             print("[A][hold][finalize-incomplete-ko]", finalize_src)
                         elif (
                             not used_latest_partial_fallback
@@ -3180,11 +3235,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             if (
                                 src_lang.startswith("ko")
                                 and is_strongly_incomplete_korean_segment(finalize_src)
-                                and _pmm_previewing_now()
+                                and _fin_bypass_ok
                             ):
                                 print(
                                     f"[A][hold-bypass][pmm-preview] "
                                     f"path=finalize seg={pmm_room_state.state.seg_id} "
+                                    f"ratio={_fin_ratio:.2f} "
                                     f"src='{finalize_src[:60]}'"
                                 )
                             await commit_now(finalize_src)
@@ -3220,17 +3276,26 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         pending_src
                         and src_lang.startswith("ko")
                         and is_strongly_incomplete_korean_segment(pending_src)
+                        and not _pmm_previewing_now()
                     ):
-                        # Stuck-pending fallback. When arm_timer's
-                        # _wait_and_commit skips commit on an incomplete
-                        # Korean fragment (waiting for a continuation
-                        # that never arrives), pending_src would sit
-                        # forever with no held_src set — the earlier
-                        # match=True branch above can't help because
-                        # held_src is None. Deepgram's UtteranceEnd is
-                        # the "no more speech" signal, so commit what
-                        # we have instead of leaving the fragment
-                        # permanently orphaned.
+                        # Stuck-pending fallback. Only fire when PMM is
+                        # NOT in PREVIEW — if PMM has locked a preview,
+                        # its reviewed English is already on-screen and
+                        # force-committing the fragment would cause PMM
+                        # to confirm on the short fragment (fragment vs
+                        # full segment length is often 25-45%), which
+                        # advances cursor prematurely and orphans the
+                        # rest of the sentence as a live-translated
+                        # broadcast. That's the 2026-08-15 dup pattern
+                        # the user has been seeing: reviewed English
+                        # via PMM PREVIEW + live English of the
+                        # continuation.
+                        #
+                        # When PMM is NOT previewing, this is the
+                        # original "pastor spoke a fragment and stopped"
+                        # case ac38a8d7 was written for — flush the
+                        # fragment as live translation so the listener
+                        # sees something instead of silence.
                         print(
                             f"[DG][utterance-end][stuck-incomplete] "
                             f"pending='{pending_src[:80]}' — force-committing"
@@ -3467,18 +3532,25 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     if looks_complete(pending_src):
                         held_src = None
                         await commit_now(pending_src)
-                    elif _pmm_previewing_now():
-                        # PMM has locked a PREVIEW with high confidence
-                        # for this segment — trust it and commit the
-                        # fragment now instead of holding for the (never-
-                        # coming) grammatical completion. Fixes scripture
-                        # quotes that end in connective particles like
-                        # "이르시되" — the manuscript segment IS that
-                        # fragment, and holding just swallows it into the
-                        # next segment's utterance.
+                    elif (
+                        _pmm_previewing_now()
+                        and _pmm_preview_fragment_ratio(pending_src) >= _PMM_BYPASS_MIN_RATIO
+                    ):
+                        # PMM has locked a PREVIEW AND the fragment is
+                        # substantially the whole segment (≥60% by
+                        # character length) — trust PMM and commit
+                        # immediately. Fixes scripture quotes ending in
+                        # connective particles like "이르시되" where the
+                        # manuscript segment IS that short-form fragment.
+                        # If the ratio is below the threshold, fall
+                        # through to the normal hold path so the pastor's
+                        # remaining speech can join instead of the
+                        # fragment being force-committed and PMM
+                        # confirming prematurely on a short prefix.
                         print(
                             f"[DG][hold-bypass][pmm-preview] "
                             f"seg={pmm_room_state.state.seg_id} "
+                            f"ratio={_pmm_preview_fragment_ratio(pending_src):.2f} "
                             f"src='{pending_src[:60]}' speech_final=True"
                         )
                         held_src = None
