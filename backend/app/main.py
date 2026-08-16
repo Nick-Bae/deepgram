@@ -2741,6 +2741,49 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 pending_task = None
                 return
 
+            # Small-edit-distance dedup: Deepgram occasionally emits a
+            # near-duplicate correction like "이제 칠 자를" then "이제 칠
+            # 절을" for the same audio. The strings share a long prefix
+            # but diverge by 1-2 characters, so the exact/punct/extension
+            # guards don't catch them. If the previous commit was very
+            # recent and the character-level Levenshtein distance is
+            # small relative to length, treat as a correction and skip.
+            if (
+                last_norm
+                and (time.time() - last_ts) < 1.5  # short window — this is a correction
+                and abs(len(normalized) - len(last_norm)) <= 3
+            ):
+                _stripped_new = _strip_dedup_punct(normalized)
+                _stripped_prev = _strip_dedup_punct(last_norm)
+                if (
+                    _stripped_new
+                    and _stripped_prev
+                    and abs(len(_stripped_new) - len(_stripped_prev)) <= 3
+                ):
+                    # Cheap same-length char diff count. For different
+                    # lengths, count length delta plus mismatches in
+                    # the overlapping prefix.
+                    def _rough_edit_diff(a: str, b: str) -> int:
+                        if a == b:
+                            return 0
+                        min_len = min(len(a), len(b))
+                        diffs = sum(1 for i in range(min_len) if a[i] != b[i])
+                        diffs += abs(len(a) - len(b))
+                        return diffs
+                    _diff = _rough_edit_diff(_stripped_new, _stripped_prev)
+                    if _diff > 0 and _diff <= 3:
+                        print(
+                            f"[A][skip][edit-dup] diff={_diff} "
+                            f"prev='{last_norm[:50]}' new='{normalized[:50]}'"
+                        )
+                        pending_src = None
+                        pending_speech_final = False
+                        held_src = None
+                        if pending_task and not pending_task.done():
+                            pending_task.cancel()
+                        pending_task = None
+                        return
+
             # Extend-after-commit dedup: when the client-triggered finalize
             # commits a sentence at a partial's sentence boundary and Deepgram
             # then keeps extending the same utterance ("...않습니다." then
@@ -2990,6 +3033,21 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             await emit_preview(piece)
                     except Exception as exc:
                         print("[EARLY][finalize][error]", exc)
+
+                # Grace window before falling back to the latest partial:
+                # the client-side finalize sometimes fires on a partial's
+                # sentence-boundary just as Deepgram is about to emit the
+                # corrected final. Without the delay, the interim (which
+                # may contain a mishearing like "칠 자를" for "칠 절을")
+                # commits, and Deepgram's proper final then commits AGAIN
+                # a moment later — the listener sees the same utterance
+                # broadcast twice with different English. Waiting ~350ms
+                # lets Deepgram's is_final=True arrive first; if it does,
+                # pending_src gets set and the fallback branch below skips.
+                try:
+                    await asyncio.sleep(0.35)
+                except asyncio.CancelledError:
+                    break
 
                 finalize_src = pending_src
                 used_latest_partial_fallback = False
