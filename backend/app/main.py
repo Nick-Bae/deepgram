@@ -2118,6 +2118,23 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print("[SERMON_REVIEW][progress-error]", exc)
                 return []
 
+        def _pmm_previewing_now() -> bool:
+            """Return True when PMM has locked a PREVIEW with confidence.
+
+            Used to bypass the is_strongly_incomplete_korean_segment hold
+            in commit-flow branches: when PMM is confident it knows what
+            segment the pastor is on (top-1 above SCORE_MIN, margin above
+            SCORE_MARGIN, streak confirmed), holding a scripture quote
+            that ends with a connective particle (e.g., "이르시되") just
+            swallows it into a mega-utterance with the following segment.
+            Instead, commit the fragment immediately and let PMM confirm
+            via the whole_sentence_score path.
+            """
+            if not pmm_room_state.enabled:
+                return False
+            state = pmm_room_state.state
+            return getattr(state, "kind", None) == "PREVIEW"
+
         async def emit_reviewed_segment_matches(src_text_raw: str) -> int:
             nonlocal seq
             matches = await _reviewed_matches_for_source(src_text_raw)
@@ -2927,8 +2944,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             src_lang.startswith("ko")
                             and is_strongly_incomplete_korean_segment(pending_src)
                         ):
-                            print("[A][hold][incomplete-ko]", pending_src)
-                            return
+                            if _pmm_previewing_now():
+                                print(
+                                    f"[A][hold-bypass][pmm-preview] "
+                                    f"seg={pmm_room_state.state.seg_id} "
+                                    f"src='{pending_src[:60]}'"
+                                )
+                            else:
+                                print("[A][hold][incomplete-ko]", pending_src)
+                                return
                         await commit_now(pending_src)
                 except asyncio.CancelledError:
                     pass
@@ -2969,6 +2993,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         if (
                             src_lang.startswith("ko")
                             and is_strongly_incomplete_korean_segment(finalize_src)
+                            and not _pmm_previewing_now()
                         ):
                             print("[A][hold][finalize-incomplete-ko]", finalize_src)
                         elif (
@@ -2977,6 +3002,16 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         ):
                             await arm_timer(cjk_hold_ms(finalize_src))
                         else:
+                            if (
+                                src_lang.startswith("ko")
+                                and is_strongly_incomplete_korean_segment(finalize_src)
+                                and _pmm_previewing_now()
+                            ):
+                                print(
+                                    f"[A][hold-bypass][pmm-preview] "
+                                    f"path=finalize seg={pmm_room_state.state.seg_id} "
+                                    f"src='{finalize_src[:60]}'"
+                                )
                             await commit_now(finalize_src)
                     except Exception:
                         pass
@@ -3233,6 +3268,22 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 if speech_final and pending_src:
                     if looks_complete(pending_src):
+                        held_src = None
+                        await commit_now(pending_src)
+                    elif _pmm_previewing_now():
+                        # PMM has locked a PREVIEW with high confidence
+                        # for this segment — trust it and commit the
+                        # fragment now instead of holding for the (never-
+                        # coming) grammatical completion. Fixes scripture
+                        # quotes that end in connective particles like
+                        # "이르시되" — the manuscript segment IS that
+                        # fragment, and holding just swallows it into the
+                        # next segment's utterance.
+                        print(
+                            f"[DG][hold-bypass][pmm-preview] "
+                            f"seg={pmm_room_state.state.seg_id} "
+                            f"src='{pending_src[:60]}' speech_final=True"
+                        )
                         held_src = None
                         await commit_now(pending_src)
                     else:
