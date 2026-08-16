@@ -2669,16 +2669,24 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             lock_score=pmm_room_state.state.lock_score,
                             prefix_len=pmm_room_state.state.confirmations,
                         )
-                    # Track the reviewed text so downstream dedup guards
-                    # in emit_reviewed_segment_matches / send_translation
-                    # catch commit-path re-broadcasts of the same segment.
-                    # Without this, PMM PREVIEW shows the reviewed English,
-                    # then commit_now (or a subsequent interim partial with
-                    # the same fuzzy match) broadcasts it AGAIN — visible
-                    # to the listener as duplication. The hold-bypass fix
-                    # (d70bc016) made this dominant path fire far more
-                    # often, exposing this gap.
+                    # Dedup CHECK (not just add): if emit_reviewed_segment_matches
+                    # or send_translation already broadcast this reviewed
+                    # English earlier this session, skip this PMM preview
+                    # broadcast. 2026-08-15 screenshot showed the exact
+                    # dup: emit_reviewed_segment_matches fired on an
+                    # interim partial ("segment=S196 seq=3") and
+                    # immediately after PMM entered PREVIEW for the same
+                    # S196 and rebroadcast the identical reviewed English.
+                    # Track BOTH ways: add to the set on emission so
+                    # downstream paths dedup too, but read the set first
+                    # to catch when we're the second in line.
                     _pmm_review_key = norm_ws(action.reviewed_text or "").lower()
+                    if _pmm_review_key and _pmm_review_key in emitted_review_text_keys:
+                        print(
+                            f"[PMM][skip-dup-preview] seg={action.seg_id} "
+                            f"text-key={_pmm_review_key[:40]!r}"
+                        )
+                        continue  # skip broadcast; already emitted this session
                     if _pmm_review_key:
                         emitted_review_text_keys.add(_pmm_review_key)
                     payload = {
@@ -2703,6 +2711,13 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             from_seg_id=action.from_seg_id, to_seg_id=action.to_seg_id
                         )
                     _pmm_review_key = norm_ws(action.reviewed_text or "").lower()
+                    if _pmm_review_key and _pmm_review_key in emitted_review_text_keys:
+                        print(
+                            f"[PMM][skip-dup-preview] kind=replace "
+                            f"seg={action.to_seg_id} "
+                            f"text-key={_pmm_review_key[:40]!r}"
+                        )
+                        continue
                     if _pmm_review_key:
                         emitted_review_text_keys.add(_pmm_review_key)
                     payload = {
