@@ -2616,6 +2616,18 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             lock_score=pmm_room_state.state.lock_score,
                             prefix_len=pmm_room_state.state.confirmations,
                         )
+                    # Track the reviewed text so downstream dedup guards
+                    # in emit_reviewed_segment_matches / send_translation
+                    # catch commit-path re-broadcasts of the same segment.
+                    # Without this, PMM PREVIEW shows the reviewed English,
+                    # then commit_now (or a subsequent interim partial with
+                    # the same fuzzy match) broadcasts it AGAIN — visible
+                    # to the listener as duplication. The hold-bypass fix
+                    # (d70bc016) made this dominant path fire far more
+                    # often, exposing this gap.
+                    _pmm_review_key = norm_ws(action.reviewed_text or "").lower()
+                    if _pmm_review_key:
+                        emitted_review_text_keys.add(_pmm_review_key)
                     payload = {
                         "type": "translation",
                         "text": action.reviewed_text,
@@ -2637,6 +2649,9 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         trace.mark_corrective_replacement(
                             from_seg_id=action.from_seg_id, to_seg_id=action.to_seg_id
                         )
+                    _pmm_review_key = norm_ws(action.reviewed_text or "").lower()
+                    if _pmm_review_key:
+                        emitted_review_text_keys.add(_pmm_review_key)
                     payload = {
                         "type": "translation",
                         "text": action.reviewed_text,
