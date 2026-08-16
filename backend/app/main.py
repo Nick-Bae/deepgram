@@ -2835,10 +2835,24 @@ async def ws_stt_deepgram(websocket: WebSocket):
             setattr(commit_now, "_last_src", src_text_raw)
 
             pmm_confirmed = False
+            pmm_was_previewing = False
+            pmm_preview_seg_id: str | None = None
             if pmm_room_state.enabled:
                 trace = pmm_room_state.ensure_trace()
                 now_ms = int(time.time() * 1000)
                 current_state = pmm_room_state.state
+                # Snapshot PREVIEW state BEFORE pmm_advance so we can detect
+                # the hold-bypass-then-no-confirm case: PMM had a locked
+                # preview (its reviewed English was already broadcast via
+                # pmm_broadcast_actions), then hold-bypass committed a
+                # fragment that doesn't confirm the preview. Falling through
+                # to live translation would broadcast a stray live rendering
+                # of the fragment ("약속을" → "covenant") ALONGSIDE the
+                # already-shown full sentence — the exact user-visible dup
+                # from the 2026-08-15 screenshot.
+                if current_state.kind == "PREVIEW":
+                    pmm_was_previewing = True
+                    pmm_preview_seg_id = getattr(current_state, "seg_id", None)
                 if (
                     current_state.kind == "PREVIEW"
                     and pmm_room_state.preview_shown_at_ms is not None
@@ -2885,6 +2899,32 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             # fall through to normal commit path below
                 except Exception as exc:
                     print("[PMM][commit-error]", exc)
+
+            # Trust-PMM-preview guard: if PMM was in PREVIEW at commit entry
+            # AND did NOT confirm this commit, the previewed segment's
+            # reviewed English was already broadcast via pmm_broadcast_actions.
+            # Falling through to live/reviewed emission now would broadcast a
+            # SECOND English string for the same intent — visible as
+            # duplication. Skip the fall-through and let PMM's preview stand.
+            if (
+                not pmm_confirmed
+                and pmm_was_previewing
+                and pmm_preview_seg_id
+            ):
+                print(
+                    f"[A][skip][pmm-preview-shown] seg={pmm_preview_seg_id} "
+                    f"src='{src_text_raw[:60]}' — preview already broadcast"
+                )
+                last_preview_norm = ""
+                latest_partial = ""
+                latest_partial_at = 0.0
+                pending_src = None
+                pending_speech_final = False
+                held_src = None
+                if pending_task and not pending_task.done():
+                    pending_task.cancel()
+                pending_task = None
+                return
 
             if pmm_confirmed:
                 # Reviewed English already on screen from the preview; skip
