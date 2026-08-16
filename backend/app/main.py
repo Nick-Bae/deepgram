@@ -3041,6 +3041,28 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         force_src = pending_src
                         held_src = None
                         await commit_now(force_src)
+                    elif (
+                        pending_src
+                        and src_lang.startswith("ko")
+                        and is_strongly_incomplete_korean_segment(pending_src)
+                    ):
+                        # Stuck-pending fallback. When arm_timer's
+                        # _wait_and_commit skips commit on an incomplete
+                        # Korean fragment (waiting for a continuation
+                        # that never arrives), pending_src would sit
+                        # forever with no held_src set — the earlier
+                        # match=True branch above can't help because
+                        # held_src is None. Deepgram's UtteranceEnd is
+                        # the "no more speech" signal, so commit what
+                        # we have instead of leaving the fragment
+                        # permanently orphaned.
+                        print(
+                            f"[DG][utterance-end][stuck-incomplete] "
+                            f"pending='{pending_src[:80]}' — force-committing"
+                        )
+                        force_src = pending_src
+                        held_src = None
+                        await commit_now(force_src)
                     else:
                         print(
                             f"[DG][utterance-end] held='{held_src or ''}' "
