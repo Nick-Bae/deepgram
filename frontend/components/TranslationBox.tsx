@@ -173,7 +173,7 @@ export default function TranslationBox({
   const [text, setText] = useState('')
   const [translated, setTranslated] = useState('')
   const [isListening, setIsListening] = useState(false)
-  const [isMuted, setIsMuted] = useState(false)
+  const [isMuted, setIsMuted] = useState(true)
   const [volume, setVolume] = useState(1)
   const [voicePreference, setVoicePreference] = useState('en-US-Standard-D')
   const [ttsProvider, setTtsProvider] = useState<TTSProvider>('google')
