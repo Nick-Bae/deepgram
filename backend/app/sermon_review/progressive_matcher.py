@@ -42,6 +42,15 @@ class MatcherConfig:
     min_dwell_ms: int = 1200
     search_window_back: int = 1
     search_window_forward: int = 5
+    # Cursor-bias fast-preview — relax gate thresholds ONLY when the top-1
+    # scored segment is segments[cursor] (the next-in-sequence one). Non-
+    # adjacent (jump) matches still need the full strict prefix + partial-
+    # confirm gates. Trades a little safety for earlier reveal when the
+    # pastor stays on-script; score_min/score_margin are unchanged so we
+    # still require a strong top-1 vs top-2 gap.
+    cursor_bias_partial_confirm_count: int = 1
+    cursor_bias_min_prefix_chars: int = 4
+    cursor_bias_min_prefix_eojeol: int = 2
 
 
 DEFAULT_CONFIG = MatcherConfig()
@@ -190,6 +199,30 @@ def _prefix_qualifies(prefix: str, config: MatcherConfig) -> bool:
     )
 
 
+def _prefix_qualifies_cursor_bias(prefix: str, config: MatcherConfig) -> bool:
+    """Looser prefix requirement used only when the top-scored segment is
+    segments[cursor]. Bounded by cursor position → safe to fire earlier."""
+    return (
+        len(prefix) >= config.cursor_bias_min_prefix_chars
+        or _eojeol_count(prefix) >= config.cursor_bias_min_prefix_eojeol
+    )
+
+
+def _cursor_segment_id(
+    cursor: int,
+    segments: list[dict[str, Any]],
+) -> Optional[str]:
+    """seg_id at cursor position, skipping Skip-marked segments (FR-15).
+    Returns None if cursor is past the end or every remaining segment is
+    Skip."""
+    for seg in segments[cursor:]:
+        if str(seg.get("status") or "Draft") == "Skip":
+            continue
+        seg_id = str(seg.get("segmentId") or "")
+        return seg_id or None
+    return None
+
+
 def _passes_gates(scored: list[tuple[dict[str, Any], float]], config: MatcherConfig) -> bool:
     if not scored:
         return False
@@ -236,16 +269,28 @@ def _on_interim(
     segments: list[dict[str, Any]],
     config: MatcherConfig,
 ) -> tuple[State, list[Action]]:
-    if not _prefix_qualifies(event.prefix, config):
+    # Cursor-bias thresholds are the loosest — if the prefix doesn't meet
+    # even those, no path can fire yet.
+    if not _prefix_qualifies_cursor_bias(event.prefix, config):
         return state, []
 
     window = _search_window(segments, cursor, config)
     scored = _score_all(event.prefix, window)
 
+    # Cursor-adjacent = top-1 segment is segments[cursor]. When true, use
+    # cursor-bias gates (fewer confirmations, looser prefix). When false,
+    # non-adjacent (jump) matches must clear the strict prefix gate.
+    adjacent_seg_id = _cursor_segment_id(cursor, segments)
+    top_seg_id = str(scored[0][0].get("segmentId") or "") if scored else ""
+    is_adjacent = bool(adjacent_seg_id) and top_seg_id == adjacent_seg_id
+
+    if not is_adjacent and not _prefix_qualifies(event.prefix, config):
+        return state, []
+
     if state.kind == "IDLE":
-        return _from_idle(state, scored, config)
+        return _from_idle(state, scored, config, is_adjacent=is_adjacent)
     if state.kind == "CANDIDATE":
-        return _from_candidate(state, scored, config)
+        return _from_candidate(state, scored, config, is_adjacent=is_adjacent)
     if state.kind == "PREVIEW":
         return _from_preview(state, event, scored, window, config)
     if state.kind == "DEVIATED":
@@ -255,18 +300,46 @@ def _on_interim(
     return state, []
 
 
+def _effective_partial_confirm_count(config: MatcherConfig, is_adjacent: bool) -> int:
+    return (
+        config.cursor_bias_partial_confirm_count
+        if is_adjacent
+        else config.partial_confirm_count
+    )
+
+
 def _from_idle(
     state: State,
     scored: list[tuple[dict[str, Any], float]],
     config: MatcherConfig,
+    *,
+    is_adjacent: bool,
 ) -> tuple[State, list[Action]]:
     if not _passes_gates(scored, config):
         return state, []
     top_seg, top_score = scored[0]
+    top_id = str(top_seg.get("segmentId") or "")
+
+    # Cursor-bias fast path: skip CANDIDATE and PREVIEW in one interim
+    # when the top segment is the next-in-sequence one AND config says
+    # cursor-bias needs only one confirmation.
+    if is_adjacent and _effective_partial_confirm_count(config, True) <= 1:
+        reviewed_text = _segment_reviewed_text(top_seg)
+        return (
+            State(
+                kind="PREVIEW",
+                seg_id=top_id,
+                confirmations=1,
+                lock_score=top_score,
+                preview_shown_at_ms=None,
+            ),
+            [ShowPreview(seg_id=top_id, reviewed_text=reviewed_text)],
+        )
+
     return (
         State(
             kind="CANDIDATE",
-            seg_id=str(top_seg.get("segmentId") or ""),
+            seg_id=top_id,
             confirmations=1,
             lock_score=top_score,
         ),
@@ -278,13 +351,30 @@ def _from_candidate(
     state: State,
     scored: list[tuple[dict[str, Any], float]],
     config: MatcherConfig,
+    *,
+    is_adjacent: bool,
 ) -> tuple[State, list[Action]]:
     if not _passes_gates(scored, config):
         return INITIAL_STATE, []
     top_seg, top_score = scored[0]
     top_id = str(top_seg.get("segmentId") or "")
+    effective_count = _effective_partial_confirm_count(config, is_adjacent)
+
     if top_id != state.seg_id:
-        # Different top segment — reset the candidate to the new one.
+        # Different top segment — reset. Fast-path applies to the new
+        # candidate too when it's the cursor-adjacent one.
+        if is_adjacent and effective_count <= 1:
+            reviewed_text = _segment_reviewed_text(top_seg)
+            return (
+                State(
+                    kind="PREVIEW",
+                    seg_id=top_id,
+                    confirmations=1,
+                    lock_score=top_score,
+                    preview_shown_at_ms=None,
+                ),
+                [ShowPreview(seg_id=top_id, reviewed_text=reviewed_text)],
+            )
         return (
             State(
                 kind="CANDIDATE",
@@ -296,7 +386,7 @@ def _from_candidate(
         )
     confirmations = state.confirmations + 1
     lock_score = max(state.lock_score, top_score)
-    if confirmations < config.partial_confirm_count:
+    if confirmations < effective_count:
         return (
             replace(state, confirmations=confirmations, lock_score=lock_score),
             [],
