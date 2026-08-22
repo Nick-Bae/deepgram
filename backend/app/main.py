@@ -55,7 +55,11 @@ from app.routes import billing as billing_routes
 from app.routes import admin as admin_routes
 from app.routes import sermon_review as sermon_review_routes
 from app.routes import pipeline_trace as pipeline_trace_routes
-from app.sermon_review.lookup import get_reviewed_matches, get_reviewed_text
+from app.sermon_review.lookup import (
+    _similarity as _sermon_similarity,
+    get_reviewed_matches,
+    get_reviewed_text,
+)
 from app.sermon_review.progressive_matcher import (
     CommitEvent as PMMCommitEvent,
     DEFAULT_CONFIG as PMM_CONFIG,
@@ -801,6 +805,59 @@ def _uid_from_id_token(raw_token: Optional[str]) -> Optional[str]:
     except Exception:
         return None
     return _clean_token(user.uid) if user else None
+
+
+_PMM_TAIL_EXTRACT_MIN_OVERFLOW_RATIO = 1.05
+_PMM_TAIL_EXTRACT_MIN_CHARS = 3
+_PMM_TAIL_EXTRACT_MIN_PREFIX_SIM = 0.70
+_PMM_TAIL_TERMINATOR_RE = re.compile(r'[.!?。？！…]["\'”’」』]?\s+')
+
+
+def _pmm_extract_tail_after_commit(
+    committed_text: str, segment_original: str
+) -> str:
+    """When a PMM-confirmed commit contains MORE Korean than the confirmed
+    segment's original text (Deepgram merged the next short segment into
+    the same output — the "주께서" pattern from 2026-08-22), return the
+    trailing portion that goes beyond the segment.
+
+    Empty string when no meaningful overflow exists. Splits candidates at
+    sentence terminators (.!?。？！… optionally followed by a closing quote)
+    and picks the prefix with the highest similarity to segment_original.
+    The returned tail can be re-injected into PMM as a fresh InterimEvent
+    so the absorbed segment gets its own preview cycle.
+    """
+    if not committed_text or not segment_original:
+        return ""
+    committed_stripped = "".join(committed_text.split())
+    segment_stripped = "".join(segment_original.split())
+    if not segment_stripped:
+        return ""
+    if len(committed_stripped) < len(segment_stripped) * _PMM_TAIL_EXTRACT_MIN_OVERFLOW_RATIO:
+        return ""
+
+    split_positions = [m.end() for m in _PMM_TAIL_TERMINATOR_RE.finditer(committed_text)]
+    if not split_positions:
+        return ""
+
+    best_pos: Optional[int] = None
+    best_score = 0.0
+    for pos in split_positions:
+        prefix = committed_text[:pos].strip()
+        if not prefix:
+            continue
+        score = _sermon_similarity(prefix, segment_original)
+        if score > best_score:
+            best_score = score
+            best_pos = pos
+
+    if best_pos is None or best_score < _PMM_TAIL_EXTRACT_MIN_PREFIX_SIM:
+        return ""
+
+    tail = committed_text[best_pos:].strip()
+    if len(tail) < _PMM_TAIL_EXTRACT_MIN_CHARS:
+        return ""
+    return tail
 
 
 def _try_reload_sermon(
@@ -2999,6 +3056,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                             # continuation-suppress check at commit_now
                             # entry can suppress the rest-of-sentence
                             # utterances that follow a hold-bypass confirm.
+                            _confirmed_ko: str = ""
                             try:
                                 _confirmed_seg = next(
                                     (s for s in pmm_room_state.segments
@@ -3011,6 +3069,42 @@ async def ws_stt_deepgram(websocket: WebSocket):
                                         recent_confirmed_ko.append((time.time(), _confirmed_ko))
                             except Exception:
                                 pass
+
+                            # Tail-recycle: when Deepgram merged the next
+                            # short segment into the same output (e.g.
+                            # "…말합니다. 주께서" absorbed S227), extract
+                            # the trailing portion beyond the confirmed
+                            # segment and re-inject as a fresh PMM interim
+                            # so the absorbed segment gets its own preview
+                            # cycle. Only fires when committed text
+                            # substantially overflows segment length.
+                            _pmm_tail = _pmm_extract_tail_after_commit(
+                                src_text_raw, _confirmed_ko
+                            )
+                            if _pmm_tail:
+                                try:
+                                    _tail_state, _tail_actions = pmm_advance(
+                                        pmm_room_state.state,
+                                        PMMInterimEvent(prefix=_pmm_tail, now_ms=now_ms),
+                                        cursor=pmm_room_state.cursor,
+                                        segments=pmm_room_state.segments,
+                                        config=_pmm_effective_config,
+                                    )
+                                    pmm_room_state.state = _tail_state
+                                    _tail_action_kinds = [
+                                        type(a).__name__ for a in _tail_actions
+                                    ]
+                                    print(
+                                        f"[PMM][tail-recycle] "
+                                        f"prev_seg={action.seg_id} "
+                                        f"tail='{_pmm_tail[:60]}' "
+                                        f"cursor={pmm_room_state.cursor} "
+                                        f"actions={_tail_action_kinds}"
+                                    )
+                                    if _tail_actions:
+                                        await pmm_broadcast_actions(_tail_actions)
+                                except Exception as exc:
+                                    print(f"[PMM][tail-recycle-error] {exc}")
                         elif isinstance(action, PMMRequestLiveTranslation):
                             trace.mark_committed(
                                 whole_sentence_score=None, source="live"
