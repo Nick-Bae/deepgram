@@ -46,11 +46,20 @@ class MatcherConfig:
     # scored segment is segments[cursor] (the next-in-sequence one). Non-
     # adjacent (jump) matches still need the full strict prefix + partial-
     # confirm gates. Trades a little safety for earlier reveal when the
-    # pastor stays on-script; score_min/score_margin are unchanged so we
-    # still require a strong top-1 vs top-2 gap.
+    # pastor stays on-script; score_margin (top-1 vs top-2 gap) is
+    # unchanged so we still reject ambiguous matches.
     cursor_bias_partial_confirm_count: int = 1
     cursor_bias_min_prefix_chars: int = 4
     cursor_bias_min_prefix_eojeol: int = 2
+    # 2026-08-22: added to catch STT-mistranscription band. Real tests
+    # showed on-script segments scoring 0.70-0.77 (e.g. Deepgram heard
+    # "사 대 행정 이 장" for "사도행전 2장" → score 0.70 → fell through
+    # to live GPT → hallucinated "Psalm 24 is exactly that" for Acts 2).
+    # Applied ONLY at the ENTRY gate for cursor-adjacent segments. The
+    # score_margin=0.10 guard is unchanged, so a slightly-lower top-1
+    # cannot beat a comparable top-2. Deviation detection inside PREVIEW
+    # keeps strict 0.78 so genuine off-script drift still fires.
+    cursor_bias_score_min: float = 0.72
 
 
 DEFAULT_CONFIG = MatcherConfig()
@@ -223,12 +232,24 @@ def _cursor_segment_id(
     return None
 
 
-def _passes_gates(scored: list[tuple[dict[str, Any], float]], config: MatcherConfig) -> bool:
+def _passes_gates(
+    scored: list[tuple[dict[str, Any], float]],
+    config: MatcherConfig,
+    *,
+    is_adjacent: bool = False,
+) -> bool:
+    """Score-based entry gate. When is_adjacent=True (top-1 == segments[cursor]),
+    use the looser cursor_bias_score_min; otherwise use strict score_min.
+    score_margin is unchanged in both paths so ambiguous top-1 vs top-2 is
+    always rejected."""
     if not scored:
         return False
     top_score = scored[0][1]
     second_score = scored[1][1] if len(scored) > 1 else 0.0
-    if top_score < config.score_min:
+    effective_score_min = (
+        config.cursor_bias_score_min if is_adjacent else config.score_min
+    )
+    if top_score < effective_score_min:
         return False
     if (top_score - second_score) < config.score_margin:
         return False
@@ -315,7 +336,7 @@ def _from_idle(
     *,
     is_adjacent: bool,
 ) -> tuple[State, list[Action]]:
-    if not _passes_gates(scored, config):
+    if not _passes_gates(scored, config, is_adjacent=is_adjacent):
         return state, []
     top_seg, top_score = scored[0]
     top_id = str(top_seg.get("segmentId") or "")
@@ -354,7 +375,7 @@ def _from_candidate(
     *,
     is_adjacent: bool,
 ) -> tuple[State, list[Action]]:
-    if not _passes_gates(scored, config):
+    if not _passes_gates(scored, config, is_adjacent=is_adjacent):
         return INITIAL_STATE, []
     top_seg, top_score = scored[0]
     top_id = str(top_seg.get("segmentId") or "")

@@ -513,10 +513,10 @@ class CursorBiasFastPathTests(unittest.TestCase):
         self.assertEqual(state.kind, "IDLE")
         self.assertEqual(actions, [])
 
-    def test_cursor_adjacent_still_blocked_by_score_min(self) -> None:
-        # cursor-bias relaxes prefix + confirm count only. score_min /
-        # score_margin are unchanged — a low-score adjacent match must
-        # still fail.
+    def test_cursor_adjacent_still_blocked_below_cursor_bias_score_min(self) -> None:
+        # Adjacent path still has a floor — cursor_bias_score_min=0.72 by
+        # default. A wholly-unrelated prefix scores near 0 and fails even
+        # the lower gate. score_margin is unchanged in both paths.
         segments = [
             _seg("seg-1", "완전히 다른 내용 여기에 있습니다 확실히."),
         ]
@@ -555,6 +555,83 @@ class CursorBiasFastPathTests(unittest.TestCase):
         self.assertEqual(state.kind, "CANDIDATE")
         self.assertEqual(state.seg_id, "seg-2")
         self.assertEqual(actions, [])
+
+
+class CursorBiasScoreGateTests(unittest.TestCase):
+    """cursor_bias_score_min lowers the ENTRY score gate for cursor-adjacent
+    matches. Simulates the STT-mistranscription band (~0.70-0.77) where the
+    pastor is on-script but Deepgram garbled the Korean enough to fail the
+    strict 0.78 gate. Non-adjacent matches still require strict score_min.
+    """
+
+    def setUp(self) -> None:
+        self.segments = [
+            _seg("seg-1", "첫번째 문장은 완전히 다른 내용입니다."),
+            _seg("seg-2", "우리가 거짓말을 하는 이유는 진실보다 더 지키고 싶은 것이 있기 때문입니다."),
+            _seg("seg-3", "다른 문장이 여기에 있습니다 확실히."),
+        ]
+
+    def test_adjacent_passes_lowered_score_gate(self) -> None:
+        # Config: strict=1.05 (impossible), cursor-bias=0.5. Exact-match
+        # prefix scores 1.0 → passes cursor-bias (adjacent), fails strict.
+        config = MatcherConfig(score_min=1.05, cursor_bias_score_min=0.5)
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
+            cursor=1, segments=self.segments,  # adjacent = seg-2
+            config=config,
+        )
+        self.assertEqual(state.kind, "PREVIEW")
+        self.assertEqual(state.seg_id, "seg-2")
+        self.assertIsInstance(actions[0], ShowPreview)
+
+    def test_non_adjacent_still_uses_strict_score_gate(self) -> None:
+        # Same config, but cursor=0 → adjacent=seg-1, top-1=seg-2 →
+        # non-adjacent → strict gate (1.05) applies → IDLE.
+        config = MatcherConfig(score_min=1.05, cursor_bias_score_min=0.5)
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
+            cursor=0, segments=self.segments,
+            config=config,
+        )
+        self.assertEqual(state.kind, "IDLE")
+        self.assertEqual(actions, [])
+
+    def test_adjacent_below_cursor_bias_score_min_stays_idle(self) -> None:
+        # cursor_bias_score_min set above any achievable score → adjacent
+        # match still cannot enter PREVIEW.
+        config = MatcherConfig(score_min=1.05, cursor_bias_score_min=1.05)
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
+            cursor=1, segments=self.segments,
+            config=config,
+        )
+        self.assertEqual(state.kind, "IDLE")
+        self.assertEqual(actions, [])
+
+    def test_adjacent_score_margin_still_enforced(self) -> None:
+        # Two segments with identical prefix → margin=0 → both paths fail.
+        # Lowered cursor_bias_score_min does NOT bypass the anti-jump guard.
+        shared_prefix = "우리가 예수님을 사랑하는 것은"
+        segments = [
+            _seg("seg-1", f"{shared_prefix} 첫번째 이유가 있기 때문입니다."),
+            _seg("seg-2", f"{shared_prefix} 두번째 이유가 있기 때문입니다."),
+        ]
+        config = MatcherConfig(score_min=1.05, cursor_bias_score_min=0.5)
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix=shared_prefix, now_ms=1000),
+            cursor=0, segments=segments,  # adjacent = seg-1, tied score with seg-2
+            config=config,
+        )
+        self.assertEqual(state.kind, "IDLE")
+        self.assertEqual(actions, [])
+
+    def test_default_config_cursor_bias_below_strict(self) -> None:
+        # Sanity: the shipped default values maintain cursor_bias < strict.
+        self.assertLess(DEFAULT_CONFIG.cursor_bias_score_min, DEFAULT_CONFIG.score_min)
 
 
 if __name__ == "__main__":
