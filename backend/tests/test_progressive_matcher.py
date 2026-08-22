@@ -37,7 +37,12 @@ def _seg(seg_id: str, original: str, reviewed: str = "", status: str = "Reviewed
 
 
 class HappyPathTests(unittest.TestCase):
-    """IDLE → CANDIDATE → PREVIEW on two confirmations of the same segment."""
+    """IDLE → CANDIDATE → PREVIEW on two confirmations of the same segment.
+
+    These tests exercise the strict (non-adjacent) path where the top-scoring
+    segment is NOT segments[cursor]. Cursor-bias fast-path is covered
+    separately in CursorBiasFastPathTests.
+    """
 
     def setUp(self) -> None:
         self.segments = [
@@ -47,10 +52,11 @@ class HappyPathTests(unittest.TestCase):
         ]
 
     def test_idle_to_candidate_on_first_qualifying_interim(self) -> None:
+        # cursor=0 → adjacent=seg-1, top-1=seg-2 → non-adjacent → strict path
         state, actions = advance(
             INITIAL_STATE,
             InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
-            cursor=1,
+            cursor=0,
             segments=self.segments,
         )
         self.assertEqual(state.kind, "CANDIDATE")
@@ -62,12 +68,12 @@ class HappyPathTests(unittest.TestCase):
         state, _ = advance(
             INITIAL_STATE,
             InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
-            cursor=1, segments=self.segments,
+            cursor=0, segments=self.segments,
         )
         state, actions = advance(
             state,
             InterimEvent(prefix="우리가 거짓말을 하는 이유는", now_ms=1200),
-            cursor=1, segments=self.segments,
+            cursor=0, segments=self.segments,
         )
         self.assertEqual(state.kind, "PREVIEW")
         self.assertEqual(state.seg_id, "seg-2")
@@ -101,7 +107,10 @@ class MinimumThresholdTests(unittest.TestCase):
 
 class CandidateResetTests(unittest.TestCase):
     def test_candidate_resets_when_top_switches(self) -> None:
+        # Add a lead segment so cursor=0 → adjacent=seg-0, keeping the
+        # switch between seg-1 and seg-2 on the strict (non-adjacent) path.
         segments = [
+            _seg("seg-0", "완전히 무관한 서두 문장이 여기에 있습니다."),
             _seg("seg-1", "우리가 거짓말을 하는 이유는 있습니다."),
             _seg("seg-2", "다른 주제로 이야기를 시작합니다 완전히."),
         ]
@@ -157,15 +166,17 @@ class PreviewNoOpTests(unittest.TestCase):
     """Once locked into PREVIEW, ordinary interim revisions don't replace."""
 
     def _reach_preview(self, segments):
+        # cursor=0 → adjacent=seg-1, top-1=seg-2 → non-adjacent → strict path
+        # (needs 2 confirmations before PREVIEW fires).
         state, _ = advance(
             INITIAL_STATE,
             InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
-            cursor=1, segments=segments,
+            cursor=0, segments=segments,
         )
         state, actions = advance(
             state,
             InterimEvent(prefix="우리가 거짓말을 하는 이유는", now_ms=1200),
-            cursor=1, segments=segments,
+            cursor=0, segments=segments,
         )
         self.assertEqual(state.kind, "PREVIEW")
         self.assertIsInstance(actions[0], ShowPreview)
@@ -180,7 +191,7 @@ class PreviewNoOpTests(unittest.TestCase):
         state, actions = advance(
             state,
             InterimEvent(prefix="우리가 거짓말을 하는 이유는 진실보다", now_ms=1400),
-            cursor=1, segments=segments,
+            cursor=0, segments=segments,
         )
         self.assertEqual(state.kind, "PREVIEW")
         self.assertEqual(state.seg_id, "seg-2")
@@ -199,15 +210,19 @@ class CorrectiveReplacementTests(unittest.TestCase):
         ]
 
     def _reach_preview_on_seg2(self, now_ms: int):
+        # cursor=0 → adjacent=seg-1, top-1=seg-2 → non-adjacent → strict path
+        # (needs 2 confirmations before PREVIEW fires). Kept on strict path
+        # so the corrective-replacement flow below tests non-adjacent
+        # behavior end-to-end.
         state, _ = advance(
             INITIAL_STATE,
             InterimEvent(prefix="우리가 거짓말을 하는", now_ms=now_ms),
-            cursor=1, segments=self.segments,
+            cursor=0, segments=self.segments,
         )
         state, actions = advance(
             state,
             InterimEvent(prefix="우리가 거짓말을 하는 이유는", now_ms=now_ms + 200),
-            cursor=1, segments=self.segments,
+            cursor=0, segments=self.segments,
         )
         # In production, the caller updates preview_shown_at_ms from the
         # ShowPreview action's timestamp. Simulate that here by forcing the
@@ -224,7 +239,7 @@ class CorrectiveReplacementTests(unittest.TestCase):
             state, actions = advance(
                 state,
                 InterimEvent(prefix=new_prefix, now_ms=ts),
-                cursor=1, segments=self.segments,
+                cursor=0, segments=self.segments,
             )
             if i < 2:
                 self.assertEqual(state.kind, "PREVIEW")
@@ -268,7 +283,7 @@ class CorrectiveReplacementTests(unittest.TestCase):
             state, actions = advance(
                 state,
                 InterimEvent(prefix=new_prefix, now_ms=ts),
-                cursor=1, segments=self.segments,
+                cursor=0, segments=self.segments,
             )
             self.assertEqual(state.kind, "PREVIEW")
             self.assertEqual(state.seg_id, "seg-2")  # dwell blocks
@@ -399,16 +414,18 @@ class CommitTests(unittest.TestCase):
 
     def test_commit_from_candidate_requests_live_gpt(self) -> None:
         segments = self._segments()
+        # cursor=0 → adjacent=seg-1, top-1=seg-2 → non-adjacent → strict path
+        # produces CANDIDATE after one interim.
         state, _ = advance(
             INITIAL_STATE,
             InterimEvent(prefix="우리가 거짓말을 하는", now_ms=0),
-            cursor=1, segments=segments,
+            cursor=0, segments=segments,
         )
         self.assertEqual(state.kind, "CANDIDATE")
         state, actions = advance(
             state,
             CommitEvent(full_text="우리가 거짓말", now_ms=5000),
-            cursor=1, segments=segments,
+            cursor=0, segments=segments,
         )
         self.assertEqual(state, INITIAL_STATE)
         self.assertIsInstance(actions[0], RequestLiveTranslation)
@@ -422,6 +439,122 @@ class CommitTests(unittest.TestCase):
         )
         self.assertEqual(state, INITIAL_STATE)
         self.assertIsInstance(actions[0], RequestLiveTranslation)
+
+
+class CursorBiasFastPathTests(unittest.TestCase):
+    """Cursor-adjacent shortcut: when the top-scoring segment is
+    segments[cursor], PREVIEW fires after one interim (skipping CANDIDATE),
+    and prefix qualification uses the looser cursor-bias thresholds."""
+
+    def setUp(self) -> None:
+        self.segments = [
+            _seg("seg-1", "첫번째 문장 완전히 다른 내용이 여기에."),
+            _seg("seg-2", "우리가 거짓말을 하는 이유는 진실보다 더 지키고 싶은 것이 있기 때문입니다."),
+            _seg("seg-3", "다른 주제로 넘어가는 다음 문장입니다."),
+        ]
+
+    def test_cursor_adjacent_idle_to_preview_in_one_interim(self) -> None:
+        # cursor=1 → adjacent=seg-2, top-1=seg-2 → fast PREVIEW immediately.
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
+            cursor=1, segments=self.segments,
+        )
+        self.assertEqual(state.kind, "PREVIEW")
+        self.assertEqual(state.seg_id, "seg-2")
+        self.assertEqual(state.confirmations, 1)
+        self.assertEqual(len(actions), 1)
+        self.assertIsInstance(actions[0], ShowPreview)
+        self.assertEqual(actions[0].seg_id, "seg-2")
+
+    def test_cursor_adjacent_short_prefix_qualifies(self) -> None:
+        # 7-char, 2-eojeol prefix — below strict (8 chars / 3 eojeol) but
+        # above cursor-bias (4 chars / 2 eojeol). Adjacent path fires.
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말", now_ms=1000),
+            cursor=1, segments=self.segments,
+        )
+        self.assertEqual(state.kind, "PREVIEW")
+        self.assertEqual(state.seg_id, "seg-2")
+        self.assertIsInstance(actions[0], ShowPreview)
+
+    def test_cursor_adjacent_below_min_prefix_still_idle(self) -> None:
+        # 2-char, 1-eojeol — below cursor-bias floor. No action.
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리", now_ms=1000),
+            cursor=1, segments=self.segments,
+        )
+        self.assertEqual(state.kind, "IDLE")
+        self.assertEqual(actions, [])
+
+    def test_non_adjacent_top_still_needs_strict_gates(self) -> None:
+        # cursor=0 → adjacent=seg-1, but prefix matches seg-2 (non-adjacent).
+        # Non-adjacent path applies → CANDIDATE, needs a second confirmation.
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
+            cursor=0, segments=self.segments,
+        )
+        self.assertEqual(state.kind, "CANDIDATE")
+        self.assertEqual(state.seg_id, "seg-2")
+        self.assertEqual(actions, [])
+
+    def test_non_adjacent_short_prefix_below_strict_stays_idle(self) -> None:
+        # 7-char, 2-eojeol prefix qualifies cursor-bias but NOT strict
+        # (strict needs ≥8 chars OR ≥3 eojeols). cursor=0 → adjacent=seg-1,
+        # top-1=seg-2 → non-adjacent → strict gate applies → IDLE.
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말", now_ms=1000),
+            cursor=0, segments=self.segments,
+        )
+        self.assertEqual(state.kind, "IDLE")
+        self.assertEqual(actions, [])
+
+    def test_cursor_adjacent_still_blocked_by_score_min(self) -> None:
+        # cursor-bias relaxes prefix + confirm count only. score_min /
+        # score_margin are unchanged — a low-score adjacent match must
+        # still fail.
+        segments = [
+            _seg("seg-1", "완전히 다른 내용 여기에 있습니다 확실히."),
+        ]
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="아무 상관 없는 다른 텍스트", now_ms=1000),
+            cursor=0, segments=segments,
+        )
+        self.assertEqual(state.kind, "IDLE")
+        self.assertEqual(actions, [])
+
+    def test_cursor_adjacent_skip_marked_segment_is_bypassed(self) -> None:
+        # If segments[cursor] is Skip, adjacent = the next non-Skip segment.
+        segments = [
+            _seg("seg-0", "완전히 무관한 첫 문장입니다.", status="Skip"),
+            _seg("seg-1", "우리가 거짓말을 하는 이유는 여기 있습니다."),
+        ]
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
+            cursor=0, segments=segments,
+        )
+        self.assertEqual(state.kind, "PREVIEW")
+        self.assertEqual(state.seg_id, "seg-1")
+        self.assertIsInstance(actions[0], ShowPreview)
+
+    def test_cursor_bias_disabled_falls_back_to_strict(self) -> None:
+        # Setting cursor_bias_partial_confirm_count=2 reverts fast path.
+        strict_config = MatcherConfig(cursor_bias_partial_confirm_count=2)
+        state, actions = advance(
+            INITIAL_STATE,
+            InterimEvent(prefix="우리가 거짓말을 하는", now_ms=1000),
+            cursor=1, segments=self.segments,
+            config=strict_config,
+        )
+        self.assertEqual(state.kind, "CANDIDATE")
+        self.assertEqual(state.seg_id, "seg-2")
+        self.assertEqual(actions, [])
 
 
 if __name__ == "__main__":
