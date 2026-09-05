@@ -1089,7 +1089,6 @@ async def _room_sweeper_loop() -> None:
                 except Exception as exc:
                     print(f"[ROOM_SWEEPER] end_room failed org={org_id} room={room_id} err={exc}")
                     continue
-                manager.forget_room(org_id, room_id)
                 try:
                     await manager.broadcast_room(
                         org_id,
@@ -1114,6 +1113,7 @@ async def _room_sweeper_loop() -> None:
                     )
                 except Exception:
                     pass
+                manager.forget_room(org_id, room_id)
             _check_spend_alerts()
         except asyncio.CancelledError:
             break

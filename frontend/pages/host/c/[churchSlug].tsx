@@ -758,12 +758,6 @@ export default function HostChurchPage() {
         rowRoomId = localRoomId || null;
       } else if (pendingRoomSync?.roomId === localRoomId) {
         pendingRoomSyncRef.current = null;
-      } else if (preserveLocalActiveRoom && localRoomId) {
-        rowRoomId = localRoomId;
-        console.warn("[HOST][room-sync][preserve-local-active-room]", {
-          serviceKey: selectedKey || serviceKey,
-          roomId: localRoomId,
-        });
       }
 
       setActiveRoomId(rowRoomId);
