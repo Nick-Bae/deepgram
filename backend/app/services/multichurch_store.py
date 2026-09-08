@@ -27,8 +27,10 @@ except Exception:  # pragma: no cover - auth module may be unavailable in some t
 
 try:
     from google.cloud import firestore as gcf_firestore  # type: ignore
+    from google.api_core import exceptions as gcf_api_exceptions  # type: ignore
 except Exception:  # pragma: no cover - optional dependency in dev
     gcf_firestore = None
+    gcf_api_exceptions = None
 
 
 def _utcnow() -> datetime:
@@ -3990,19 +3992,18 @@ class FirestoreMultiChurchStore:
         if not clean_event_id:
             raise ValueError("invalid_event_id")
         ref = self._billing_event_ref(clean_event_id)
-        snap = ref.get(timeout=_FS_TIMEOUT)
-        if snap.exists:
+        try:
+            ref.create(
+                {
+                    "eventId": clean_event_id,
+                    "eventType": str(event_type or "").strip(),
+                    "payload": dict(payload or {}),
+                    "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                },
+                timeout=_FS_TIMEOUT,
+            )
+        except gcf_api_exceptions.AlreadyExists:
             return False
-        ref.set(
-            {
-                "eventId": clean_event_id,
-                "eventType": str(event_type or "").strip(),
-                "payload": dict(payload or {}),
-                "createdAt": gcf_firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-            timeout=_FS_TIMEOUT,
-        )
         return True
 
     def get_org_billing_limits(
