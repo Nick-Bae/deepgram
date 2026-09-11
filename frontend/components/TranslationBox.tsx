@@ -79,7 +79,7 @@ const TTS_PROVIDER_OPTIONS = [
 ] as const
 
 type TTSProvider = (typeof TTS_PROVIDER_OPTIONS)[number]['value']
-type TranslationEngine = 'deepgram' | 'openai-realtime-translate' | 'gemini-live-translate'
+export type TranslationEngine = 'deepgram' | 'openai-realtime-translate' | 'gemini-live-translate'
 type BroadcastIssueTone = 'warning' | 'critical'
 type BroadcastIssue = {
   id: string
@@ -152,6 +152,9 @@ type TranslationBoxProps = {
   roomId: string
   sourceLang: string
   targetLang: string
+  engine: TranslationEngine
+  onEngineChange: (value: TranslationEngine) => void
+  onListeningChange?: (listening: boolean) => void
   onAutoStartComplete?: () => void
   onAutoStartFailed?: (message: string) => void
   onSourceLangChange: (value: string) => void
@@ -163,6 +166,9 @@ export default function TranslationBox({
   roomId,
   sourceLang,
   targetLang,
+  engine: translationEngine,
+  onEngineChange: setTranslationEngine,
+  onListeningChange,
   onAutoStartComplete,
   onAutoStartFailed,
   onSourceLangChange,
@@ -182,13 +188,15 @@ export default function TranslationBox({
   const [text, setText] = useState('')
   const [translated, setTranslated] = useState('')
   const [isListening, setIsListening] = useState(false)
+  useEffect(() => {
+    onListeningChange?.(isListening)
+  }, [isListening, onListeningChange])
   const [isMuted, setIsMuted] = useState(true)
   const [volume, setVolume] = useState(1)
   const [voicePreference, setVoicePreference] = useState('en-US-Standard-D')
   const [ttsProvider, setTtsProvider] = useState<TTSProvider>('google')
   const [isBroadcasting, setIsBroadcasting] = useState(true)
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
-  const [translationEngine, setTranslationEngine] = useState<TranslationEngine>('deepgram')
   const [displaySpeed, setDisplaySpeed] = useState(1)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const [socketClock, setSocketClock] = useState(() => Date.now())
@@ -1646,20 +1654,6 @@ export default function TranslationBox({
 
               {showAdvancedControls ? (
                 <div className="grid gap-3" style={dashboardCardStyle}>
-                  <div className="grid gap-1.5 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
-                    <label style={utilityLabelStyle}>Translation Engine</label>
-                    <select
-                      value={translationEngine}
-                      onChange={e => setTranslationEngine(e.target.value as TranslationEngine)}
-                      disabled={isListening}
-                      className="w-full rounded-[0.9rem] px-3 py-2 text-sm font-medium focus:outline-none"
-                      style={{ ...inputStyle, border: 'none', opacity: isListening ? 0.62 : 1 }}
-                    >
-                      <option value="deepgram" className="bg-white text-slate-900">Deepgram + GPT text translation</option>
-                      <option value="openai-realtime-translate" className="bg-white text-slate-900">OpenAI gpt-realtime-translate</option>
-                      <option value="gemini-live-translate" className="bg-white text-slate-900">Gemini 3.5 Live Translate (preview)</option>
-                    </select>
-                  </div>
                   <div className="grid gap-2 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
                     <div className="flex items-center justify-between gap-4">
                       <span style={utilityBodyStyle}>Display speed</span>
