@@ -44,7 +44,7 @@ jobs:
             --region ${{ secrets.CLOUD_RUN_REGION }} \
             --platform managed \
             --min-instances=1 \
-            --max-instances=5 \
+            --max-instances=1 \
             --concurrency=80 \
             --cpu=1 \
             --memory=1Gi \
