@@ -107,6 +107,16 @@ SILENCE_COMMIT_MS=450
 ROOM_IDLE_TIMEOUT_SEC=900
 ROOM_MAX_DURATION_SEC=10800
 
+# Redis Pub/Sub cross-instance fanout (required for Cloud Run --max-instances > 1)
+# See docs/02-design/features/redis-pubsub-fanout.design.md
+REDIS_ENABLED=0                     # 0 = local-only broadcast; 1 = publish/subscribe via Redis
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_PASSWORD=
+REDIS_CHANNEL_PREFIX=worshiptranslate
+REDIS_SEQ_TTL_SEC=86400
+INSTANCE_ID=                        # auto-generated per process if empty
+
 # DANGER — production must NOT set these
 DISABLE_BILLING_LIMITS=      # Must be unset or 0 in prod
 MASTER_USER_UIDS=            # Must be empty in prod
@@ -168,6 +178,13 @@ Pastors can review and correct machine translations offline in Google Sheets, th
 ### Key WebSocket Endpoints
 - `/ws/stt_deepgram` — Host audio input (requires auth)
 - `/ws/translate` — Listener translation output (public, rate-limited)
+
+### Cross-instance broadcast (Redis Pub/Sub)
+- `app/services/redis_pubsub.py` — refcounted async pub/sub client
+- When `REDIS_ENABLED=1`, `ConnectionManager.broadcast_room()` publishes to Redis; the subscriber on every instance delivers to its own local sockets. When off (default), it delivers locally only.
+- Callsites don't change — the adapter lives inside `socket_manager.py`.
+- Design: `docs/02-design/features/redis-pubsub-fanout.design.md`
+- Local smoke test: `docs/03-analysis/redis-pubsub-smoke.md`
 
 ### Firestore Data Model
 - `organizations/{orgId}` — Org config, billing state, plan, prompt overrides

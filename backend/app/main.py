@@ -1154,6 +1154,12 @@ async def _on_startup():
         f"host_presence_grace={ROOM_HOST_PRESENCE_GRACE_SEC}s "
         f"host_presence_end_rooms={ROOM_HOST_PRESENCE_END_ROOMS}"
     )
+    from app.services.redis_pubsub import pubsub as _pubsub
+    if _pubsub.enabled:
+        await _pubsub.start()
+        print(f"[REDIS_PUBSUB] enabled connected={_pubsub.connected} instance={ENV.INSTANCE_ID}")
+    else:
+        print("[REDIS_PUBSUB] disabled (REDIS_ENABLED=0) — local-only broadcast")
     asyncio.create_task(_cleanup_live_rooms_on_startup())
     if _room_sweeper_task is None or _room_sweeper_task.done():
         _room_sweeper_task = asyncio.create_task(_room_sweeper_loop())
@@ -1169,6 +1175,11 @@ async def _on_shutdown():
         except asyncio.CancelledError:
             pass
     _room_sweeper_task = None
+    try:
+        from app.services.redis_pubsub import pubsub as _pubsub
+        await _pubsub.stop()
+    except Exception as exc:
+        print(f"[REDIS_PUBSUB][shutdown-error] {exc}")
 
 # ------------------------------------------------------------------------------
 # Consumer hub: /ws/translate

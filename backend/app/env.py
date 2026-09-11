@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +15,13 @@ def _env_str(*names: str, default: str = "") -> str:
         if raw:
             return raw
     return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 
 class ENV:
@@ -47,6 +55,18 @@ class ENV:
     SERMON_XLSX_MAX_DECOMPRESSED_BYTES: int = int(
         os.getenv("SERMON_XLSX_MAX_DECOMPRESSED_BYTES", str(50 * 1024 * 1024))
     )
+
+    # Redis Pub/Sub cross-instance fanout (redis-pubsub-fanout feature).
+    # When enabled, broadcast_room publishes to Redis instead of only local sockets,
+    # so listeners on any Cloud Run instance receive translations.
+    REDIS_ENABLED: bool = _env_bool("REDIS_ENABLED", False)
+    REDIS_HOST: str = _env_str("REDIS_HOST", default="127.0.0.1")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    REDIS_CHANNEL_PREFIX: str = _env_str("REDIS_CHANNEL_PREFIX", default="worshiptranslate")
+    REDIS_SEQ_TTL_SEC: int = int(os.getenv("REDIS_SEQ_TTL_SEC", "86400"))
+    REDIS_CONNECT_TIMEOUT_SEC: float = float(os.getenv("REDIS_CONNECT_TIMEOUT_SEC", "5"))
+    INSTANCE_ID: str = _env_str("INSTANCE_ID", default=f"inst-{uuid.uuid4().hex[:12]}")
 
     @classmethod
     def resolve_translation_model(cls, model_override: str | None = None, *, sermon: bool = False) -> str:

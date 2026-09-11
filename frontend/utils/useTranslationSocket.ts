@@ -132,6 +132,14 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
   const seqRef = useRef(0);
   const nextSeq = () => ++seqRef.current;
 
+  // Redis Pub/Sub fanout dedup: the backend stamps `_rseq` on every cross-instance
+  // broadcast (monotonic per room, from Redis INCR). Under `--max-instances > 1`,
+  // a subscription glitch or reconnect race could theoretically deliver the same
+  // message twice; dropping any `_rseq` <= the last one we saw makes that a no-op.
+  // Cheap to run under `--max-instances=1` too (backend still stamps `_rseq`), so
+  // this ships before the Cloud Run bump.
+  const fanoutSeqRef = useRef<number | null>(null);
+
   useEffect(() => {
     aliveRef.current = true;
     const streamContext = resolveStreamContext(WS_URL);
@@ -271,6 +279,10 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         setReconnectAttempt(0)
         // reset local seq on a fresh connection so effects re-run on first message
         seqRef.current = 0;
+        // Reset fanout dedup ref on reconnect — a new backend instance may
+        // start a fresh Redis INCR counter (per-room TTL is 24h; harmless
+        // to reset here regardless).
+        fanoutSeqRef.current = null;
         startHeartbeat(ws)
         try {
           const payload: Record<string, string> = { type: 'consumer_join', role: isProducer ? 'host' : 'listener' };
@@ -334,6 +346,19 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         // Display shows only the complete final sentence when is_final=true arrives.
         if (raw.type === 'translation_stream_token') {
           return;
+        }
+
+        // Fanout-layer dedup — see fanoutSeqRef declaration. `_rseq` is only
+        // stamped when Redis pubsub is enabled and connected on the backend;
+        // messages without `_rseq` (Redis off, or legacy fallback broadcasts)
+        // fall through unchanged.
+        if (typeof raw._rseq === 'number') {
+          const last = fanoutSeqRef.current;
+          if (last !== null && raw._rseq <= last) {
+            d('ws', 'dropping duplicate fanout seq', { rseq: raw._rseq, last });
+            return;
+          }
+          fanoutSeqRef.current = raw._rseq;
         }
 
         // Shape 3: { mode: 'live'|'pre'|'realtime', text, seq?, src?, tgt? }
