@@ -163,11 +163,12 @@ class RedisPubSub:
         if not self._enabled or not self._connected or self._pub is None:
             return None
         seq = await self._next_seq(org_id, room_id)
-        # Stamp seq onto the underlying message payload so listeners see it.
-        # We intentionally MUTATE the message dict so any caller-side references
-        # also carry seq (cheap, no copy). Callers already pass a dict per-broadcast.
+        # Stamp the fanout-layer seq onto the payload under `_rseq` so the
+        # frontend can dedup cross-instance duplicates without colliding with
+        # any application-level `seq` field (Shape 3 messages already use
+        # `message.seq` for per-host-session ordering — see main.py:1487).
         if seq is not None:
-            message["seq"] = seq
+            message["_rseq"] = seq
         envelope = {
             "v": _ENVELOPE_VERSION,
             "seq": seq,

@@ -59,7 +59,7 @@ Payload (JSON):
 
 - `seq`: monotonic per (org, room), from `INCR worshiptranslate:seq:{org}:{room}` (TTL 24h).
 - `publisher`: this instance's UUID — for debugging; not used to filter (subscribers receive their own publishes and deliver locally).
-- `message`: the exact object that used to be passed to `broadcast_room` — plus we stamp `seq` on it so listeners get it too.
+- `message`: the exact object that used to be passed to `broadcast_room`, with an added `_rseq` field carrying the envelope's seq. We use `_rseq` (not `seq`) to avoid stomping on Shape 3's application-level `message.seq` (per-host-session counter used for React effect ordering in `useTranslationSocket`). The frontend uses `_rseq` for cross-instance dedup; app-level `seq` semantics are unchanged.
 
 ## 5. Subscription lifecycle (refcounted)
 
@@ -80,9 +80,9 @@ Subscriber task loop: `psubscribe` on the channel; on each message decode JSON, 
 | ChatGPT plan step | Our take |
 |---|---|
 | Rename all callsites `broadcast_room` → `publish_room` | Skip. Keep `broadcast_room` as the public API — change its internals. ~15 callsites unchanged. |
-| Add seq stamping at every callsite | Skip. Stamp in the publish path once. |
+| Add seq stamping at every callsite | Skip. Stamp in the publish path once, as `_rseq` (see envelope). |
 | Manual local ref-counter in ConnectionManager | Move to `redis_pubsub` module (single source of truth). |
-| Frontend seq dedup as part of this feature | Deferred. Prod rollout starts with max-instances=1, so no duplication risk. |
+| Frontend seq dedup as part of this feature | Included. `useTranslationSocket` drops any `_rseq <= last` on the current connection. Cheap under `max-instances=1`; protects future bump. |
 | Replay buffer for reconnect | Deferred to follow-up. Note in code where the hook goes. |
 | Split translator-service / listener-service | Not now. |
 

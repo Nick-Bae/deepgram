@@ -12,6 +12,24 @@ from app.services.redis_pubsub import pubsub
 
 RoomKey = Tuple[str, str]
 
+_WARN_INTERVAL_SEC = 60.0
+_last_warn_at: Dict[str, float] = {}
+
+
+def _throttled_warn(key: str, msg: str) -> None:
+    """Log a warning at most once per _WARN_INTERVAL_SEC per key."""
+    now = time.monotonic()
+    if now - _last_warn_at.get(key, 0.0) < _WARN_INTERVAL_SEC:
+        return
+    _last_warn_at[key] = now
+    print(f"[REDIS_PUBSUB][warn] {msg}")
+
+
+def _msg_type(message) -> str:
+    if isinstance(message, dict):
+        return str(message.get("type") or message.get("mode") or "?")
+    return "?"
+
 
 class ConnectionManager:
     def __init__(self):
@@ -164,6 +182,12 @@ class ConnectionManager:
 
     async def broadcast(self, message):
         # Legacy (null org/room) path — local instance only. See design §2.
+        if pubsub.enabled:
+            _throttled_warn(
+                "legacy_broadcast",
+                f"manager.broadcast() called under REDIS_ENABLED=1 (msg_type={_msg_type(message)}) — "
+                "stays on this instance only; will not reach listeners on other instances",
+            )
         dead = []
         for ws in list(self.active):
             try:
@@ -186,6 +210,12 @@ class ConnectionManager:
         """
         key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
         if not key[0] or not key[1]:
+            if pubsub.enabled:
+                _throttled_warn(
+                    "missing_room",
+                    f"broadcast_room called without org/room (org={org_id!r} room={room_id!r} "
+                    f"msg_type={_msg_type(message)}) — message dropped, not fanned out",
+                )
             return
         if pubsub.enabled and pubsub.connected:
             await pubsub.publish_room(key[0], key[1], message)

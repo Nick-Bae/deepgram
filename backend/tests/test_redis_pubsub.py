@@ -74,7 +74,8 @@ class RedisPubSubRoundTripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((org, room), ("ark", "sunday-main"))
         self.assertEqual(msg["type"], "translation")
         self.assertEqual(msg["payload"], "hello")
-        self.assertEqual(msg["seq"], seq)  # seq stamped onto message
+        self.assertEqual(msg["_rseq"], seq)  # fanout seq stamped as _rseq (not seq)
+        self.assertNotIn("seq", msg)          # must not stomp on app-level seq
 
     async def test_seq_monotonic_per_room(self):
         await self.ps.ensure_subscription("ark", "s1")
