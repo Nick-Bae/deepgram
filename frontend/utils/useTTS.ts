@@ -10,6 +10,7 @@ const langToBcp47 = (code: string) => {
     case 'en': return 'en-US'
     case 'es': return 'es-ES'
     case 'zh-CN': return 'zh-CN'
+    case 'hi': return 'hi-IN'
     default: return 'en-US'
   }
 }

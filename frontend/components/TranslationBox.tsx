@@ -23,6 +23,7 @@ function languageFlag(code: string) {
     case 'en': return '🇺🇸';
     case 'zh': return '🇨🇳';
     case 'es': return '🇪🇸';
+    case 'hi': return '🇮🇳';
     default: return '🌐';
   }
 }
@@ -32,6 +33,7 @@ const availableLanguages = [
   { code: 'zh-CN', name: 'Chinese (Simplified)' },
   { code: 'en', name: 'English' },
   { code: 'es', name: 'Spanish' },
+  { code: 'hi', name: 'Hindi' },
 ]
 
 type TTSVoiceOption = { value: string; label: string }
@@ -59,6 +61,13 @@ const GOOGLE_TTS_PRESETS: TTSVoicePresetMap = {
   zh: [
     { value: 'cmn-CN-Wavenet-A', label: 'Wavenet A · Mandarin' },
     { value: 'cmn-CN-Wavenet-D', label: 'Wavenet D · newsy' },
+  ],
+  hi: [
+    { value: 'hi-IN-Neural2-A', label: 'Neural2 A · female' },
+    { value: 'hi-IN-Neural2-B', label: 'Neural2 B · male' },
+    { value: 'hi-IN-Neural2-C', label: 'Neural2 C · male' },
+    { value: 'hi-IN-Neural2-D', label: 'Neural2 D · female' },
+    { value: 'hi-IN-Wavenet-A', label: 'Wavenet A · female · natural' },
   ],
   default: [
     { value: 'en-US-Standard-D', label: 'Standard D · male · lowest latency' },
@@ -564,6 +573,7 @@ export default function TranslationBox({
     if (b === 'ko') return 'ko-KR';
     if (b === 'zh') return 'zh-CN';
     if (b === 'es') return 'es-ES';
+    if (b === 'hi') return 'hi-IN';
     return code || 'en-US';
   }
 
