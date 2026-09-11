@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { sendEmailVerification } from "firebase/auth";
 import QRCode from "qrcode";
 
-import TranslationBox from "../../../components/TranslationBox";
+import TranslationBox, { type TranslationEngine } from "../../../components/TranslationBox";
 import SttKeytermsEditor from "../../../components/SttKeytermsEditor";
 import { useAuth } from "../../../lib/authContext";
 import { getFirebaseClient, skipEmailVerification } from "../../../lib/firebaseClient";
@@ -336,6 +336,8 @@ export default function HostChurchPage() {
   const [serviceKey, setServiceKey] = useState("");
   const [sourceLang, setSourceLang] = useState("ko");
   const [targetLang, setTargetLang] = useState("en");
+  const [translationEngine, setTranslationEngine] = useState<TranslationEngine>("deepgram");
+  const [translationEngineListening, setTranslationEngineListening] = useState(false);
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
   const [memberships, setMemberships] = useState<OrgMembership[]>([]);
   const [switchingOrg, setSwitchingOrg] = useState(false);
@@ -2758,9 +2760,46 @@ export default function HostChurchPage() {
                   <div style={{ display: "grid", gap: 16 }}>
                     {/* Feed header: label + QR */}
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" as const }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" as const }}>
                         <span style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.18em", textTransform: "uppercase" as const, color: BC.blush }}>Translation Feed</span>
                         <span style={{ fontSize: 12, color: BC.mist }}>· {(sourceLang || "ko").toUpperCase()} → {(targetLang || "en").toUpperCase()} · {selectedService?.title || ""}</span>
+                        <label
+                          style={{
+                            ...broadcastMutedChipStyle,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 8,
+                            borderRadius: 999,
+                            padding: "5px 12px",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            letterSpacing: "0.08em",
+                            textTransform: "uppercase" as const,
+                            opacity: translationEngineListening ? 0.6 : 1,
+                          }}
+                          title={translationEngineListening ? "Stop broadcasting to switch engines" : "Translation engine"}
+                        >
+                          <span style={{ color: BC.blush }}>Engine</span>
+                          <select
+                            value={translationEngine}
+                            onChange={(e) => setTranslationEngine(e.target.value as TranslationEngine)}
+                            disabled={translationEngineListening}
+                            style={{
+                              background: "transparent",
+                              border: "none",
+                              color: "inherit",
+                              font: "inherit",
+                              letterSpacing: "0.06em",
+                              textTransform: "none" as const,
+                              cursor: translationEngineListening ? "not-allowed" : "pointer",
+                              outline: "none",
+                            }}
+                          >
+                            <option value="deepgram">Deepgram + GPT</option>
+                            <option value="openai-realtime-translate">OpenAI Realtime</option>
+                            <option value="gemini-live-translate">Gemini Live</option>
+                          </select>
+                        </label>
                       </div>
                       {qrDataUrl && displayUrl ? (
                         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 18, ...broadcastAccentCardStyle }}>
@@ -2787,6 +2826,9 @@ export default function HostChurchPage() {
                         roomId={activeRoomId}
                         sourceLang={sourceLang}
                         targetLang={targetLang}
+                        engine={translationEngine}
+                        onEngineChange={setTranslationEngine}
+                        onListeningChange={setTranslationEngineListening}
                         onAutoStartComplete={handleAutoStartComplete}
                         onAutoStartFailed={handleAutoStartFailed}
                         onSourceLangChange={setSourceLang}
