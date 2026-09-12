@@ -3,7 +3,7 @@
 import os, json, asyncio, logging, time, re, base64
 from collections import deque
 from threading import Lock
-from typing import Optional, Any, Callable, Awaitable, Dict, Tuple
+from typing import Optional, Any, Callable, Awaitable, Dict, Set, Tuple
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -165,6 +165,12 @@ LISTENER_SERVER_TTS_ENGINES = {
 # (`set_broadcast_voice` control message). Falls back to the language default
 # in google_tts.LANGUAGE_FALLBACKS when a room has no explicit choice.
 ROOM_BROADCAST_VOICE: Dict[Tuple[str, str], str] = {}
+
+# Per-(org, room) Audience TTS toggle set by the host over WS
+# (`set_audience_tts_enabled`). When False, _broadcast_listener_server_tts
+# does not synthesize or broadcast audio for that room — listeners see text
+# only. Absence of an entry means "enabled" (opt-out model).
+ROOM_AUDIENCE_TTS_DISABLED: Set[Tuple[str, str]] = set()
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
 WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
@@ -574,6 +580,9 @@ async def _broadcast_listener_server_tts(
     if engine and engine.lower() not in LISTENER_SERVER_TTS_ENGINES:
         return
     if not org_id or not room_id or not text or not text.strip():
+        return
+    # Host opted out of Audience TTS for this room — skip synth + broadcast.
+    if (org_id, room_id) in ROOM_AUDIENCE_TTS_DISABLED:
         return
     # Voice priority: explicit param → per-room preference (set by host over WS) → default.
     room_voice = ROOM_BROADCAST_VOICE.get((org_id, room_id))
@@ -1767,6 +1776,22 @@ async def ws_translate(ws: WebSocket):
                     ROOM_BROADCAST_VOICE[key] = voice_str
                 else:
                     ROOM_BROADCAST_VOICE.pop(key, None)
+                continue
+            if mtype_l == "set_audience_tts_enabled":
+                if manager.get_role(ws) != "host" or not host_authed:
+                    try:
+                        await ws.send_json({"type": "error", "message": "host_auth_required"})
+                    except Exception:
+                        pass
+                    continue
+                if not joined_org_id or not joined_room_id:
+                    continue
+                enabled = bool(msg.get("enabled"))
+                key = (joined_org_id, joined_room_id)
+                if enabled:
+                    ROOM_AUDIENCE_TTS_DISABLED.discard(key)
+                else:
+                    ROOM_AUDIENCE_TTS_DISABLED.add(key)
                 continue
             if mtype_l == "producer_commit":
                 await handle_commit(msg, is_partial=False)

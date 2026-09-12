@@ -95,6 +95,7 @@ export type TranslationSocketHook = {
   ) => void;
   sendDisplayConfig: (speed: number) => void;
   sendBroadcastVoice: (voice: string) => void;
+  sendAudienceTts: (enabled: boolean) => void;
 };
 
 const HEARTBEAT_INTERVAL_MS = 10000
@@ -513,6 +514,14 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     ws.send(JSON.stringify(payload));
   }, []);
 
+  const sendAudienceTts = useCallback((enabled: boolean) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const payload = { type: 'set_audience_tts_enabled', enabled: Boolean(enabled) };
+    try { d('ws->', JSON.stringify(payload)); } catch {}
+    ws.send(JSON.stringify(payload));
+  }, []);
+
   return {
     connected,
     connectionState,
@@ -523,5 +532,6 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     sendProducerText,
     sendDisplayConfig,
     sendBroadcastVoice,
+    sendAudienceTts,
   };
 }
