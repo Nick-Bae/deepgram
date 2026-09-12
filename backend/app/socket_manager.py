@@ -200,13 +200,19 @@ class ConnectionManager:
     async def broadcast_room(self, org_id: str, room_id: str, message):
         """Fan-out to every listener in (org, room) across all Cloud Run instances.
 
-        When Redis Pub/Sub is connected, publish to Redis and return — the Redis
-        subscriber on this and every other subscribed instance calls
-        ``_broadcast_local_room`` to deliver to their own sockets. This avoids
-        double-delivery on the publisher instance.
+        Delivery is always local-first. When Redis Pub/Sub is connected, we
+        additionally publish so subscribers on OTHER instances deliver to their
+        own sockets. The subscriber loop on THIS instance filters out
+        messages it published (envelope.publisher == INSTANCE_ID), so the
+        publisher never double-delivers to its own listeners.
 
-        When Redis is disabled or disconnected, fall back to local-only delivery
-        (single-instance behavior identical to pre-Redis).
+        This design eliminates the subscription-race that plagued the initial
+        Redis rollout (see docs/02-design/features/redis-pubsub-fanout.design.md
+        §8a). Local delivery does not depend on subscription state or Redis
+        round-trip timing.
+
+        When Redis is disabled or disconnected, delivery is local-only —
+        identical behavior to pre-Redis single-instance.
         """
         key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
         if not key[0] or not key[1]:
@@ -218,7 +224,13 @@ class ConnectionManager:
                 )
             return
         if pubsub.enabled and pubsub.connected:
-            await pubsub.publish_room(key[0], key[1], message)
+            # Deliver locally + publish for other instances, concurrently.
+            # publish_room works on a copy of `message`, so the local delivery
+            # can't race with `_rseq` stamping.
+            await asyncio.gather(
+                self._broadcast_local_room(key[0], key[1], message),
+                pubsub.publish_room(key[0], key[1], message),
+            )
             return
         await self._broadcast_local_room(key[0], key[1], message)
 
