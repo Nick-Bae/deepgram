@@ -4225,6 +4225,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         """
         if not data or not org_id or not room_id:
             return
+        probe.mark_t3()
         message = {
             "type": "translated_audio",
             "provider": "openai",
