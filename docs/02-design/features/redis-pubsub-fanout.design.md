@@ -108,6 +108,50 @@ INSTANCE_ID=               # auto-generated UUID if empty
 | Publish fails | Log + emit metric. Do not raise into the WS handler. |
 | Subscriber decode fails | Log + skip; do not tear down the loop. |
 
+### 8a. Post-mortem: subscription race dropped every delivery (2026-09-11)
+
+**What happened.** With `REDIS_ENABLED=1` enabled in prod at `--max-instances=1`, both host and listener audio broke immediately. Setting `REDIS_ENABLED=0` restored service. Unit tests still passed.
+
+**Root cause.** In the original `broadcast_room` under Redis mode, delivery flowed only through Redis:
+
+```
+broadcast_room
+  → pubsub.publish_room  (publish to Redis; return)
+  → Redis pubsub delivers back to same-instance subscriber
+  → subscriber calls _broadcast_local_room  → sockets
+```
+
+The subscribe path was set up fire-and-forget from `join_room`:
+
+```python
+if new_room_first_ws:
+    _schedule(pubsub.ensure_subscription(key[0], key[1]))
+```
+
+`_schedule` used `asyncio.create_task` — non-blocking. When a WS joined the room and moments later a broadcast fired, `SUBSCRIBE channel` had not yet reached Redis. Redis pub/sub is **not buffered**: messages published before a subscription is active are silently dropped. Every early broadcast landed on the floor. Because the host page's `useTranslationSocket` on `/ws/translate` is what drives its TTS, the host lost audio too — not just listeners.
+
+**Why tests missed it.** `tests/test_redis_pubsub.py` manually `await`s `ensure_subscription()` before each publish. The fire-and-forget path from `join_room` was never exercised. The 2-process Docker smoke test in `docs/03-analysis/redis-pubsub-smoke.md` would have caught it — but was not executed before shipping.
+
+**Fix (adopted).** Deliver locally *immediately* on the publisher instance, and publish to Redis in parallel for other instances. On the subscriber side, skip messages where `envelope.publisher == ENV.INSTANCE_ID` so the publisher instance doesn't double-deliver its own message.
+
+```
+broadcast_room (when pubsub connected):
+  ├─ _broadcast_local_room   (immediate; no subscription dependence)
+  └─ pubsub.publish_room     (parallel; fanout to other instances)
+
+_dispatch (subscriber callback):
+  if envelope["publisher"] == ENV.INSTANCE_ID: skip
+```
+
+This eliminates the race on the publisher side (`--max-instances=1` fully covered). For `--max-instances > 1`, a receiver-side subscription race still exists in theory (subscription-late-vs-publish-early on a DIFFERENT instance), but is much smaller because subscribe latency is measured in milliseconds and the pattern is only a problem for the very first message immediately after join. If it bites in the multi-instance era, the next follow-up is:
+
+- **Option B (deferred):** make `ensure_subscription` awaitable from `join_room` — turns `join_room` async and updates callers. Fully eliminates the receiver-side race.
+- **Option C (deferred):** switch fanout to Redis Streams instead of Pub/Sub. Streams buffer publishes, so subscribers can catch up on missed messages. Bigger change, no race even under adverse timing.
+
+**Also:** `publish_room` now works on a shallow copy of the message dict rather than mutating the caller's dict, so the local-delivery path (which runs first) never sees a partially-stamped `_rseq`.
+
+**Verification.** Add an integration test that: (a) joins a room via `manager.join_room` without awaiting subscription, (b) immediately publishes, (c) asserts the local WS bucket received the message. See `tests/test_redis_pubsub.py::ConnectionManagerFallbackTests::test_publisher_own_broadcast_delivers_without_race`.
+
 ## 9. Rollout plan
 
 1. **Dev:** `REDIS_ENABLED=1` + local docker `redis:7`. Two uvicorn processes on 8080/8081; verify cross-instance delivery.

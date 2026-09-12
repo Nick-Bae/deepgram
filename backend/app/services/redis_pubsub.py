@@ -159,7 +159,13 @@ class RedisPubSub:
             return None
 
     async def publish_room(self, org_id: str, room_id: str, message: dict) -> Optional[int]:
-        """Publish a message envelope; returns the assigned seq or None if not delivered."""
+        """Publish a message envelope; returns the assigned seq or None if not delivered.
+
+        Works on a shallow copy of `message` — never mutates the caller's dict.
+        This matters when the caller also delivers `message` locally (see
+        ConnectionManager.broadcast_room's parallel path): a mutation here
+        could race with json.dumps in the local send loop.
+        """
         if not self._enabled or not self._connected or self._pub is None:
             return None
         seq = await self._next_seq(org_id, room_id)
@@ -167,14 +173,15 @@ class RedisPubSub:
         # frontend can dedup cross-instance duplicates without colliding with
         # any application-level `seq` field (Shape 3 messages already use
         # `message.seq` for per-host-session ordering — see main.py:1487).
+        published_message = dict(message)
         if seq is not None:
-            message["_rseq"] = seq
+            published_message["_rseq"] = seq
         envelope = {
             "v": _ENVELOPE_VERSION,
             "seq": seq,
             "publisher": ENV.INSTANCE_ID,
             "ts": _iso_now(),
-            "message": message,
+            "message": published_message,
         }
         try:
             channel = _channel_name(org_id, room_id)
@@ -303,7 +310,14 @@ class RedisPubSub:
             if not org_id or not room_id:
                 return
             envelope = json.loads(data) if isinstance(data, (str, bytes)) else data
-            payload = envelope.get("message") if isinstance(envelope, dict) else None
+            if not isinstance(envelope, dict):
+                return
+            # Skip messages we published from this instance. broadcast_room
+            # already delivered them locally; re-delivering here would double
+            # up on the publisher instance (see design doc §8a).
+            if envelope.get("publisher") == ENV.INSTANCE_ID:
+                return
+            payload = envelope.get("message")
             if not isinstance(payload, dict):
                 return
             await self._callback(org_id, room_id, payload)
