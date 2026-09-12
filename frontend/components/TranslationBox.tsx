@@ -1652,15 +1652,15 @@ export default function TranslationBox({
                 {([
                   { label: 'Broadcast output', desc: isBroadcasting ? 'Listeners are receiving translated output.' : 'Output is paused for listeners.', value: isBroadcasting, onToggle: () => setIsBroadcasting(v => !v) },
                   { label: 'Early preview', desc: translationEngine === 'deepgram' ? (earlyCommitEnabled ? 'Preview text is shown before final commit.' : 'Only finalized clauses are displayed.') : 'Handled by the selected realtime translation stream.', value: translationEngine === 'deepgram' && earlyCommitEnabled, onToggle: () => translationEngine === 'deepgram' && setEarlyCommitEnabled(v => !v) },
-                  // Audience TTS only applies to Deepgram + GPT — the other engines
-                  // either don't have listener audio (text engines) or carry native
-                  // audio from the model (Realtime Translate variants).
+                  // Listener audio only applies to Deepgram + GPT — the other
+                  // engines either don't have listener audio (text engines) or
+                  // carry native audio from the model (Realtime Translate variants).
                   ...(translationEngine === 'deepgram'
                     ? [{
-                        label: 'Audience TTS',
+                        label: 'Listener audio',
                         desc: audienceTtsEnabled
-                          ? 'Listeners hear Google Neural2 audio (+ ~$1–2 / 2 hr).'
-                          : 'Listeners see text only. No Google TTS charge.',
+                          ? 'Listeners hear the translated voice.'
+                          : 'Listeners see text only.',
                         value: audienceTtsEnabled,
                         onToggle: () => setAudienceTtsEnabled(v => !v),
                       }]
