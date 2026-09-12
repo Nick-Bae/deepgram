@@ -2388,7 +2388,11 @@ export default function HostChurchPage() {
           display: flex;
           gap: 12px;
           flex-wrap: wrap;
-          align-items: end;
+          /* align-items: start so the CHURCH label + dropdown line up with
+             SERVICE's label + dropdown at the TOP of the row, instead of
+             being pulled down when SERVICE has extra lines below (linked
+             sermon info, "no sermon linked" note). */
+          align-items: start;
         }
         .broadcast-setup-field {
           display: grid;
