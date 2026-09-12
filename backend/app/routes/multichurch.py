@@ -48,6 +48,11 @@ class UpdateOrgProfileRequest(BaseModel):
     progressiveManuscriptMatching: bool | None = Field(default=None)
 
 
+class UpdateServiceLanguagePairRequest(BaseModel):
+    source: str = Field(..., min_length=2, max_length=20, pattern=validators.LANG_CODE)
+    target: str = Field(..., min_length=2, max_length=20, pattern=validators.LANG_CODE)
+
+
 def _start_service_for_org(
     *,
     org_id: str,
@@ -194,6 +199,33 @@ def create_service(
         }:
             raise HTTPException(status_code=402, detail=detail) from exc
         raise HTTPException(status_code=403, detail=detail) from exc
+
+
+@router.patch("/org/{org_id}/services/{service_key}/language-pair")
+def update_service_language_pair(
+    *,
+    org_id: str = Path(pattern=validators.ORG_ID),
+    service_key: str = Path(pattern=validators.SERVICE_KEY),
+    payload: UpdateServiceLanguagePairRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user_required),
+):
+    try:
+        return multichurch_store.update_service_default_language_pair(
+            org_id=org_id,
+            service_key=service_key,
+            source=payload.source,
+            target=payload.target,
+            requested_by_uid=current_user.uid,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail in {"invalid_uid", "invalid_service_key", "invalid_language_pair"}:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if detail in {"org_not_found", "service_not_found"}:
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "update_failed") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
 
 
 @router.delete("/org/{org_id}/services/{service_key}")

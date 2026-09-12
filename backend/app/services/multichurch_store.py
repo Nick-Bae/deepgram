@@ -1147,6 +1147,51 @@ class InMemoryMultiChurchStore:
             self._services.pop(row_key, None)
             return {"deleted": True, "orgId": clean_org_id, "serviceKey": normalized_key}
 
+    def update_service_default_language_pair(
+        self,
+        *,
+        org_id: str,
+        service_key: str,
+        source: str,
+        target: str,
+        requested_by_uid: str,
+    ) -> Dict[str, Any]:
+        """Persist a service's default (source, target) language pair.
+
+        Called by the host page when the user changes the language selectors
+        and saves it as the default so future sessions start with the same
+        pair without re-selecting. Owner/admin/host roles only.
+        """
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        src = _clean_token(source) or "ko"
+        tgt = _clean_token(target) or "en"
+        if not src or not tgt:
+            raise ValueError("invalid_language_pair")
+        normalized_key = _normalize_service_key(service_key)
+
+        with self._lock:
+            if clean_org_id not in self._orgs:
+                raise ValueError("org_not_found")
+            role = self._member_role(clean_org_id, clean_uid)
+            if role not in {"owner", "admin", "host"}:
+                raise PermissionError("forbidden")
+            row_key = (clean_org_id, normalized_key)
+            service = self._services.get(row_key)
+            if not service:
+                raise ValueError("service_not_found")
+            service["defaultLanguagePair"] = {"source": src, "target": tgt}
+            service["updatedAt"] = _utcnow()
+            return {
+                "orgId": clean_org_id,
+                "serviceKey": normalized_key,
+                "defaultLanguagePair": {"source": src, "target": tgt},
+            }
+
     def list_memberships(self, uid: str) -> List[Dict[str, Any]]:
         clean_uid = _clean_token(uid)
         if not clean_uid:
@@ -3621,6 +3666,50 @@ class FirestoreMultiChurchStore:
                     raise ValueError("service_active")
         service_ref.delete(timeout=_FS_TIMEOUT)
         return {"deleted": True, "orgId": clean_org_id, "serviceKey": normalized_key}
+
+    def update_service_default_language_pair(
+        self,
+        *,
+        org_id: str,
+        service_key: str,
+        source: str,
+        target: str,
+        requested_by_uid: str,
+    ) -> Dict[str, Any]:
+        clean_org_id = _clean_token(org_id)
+        clean_uid = _clean_token(requested_by_uid)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not clean_uid:
+            raise ValueError("invalid_uid")
+        src = _clean_token(source) or "ko"
+        tgt = _clean_token(target) or "en"
+        if not src or not tgt:
+            raise ValueError("invalid_language_pair")
+        normalized_key = _normalize_service_key(service_key)
+
+        org_snap = self._org_ref(clean_org_id).get(timeout=_FS_TIMEOUT)
+        if not org_snap.exists:
+            raise ValueError("org_not_found")
+        role = self._member_role(clean_org_id, clean_uid)
+        if role not in {"owner", "admin", "host"}:
+            raise PermissionError("forbidden")
+        service_ref = self._service_ref(clean_org_id, normalized_key)
+        service_snap = service_ref.get(timeout=_FS_TIMEOUT)
+        if not service_snap.exists:
+            raise ValueError("service_not_found")
+        service_ref.update(
+            {
+                "defaultLanguagePair": {"source": src, "target": tgt},
+                "updatedAt": _utcnow(),
+            },
+            timeout=_FS_TIMEOUT,
+        )
+        return {
+            "orgId": clean_org_id,
+            "serviceKey": normalized_key,
+            "defaultLanguagePair": {"source": src, "target": tgt},
+        }
 
     def _membership_row(self, *, org_id: str, org: Dict[str, Any], role: Optional[str]) -> Dict[str, Any]:
         normalized_role = _normalize_role(role, fallback="viewer")

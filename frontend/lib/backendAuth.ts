@@ -638,6 +638,24 @@ export function deleteOrgService(idToken: string, orgId: string, serviceKey: str
   );
 }
 
+export function saveServiceLanguagePair(
+  idToken: string,
+  orgId: string,
+  serviceKey: string,
+  source: string,
+  target: string,
+): Promise<{ orgId: string; serviceKey: string; defaultLanguagePair: { source: string; target: string } }> {
+  return authFetch(
+    `/api/org/${encodeURIComponent(orgId)}/services/${encodeURIComponent(serviceKey)}/language-pair`,
+    idToken,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, target }),
+    },
+  );
+}
+
 export function saveOrgProfile(
   idToken: string,
   orgId: string,

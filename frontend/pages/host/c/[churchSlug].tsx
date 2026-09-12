@@ -25,6 +25,7 @@ import {
   saveOrgProfile,
   saveOrgBillingLimits,
   saveOrgSermonBudget,
+  saveServiceLanguagePair,
   setCurrentOrg,
   type BillingPlanKey,
   type InviteRole,
@@ -338,6 +339,8 @@ export default function HostChurchPage() {
   const [targetLang, setTargetLang] = useState("en");
   const [translationEngine, setTranslationEngine] = useState<TranslationEngine>("deepgram");
   const [translationEngineListening, setTranslationEngineListening] = useState(false);
+  const [savingLanguagePair, setSavingLanguagePair] = useState(false);
+  const [languagePairSavedAt, setLanguagePairSavedAt] = useState<number | null>(null);
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
   const [memberships, setMemberships] = useState<OrgMembership[]>([]);
   const [switchingOrg, setSwitchingOrg] = useState(false);
@@ -840,6 +843,42 @@ export default function HostChurchPage() {
     if (selectedService.defaultLanguagePair?.source) setSourceLang(selectedService.defaultLanguagePair.source);
     if (selectedService.defaultLanguagePair?.target) setTargetLang(selectedService.defaultLanguagePair.target);
   }, [selectedService?.serviceKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Show the "Save as default" pill whenever the host's current source/target
+  // selection differs from the service's stored defaultLanguagePair. Refuses
+  // to show for services with no default set yet (shouldn't happen — every
+  // service has one at create time — but defensive).
+  const savedLanguagePair = selectedService?.defaultLanguagePair;
+  const hasUnsavedLanguagePair = Boolean(
+    savedLanguagePair &&
+      (sourceLang !== savedLanguagePair.source || targetLang !== savedLanguagePair.target),
+  );
+
+  const handleSaveLanguagePair = useCallback(async () => {
+    if (!resolvedOrgId || !serviceKey || savingLanguagePair) return;
+    setSavingLanguagePair(true);
+    try {
+      const idToken = await getIdToken();
+      if (!idToken) return;
+      const result = await saveServiceLanguagePair(idToken, resolvedOrgId, serviceKey, sourceLang, targetLang);
+      // Reflect the new default in local state so the pill hides immediately.
+      setOrgData((prev) => {
+        if (!prev) return prev;
+        const services = prev.services.map((row) =>
+          row.serviceKey === serviceKey
+            ? { ...row, defaultLanguagePair: result.defaultLanguagePair }
+            : row,
+        );
+        return { ...prev, services };
+      });
+      setLanguagePairSavedAt(Date.now());
+      window.setTimeout(() => setLanguagePairSavedAt((prev) => (prev && Date.now() - prev >= 1800 ? null : prev)), 2000);
+    } catch (err) {
+      console.warn("[save-language-pair][error]", err);
+    } finally {
+      setSavingLanguagePair(false);
+    }
+  }, [getIdToken, resolvedOrgId, serviceKey, savingLanguagePair, sourceLang, targetLang]);
 
   // Linked-sermon version indicator: when a service has a linkedSermonId,
   // pull its title/updatedAt/segment count so the host can confirm before
@@ -2800,6 +2839,48 @@ export default function HostChurchPage() {
                             <option value="gemini-live-translate">Gemini Live Translate</option>
                           </select>
                         </label>
+                        {hasUnsavedLanguagePair ? (
+                          <button
+                            type="button"
+                            onClick={handleSaveLanguagePair}
+                            disabled={savingLanguagePair}
+                            style={{
+                              ...broadcastMutedChipStyle,
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 6,
+                              borderRadius: 999,
+                              border: "none",
+                              padding: "5px 12px",
+                              fontSize: 11,
+                              fontWeight: 700,
+                              letterSpacing: "0.08em",
+                              textTransform: "uppercase" as const,
+                              cursor: savingLanguagePair ? "default" : "pointer",
+                              whiteSpace: "nowrap" as const,
+                            }}
+                            title={`Save ${(sourceLang || "ko").toUpperCase()} → ${(targetLang || "en").toUpperCase()} as this service's default language pair`}
+                          >
+                            {savingLanguagePair ? "Saving…" : `Save ${(sourceLang || "ko").toUpperCase()} → ${(targetLang || "en").toUpperCase()} as default`}
+                          </button>
+                        ) : languagePairSavedAt && Date.now() - languagePairSavedAt < 2000 ? (
+                          <span
+                            style={{
+                              ...broadcastMutedChipStyle,
+                              display: "inline-flex",
+                              alignItems: "center",
+                              borderRadius: 999,
+                              padding: "5px 12px",
+                              fontSize: 11,
+                              fontWeight: 700,
+                              letterSpacing: "0.08em",
+                              textTransform: "uppercase" as const,
+                              whiteSpace: "nowrap" as const,
+                            }}
+                          >
+                            Saved ✓
+                          </span>
+                        ) : null}
                       </div>
                       {qrDataUrl && displayUrl ? (
                         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderRadius: 18, ...broadcastAccentCardStyle }}>
