@@ -577,6 +577,12 @@ async def _broadcast_listener_server_tts(
     # Voice priority: explicit param → per-room preference (set by host over WS) → default.
     room_voice = ROOM_BROADCAST_VOICE.get((org_id, room_id))
     effective_voice = voice or room_voice
+    # DEBUG: trace voice-preset routing (remove after verification)
+    print(
+        f"[VOICE_DEBUG][broadcast] key=({org_id!r},{room_id!r}) "
+        f"stored={room_voice!r} explicit={voice!r} effective={effective_voice!r} "
+        f"lang={target_lang!r} store_size={len(ROOM_BROADCAST_VOICE)}"
+    )
     try:
         audio_bytes, meta = await google_tts_service.synthesize_async(
             text,
@@ -587,6 +593,7 @@ async def _broadcast_listener_server_tts(
     except Exception as exc:
         print(f"[LISTENER_TTS][synth-error] engine={engine} org={org_id} room={room_id} err={exc}")
         return
+    print(f"[VOICE_DEBUG][synth-ok] voice_name={meta.get('voice_name')!r} sr={meta.get('sample_rate_hz')!r}")
     try:
         import base64 as _b64
         message = {
@@ -1751,21 +1758,32 @@ async def ws_translate(ws: WebSocket):
                     pass
                 continue
             if mtype_l == "set_broadcast_voice":
-                if manager.get_role(ws) != "host" or not host_authed:
+                # DEBUG: trace voice-preset routing (remove after verification)
+                _role = manager.get_role(ws)
+                _raw_voice_dbg = msg.get("voice")
+                print(
+                    f"[VOICE_DEBUG][recv] role={_role} host_authed={host_authed} "
+                    f"org={joined_org_id!r} room={joined_room_id!r} voice={_raw_voice_dbg!r}"
+                )
+                if _role != "host" or not host_authed:
+                    print("[VOICE_DEBUG][reject] host_auth_required")
                     try:
                         await ws.send_json({"type": "error", "message": "host_auth_required"})
                     except Exception:
                         pass
                     continue
                 if not joined_org_id or not joined_room_id:
+                    print("[VOICE_DEBUG][reject] no joined org/room")
                     continue
                 raw_voice = msg.get("voice")
                 voice_str = str(raw_voice or "").strip()
                 key = (joined_org_id, joined_room_id)
                 if voice_str and voice_str.lower() != "auto":
                     ROOM_BROADCAST_VOICE[key] = voice_str
+                    print(f"[VOICE_DEBUG][store] key={key} voice={voice_str!r}")
                 else:
                     ROOM_BROADCAST_VOICE.pop(key, None)
+                    print(f"[VOICE_DEBUG][clear] key={key}")
                 continue
             if mtype_l == "producer_commit":
                 await handle_commit(msg, is_partial=False)
