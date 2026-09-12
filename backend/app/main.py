@@ -3,7 +3,7 @@
 import os, json, asyncio, logging, time, re, base64
 from collections import deque
 from threading import Lock
-from typing import Optional, Any, Callable, Awaitable
+from typing import Optional, Any, Callable, Awaitable, Dict, Tuple
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -160,6 +160,10 @@ LISTENER_SERVER_TTS_ENGINES = {
     for e in (os.getenv("LISTENER_TTS_ENGINES") or "deepgram").split(",")
     if e.strip()
 }
+# Per-(org, room) broadcast voice preference set by the host over WS
+# (`set_broadcast_voice` control message). Falls back to the language default
+# in google_tts.LANGUAGE_FALLBACKS when a room has no explicit choice.
+ROOM_BROADCAST_VOICE: Dict[Tuple[str, str], str] = {}
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
 WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
@@ -570,11 +574,14 @@ async def _broadcast_listener_server_tts(
         return
     if not org_id or not room_id or not text or not text.strip():
         return
+    # Voice priority: explicit param → per-room preference (set by host over WS) → default.
+    room_voice = ROOM_BROADCAST_VOICE.get((org_id, room_id))
+    effective_voice = voice or room_voice
     try:
         audio_bytes, meta = await google_tts_service.synthesize_async(
             text,
             language=target_lang,
-            voice=voice,
+            voice=effective_voice,
             output_format="linear16",
         )
     except Exception as exc:
@@ -1742,6 +1749,23 @@ async def ws_translate(ws: WebSocket):
                         await manager.broadcast({"type": "display_config", "speed": speed})
                 except Exception:
                     pass
+                continue
+            if mtype_l == "set_broadcast_voice":
+                if manager.get_role(ws) != "host" or not host_authed:
+                    try:
+                        await ws.send_json({"type": "error", "message": "host_auth_required"})
+                    except Exception:
+                        pass
+                    continue
+                if not joined_org_id or not joined_room_id:
+                    continue
+                raw_voice = msg.get("voice")
+                voice_str = str(raw_voice or "").strip()
+                key = (joined_org_id, joined_room_id)
+                if voice_str and voice_str.lower() != "auto":
+                    ROOM_BROADCAST_VOICE[key] = voice_str
+                else:
+                    ROOM_BROADCAST_VOICE.pop(key, None)
                 continue
             if mtype_l == "producer_commit":
                 await handle_commit(msg, is_partial=False)

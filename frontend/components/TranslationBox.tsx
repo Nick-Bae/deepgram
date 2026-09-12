@@ -182,6 +182,7 @@ export default function TranslationBox({
     disconnectStartedAt,
     last,
     sendDisplayConfig,
+    sendBroadcastVoice,
   } = useTranslationSocket({ isProducer: true })
 
   // UI state
@@ -262,6 +263,19 @@ export default function TranslationBox({
     if (!connected) return
     sendDisplayConfig(displaySpeed)
   }, [connected, displaySpeed, sendDisplayConfig])
+
+  // Push the host's chosen Google TTS voice to the backend so the server-side
+  // listener broadcast (Deepgram + GPT path) synthesizes with the same voice
+  // the host hears on their monitor. Sending 'auto' or an empty string clears
+  // the per-room preference and lets the backend fall back to the language default.
+  useEffect(() => {
+    if (!connected) return
+    const isGoogle = ttsProvider === 'google'
+    const voiceToSend = isGoogle && voicePreference && voicePreference !== 'auto'
+      ? voicePreference
+      : ''
+    sendBroadcastVoice(voiceToSend)
+  }, [connected, ttsProvider, voicePreference, sendBroadcastVoice])
 
   const applyDisplaySpeed = useCallback(
     (next: number) => {

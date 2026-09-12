@@ -94,6 +94,7 @@ export type TranslationSocketHook = {
     finalFlag?: boolean
   ) => void;
   sendDisplayConfig: (speed: number) => void;
+  sendBroadcastVoice: (voice: string) => void;
 };
 
 const HEARTBEAT_INTERVAL_MS = 10000
@@ -503,6 +504,15 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     ws.send(JSON.stringify(payload));
   }, []);
 
+  const sendBroadcastVoice = useCallback((voice: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const safeVoice = (voice || '').trim();
+    const payload: Record<string, string> = { type: 'set_broadcast_voice', voice: safeVoice };
+    try { d('ws->', JSON.stringify(payload)); } catch {}
+    ws.send(JSON.stringify(payload));
+  }, []);
+
   return {
     connected,
     connectionState,
@@ -512,5 +522,6 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     last,
     sendProducerText,
     sendDisplayConfig,
+    sendBroadcastVoice,
   };
 }
