@@ -86,6 +86,9 @@ def _client() -> texttospeech.TextToSpeechClient:
     return texttospeech.TextToSpeechClient()
 
 
+LINEAR16_SAMPLE_RATE_HZ = 24000
+
+
 async def synthesize_async(
     text: str,
     *,
@@ -93,6 +96,7 @@ async def synthesize_async(
     voice: str | None = None,
     speaking_rate: float | None = None,
     pitch: float | None = None,
+    output_format: str = "mp3",
 ) -> tuple[bytes, dict[str, str]]:
     if not text or not text.strip():
         raise ValueError("text is required for TTS")
@@ -101,6 +105,19 @@ async def synthesize_async(
     rate = _clamp(speaking_rate if speaking_rate is not None else DEFAULT_RATE, 0.25, 4.0)
     pitch_val = _clamp(pitch if pitch is not None else DEFAULT_PITCH, -20.0, 20.0)
 
+    fmt = (output_format or "mp3").strip().lower()
+    if fmt in {"linear16", "pcm", "pcm_s16le", "l16"}:
+        encoding = texttospeech.AudioEncoding.LINEAR16
+        # Neural2 voices synthesize at 24 kHz natively; keep container matched.
+        sample_rate = LINEAR16_SAMPLE_RATE_HZ
+        meta_encoding = "pcm_s16le"
+    elif fmt in {"mp3", ""}:
+        encoding = texttospeech.AudioEncoding.MP3
+        sample_rate = None
+        meta_encoding = "mp3"
+    else:
+        raise ValueError(f"unsupported output_format: {output_format}")
+
     def _synthesize_blocking() -> tuple[bytes, dict[str, str]]:
         client = _client()
         synthesis_input = texttospeech.SynthesisInput(text=text)
@@ -108,16 +125,26 @@ async def synthesize_async(
             language_code=lang_code,
             name=voice_name,
         )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=rate,
-            pitch=pitch_val,
-        )
+        audio_config_kwargs: dict = {
+            "audio_encoding": encoding,
+            "speaking_rate": rate,
+            "pitch": pitch_val,
+        }
+        if sample_rate is not None:
+            audio_config_kwargs["sample_rate_hertz"] = sample_rate
+        audio_config = texttospeech.AudioConfig(**audio_config_kwargs)
         response = client.synthesize_speech(
             input=synthesis_input,
             voice=voice_params,
             audio_config=audio_config,
         )
-        return response.audio_content, {"voice_name": voice_name, "language_code": lang_code}
+        meta: dict[str, str] = {
+            "voice_name": voice_name,
+            "language_code": lang_code,
+            "encoding": meta_encoding,
+        }
+        if sample_rate is not None:
+            meta["sample_rate_hz"] = str(sample_rate)
+        return response.audio_content, meta
 
     return await asyncio.to_thread(_synthesize_blocking)

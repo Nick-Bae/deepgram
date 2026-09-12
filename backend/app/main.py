@@ -3,7 +3,7 @@
 import os, json, asyncio, logging, time, re, base64
 from collections import deque
 from threading import Lock
-from typing import Optional, Any, Callable, Awaitable
+from typing import Optional, Any, Callable, Awaitable, Dict, Tuple
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -36,6 +36,7 @@ from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram, deepgram_model_for_language, _build_keyterm_list, _build_replace_list, DG_DEBUG
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
+from app.services import google_tts as google_tts_service
 from app.utils.translate import (
     _preprocess_source_text,
     is_invalid_translation_output,
@@ -150,6 +151,19 @@ ROOM_HOST_PRESENCE_GRACE_SEC = _env_int("ROOM_HOST_PRESENCE_GRACE_SEC", 300, min
 # revision can incorrectly see zero hosts while the real producer is active.
 ROOM_HOST_PRESENCE_END_ROOMS = False
 STT_NO_SPEECH_TIMEOUT_SEC = _env_int("STT_NO_SPEECH_TIMEOUT_SEC", 120, min_value=30, max_value=3600)
+# Server-side Google Cloud TTS for the listener page. When enabled, the Deepgram+GPT
+# broadcast path synthesizes translated audio and broadcasts it as `translated_audio`
+# so listeners hear a high-quality Neural2 voice instead of browser SpeechSynthesis.
+LISTENER_SERVER_TTS_ENABLED = _env_bool("LISTENER_TTS_ENABLED", True)
+LISTENER_SERVER_TTS_ENGINES = {
+    e.strip().lower()
+    for e in (os.getenv("LISTENER_TTS_ENGINES") or "deepgram").split(",")
+    if e.strip()
+}
+# Per-(org, room) broadcast voice preference set by the host over WS
+# (`set_broadcast_voice` control message). Falls back to the language default
+# in google_tts.LANGUAGE_FALLBACKS when a room has no explicit choice.
+ROOM_BROADCAST_VOICE: Dict[Tuple[str, str], str] = {}
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
 WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
@@ -535,6 +549,60 @@ def _rate_limit_meta(payload: dict[str, Any]) -> dict[str, Any]:
         "limit": payload.get("limit"),
         "estimated_tokens": payload.get("estimatedTokens"),
     }
+
+
+async def _broadcast_listener_server_tts(
+    org_id: str,
+    room_id: str,
+    text: str,
+    target_lang: str,
+    engine: str,
+    *,
+    voice: Optional[str] = None,
+) -> None:
+    """Synthesize `text` with Google Cloud TTS (LINEAR16 24k) and broadcast the
+    audio to listeners as a `translated_audio` message (matching Gemini's shape).
+
+    Fire-and-forget from the caller: text broadcast happens first, then this
+    schedules the audio. Listeners handle `translated_audio` via
+    `onTranslatedAudio → enqueuePcmAudio` and suppress SpeechSynthesis when
+    native audio arrives.
+    """
+    if not LISTENER_SERVER_TTS_ENABLED:
+        return
+    if engine and engine.lower() not in LISTENER_SERVER_TTS_ENGINES:
+        return
+    if not org_id or not room_id or not text or not text.strip():
+        return
+    # Voice priority: explicit param → per-room preference (set by host over WS) → default.
+    room_voice = ROOM_BROADCAST_VOICE.get((org_id, room_id))
+    effective_voice = voice or room_voice
+    try:
+        audio_bytes, meta = await google_tts_service.synthesize_async(
+            text,
+            language=target_lang,
+            voice=effective_voice,
+            output_format="linear16",
+        )
+    except Exception as exc:
+        print(f"[LISTENER_TTS][synth-error] engine={engine} org={org_id} room={room_id} err={exc}")
+        return
+    try:
+        import base64 as _b64
+        message = {
+            "type": "translated_audio",
+            "provider": "google",
+            "engine": "google-cloud-tts",
+            "encoding": meta.get("encoding") or "pcm_s16le",
+            "sampleRate": int(meta.get("sample_rate_hz") or google_tts_service.LINEAR16_SAMPLE_RATE_HZ),
+            "channels": 1,
+            "data": _b64.b64encode(audio_bytes).decode("ascii"),
+            "voice": meta.get("voice_name"),
+            "lang": meta.get("language_code"),
+        }
+        await manager.broadcast_room(org_id, room_id, message)
+    except Exception as exc:
+        print(f"[LISTENER_TTS][broadcast-error] engine={engine} org={org_id} room={room_id} err={exc}")
 
 
 async def _translate_text_guarded(
@@ -1484,6 +1552,20 @@ async def ws_translate(ws: WebSocket):
                 f"text={src_text[:160]!r}",
             )
 
+        # Server-side TTS (Deepgram + GPT path): only for the final commit, when the
+        # translated text is non-empty and we have an org/room to broadcast into.
+        will_broadcast_server_tts = bool(
+            not is_partial
+            and translated
+            and translated.strip()
+            and target_org_id
+            and target_room_id
+            and LISTENER_SERVER_TTS_ENABLED
+            and "deepgram" in LISTENER_SERVER_TTS_ENGINES
+        )
+        if will_broadcast_server_tts:
+            meta_payload["expect_server_audio"] = True
+
         live_msg_new = {
             "mode": live_mode if not is_partial else "realtime",
             "text": translated,
@@ -1517,6 +1599,19 @@ async def ws_translate(ws: WebSocket):
                 )
         except Exception as exc:
             print("[WS translate][broadcast][error]", exc)
+
+        # Kick off server-TTS synth + audio broadcast AFTER the text broadcast so
+        # the listener sees the translated text without waiting on TTS latency.
+        if will_broadcast_server_tts:
+            asyncio.create_task(
+                _broadcast_listener_server_tts(
+                    target_org_id,
+                    target_room_id,
+                    translated,
+                    tgt_lang_full,
+                    "deepgram",
+                )
+            )
 
         try:
             await ws.send_json(live_msg_legacy)
@@ -1654,6 +1749,23 @@ async def ws_translate(ws: WebSocket):
                         await manager.broadcast({"type": "display_config", "speed": speed})
                 except Exception:
                     pass
+                continue
+            if mtype_l == "set_broadcast_voice":
+                if manager.get_role(ws) != "host" or not host_authed:
+                    try:
+                        await ws.send_json({"type": "error", "message": "host_auth_required"})
+                    except Exception:
+                        pass
+                    continue
+                if not joined_org_id or not joined_room_id:
+                    continue
+                raw_voice = msg.get("voice")
+                voice_str = str(raw_voice or "").strip()
+                key = (joined_org_id, joined_room_id)
+                if voice_str and voice_str.lower() != "auto":
+                    ROOM_BROADCAST_VOICE[key] = voice_str
+                else:
+                    ROOM_BROADCAST_VOICE.pop(key, None)
                 continue
             if mtype_l == "producer_commit":
                 await handle_commit(msg, is_partial=False)
@@ -2653,6 +2765,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 meta_payload,
             )
 
+            # Server-side TTS (Deepgram + GPT path): only for the final commit,
+            # when the translated text is non-empty and we have an org/room.
+            will_broadcast_server_tts = bool(
+                not partial
+                and translated
+                and translated.strip()
+                and org_id
+                and room_id
+                and LISTENER_SERVER_TTS_ENABLED
+                and "deepgram" in LISTENER_SERVER_TTS_ENGINES
+            )
+            if will_broadcast_server_tts:
+                meta_payload["expect_server_audio"] = True
+
             live_msg_new = {
                 "mode": live_mode,
                 "text": translated,
@@ -2694,6 +2820,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print(f"[BROADCAST] seq={assigned_seq} '{translated[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
+
+            # Kick off server-TTS synth + audio broadcast AFTER the text so
+            # listener sees the caption without waiting on TTS latency.
+            if will_broadcast_server_tts:
+                asyncio.create_task(
+                    _broadcast_listener_server_tts(
+                        org_id,
+                        room_id,
+                        translated,
+                        tgt_lang_full,
+                        "deepgram",
+                    )
+                )
 
             if not partial and org_id and room_id and clean_src and translated:
                 import datetime as _dt
