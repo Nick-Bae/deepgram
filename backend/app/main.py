@@ -4194,6 +4194,36 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
                 ),
             )
 
+    async def _broadcast_audio(data: str) -> None:
+        """Forward one chunk of OpenAI Realtime Translate's native output audio.
+
+        OpenAI streams the translated English audio back via
+        `session.output_audio.delta` events; each `delta` is a base64-encoded
+        PCM16 mono chunk at 24kHz — same shape as Gemini Live Translate and
+        exactly what the viewer's `usePcmAudioPlayer` expects.
+
+        We forward it as a `translated_audio` message so the viewer plays it
+        via the same PCM audio player used for Gemini. The host WS also
+        receives it (via `_send_to_producer`) so the host page can play the
+        same audio if it wants to monitor.
+        """
+        if not data or not org_id or not room_id:
+            return
+        message = {
+            "type": "translated_audio",
+            "provider": "openai",
+            "engine": OPENAI_REALTIME_TRANSLATE_MODEL,
+            "encoding": "pcm_s16le",
+            "sampleRate": 24000,
+            "channels": 1,
+            "data": data,
+        }
+        await _send_to_producer(message)
+        try:
+            await manager.broadcast_room(org_id, room_id, message)
+        except Exception as exc:
+            print("[OAI-RT][audio-broadcast][error]", exc)
+
     async def _commit_output(reason: str) -> None:
         nonlocal output_buffer, source_buffer, flush_task
         text = output_buffer.strip()
@@ -4288,6 +4318,12 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
                         continue
                     source_buffer += delta
                     await _send_to_producer({"type": "stt.partial", "text": source_buffer.strip()})
+                    continue
+                if etype == "session.output_audio.delta":
+                    # Native translated audio from OpenAI (PCM16 24kHz base64).
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        await _broadcast_audio(delta)
                     continue
                 if etype.endswith(".done") or etype.endswith(".completed"):
                     if "output_transcript" in etype or etype == "session.output_audio.done":
