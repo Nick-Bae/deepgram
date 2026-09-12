@@ -200,11 +200,13 @@ export default function TranslationBox({
   const [isBroadcasting, setIsBroadcasting] = useState(true)
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
   const [displaySpeed, setDisplaySpeed] = useState(1)
-  // Audience TTS: whether listener page gets Google Cloud TTS audio broadcast.
-  // Only meaningful for Deepgram + GPT (text engines have no audio, native
-  // engines carry their own). Fires set_audience_tts_enabled on the WS so
-  // the backend can skip synth + broadcast (saves Google TTS cost).
-  const [audienceTtsEnabled, setAudienceTtsEnabled] = useState(true)
+  // Listener audio: whether the listener page gets Google Cloud TTS audio
+  // broadcast. Only meaningful for Deepgram + GPT (text engines have no
+  // audio, native engines carry their own). Fires set_audience_tts_enabled
+  // on the WS so the backend can skip synth + broadcast (saves Google TTS
+  // cost). Default OFF — the host must explicitly opt in per service so
+  // no Google TTS charges are incurred without their knowledge.
+  const [audienceTtsEnabled, setAudienceTtsEnabled] = useState(false)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const [socketClock, setSocketClock] = useState(() => Date.now())
   const [deepgramStartingAt, setDeepgramStartingAt] = useState<number | null>(null)
