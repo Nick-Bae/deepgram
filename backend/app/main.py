@@ -2783,6 +2783,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 meta_payload,
             )
 
+            # Server-side TTS (Deepgram + GPT path): only for the final commit,
+            # when the translated text is non-empty and we have an org/room.
+            will_broadcast_server_tts = bool(
+                not partial
+                and translated
+                and translated.strip()
+                and org_id
+                and room_id
+                and LISTENER_SERVER_TTS_ENABLED
+                and "deepgram" in LISTENER_SERVER_TTS_ENGINES
+            )
+            if will_broadcast_server_tts:
+                meta_payload["expect_server_audio"] = True
+
             live_msg_new = {
                 "mode": live_mode,
                 "text": translated,
@@ -2824,6 +2838,19 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print(f"[BROADCAST] seq={assigned_seq} '{translated[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
+
+            # Kick off server-TTS synth + audio broadcast AFTER the text so
+            # listener sees the caption without waiting on TTS latency.
+            if will_broadcast_server_tts:
+                asyncio.create_task(
+                    _broadcast_listener_server_tts(
+                        org_id,
+                        room_id,
+                        translated,
+                        tgt_lang_full,
+                        "deepgram",
+                    )
+                )
 
             if not partial and org_id and room_id and clean_src and translated:
                 import datetime as _dt
