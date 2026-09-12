@@ -37,6 +37,7 @@ from app.deepgram_session import connect_to_deepgram, deepgram_model_for_languag
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
 from app.services import google_tts as google_tts_service
+from app.latency_probe import LatencyProbe
 from app.utils.hangul import strip_ko_particles
 from app.utils.translate import (
     _preprocess_source_text,
@@ -2121,6 +2122,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     total_audio_bytes = 0
     session_end_reason = "unknown"
     prompt_overrides_cache: dict[str, tuple[float, tuple[Optional[str], Optional[str]]]] = {}
+    probe = LatencyProbe("deepgram", org_id, room_id)
 
     def _cached_prompt_overrides(active_org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         clean_org_id = _clean_token(active_org_id)
@@ -2178,6 +2180,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         pass
                     break
                 if (b := msg.get("bytes")):
+                    probe.mark_t0()
                     # your AudioWorklet streams raw 16-bit PCM @ 48k
                     total_audio_bytes += len(b)
                     await dg.send(b)
@@ -2833,6 +2836,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 pass
 
             try:
+                if partial:
+                    probe.mark_t1()
+                else:
+                    probe.mark_t2()
                 if org_id and room_id:
                     await asyncio.gather(
                         manager.broadcast_room(org_id, room_id, live_msg_new),
@@ -2850,6 +2857,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             # Kick off server-TTS synth + audio broadcast AFTER the text so
             # listener sees the caption without waiting on TTS latency.
             if will_broadcast_server_tts:
+                probe.mark_t3()
                 asyncio.create_task(
                     _broadcast_listener_server_tts(
                         org_id,
@@ -2859,6 +2867,9 @@ async def ws_stt_deepgram(websocket: WebSocket):
                         "deepgram",
                     )
                 )
+
+            if not partial:
+                probe.emit_and_reset()
 
             if not partial and org_id and room_id and clean_src and translated:
                 import datetime as _dt
@@ -4090,6 +4101,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
     flush_task: asyncio.Task | None = None
     last_audio_touch_ts = 0.0
     total_audio_bytes = 0
+    probe = LatencyProbe("openai-realtime-translate", org_id, room_id)
 
     async def _send_to_producer(message: dict[str, Any]) -> None:
         if closed.is_set():
@@ -4103,6 +4115,10 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
 
     async def _broadcast_translation(text: str, *, partial: bool, src_text: str = "") -> None:
         nonlocal seq
+        if partial:
+            probe.mark_t1()
+        else:
+            probe.mark_t2()
         clean = " ".join((text or "").split())
         clean_src = " ".join((src_text or "").split())
         reviewed_text: Optional[str] = None
@@ -4209,6 +4225,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         """
         if not data or not org_id or not room_id:
             return
+        probe.mark_t3()
         message = {
             "type": "translated_audio",
             "provider": "openai",
@@ -4235,6 +4252,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         flush_task = None
         print(f"[OAI-RT][commit][{reason}] '{text[:80]}'")
         await _broadcast_translation(text, partial=False, src_text=src_text)
+        probe.emit_and_reset()
 
     def _schedule_idle_flush(delay: float = 1.15) -> None:
         nonlocal flush_task
@@ -4260,6 +4278,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
                 if msg.get("type") == "websocket.disconnect":
                     break
                 if (b := msg.get("bytes")):
+                    probe.mark_t0()
                     total_audio_bytes += len(b)
                     pcm24 = _downsample_pcm16_48k_to_24k(b)
                     await oai.send(json.dumps({
@@ -4306,6 +4325,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
                     if not delta:
                         continue
                     output_buffer += delta
+                    probe.mark_t1()
                     await _broadcast_translation(output_buffer, partial=True, src_text=source_buffer.strip())
                     if _looks_like_english_sentence(output_buffer):
                         await _commit_output("sentence")
@@ -4459,6 +4479,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     total_audio_bytes = 0
     downsampler = Pcm16Downsampler48To16()
     chunk_buffer = PcmChunkBuffer()
+    probe = LatencyProbe("gemini-live-translate", org_id, room_id)
 
     async def _send_to_producer(message: dict[str, Any]) -> None:
         if closed.is_set():
@@ -4472,6 +4493,10 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
 
     async def _broadcast_translation(text: str, *, partial: bool, src_text: str = "") -> None:
         nonlocal seq
+        if partial:
+            probe.mark_t1()
+        else:
+            probe.mark_t2()
         clean = " ".join((text or "").split())
         clean_src = " ".join((src_text or "").split())
         reviewed_text: Optional[str] = None
@@ -4574,6 +4599,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     async def _broadcast_audio(data: str) -> None:
         if not data:
             return
+        probe.mark_t3()
         message = {
             "type": "translated_audio",
             "provider": "google",
@@ -4600,6 +4626,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         flush_task = None
         print(f"[GEMINI-LIVE][commit][{reason}] '{text[:80]}'")
         await _broadcast_translation(text, partial=False, src_text=src_text)
+        probe.emit_and_reset()
 
     def _schedule_idle_flush(delay: float = 1.0) -> None:
         nonlocal flush_task
@@ -4629,6 +4656,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
                 if msg.get("type") == "websocket.disconnect":
                     break
                 if (pcm48 := msg.get("bytes")):
+                    probe.mark_t0()
                     total_audio_bytes += len(pcm48)
                     pcm16 = downsampler.push(pcm48)
                     for chunk in chunk_buffer.push(pcm16):
