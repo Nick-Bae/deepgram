@@ -59,6 +59,10 @@ type Options = {
   track?: "en" | "kr" | "both" // which language(s) to keep as lines
   enabled?: boolean;
   onTranslatedAudio?: (data: string, sampleRate: number, provider?: string) => void;
+  // Fired when a final translation message carries `meta.expect_server_audio: true`.
+  // Listener page uses this to defer browser SpeechSynthesis until the matching
+  // `translated_audio` (Google TTS) message arrives.
+  onServerAudioExpected?: (text: string, seq: number | null) => void;
 };
 
 const VIEWER_STALE_SOCKET_MS = 90000;
@@ -77,6 +81,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const track = opts.track ?? "en";
   const enabled = opts.enabled ?? true;
   const onTranslatedAudioRef = useRef(opts.onTranslatedAudio);
+  const onServerAudioExpectedRef = useRef(opts.onServerAudioExpected);
   const streamContext = useMemo(() => resolveStreamContext(explicitUrl), [explicitUrl]);
 
   const [connected, setConnected] = useState(false);
@@ -107,6 +112,9 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   useEffect(() => {
     onTranslatedAudioRef.current = opts.onTranslatedAudio;
   }, [opts.onTranslatedAudio]);
+  useEffect(() => {
+    onServerAudioExpectedRef.current = opts.onServerAudioExpected;
+  }, [opts.onServerAudioExpected]);
 
   // Resolve viewing WS URL (append role=viewer)
   const resolvedUrl = useMemo(() => {
@@ -514,6 +522,12 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
               // so pacing shows only the authoritative live text (unconfirmed-
               // commit path). If text matches the preview, dedup below skips it.
               if (previewLineIdRef.current != null) clearPreviewFromDisplay();
+              // Backend hint: server-side TTS audio is on its way for this line.
+              // Listener page uses this to hold off SpeechSynthesis so we don't
+              // double-play the sentence.
+              if (msg.meta && (msg.meta as any).expect_server_audio === true) {
+                try { onServerAudioExpectedRef.current?.(t, seq); } catch { /* ignore */ }
+              }
               setEnFinal(t);
               if (track === "en" || track === "both") enqueueEnglish(seq, splitSentences(t));
               return;

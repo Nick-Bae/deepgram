@@ -152,17 +152,27 @@ export default function ChurchServiceListenerPage() {
   const { enabled: ttsEnabled, setEnabled: setTtsEnabled, speak } = useTTS(targetLang);
   const { enqueue: enqueuePcmAudio, unlock: unlockPcmAudio } = usePcmAudioPlayer(ttsEnabled);
   const lastNativeAudioAtRef = useRef(0);
+  // When the backend flags `expect_server_audio` on a text broadcast, hold
+  // off browser SpeechSynthesis until the matching `translated_audio` arrives
+  // (or a watchdog window elapses). Prevents double-playing the sentence.
+  const pendingServerAudioRef = useRef<{ text: string; expiresAt: number } | null>(null);
+  const SERVER_AUDIO_GRACE_MS = 4000;
   const handleTranslatedAudio = useCallback((data: string, sampleRate: number) => {
     if (enqueuePcmAudio(data, sampleRate)) {
       lastNativeAudioAtRef.current = Date.now();
+      pendingServerAudioRef.current = null;
     }
   }, [enqueuePcmAudio]);
+  const handleServerAudioExpected = useCallback((text: string) => {
+    pendingServerAudioRef.current = { text, expiresAt: Date.now() + SERVER_AUDIO_GRACE_MS };
+  }, []);
 
   const { connected, enLines } = useSubtitleSocket(scopedWsUrl, {
     maxLines: 4,
     track: "en",
     enabled: socketEnabled,
     onTranslatedAudio: handleTranslatedAudio,
+    onServerAudioExpected: handleServerAudioExpected,
   });
 
   const enLinesRef = useRef<string[]>([]);
@@ -237,6 +247,14 @@ export default function ChurchServiceListenerPage() {
     if (!lastLine || lastLine === lastSpokenLineRef.current) return;
     lastSpokenLineRef.current = lastLine;
     if (Date.now() - lastNativeAudioAtRef.current < 2500) return;
+    const pending = pendingServerAudioRef.current;
+    if (pending && pending.text === lastLine && Date.now() < pending.expiresAt) {
+      // Server-side Google Cloud TTS is on its way for this exact line; let
+      // handleTranslatedAudio play it. If audio never arrives (network hiccup),
+      // the SERVER_AUDIO_GRACE_MS watchdog lets a later line fall back to
+      // SpeechSynthesis naturally.
+      return;
+    }
     speak(lastLine);
   }, [enLines, fallbackEnLines, speak]);
 
