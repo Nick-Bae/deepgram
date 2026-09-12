@@ -183,6 +183,7 @@ export default function TranslationBox({
     last,
     sendDisplayConfig,
     sendBroadcastVoice,
+    sendAudienceTts,
   } = useTranslationSocket({ isProducer: true })
 
   // UI state
@@ -199,6 +200,11 @@ export default function TranslationBox({
   const [isBroadcasting, setIsBroadcasting] = useState(true)
   const [earlyCommitEnabled, setEarlyCommitEnabled] = useState(false)
   const [displaySpeed, setDisplaySpeed] = useState(1)
+  // Audience TTS: whether listener page gets Google Cloud TTS audio broadcast.
+  // Only meaningful for Deepgram + GPT (text engines have no audio, native
+  // engines carry their own). Fires set_audience_tts_enabled on the WS so
+  // the backend can skip synth + broadcast (saves Google TTS cost).
+  const [audienceTtsEnabled, setAudienceTtsEnabled] = useState(true)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const [socketClock, setSocketClock] = useState(() => Date.now())
   const [deepgramStartingAt, setDeepgramStartingAt] = useState<number | null>(null)
@@ -296,7 +302,7 @@ export default function TranslationBox({
     translationEngine === 'openai-realtime-translate'
       ? 'OpenAI Realtime Translate'
       : translationEngine === 'gemini-live-translate'
-        ? 'Gemini 3.5 Live Translate'
+        ? 'Gemini Live Translate'
         : 'Deepgram + GPT'
   const startProducer = useCallback(async () => {
     const startWithOptions = dgStart as (options?: { sourceLang?: string; targetLang?: string; earlyCommit?: boolean; engine?: TranslationEngine }) => Promise<void>
@@ -1146,7 +1152,11 @@ export default function TranslationBox({
     }
   }, [correctionDraft])
 
-  const ttsAudienceEnabled = !isMuted
+  // Sync audience TTS state to backend whenever it changes on the host.
+  useEffect(() => {
+    if (!connected) return
+    sendAudienceTts(audienceTtsEnabled)
+  }, [connected, audienceTtsEnabled, sendAudienceTts])
   const palette = {
     cloud: '#F2F3F4',
     sand: '#DED1C6',
@@ -1642,7 +1652,19 @@ export default function TranslationBox({
                 {([
                   { label: 'Broadcast output', desc: isBroadcasting ? 'Listeners are receiving translated output.' : 'Output is paused for listeners.', value: isBroadcasting, onToggle: () => setIsBroadcasting(v => !v) },
                   { label: 'Early preview', desc: translationEngine === 'deepgram' ? (earlyCommitEnabled ? 'Preview text is shown before final commit.' : 'Only finalized clauses are displayed.') : 'Handled by the selected realtime translation stream.', value: translationEngine === 'deepgram' && earlyCommitEnabled, onToggle: () => translationEngine === 'deepgram' && setEarlyCommitEnabled(v => !v) },
-                  { label: 'Audience TTS', desc: ttsAudienceEnabled ? 'Speech synthesis is active.' : 'Speech synthesis is muted.', value: ttsAudienceEnabled, onToggle: () => setIsMuted(m => !m) },
+                  // Audience TTS only applies to Deepgram + GPT — the other engines
+                  // either don't have listener audio (text engines) or carry native
+                  // audio from the model (Realtime Translate variants).
+                  ...(translationEngine === 'deepgram'
+                    ? [{
+                        label: 'Audience TTS',
+                        desc: audienceTtsEnabled
+                          ? 'Listeners hear Google Neural2 audio (+ ~$1–2 / 2 hr).'
+                          : 'Listeners see text only. No Google TTS charge.',
+                        value: audienceTtsEnabled,
+                        onToggle: () => setAudienceTtsEnabled(v => !v),
+                      }]
+                    : []),
                 ] as const).map(item => (
                   <div key={item.label} className="flex items-center justify-between gap-4 rounded-[1.1rem] px-4 py-3" style={controlSurfaceStyle}>
                     <div className="min-w-0">

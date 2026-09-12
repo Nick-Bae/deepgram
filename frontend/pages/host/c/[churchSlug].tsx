@@ -2796,8 +2796,8 @@ export default function HostChurchPage() {
                             }}
                           >
                             <option value="deepgram">Deepgram + GPT</option>
-                            <option value="openai-realtime-translate">OpenAI Realtime</option>
-                            <option value="gemini-live-translate">Gemini Live</option>
+                            <option value="openai-realtime-translate">OpenAI Realtime Translate</option>
+                            <option value="gemini-live-translate">Gemini Live Translate</option>
                           </select>
                         </label>
                       </div>
