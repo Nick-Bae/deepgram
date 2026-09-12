@@ -3,7 +3,7 @@
 import os, json, asyncio, logging, time, re, base64
 from collections import deque
 from threading import Lock
-from typing import Optional, Any, Callable, Awaitable, Dict, Tuple
+from typing import Optional, Any, Callable, Awaitable, Dict, Set, Tuple
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -38,6 +38,7 @@ from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
 from app.services import google_tts as google_tts_service
 from app.latency_probe import LatencyProbe
+from app.utils.hangul import strip_ko_particles
 from app.utils.translate import (
     _preprocess_source_text,
     is_invalid_translation_output,
@@ -165,6 +166,12 @@ LISTENER_SERVER_TTS_ENGINES = {
 # (`set_broadcast_voice` control message). Falls back to the language default
 # in google_tts.LANGUAGE_FALLBACKS when a room has no explicit choice.
 ROOM_BROADCAST_VOICE: Dict[Tuple[str, str], str] = {}
+
+# Per-(org, room) Audience TTS toggle set by the host over WS
+# (`set_audience_tts_enabled`). When False, _broadcast_listener_server_tts
+# does not synthesize or broadcast audio for that room — listeners see text
+# only. Absence of an entry means "enabled" (opt-out model).
+ROOM_AUDIENCE_TTS_DISABLED: Set[Tuple[str, str]] = set()
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
 WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
@@ -574,6 +581,9 @@ async def _broadcast_listener_server_tts(
     if engine and engine.lower() not in LISTENER_SERVER_TTS_ENGINES:
         return
     if not org_id or not room_id or not text or not text.strip():
+        return
+    # Host opted out of Audience TTS for this room — skip synth + broadcast.
+    if (org_id, room_id) in ROOM_AUDIENCE_TTS_DISABLED:
         return
     # Voice priority: explicit param → per-room preference (set by host over WS) → default.
     room_voice = ROOM_BROADCAST_VOICE.get((org_id, room_id))
@@ -1767,6 +1777,22 @@ async def ws_translate(ws: WebSocket):
                     ROOM_BROADCAST_VOICE[key] = voice_str
                 else:
                     ROOM_BROADCAST_VOICE.pop(key, None)
+                continue
+            if mtype_l == "set_audience_tts_enabled":
+                if manager.get_role(ws) != "host" or not host_authed:
+                    try:
+                        await ws.send_json({"type": "error", "message": "host_auth_required"})
+                    except Exception:
+                        pass
+                    continue
+                if not joined_org_id or not joined_room_id:
+                    continue
+                enabled = bool(msg.get("enabled"))
+                key = (joined_org_id, joined_room_id)
+                if enabled:
+                    ROOM_AUDIENCE_TTS_DISABLED.discard(key)
+                else:
+                    ROOM_AUDIENCE_TTS_DISABLED.add(key)
                 continue
             if mtype_l == "producer_commit":
                 await handle_commit(msg, is_partial=False)
@@ -3008,19 +3034,46 @@ async def ws_stt_deepgram(websocket: WebSocket):
             ]
             if src_lang.startswith("ko") and recent_confirmed_ko:
                 _new_stripped = norm_ws(src_text_raw).replace(" ", "")
+                # Particle-stripped variant catches Deepgram particle-swap/drop
+                # cases (예수님을↔예수님은, 이야기의↔이야기, 한가운데로↔한가운데)
+                # where the exact substring check below fails. See hangul.py
+                # `strip_ko_particles` docstring for the STT rationale.
+                _new_particles = strip_ko_particles(src_text_raw)
                 for _ts, _ko in recent_confirmed_ko:
                     _confirmed_stripped = norm_ws(_ko).replace(" ", "")
+                    _confirmed_particles = strip_ko_particles(_ko)
                     if not _new_stripped or not _confirmed_stripped:
                         continue
-                    # Skip if new is a substring of the confirmed segment's
-                    # Korean (the continuation case). Length gate prevents
-                    # tiny commits like "그" or "네" from matching every
-                    # confirmed segment.
+                    # Exact-char substring check (fires when Deepgram heard
+                    # the tail identically to the sermon segment's Korean).
+                    # Length gate prevents tiny commits like "그" or "네"
+                    # from matching every confirmed segment.
                     if len(_new_stripped) >= 4 and _new_stripped in _confirmed_stripped:
                         print(
                             f"[A][skip][continuation] "
                             f"src='{src_text_raw[:50]}' "
                             f"is-substring-of recent-confirmed='{_ko[:50]}'"
+                        )
+                        pending_src = None
+                        pending_speech_final = False
+                        held_src = None
+                        if pending_task and not pending_task.done():
+                            pending_task.cancel()
+                        pending_task = None
+                        return
+                    # Particle-tolerant substring check (fires when Deepgram
+                    # swapped or dropped a particle but the content morphemes
+                    # match). Higher length gate (8) because stripping removes
+                    # 1-2 chars per word and shorter overlaps become risky.
+                    if (
+                        len(_new_particles) >= 8
+                        and _new_particles in _confirmed_particles
+                    ):
+                        print(
+                            f"[A][skip][continuation-particles] "
+                            f"src='{src_text_raw[:50]}' "
+                            f"stripped='{_new_particles[:50]}' "
+                            f"matches recent-confirmed='{_ko[:50]}'"
                         )
                         pending_src = None
                         pending_speech_final = False
@@ -4157,6 +4210,36 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
                 ),
             )
 
+    async def _broadcast_audio(data: str) -> None:
+        """Forward one chunk of OpenAI Realtime Translate's native output audio.
+
+        OpenAI streams the translated English audio back via
+        `session.output_audio.delta` events; each `delta` is a base64-encoded
+        PCM16 mono chunk at 24kHz — same shape as Gemini Live Translate and
+        exactly what the viewer's `usePcmAudioPlayer` expects.
+
+        We forward it as a `translated_audio` message so the viewer plays it
+        via the same PCM audio player used for Gemini. The host WS also
+        receives it (via `_send_to_producer`) so the host page can play the
+        same audio if it wants to monitor.
+        """
+        if not data or not org_id or not room_id:
+            return
+        message = {
+            "type": "translated_audio",
+            "provider": "openai",
+            "engine": OPENAI_REALTIME_TRANSLATE_MODEL,
+            "encoding": "pcm_s16le",
+            "sampleRate": 24000,
+            "channels": 1,
+            "data": data,
+        }
+        await _send_to_producer(message)
+        try:
+            await manager.broadcast_room(org_id, room_id, message)
+        except Exception as exc:
+            print("[OAI-RT][audio-broadcast][error]", exc)
+
     async def _commit_output(reason: str) -> None:
         nonlocal output_buffer, source_buffer, flush_task
         text = output_buffer.strip()
@@ -4254,6 +4337,12 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
                         continue
                     source_buffer += delta
                     await _send_to_producer({"type": "stt.partial", "text": source_buffer.strip()})
+                    continue
+                if etype == "session.output_audio.delta":
+                    # Native translated audio from OpenAI (PCM16 24kHz base64).
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        await _broadcast_audio(delta)
                     continue
                 if etype.endswith(".done") or etype.endswith(".completed"):
                     if "output_transcript" in etype or etype == "session.output_audio.done":
