@@ -37,6 +37,7 @@ from app.deepgram_session import connect_to_deepgram, deepgram_model_for_languag
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
 from app.services import google_tts as google_tts_service
+from app.utils.hangul import strip_ko_particles
 from app.utils.translate import (
     _preprocess_source_text,
     is_invalid_translation_output,
@@ -2997,19 +2998,46 @@ async def ws_stt_deepgram(websocket: WebSocket):
             ]
             if src_lang.startswith("ko") and recent_confirmed_ko:
                 _new_stripped = norm_ws(src_text_raw).replace(" ", "")
+                # Particle-stripped variant catches Deepgram particle-swap/drop
+                # cases (예수님을↔예수님은, 이야기의↔이야기, 한가운데로↔한가운데)
+                # where the exact substring check below fails. See hangul.py
+                # `strip_ko_particles` docstring for the STT rationale.
+                _new_particles = strip_ko_particles(src_text_raw)
                 for _ts, _ko in recent_confirmed_ko:
                     _confirmed_stripped = norm_ws(_ko).replace(" ", "")
+                    _confirmed_particles = strip_ko_particles(_ko)
                     if not _new_stripped or not _confirmed_stripped:
                         continue
-                    # Skip if new is a substring of the confirmed segment's
-                    # Korean (the continuation case). Length gate prevents
-                    # tiny commits like "그" or "네" from matching every
-                    # confirmed segment.
+                    # Exact-char substring check (fires when Deepgram heard
+                    # the tail identically to the sermon segment's Korean).
+                    # Length gate prevents tiny commits like "그" or "네"
+                    # from matching every confirmed segment.
                     if len(_new_stripped) >= 4 and _new_stripped in _confirmed_stripped:
                         print(
                             f"[A][skip][continuation] "
                             f"src='{src_text_raw[:50]}' "
                             f"is-substring-of recent-confirmed='{_ko[:50]}'"
+                        )
+                        pending_src = None
+                        pending_speech_final = False
+                        held_src = None
+                        if pending_task and not pending_task.done():
+                            pending_task.cancel()
+                        pending_task = None
+                        return
+                    # Particle-tolerant substring check (fires when Deepgram
+                    # swapped or dropped a particle but the content morphemes
+                    # match). Higher length gate (8) because stripping removes
+                    # 1-2 chars per word and shorter overlaps become risky.
+                    if (
+                        len(_new_particles) >= 8
+                        and _new_particles in _confirmed_particles
+                    ):
+                        print(
+                            f"[A][skip][continuation-particles] "
+                            f"src='{src_text_raw[:50]}' "
+                            f"stripped='{_new_particles[:50]}' "
+                            f"matches recent-confirmed='{_ko[:50]}'"
                         )
                         pending_src = None
                         pending_speech_final = False
