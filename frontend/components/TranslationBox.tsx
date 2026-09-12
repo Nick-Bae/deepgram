@@ -739,6 +739,16 @@ export default function TranslationBox({
       console.warn('[FE][TTS][error]', err);
       finalize();
     };
+    // `unlockAudio` runs a temporary silent-muted playback to satisfy the
+    // browser autoplay policy on first use, then restores `audio.muted` to
+    // whatever `isMuted` was at unlock time. If unlock happened while
+    // `isMuted=true` (default since 48a681f3), `audio.muted` sticks at true.
+    // A later unmute-toggle short-circuits unlock (audioUnlockedRef is already
+    // set), so the muted state never gets reset — every subsequent play is
+    // silent, even though `.play()` resolves and `[FE][TTS][start]` logs.
+    // Reaching this point means we've passed the `isMuted` early-return above,
+    // so force muted=false on the element to match intent.
+    audio.muted = false;
     audio.src = next.url;
     audio.currentTime = 0;
     const attempt = audio.play();
