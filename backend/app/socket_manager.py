@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Dict, Set, Tuple
+from typing import Callable, Dict, Set, Tuple
 
 from fastapi import WebSocket
 
@@ -40,6 +40,18 @@ class ConnectionManager:
         self.hostless_since_by_room: Dict[RoomKey, float] = {}
         self.host_presence_by_ws: Dict[WebSocket, RoomKey] = {}
         self.host_presence_counts_by_room: Dict[RoomKey, int] = {}
+        # STT handlers register a shutdown callback (typically `closed.set`) so
+        # close_room_hosts can deterministically unblock `await closed.wait()`
+        # in the handler and trigger provider cleanup, rather than waiting on
+        # the uvicorn/websockets close handshake (which can take ~10s if the
+        # client never ACKs the close frame).
+        self.host_shutdown_cb_by_ws: Dict[WebSocket, Callable[[], None]] = {}
+
+    def register_host_shutdown_callback(self, ws: WebSocket, callback: Callable[[], None]) -> None:
+        self.host_shutdown_cb_by_ws[ws] = callback
+
+    def unregister_host_shutdown_callback(self, ws: WebSocket) -> None:
+        self.host_shutdown_cb_by_ws.pop(ws, None)
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -100,6 +112,8 @@ class ConnectionManager:
         self.hostless_since_by_room.pop(key, None)
 
     def note_host_disconnected(self, ws: WebSocket) -> None:
+        # Also drop any registered shutdown callback so it can't leak by ws.
+        self.host_shutdown_cb_by_ws.pop(ws, None)
         key = self.host_presence_by_ws.pop(ws, None)
         if not key:
             return
@@ -180,6 +194,92 @@ class ConnectionManager:
             if ws_key == key:
                 self.host_presence_by_ws.pop(ws, None)
 
+    async def close_room_hosts(
+        self,
+        org_id: str,
+        room_id: str,
+        code: int = 1000,
+        reason: str = "room_ended",
+    ) -> int:
+        """Server-close every host WS registered in (org, room).
+
+        Host STT sockets are tracked in host_presence_by_ws but NOT in
+        connections_by_room (STT handlers don't call join_room), so
+        close_room_listeners misses them. Without this, End Service leaves
+        the Deepgram/OpenAI/Gemini upstream session running until the STT
+        handler's own idle watchdog fires — burning provider cost meanwhile.
+        """
+        key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        if not key[0] or not key[1]:
+            return 0
+        # Snapshot before iterating — close() cascades into disconnect handlers
+        # that mutate host_presence_by_ws.
+        hosts = [ws for ws, k in list(self.host_presence_by_ws.items()) if k == key]
+        # Fire per-host shutdown callbacks synchronously first so the handler's
+        # `closed` event is set BEFORE we send the close frame. That way even
+        # if the client never ACKs the close, the handler's `await closed.wait()`
+        # returns immediately and provider cleanup runs. Without this, the
+        # handler would block until uvicorn's close handshake timeout (~10s).
+        for ws in hosts:
+            cb = self.host_shutdown_cb_by_ws.pop(ws, None)
+            if cb is None:
+                continue
+            try:
+                cb()
+            except Exception:
+                pass
+        results = await asyncio.gather(
+            *(self._close_one(ws, code, reason) for ws in hosts),
+            return_exceptions=True,
+        )
+        for ws in hosts:
+            try:
+                self.note_host_disconnected(ws)
+            except Exception:
+                pass
+        return sum(1 for r in results if r is True)
+
+    async def close_room_listeners(
+        self,
+        org_id: str,
+        room_id: str,
+        code: int = 1000,
+        reason: str = "room_ended",
+    ) -> int:
+        """Server-close every WebSocket in (org, room) and drop tracking.
+
+        Why: after a room ends, listeners that stay connected (backgrounded
+        tabs whose /resolve poll is throttled, sleeping devices) keep a Cloud
+        Run socket slot occupied until the LB idle timeout kicks in. Closing
+        from the server frees those slots immediately regardless of client
+        state.
+
+        Closes run concurrently with a per-socket timeout so a single dead
+        or backpressured listener can't stall the rest of the room cleanup
+        (or the End Service response).
+        """
+        key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        if not key[0] or not key[1]:
+            return 0
+        sockets = list(self.connections_by_room.get(key) or set())
+        results = await asyncio.gather(
+            *(self._close_one(ws, code, reason) for ws in sockets),
+            return_exceptions=True,
+        )
+        for ws in sockets:
+            try:
+                self.disconnect(ws)
+            except Exception:
+                pass
+        return sum(1 for r in results if r is True)
+
+    async def _close_one(self, ws, code: int, reason: str) -> bool:
+        try:
+            await asyncio.wait_for(ws.close(code=code, reason=reason), timeout=2.0)
+            return True
+        except Exception:
+            return False
+
     async def broadcast(self, message):
         # Legacy (null org/room) path — local instance only. See design §2.
         if pubsub.enabled:
@@ -244,6 +344,18 @@ class ConnectionManager:
                 dead.append(ws)
         for ws in dead:
             self.disconnect(ws)
+        # Auto-close on room-end. Same code path handles single-instance
+        # (broadcast_room → this method directly), the Redis publisher instance
+        # (broadcast_room → gather(local, publish) → this method), and Redis
+        # subscriber instances (reader → callback → this method). Both listener
+        # and host sockets are closed here — a host STT socket may be on a
+        # different Cloud Run instance than the one that received End Service,
+        # and only the instance holding the socket can close it. Without host
+        # cleanup here, the Deepgram/OpenAI/Gemini upstream session on a sibling
+        # instance keeps running.
+        if isinstance(message, dict) and message.get("roomStatus") == "ended":
+            await self.close_room_listeners(org_id, room_id, reason="room_ended")
+            await self.close_room_hosts(org_id, room_id, reason="room_ended")
 
 
 def _schedule(coro) -> None:

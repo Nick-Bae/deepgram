@@ -195,16 +195,28 @@ class ScriptStore:
         service_key: Optional[str] = None,
         service_date: Optional[str] = None,
     ) -> Tuple[int, int]:
-        """Clear all pairs; returns (removed_count, new_version)."""
+        """Clear all pairs; returns (removed_count, new_version).
+
+        Room-scoped keys (from end_room) are removed entirely so ended rooms
+        don't accumulate empty ScriptBuffer entries — one per room ever ends
+        adds up over long-running instances. Org/global keys stay resident
+        because they're reused across services.
+        """
         with self._lock:
             key = self._org_key(org_id, room_id=room_id, service_key=service_key, service_date=service_date)
             buffer = self._buffers.get(key) or ScriptBuffer()
             removed = len(buffer.pairs)
-            buffer.pairs = []
-            buffer.sermons = {}
-            buffer.version += 1
-            self._buffers[key] = buffer
-            return removed, buffer.version
+            next_version = buffer.version + 1
+            if room_id:
+                self._buffers.pop(key, None)
+                for cache_key in [ck for ck in self._glossary_cache if ck[0] == key]:
+                    self._glossary_cache.pop(cache_key, None)
+            else:
+                buffer.pairs = []
+                buffer.sermons = {}
+                buffer.version = next_version
+                self._buffers[key] = buffer
+            return removed, next_version
 
     def stats(
         self,

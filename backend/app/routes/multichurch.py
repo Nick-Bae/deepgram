@@ -320,7 +320,7 @@ def start_service_by_slug(
 
 
 @router.post("/org/{org_id}/room/{room_id}/end")
-def end_room(
+async def end_room(
     *,
     org_id: str = Path(pattern=validators.ORG_ID),
     room_id: str = Path(pattern=validators.ORG_ID),
@@ -334,11 +334,12 @@ def end_room(
     )
     if not allowed:
         raise HTTPException(status_code=403, detail="host_auth_failed")
+    reason = (payload.reason or "host_end").strip().lower()
     try:
         result = multichurch_store.end_room(
             org_id=org_id,
             room_id=room_id,
-            reason=(payload.reason or "host_end").strip().lower(),
+            reason=reason,
             transcript=(payload.transcript or "").strip() or None,
         )
     except ValueError as exc:
@@ -346,6 +347,42 @@ def end_room(
 
     # Free in-memory sermon script for this room
     script_store.clear(room_id=room_id)
+
+    # Notify still-connected listeners, then server-close their sockets.
+    # The /resolve poll would eventually see roomStatus=ended and cause the
+    # client to close, but a backgrounded tab's setInterval is throttled or
+    # suspended — the socket would otherwise linger until the Cloud Run LB
+    # idle timeout. Broadcast first so any live viewer receives the STATUS
+    # frame before the close frame; then close to release socket slots.
+    if not result.get("alreadyEnded"):
+        try:
+            await manager.broadcast_room(
+                org_id,
+                room_id,
+                {
+                    "type": "STATUS",
+                    "orgId": org_id,
+                    "roomId": room_id,
+                    "roomStatus": "ended",
+                    "viewerCount": 0,
+                    "reason": reason,
+                },
+            )
+        except Exception:
+            pass
+    try:
+        await manager.close_room_listeners(org_id, room_id, reason="room_ended")
+    except Exception:
+        pass
+    # Also close the host STT socket for this room — without this, End Service
+    # leaves the Deepgram/OpenAI/Gemini upstream session running until the STT
+    # handler's own idle watchdog fires (STT_NO_SPEECH_TIMEOUT_SEC), burning
+    # provider cost meanwhile.
+    try:
+        await manager.close_room_hosts(org_id, room_id, reason="room_ended")
+    except Exception:
+        pass
+
     manager.forget_room(org_id, room_id)
 
     return result

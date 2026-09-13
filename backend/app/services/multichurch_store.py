@@ -2632,6 +2632,13 @@ class InMemoryMultiChurchStore:
                 "languagePair": {"source": source, "target": target},
             }
 
+    def is_room_live(self, org_id: str, room_id: str) -> bool:
+        with self._lock:
+            room = self._rooms.get((org_id, room_id))
+            if not room:
+                return False
+            return str(room.get("status") or "").lower() == "live"
+
     def end_room(
         self,
         org_id: str,
@@ -3181,6 +3188,20 @@ class FirestoreMultiChurchStore:
 
     def _room_ref(self, org_id: str, room_id: str):
         return self._org_ref(org_id).collection("rooms").document(room_id)
+
+    def is_room_live(self, org_id: str, room_id: str) -> bool:
+        clean_org = _clean_token(org_id)
+        clean_room = _clean_token(room_id)
+        if not clean_org or not clean_room:
+            return False
+        try:
+            snap = self._room_ref(clean_org, clean_room).get(timeout=_FS_TIMEOUT)
+        except Exception:
+            return False
+        if not snap.exists:
+            return False
+        doc = snap.to_dict() or {}
+        return str(doc.get("status") or "").lower() == "live"
 
     def _usage_ref(self, org_id: str, period_key: str):
         return self._org_ref(org_id).collection("usage").document(period_key)

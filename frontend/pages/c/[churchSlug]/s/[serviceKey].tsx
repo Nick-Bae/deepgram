@@ -79,6 +79,12 @@ export default function ChurchServiceListenerPage() {
   const [displayMode, setDisplayMode] = useState<DisplayMode>("subtitle");
   const [fallbackEnLines, setFallbackEnLines] = useState<string[]>([]);
   const fallbackSeqRef = useRef(0);
+  // Terminal state. Once flipped true, no older /resolve response can flip
+  // the page back to "live" — a slow response from before End Service could
+  // otherwise arrive after a newer one that reported "ended" and re-enable
+  // polling and the WebSocket.
+  const serviceEndedRef = useRef(false);
+  const [serviceEnded, setServiceEnded] = useState(false);
 
   const toggleDisplayMode = useCallback(() => {
     setDisplayMode((prev) => (prev === "subtitle" ? "fullScreen" : "subtitle"));
@@ -94,12 +100,36 @@ export default function ChurchServiceListenerPage() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleDisplayMode]);
 
+  // Reset terminal state whenever the identity of the service changes so
+  // navigating between services doesn't carry an "ended" flag across —
+  // otherwise Next.js's page reuse would leave a new service permanently
+  // stuck at "ended" with no socket and no polling.
+  useEffect(() => {
+    serviceEndedRef.current = false;
+    setServiceEnded(false);
+  }, [slug, serviceKey]);
+
   useEffect(() => {
     if (!slug || !serviceKey) return;
     let disposed = false;
 
+    let timer: number | null = null;
+
+    const stopPolling = () => {
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+
     const fetchResolve = async () => {
       if (typeof document !== "undefined" && document.hidden) return;
+      // Terminal state is irreversible. Skip both the network hit and any
+      // state writes so a slow older response can't undo the terminal state.
+      if (serviceEndedRef.current) {
+        stopPolling();
+        return;
+      }
       try {
         const res = await fetch(`${API_URL}/api/c/${encodeURIComponent(slug)}/s/${encodeURIComponent(serviceKey)}/resolve`);
         if (!res.ok) {
@@ -107,6 +137,7 @@ export default function ChurchServiceListenerPage() {
         }
         const data: ResolveResponse = await res.json();
         if (disposed) return;
+        if (serviceEndedRef.current) return;
         setResolveData(data);
         setErrorMsg(null);
         persistStreamContext({
@@ -116,6 +147,11 @@ export default function ChurchServiceListenerPage() {
           churchSlug: data.slug || slug,
         });
         if (!data.activeRoomId) clearRoomInSession();
+        if (data.roomStatus === "ended") {
+          serviceEndedRef.current = true;
+          setServiceEnded(true);
+          stopPolling();
+        }
       } catch (err: unknown) {
         if (disposed) return;
         const message = err instanceof Error ? err.message : String(err);
@@ -126,14 +162,14 @@ export default function ChurchServiceListenerPage() {
     };
 
     fetchResolve();
-    const timer = window.setInterval(fetchResolve, RESOLVE_POLL_MS);
+    timer = window.setInterval(fetchResolve, RESOLVE_POLL_MS);
     return () => {
       disposed = true;
-      clearInterval(timer);
+      stopPolling();
     };
   }, [serviceKey, slug]);
 
-  const socketEnabled = !!resolveData?.activeRoomId && resolveData?.roomStatus === "live";
+  const socketEnabled = !serviceEnded && !!resolveData?.activeRoomId && resolveData?.roomStatus === "live";
   const scopedWsUrl = useMemo(() => {
     if (!socketEnabled || !resolveData?.orgId || !resolveData.activeRoomId) return undefined;
     return appendStreamContextToUrl(
@@ -167,7 +203,7 @@ export default function ChurchServiceListenerPage() {
     pendingServerAudioRef.current = { text, expiresAt: Date.now() + SERVER_AUDIO_GRACE_MS };
   }, []);
 
-  const { connected, enLines } = useSubtitleSocket(scopedWsUrl, {
+  const { connected, terminated: socketTerminated, enLines } = useSubtitleSocket(scopedWsUrl, {
     maxLines: 4,
     track: "en",
     enabled: socketEnabled,
@@ -177,6 +213,17 @@ export default function ChurchServiceListenerPage() {
 
   const enLinesRef = useRef<string[]>([]);
   useEffect(() => { enLinesRef.current = enLines; }, [enLines]);
+
+  // The WS may report a terminal close (server sent reason=room_ended) before
+  // the next /resolve poll runs. Mirror that into serviceEnded so the display
+  // switches immediately and the socket doesn't re-enable on a stale live
+  // resolve.
+  useEffect(() => {
+    if (socketTerminated && !serviceEndedRef.current) {
+      serviceEndedRef.current = true;
+      setServiceEnded(true);
+    }
+  }, [socketTerminated]);
 
   const lastSpokenLineRef = useRef("");
 
