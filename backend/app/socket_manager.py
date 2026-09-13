@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Callable, Dict, Set, Tuple
+from typing import Callable, Dict, List, Set, Tuple
 
 from fastapi import WebSocket
 
@@ -46,12 +46,70 @@ class ConnectionManager:
         # the uvicorn/websockets close handshake (which can take ~10s if the
         # client never ACKs the close frame).
         self.host_shutdown_cb_by_ws: Dict[WebSocket, Callable[[], None]] = {}
+        # Hooks fired from _broadcast_local_room when a roomStatus="ended"
+        # message is delivered. Runs on EVERY instance (publisher and Redis
+        # subscribers), so per-room module-level state kept outside the manager
+        # (e.g. main.py's TTS maps) gets cleaned up wherever it lives, not
+        # only on the instance that originated End Service.
+        self.room_end_hooks: List[Callable[[str, str], None]] = []
+        # Local tombstone for rooms whose terminal broadcast has been
+        # delivered on THIS instance. Prevents a late listener-disconnect
+        # finally from publishing roomStatus="live" for a room that's already
+        # ended — the disconnect race that would otherwise send contradictory
+        # lifecycle events to sibling instances. Bounded via TTL cleanup.
+        self.ended_rooms_local: Dict[RoomKey, float] = {}
 
     def register_host_shutdown_callback(self, ws: WebSocket, callback: Callable[[], None]) -> None:
         self.host_shutdown_cb_by_ws[ws] = callback
 
     def unregister_host_shutdown_callback(self, ws: WebSocket) -> None:
         self.host_shutdown_cb_by_ws.pop(ws, None)
+
+    def register_room_end_hook(self, hook: Callable[[str, str], None]) -> None:
+        self.room_end_hooks.append(hook)
+
+    _ENDED_TOMBSTONE_TTL_SEC = 300.0
+
+    def _mark_room_ended_locally(self, org_id: str, room_id: str) -> None:
+        key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        if not key[0] or not key[1]:
+            return
+        now = time.monotonic()
+        self.ended_rooms_local[key] = now + self._ENDED_TOMBSTONE_TTL_SEC
+        # Sweep expired entries opportunistically — bounded map growth without
+        # a dedicated cleanup task.
+        if len(self.ended_rooms_local) > 512:
+            for k, exp in list(self.ended_rooms_local.items()):
+                if exp <= now:
+                    self.ended_rooms_local.pop(k, None)
+
+    def is_room_locally_ended(self, org_id: str, room_id: str) -> bool:
+        key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        if not key[0] or not key[1]:
+            return False
+        expires_at = self.ended_rooms_local.get(key)
+        if expires_at is None:
+            return False
+        if expires_at <= time.monotonic():
+            self.ended_rooms_local.pop(key, None)
+            return False
+        return True
+
+    async def register_host(self, ws: WebSocket, org_id: str, room_id: str) -> None:
+        """Async host registration with deterministic subscription readiness.
+
+        note_host_connected schedules a subscription fire-and-forget, which
+        leaves a window where a terminal broadcast published from another
+        instance is missed. STT handlers must know the subscription is active
+        before they clear the post-registration is_room_live gate, so this
+        method awaits ensure_subscription before returning.
+        """
+        self.note_host_connected(ws, org_id, room_id)
+        if pubsub.enabled:
+            try:
+                await pubsub.ensure_subscription((org_id or "").strip(), (room_id or "").strip())
+            except Exception:
+                pass  # ensure_subscription is idempotent; failures are logged
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -98,6 +156,11 @@ class ConnectionManager:
         return self.role_by_ws.get(ws, "listener")
 
     def note_host_connected(self, ws: WebSocket, org_id: str, room_id: str) -> None:
+        """Synchronous presence bookkeeping only. Callers that need the
+        Redis subscription to be active must use `register_host` (async)
+        so subscription readiness is awaited before returning. Keeping this
+        method sync preserves compatibility with disconnect() callers that
+        can't await."""
         key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
         if not key[0] or not key[1]:
             return
@@ -115,14 +178,6 @@ class ConnectionManager:
         self.host_presence_by_ws[ws] = key
         self.host_presence_counts_by_room[key] = self.host_presence_counts_by_room.get(key, 0) + 1
         self.hostless_since_by_room.pop(key, None)
-        # A host-only instance (no local listeners) would otherwise not
-        # subscribe to the room's Redis channel, so a cross-instance End
-        # Service terminal broadcast would never reach it — its host_shutdown
-        # callback would never fire, and the upstream provider session would
-        # linger. Acquire the subscription here too so every instance holding
-        # room-relevant state receives terminal messages.
-        if pubsub.enabled:
-            _schedule(pubsub.ensure_subscription(key[0], key[1]))
 
     def note_host_disconnected(self, ws: WebSocket) -> None:
         # Also drop any registered shutdown callback so it can't leak by ws.
@@ -363,6 +418,8 @@ class ConnectionManager:
     async def _broadcast_local_room(self, org_id: str, room_id: str, message: dict) -> None:
         key: RoomKey = (org_id, room_id)
         sockets = list(self.connections_by_room.get(key) or set())
+        is_terminal = isinstance(message, dict) and message.get("roomStatus") == "ended"
+
         # Concurrent, per-socket bounded sends. Sequential sends let one
         # backpressured client (dead, sleeping, throttled) stall the terminal
         # roomStatus=ended broadcast — which the pubsub reader awaits, and
@@ -373,9 +430,20 @@ class ConnectionManager:
             *(self._send_one(ws, message) for ws in sockets),
             return_exceptions=True,
         )
-        for ws, ok in zip(sockets, results):
-            if ok is not True:
+        failed = [ws for ws, ok in zip(sockets, results) if ok is not True]
+        # Close failed-send sockets BEFORE disconnect(). Otherwise disconnect
+        # removes them from connections_by_room and the terminal
+        # close_room_listeners snapshot below misses them — a timed-out
+        # listener would stay untracked but open, which is exactly the leak
+        # this branch is meant to prevent.
+        if failed:
+            await asyncio.gather(
+                *(self._close_one(ws, 1011, "send_failed") for ws in failed),
+                return_exceptions=True,
+            )
+            for ws in failed:
                 self.disconnect(ws)
+
         # Auto-close on room-end. Same code path handles single-instance
         # (broadcast_room → this method directly), the Redis publisher instance
         # (broadcast_room → gather(local, publish) → this method), and Redis
@@ -385,7 +453,16 @@ class ConnectionManager:
         # and only the instance holding the socket can close it. Without host
         # cleanup here, the Deepgram/OpenAI/Gemini upstream session on a sibling
         # instance keeps running.
-        if isinstance(message, dict) and message.get("roomStatus") == "ended":
+        if is_terminal:
+            self._mark_room_ended_locally(org_id, room_id)
+            # Run any registered per-room state hooks (e.g. TTS maps in main.py)
+            # on THIS instance — a subscriber instance that only receives the
+            # broadcast via Redis would otherwise never clean its local state.
+            for hook in list(self.room_end_hooks):
+                try:
+                    hook(org_id, room_id)
+                except Exception:
+                    pass
             await self.close_room_listeners(org_id, room_id, reason="room_ended")
             await self.close_room_hosts(org_id, room_id, reason="room_ended")
 

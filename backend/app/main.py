@@ -1253,6 +1253,10 @@ async def _cleanup_live_rooms_on_startup() -> None:
 @app.on_event("startup")
 async def _on_startup():
     global _room_sweeper_task
+    # Register room-end hooks so per-room module state (TTS voice/toggle maps)
+    # is cleared on EVERY instance when a terminal broadcast arrives via
+    # Redis, not only the instance that initiated End Service.
+    manager.register_room_end_hook(_cleanup_room_local_state)
     print(f"[MULTICHURCH] store={type(multichurch_store).__name__}")
     print(
         "[ROOM_CONFIG] "
@@ -1914,13 +1918,14 @@ async def ws_translate(ws: WebSocket):
         if room_before:
             org_id, room_id = room_before
             viewer_count = manager.room_viewer_count(org_id, room_id)
-            # Skip the "live" viewer-count broadcast if the room is empty
-            # locally: either this was the last viewer here (nothing to notify)
-            # or End Service already emptied the bucket. Prevents a race where
-            # a disconnect-triggered "live" event arrives at sibling instances
-            # *after* the terminal "ended" event and undoes the terminal state
-            # in a stale client that hasn't polled /resolve yet.
-            if viewer_count > 0:
+            # Skip the "live" viewer-count broadcast when either:
+            #   1. the local bucket is empty (nothing to notify here), or
+            #   2. the room is in the local ended tombstone (multi-listener
+            #      shutdown case — other listeners are still in the bucket
+            #      briefly, so viewer_count > 0 doesn't mean the room is live).
+            # Both prevent contradictory lifecycle events (a stale "live"
+            # arriving at sibling instances after "ended").
+            if viewer_count > 0 and not manager.is_room_locally_ended(org_id, room_id):
                 try:
                     await manager.broadcast_room(
                         org_id,
@@ -2244,10 +2249,14 @@ async def ws_stt_deepgram(websocket: WebSocket):
     seq = 0
     closed = asyncio.Event()
     manager.register_host_shutdown_callback(websocket, closed.set)
-    manager.note_host_connected(websocket, org_id, room_id)
+    # Deterministic host registration: awaits Redis subscription readiness
+    # before returning, so the post-registration is_room_live check below
+    # can only clear when this instance is actually receiving terminal
+    # broadcasts from siblings. Prevents the fire-and-forget subscribe race.
+    await manager.register_host(websocket, org_id, room_id)
 
     # Recheck AFTER host registration to close the race where End Service
-    # fires between the pre-connect check and note_host_connected.
+    # fires between the pre-connect check and register_host.
     try:
         _room_live_post = multichurch_store.is_room_live(org_id, room_id)
     except Exception:
@@ -4249,10 +4258,10 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         await websocket.send_json({"type": "error", "message": f"OpenAI realtime translate connect failed: {exc}"})
         await websocket.close(code=1011)
         return
-    # Register callback BEFORE note_host_connected — see Deepgram handler.
+    # Register callback BEFORE register_host — see Deepgram handler.
     closed = asyncio.Event()
     manager.register_host_shutdown_callback(websocket, closed.set)
-    manager.note_host_connected(websocket, org_id, room_id)
+    await manager.register_host(websocket, org_id, room_id)
 
     try:
         _room_live_post = multichurch_store.is_room_live(org_id, room_id)
@@ -4689,10 +4698,10 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         )
         await websocket.close(code=1011)
         return
-    # Register callback BEFORE note_host_connected — see Deepgram handler.
+    # Register callback BEFORE register_host — see Deepgram handler.
     closed = asyncio.Event()
     manager.register_host_shutdown_callback(websocket, closed.set)
-    manager.note_host_connected(websocket, org_id, room_id)
+    await manager.register_host(websocket, org_id, room_id)
 
     try:
         _room_live_post = multichurch_store.is_room_live(org_id, room_id)
