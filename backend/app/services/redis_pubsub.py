@@ -191,16 +191,39 @@ class RedisPubSub:
             log.warning("redis PUBLISH failed org=%s room=%s: %s", org_id, room_id, exc)
             return None
 
-    async def ensure_subscription(self, org_id: str, room_id: str) -> None:
-        """Refcount++ for (org, room); subscribe if this is the first local listener."""
+    async def ensure_subscription(self, org_id: str, room_id: str) -> bool:
+        """Refcount++ for (org, room); subscribe if this is the first local listener.
+
+        Returns True when this instance is (or already was) actually
+        subscribed to the room's channel. Returns False if the subscription
+        is pending (Redis disconnected — reader will resubscribe on reconnect).
+        Raises if the underlying SUBSCRIBE call fails; the refcount is rolled
+        back so a caller retry is not double-counted, and _subscribed does not
+        record a phantom membership.
+        """
         if not self._enabled:
-            return
+            return True
         key: RoomKey = (org_id, room_id)
         async with self._lock:
-            self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
-            if self._ref_counts[key] > 1:
-                return
-            await self._subscribe_channel(key)
+            previous = self._ref_counts.get(key, 0)
+            self._ref_counts[key] = previous + 1
+            if previous > 0:
+                # Someone else already opened this subscription. Reflect the
+                # actual state — False means Redis is currently disconnected;
+                # the reader loop's reconnect will resubscribe.
+                return self._connected and key in self._subscribed
+            try:
+                await self._subscribe_channel(key)
+            except Exception:
+                # Roll back the refcount: without this, a second attempt
+                # would see refcount > 0 and skip the actual SUBSCRIBE forever.
+                self._ref_counts.pop(key, None)
+                # Also drop any phantom _subscribed entry that _subscribe_channel
+                # may have added before the exception — refuse to lie about
+                # readiness on the next call.
+                self._subscribed.discard(key)
+                raise
+            return self._connected and key in self._subscribed
 
     async def release_subscription(self, org_id: str, room_id: str) -> None:
         """Refcount--; unsubscribe when the room's local listener count drops to zero."""
@@ -216,14 +239,20 @@ class RedisPubSub:
             await self._unsubscribe_channel(key)
 
     async def _subscribe_channel(self, key: RoomKey) -> None:
+        # We add to _subscribed even when the client is currently disconnected
+        # so the reader loop's reconnect path re-issues SUBSCRIBE for the
+        # room. Actual readiness is not "key in _subscribed" alone — it's
+        # `self._connected AND key in _subscribed`, which ensure_subscription's
+        # return value reflects.
         if not self._connected or self._pubsub is None:
-            self._subscribed.add(key)  # remember; reader loop will resubscribe on reconnect
+            self._subscribed.add(key)
             return
         try:
             await self._pubsub.subscribe(_channel_name(*key))
-            self._subscribed.add(key)
         except Exception as exc:
             log.warning("redis SUBSCRIBE failed key=%s: %s", key, exc)
+            raise  # caller (ensure_subscription) rolls back refcount
+        self._subscribed.add(key)
 
     async def _unsubscribe_channel(self, key: RoomKey) -> None:
         self._subscribed.discard(key)

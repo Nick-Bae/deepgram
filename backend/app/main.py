@@ -2253,7 +2253,20 @@ async def ws_stt_deepgram(websocket: WebSocket):
     # before returning, so the post-registration is_room_live check below
     # can only clear when this instance is actually receiving terminal
     # broadcasts from siblings. Prevents the fire-and-forget subscribe race.
-    await manager.register_host(websocket, org_id, room_id)
+    try:
+        await manager.register_host(websocket, org_id, room_id)
+    except Exception as exc:
+        print(f"[DG][register_host_failed] org={org_id} room={room_id} err={exc}")
+        manager.unregister_host_shutdown_callback(websocket)
+        try:
+            await asyncio.wait_for(dg.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
 
     # Recheck AFTER host registration to close the race where End Service
     # fires between the pre-connect check and register_host.
@@ -4261,7 +4274,20 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
     # Register callback BEFORE register_host — see Deepgram handler.
     closed = asyncio.Event()
     manager.register_host_shutdown_callback(websocket, closed.set)
-    await manager.register_host(websocket, org_id, room_id)
+    try:
+        await manager.register_host(websocket, org_id, room_id)
+    except Exception as exc:
+        print(f"[OAI-RT][register_host_failed] org={org_id} room={room_id} err={exc}")
+        manager.unregister_host_shutdown_callback(websocket)
+        try:
+            await asyncio.wait_for(oai.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
 
     try:
         _room_live_post = multichurch_store.is_room_live(org_id, room_id)
@@ -4701,7 +4727,21 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     # Register callback BEFORE register_host — see Deepgram handler.
     closed = asyncio.Event()
     manager.register_host_shutdown_callback(websocket, closed.set)
-    await manager.register_host(websocket, org_id, room_id)
+    try:
+        await manager.register_host(websocket, org_id, room_id)
+    except Exception as exc:
+        print(f"[GEMINI-LIVE][register_host_failed] org={org_id} room={room_id} err={exc}")
+        manager.unregister_host_shutdown_callback(websocket)
+        if gemini is not None:
+            try:
+                await asyncio.wait_for(gemini.close(), timeout=3.0)
+            except Exception:
+                pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
 
     try:
         _room_live_post = multichurch_store.is_room_live(org_id, room_id)

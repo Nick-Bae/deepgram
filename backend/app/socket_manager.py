@@ -66,7 +66,10 @@ class ConnectionManager:
         self.host_shutdown_cb_by_ws.pop(ws, None)
 
     def register_room_end_hook(self, hook: Callable[[str, str], None]) -> None:
-        self.room_end_hooks.append(hook)
+        # Idempotent so repeated app-lifespan startups (tests, hot reloads)
+        # don't fire the same hook twice per terminal broadcast.
+        if hook not in self.room_end_hooks:
+            self.room_end_hooks.append(hook)
 
     _ENDED_TOMBSTONE_TTL_SEC = 300.0
 
@@ -98,18 +101,30 @@ class ConnectionManager:
     async def register_host(self, ws: WebSocket, org_id: str, room_id: str) -> None:
         """Async host registration with deterministic subscription readiness.
 
-        note_host_connected schedules a subscription fire-and-forget, which
-        leaves a window where a terminal broadcast published from another
-        instance is missed. STT handlers must know the subscription is active
-        before they clear the post-registration is_room_live gate, so this
-        method awaits ensure_subscription before returning.
+        Registers host presence, then awaits Redis subscription readiness.
+        Raises RuntimeError if the subscription cannot be established — the
+        STT handler must not run a session it cannot terminate reliably
+        from another instance. Presence is rolled back before raising so
+        the manager stays consistent.
         """
         self.note_host_connected(ws, org_id, room_id)
         if pubsub.enabled:
             try:
-                await pubsub.ensure_subscription((org_id or "").strip(), (room_id or "").strip())
-            except Exception:
-                pass  # ensure_subscription is idempotent; failures are logged
+                ready = await pubsub.ensure_subscription(
+                    (org_id or "").strip(),
+                    (room_id or "").strip(),
+                )
+            except Exception as exc:
+                self.note_host_disconnected(ws)
+                raise RuntimeError(f"host_subscription_failed: {exc}") from exc
+            if not ready:
+                # Redis is enabled but not currently connected. Reader will
+                # resubscribe on reconnect, but until then we cannot receive
+                # the terminal broadcast from another instance. Safer to
+                # refuse the host connection than to run without terminal
+                # reachability.
+                self.note_host_disconnected(ws)
+                raise RuntimeError("host_subscription_not_ready")
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -417,8 +432,24 @@ class ConnectionManager:
 
     async def _broadcast_local_room(self, org_id: str, room_id: str, message: dict) -> None:
         key: RoomKey = (org_id, room_id)
-        sockets = list(self.connections_by_room.get(key) or set())
         is_terminal = isinstance(message, dict) and message.get("roomStatus") == "ended"
+
+        # Establish irreversible local terminal state BEFORE any listener can
+        # react to the terminal message. Otherwise a fast listener could
+        # receive `ended`, disconnect, reach its finally, see other listeners
+        # still in the bucket, and broadcast roomStatus="live" — the exact
+        # race the tombstone is meant to prevent. Firing hooks up front also
+        # ensures per-room module state (TTS maps in main.py) is cleared on
+        # subscriber instances before any downstream code reads it.
+        if is_terminal:
+            self._mark_room_ended_locally(org_id, room_id)
+            for hook in list(self.room_end_hooks):
+                try:
+                    hook(org_id, room_id)
+                except Exception:
+                    pass
+
+        sockets = list(self.connections_by_room.get(key) or set())
 
         # Concurrent, per-socket bounded sends. Sequential sends let one
         # backpressured client (dead, sleeping, throttled) stall the terminal
@@ -437,8 +468,13 @@ class ConnectionManager:
         # listener would stay untracked but open, which is exactly the leak
         # this branch is meant to prevent.
         if failed:
+            # For terminal broadcasts, use the same 1000/room_ended pair
+            # close_room_listeners uses. Otherwise the frontend's terminal
+            # detection (code 1000 + reason room_ended) misfires and one
+            # reconnection attempt happens before /ws/translate rejects it.
+            fail_code, fail_reason = (1000, "room_ended") if is_terminal else (1011, "send_failed")
             await asyncio.gather(
-                *(self._close_one(ws, 1011, "send_failed") for ws in failed),
+                *(self._close_one(ws, fail_code, fail_reason) for ws in failed),
                 return_exceptions=True,
             )
             for ws in failed:
@@ -454,15 +490,6 @@ class ConnectionManager:
         # cleanup here, the Deepgram/OpenAI/Gemini upstream session on a sibling
         # instance keeps running.
         if is_terminal:
-            self._mark_room_ended_locally(org_id, room_id)
-            # Run any registered per-room state hooks (e.g. TTS maps in main.py)
-            # on THIS instance — a subscriber instance that only receives the
-            # broadcast via Redis would otherwise never clean its local state.
-            for hook in list(self.room_end_hooks):
-                try:
-                    hook(org_id, room_id)
-                except Exception:
-                    pass
             await self.close_room_listeners(org_id, room_id, reason="room_ended")
             await self.close_room_hosts(org_id, room_id, reason="room_ended")
 
