@@ -14,6 +14,17 @@ from app.socket_manager import manager
 from app.services.multichurch_store import multichurch_store
 from app.services.script_store import script_store
 
+def _cleanup_room_local_state(org_id: str, room_id: str) -> None:
+    # Deferred import: main.py imports this router at load time.
+    try:
+        from app.main import _cleanup_room_local_state as _clean
+    except Exception:
+        return
+    try:
+        _clean(org_id, room_id)
+    except Exception:
+        pass
+
 router = APIRouter()
 
 
@@ -354,22 +365,27 @@ async def end_room(
     # suspended — the socket would otherwise linger until the Cloud Run LB
     # idle timeout. Broadcast first so any live viewer receives the STATUS
     # frame before the close frame; then close to release socket slots.
-    if not result.get("alreadyEnded"):
-        try:
-            await manager.broadcast_room(
-                org_id,
-                room_id,
-                {
-                    "type": "STATUS",
-                    "orgId": org_id,
-                    "roomId": room_id,
-                    "roomStatus": "ended",
-                    "viewerCount": 0,
-                    "reason": reason,
-                },
-            )
-        except Exception:
-            pass
+    #
+    # We deliberately broadcast even when the room was ALREADY ended in
+    # Firestore: if the previous End Service call succeeded on Firestore but
+    # its Redis publish failed (or its close_room_* raised before completing),
+    # this retry is the only way to notify sibling instances. Every downstream
+    # step here is idempotent, so a duplicate terminal broadcast is harmless.
+    try:
+        await manager.broadcast_room(
+            org_id,
+            room_id,
+            {
+                "type": "STATUS",
+                "orgId": org_id,
+                "roomId": room_id,
+                "roomStatus": "ended",
+                "viewerCount": 0,
+                "reason": reason,
+            },
+        )
+    except Exception:
+        pass
     try:
         await manager.close_room_listeners(org_id, room_id, reason="room_ended")
     except Exception:
@@ -384,6 +400,7 @@ async def end_room(
         pass
 
     manager.forget_room(org_id, room_id)
+    _cleanup_room_local_state(org_id, room_id)
 
     return result
 

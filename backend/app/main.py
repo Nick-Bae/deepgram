@@ -172,6 +172,22 @@ ROOM_BROADCAST_VOICE: Dict[Tuple[str, str], str] = {}
 # does not synthesize or broadcast audio for that room — listeners see text
 # only. Absence of an entry means "enabled" (opt-out model).
 ROOM_AUDIENCE_TTS_DISABLED: Set[Tuple[str, str]] = set()
+
+
+def _cleanup_room_local_state(org_id: str, room_id: str) -> None:
+    """Drop all per-(org, room) module-level state on room end.
+
+    Without this, ROOM_BROADCAST_VOICE and ROOM_AUDIENCE_TTS_DISABLED grow one
+    entry per unique room over the process lifetime — small per entry, but
+    unbounded across weeks of services. Called from End Service (route) and
+    the sweeper's end paths so both explicit and automatic terminations clean
+    up uniformly.
+    """
+    key = (org_id or "", room_id or "")
+    if not key[0] or not key[1]:
+        return
+    ROOM_BROADCAST_VOICE.pop(key, None)
+    ROOM_AUDIENCE_TTS_DISABLED.discard(key)
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
 WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
@@ -1160,9 +1176,13 @@ async def _room_sweeper_loop() -> None:
                 try:
                     result = multichurch_store.end_room(org_id, room_id, reason=reason)
                     if result.get("alreadyEnded"):
-                        manager.forget_room(org_id, room_id)
-                        print(f"[ROOM_SWEEPER] room already ended — no double billing org={org_id} room={room_id}")
-                        continue
+                        # Do NOT skip socket/state cleanup here — the previous
+                        # end_room call may have flipped Firestore but failed
+                        # partway through cleanup (Redis publish, close_room_*
+                        # timeouts, etc.). Continuing lets this sweep repair
+                        # whatever the previous attempt missed. Billing is
+                        # already booked in Firestore so re-running is safe.
+                        print(f"[ROOM_SWEEPER] room already ended — running idempotent cleanup org={org_id} room={room_id}")
                 except ValueError:
                     continue
                 except Exception as exc:
@@ -1201,6 +1221,7 @@ async def _room_sweeper_loop() -> None:
                 except Exception:
                     pass
                 manager.forget_room(org_id, room_id)
+                _cleanup_room_local_state(org_id, room_id)
             _check_spend_alerts()
         except asyncio.CancelledError:
             break
@@ -1772,6 +1793,22 @@ async def ws_translate(ws: WebSocket):
                     else:
                         host_authed = False
                     viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
+                    # Same protection as the initial query-string join: refuse
+                    # to leave a socket registered against a room that's not
+                    # live. Without this, a consumer_join with an ended room
+                    # would install a listener that only leaves via the next
+                    # terminal broadcast — or never, if none is coming.
+                    try:
+                        _cj_room_live = multichurch_store.is_room_live(joined_org_id, joined_room_id)
+                    except Exception:
+                        _cj_room_live = True  # fail open on Firestore error
+                    if not _cj_room_live:
+                        manager.disconnect(ws)
+                        try:
+                            await ws.close(code=1000, reason="room_ended")
+                        except Exception:
+                            pass
+                        break
                     try:
                         multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
                     except Exception:
@@ -1877,20 +1914,27 @@ async def ws_translate(ws: WebSocket):
         if room_before:
             org_id, room_id = room_before
             viewer_count = manager.room_viewer_count(org_id, room_id)
-            try:
-                await manager.broadcast_room(
-                    org_id,
-                    room_id,
-                    {
-                        "type": "STATUS",
-                        "orgId": org_id,
-                        "roomId": room_id,
-                        "roomStatus": "live",
-                        "viewerCount": viewer_count,
-                    },
-                )
-            except Exception:
-                pass
+            # Skip the "live" viewer-count broadcast if the room is empty
+            # locally: either this was the last viewer here (nothing to notify)
+            # or End Service already emptied the bucket. Prevents a race where
+            # a disconnect-triggered "live" event arrives at sibling instances
+            # *after* the terminal "ended" event and undoes the terminal state
+            # in a stale client that hasn't polled /resolve yet.
+            if viewer_count > 0:
+                try:
+                    await manager.broadcast_room(
+                        org_id,
+                        room_id,
+                        {
+                            "type": "STATUS",
+                            "orgId": org_id,
+                            "roomId": room_id,
+                            "roomStatus": "live",
+                            "viewerCount": viewer_count,
+                        },
+                    )
+                except Exception:
+                    pass
 
 # ------------------------------------------------------------------------------
 # Producer: /ws/stt/deepgram
@@ -2063,11 +2107,11 @@ async def _stt_idle_watchdog(
                 pass
             closed.set()
             try:
-                await websocket.close(code=1000)
+                await asyncio.wait_for(websocket.close(code=1000), timeout=2.0)
             except Exception:
                 pass
             try:
-                await deepgram.close()
+                await asyncio.wait_for(deepgram.close(), timeout=3.0)
             except Exception:
                 pass
             break
@@ -4246,7 +4290,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
     except Exception as exc:
         print(f"[OAI-RT][session-update-failed] {exc!r}")
         try:
-            await oai.close()
+            await asyncio.wait_for(oai.close(), timeout=3.0)
         except Exception:
             pass
         manager.note_host_disconnected(websocket)
@@ -4634,7 +4678,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     except Exception as exc:
         if gemini is not None:
             try:
-                await gemini.close()
+                await asyncio.wait_for(gemini.close(), timeout=3.0)
             except Exception:
                 pass
         await websocket.send_json(

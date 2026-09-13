@@ -107,9 +107,22 @@ class ConnectionManager:
             return
         if prev_key:
             self._decrement_host_presence(prev_key)
+            # Release Redis subscription for the previous room this ws was
+            # attached to (if any) — refcount so listeners on that room can
+            # keep their subscription.
+            if pubsub.enabled:
+                _schedule(pubsub.release_subscription(prev_key[0], prev_key[1]))
         self.host_presence_by_ws[ws] = key
         self.host_presence_counts_by_room[key] = self.host_presence_counts_by_room.get(key, 0) + 1
         self.hostless_since_by_room.pop(key, None)
+        # A host-only instance (no local listeners) would otherwise not
+        # subscribe to the room's Redis channel, so a cross-instance End
+        # Service terminal broadcast would never reach it — its host_shutdown
+        # callback would never fire, and the upstream provider session would
+        # linger. Acquire the subscription here too so every instance holding
+        # room-relevant state receives terminal messages.
+        if pubsub.enabled:
+            _schedule(pubsub.ensure_subscription(key[0], key[1]))
 
     def note_host_disconnected(self, ws: WebSocket) -> None:
         # Also drop any registered shutdown callback so it can't leak by ws.
@@ -120,6 +133,12 @@ class ConnectionManager:
         self._decrement_host_presence(key)
         if self.room_host_count(key[0], key[1]) == 0:
             self.hostless_since_by_room.setdefault(key, time.monotonic())
+        # Release the Redis subscription this host acquired in
+        # note_host_connected. Listeners keep their own subscription refcount
+        # via join_room/disconnect, so this only tears down when nothing on
+        # this instance is interested in the room anymore.
+        if pubsub.enabled:
+            _schedule(pubsub.release_subscription(key[0], key[1]))
 
     def _decrement_host_presence(self, key: RoomKey) -> None:
         count = self.host_presence_counts_by_room.get(key, 0) - 1
@@ -280,6 +299,13 @@ class ConnectionManager:
         except Exception:
             return False
 
+    async def _send_one(self, ws, message: dict) -> bool:
+        try:
+            await asyncio.wait_for(ws.send_json(message), timeout=2.0)
+            return True
+        except Exception:
+            return False
+
     async def broadcast(self, message):
         # Legacy (null org/room) path — local instance only. See design §2.
         if pubsub.enabled:
@@ -336,14 +362,20 @@ class ConnectionManager:
 
     async def _broadcast_local_room(self, org_id: str, room_id: str, message: dict) -> None:
         key: RoomKey = (org_id, room_id)
-        dead = []
-        for ws in list(self.connections_by_room.get(key) or set()):
-            try:
-                await ws.send_json(message)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
+        sockets = list(self.connections_by_room.get(key) or set())
+        # Concurrent, per-socket bounded sends. Sequential sends let one
+        # backpressured client (dead, sleeping, throttled) stall the terminal
+        # roomStatus=ended broadcast — which the pubsub reader awaits, and
+        # which the End Service HTTP handler awaits — for the full TCP
+        # write/close timeout. Do not let a single slow viewer hold up
+        # room shutdown or the reader task on subscriber instances.
+        results = await asyncio.gather(
+            *(self._send_one(ws, message) for ws in sockets),
+            return_exceptions=True,
+        )
+        for ws, ok in zip(sockets, results):
+            if ok is not True:
+                self.disconnect(ws)
         # Auto-close on room-end. Same code path handles single-instance
         # (broadcast_room → this method directly), the Redis publisher instance
         # (broadcast_room → gather(local, publish) → this method), and Redis
