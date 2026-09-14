@@ -1956,8 +1956,10 @@ async def ws_translate(ws: WebSocket):
             #      shutdown case — other listeners are still in the bucket
             #      briefly, so viewer_count > 0 doesn't mean the room is live).
             # Both prevent contradictory lifecycle events (a stale "live"
-            # arriving at sibling instances after "ended").
-            if viewer_count > 0 and not manager.is_room_locally_ended(org_id, room_id):
+            # arriving at sibling instances after "ended"). The decision
+            # lives on the manager so the test suite can pin it — see
+            # ConnectionManager.should_broadcast_live_status.
+            if manager.should_broadcast_live_status(org_id, room_id, viewer_count):
                 try:
                     await manager.broadcast_room(
                         org_id,

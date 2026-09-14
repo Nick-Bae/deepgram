@@ -110,6 +110,23 @@ class ConnectionManager:
             return False
         return True
 
+    def should_broadcast_live_status(
+        self,
+        org_id: str,
+        room_id: str,
+        viewer_count: int,
+    ) -> bool:
+        """Whether it's still valid to publish a roomStatus="live" event for
+        this room from this instance. Callers (currently the /ws/translate
+        disconnect finally) use this to suppress stale viewer-count updates
+        that would race with, or arrive after, a terminal "ended" broadcast.
+
+        Extracted here rather than inlined so the test suite can pin the
+        decision — removing the tombstone check from a caller would then
+        show up as a broken test instead of a silent regression.
+        """
+        return viewer_count > 0 and not self.is_room_locally_ended(org_id, room_id)
+
     async def register_listener(
         self,
         ws: WebSocket,

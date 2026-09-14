@@ -546,22 +546,20 @@ class StaleLiveSuppressionTests(unittest.IsolatedAsyncioTestCase):
         # (5-min TTL) so any late disconnect finally can consult it.
         self.assertTrue(manager.is_room_locally_ended("org", "room"))
 
-    async def test_tombstone_gates_suppression_helper(self) -> None:
-        # Direct test of the "should we broadcast live?" decision. Mirrors
-        # the condition in main.py's disconnect finally so a change to the
-        # gate would break here first.
+    async def test_should_broadcast_live_status_gates_suppression(self) -> None:
+        # Tests the REAL production decision (ConnectionManager
+        # .should_broadcast_live_status). If someone removes the tombstone
+        # check from the manager method (or from main.py's call to it),
+        # this test fails — unlike a test that inlines its own copy of
+        # the logic.
         manager = ConnectionManager()
-
-        def should_broadcast_live(viewer_count: int, org: str, room: str) -> bool:
-            return viewer_count > 0 and not manager.is_room_locally_ended(org, room)
-
         # Live room, listeners still present → broadcast allowed.
-        self.assertTrue(should_broadcast_live(3, "org", "room"))
+        self.assertTrue(manager.should_broadcast_live_status("org", "room", 3))
         # Ended room → suppress.
         manager._mark_room_ended_locally("org", "room")
-        self.assertFalse(should_broadcast_live(3, "org", "room"))
+        self.assertFalse(manager.should_broadcast_live_status("org", "room", 3))
         # Bucket empty → suppress regardless.
-        self.assertFalse(should_broadcast_live(0, "org", "other-room"))
+        self.assertFalse(manager.should_broadcast_live_status("org", "other-room", 0))
 
     async def test_tombstone_expires(self) -> None:
         manager = ConnectionManager()
@@ -678,23 +676,42 @@ class SubscribeTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
-    """_reconnect() bulk resubscription: success, timeout, error, empty."""
+    """_reconnect() bulk resubscription: success, timeout, error, empty, race."""
 
     def _patch_zero_backoff(self):
         import app.services.redis_pubsub as mod
         return patch.object(mod, "_BACKOFF_SECONDS", (0.0, 0.0, 0.0, 0.0))
 
+    def _fake_redis_class(self, pubsub_obj):
+        """Build a fake Redis class whose instances return the given pubsub.
+
+        Patched onto redis.asyncio.Redis via patch.object — NOT via
+        patch.dict(sys.modules), which doesn't reliably intercept
+        `import redis.asyncio as aioredis` when the parent redis package
+        is already imported (e.g. by fakeredis).
+        """
+        class FakeRedis:
+            def __init__(self, **kwargs):
+                self._pubsub_obj = pubsub_obj
+
+            async def close(self):
+                pass
+
+            async def ping(self):
+                return True
+
+            def pubsub(self, **kwargs):
+                return self._pubsub_obj
+        return FakeRedis
+
     async def test_reconnect_bulk_success(self) -> None:
         ps = _fresh_pubsub()
         await ps.start()
         await asyncio.sleep(0.02)
-        # Populate _ref_counts as if two listeners had registered.
         ps._ref_counts[("org", "r1")] = 1
         ps._ref_counts[("org", "r2")] = 1
         ps._connected = False
-        # Track what SUBSCRIBE was called with.
         subscribed_channels: list = []
-        original_pubsub_factory = ps._sub.pubsub
 
         class SucceedingPubSub:
             async def subscribe(self, *channels):
@@ -704,28 +721,10 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             async def get_message(self, *args, **kwargs):
                 return None
 
-        # Replace the underlying redis import at _reconnect's call site.
-        import app.services.redis_pubsub as mod
-
-        class FakeAio:
-            class Redis:
-                def __init__(self, **kwargs):
-                    self._pubsub_obj = SucceedingPubSub()
-
-                async def close(self):
-                    pass
-
-                async def ping(self):
-                    return True
-
-                def pubsub(self, **kwargs):
-                    return self._pubsub_obj
-
-        with self._patch_zero_backoff(), patch.dict(
-            "sys.modules", {"redis.asyncio": FakeAio}
-        ):
+        import redis.asyncio as real_aioredis
+        FakeRedis = self._fake_redis_class(SucceedingPubSub())
+        with self._patch_zero_backoff(), patch.object(real_aioredis, "Redis", FakeRedis):
             await ps._reconnect(0)
-        # Bulk call happened once with both channels.
         self.assertEqual(len(subscribed_channels), 2)
         self.assertTrue(ps._connected)
         self.assertIn(("org", "r1"), ps._subscribed)
@@ -747,31 +746,16 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             async def get_message(self, *args, **kwargs):
                 return None
 
-        class FakeAio:
-            class Redis:
-                def __init__(self, **kwargs):
-                    self._pubsub_obj = HangingPubSub()
-
-                async def close(self):
-                    pass
-
-                async def ping(self):
-                    return True
-
-                def pubsub(self, **kwargs):
-                    return self._pubsub_obj
-
+        import redis.asyncio as real_aioredis
+        FakeRedis = self._fake_redis_class(HangingPubSub())
         from app.env import ENV
         original_timeout = ENV.REDIS_COMMAND_TIMEOUT_SEC
         ENV.REDIS_COMMAND_TIMEOUT_SEC = 0.1
         try:
-            with self._patch_zero_backoff(), patch.dict(
-                "sys.modules", {"redis.asyncio": FakeAio}
-            ):
+            with self._patch_zero_backoff(), patch.object(real_aioredis, "Redis", FakeRedis):
                 await ps._reconnect(0)
         finally:
             ENV.REDIS_COMMAND_TIMEOUT_SEC = original_timeout
-        # Bulk timeout: _connected stays False so reader retries.
         self.assertFalse(ps._connected)
         self.assertEqual(len(ps._subscribed), 0)
         await ps.stop()
@@ -791,23 +775,9 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             async def get_message(self, *args, **kwargs):
                 return None
 
-        class FakeAio:
-            class Redis:
-                def __init__(self, **kwargs):
-                    self._pubsub_obj = FailingPubSub()
-
-                async def close(self):
-                    pass
-
-                async def ping(self):
-                    return True
-
-                def pubsub(self, **kwargs):
-                    return self._pubsub_obj
-
-        with self._patch_zero_backoff(), patch.dict(
-            "sys.modules", {"redis.asyncio": FakeAio}
-        ):
+        import redis.asyncio as real_aioredis
+        FakeRedis = self._fake_redis_class(FailingPubSub())
+        with self._patch_zero_backoff(), patch.object(real_aioredis, "Redis", FakeRedis):
             await ps._reconnect(0)
         self.assertFalse(ps._connected)
         self.assertEqual(len(ps._subscribed), 0)
@@ -817,7 +787,6 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         ps = _fresh_pubsub()
         await ps.start()
         await asyncio.sleep(0.02)
-        # No _ref_counts entries.
         ps._connected = False
 
         class NoopPubSub:
@@ -828,26 +797,58 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             async def get_message(self, *args, **kwargs):
                 return None
 
-        class FakeAio:
-            class Redis:
-                def __init__(self, **kwargs):
-                    self._pubsub_obj = NoopPubSub()
-
-                async def close(self):
-                    pass
-
-                async def ping(self):
-                    return True
-
-                def pubsub(self, **kwargs):
-                    return self._pubsub_obj
-
-        with self._patch_zero_backoff(), patch.dict(
-            "sys.modules", {"redis.asyncio": FakeAio}
-        ):
+        import redis.asyncio as real_aioredis
+        FakeRedis = self._fake_redis_class(NoopPubSub())
+        with self._patch_zero_backoff(), patch.object(real_aioredis, "Redis", FakeRedis):
             await ps._reconnect(0)
         self.assertTrue(ps._connected)
         self.assertEqual(len(ps._subscribed), 0)
+        await ps.stop()
+
+    async def test_release_blocks_while_reconnect_holds_lock(self) -> None:
+        # Deterministic test of the concurrency fix: reconnect must hold
+        # _lock across the whole reconciliation so a concurrent
+        # release_subscription cannot pop the last refcount for a room
+        # mid-reconcile (which would orphan a Redis subscription).
+        ps = _fresh_pubsub()
+        await ps.start()
+        await asyncio.sleep(0.02)
+        ps._ref_counts[("org", "r1")] = 1
+        ps._connected = False
+
+        reconnect_in_subscribe = asyncio.Event()
+        let_subscribe_finish = asyncio.Event()
+
+        class SlowPubSub:
+            async def subscribe(self, *channels):
+                reconnect_in_subscribe.set()
+                await let_subscribe_finish.wait()
+            async def unsubscribe(self, *args, **kwargs):
+                return None
+            async def get_message(self, *args, **kwargs):
+                return None
+
+        import redis.asyncio as real_aioredis
+        FakeRedis = self._fake_redis_class(SlowPubSub())
+        with self._patch_zero_backoff(), patch.object(real_aioredis, "Redis", FakeRedis):
+            reconnect_task = asyncio.create_task(ps._reconnect(0))
+            await asyncio.wait_for(reconnect_in_subscribe.wait(), timeout=1.0)
+            # _reconnect now holds _lock, awaiting the bulk subscribe.
+            release_task = asyncio.create_task(ps.release_subscription("org", "r1"))
+            # Give release a chance to try acquiring the lock.
+            await asyncio.sleep(0.05)
+            self.assertFalse(release_task.done(),
+                             "release must block while reconnect holds _lock")
+            # Refcount still 1 — no interleaved decrement.
+            self.assertEqual(ps._ref_counts.get(("org", "r1")), 1)
+            # Let reconnect finish.
+            let_subscribe_finish.set()
+            await asyncio.wait_for(reconnect_task, timeout=1.0)
+            await asyncio.wait_for(release_task, timeout=1.0)
+        # Post-race: reconnect subscribed r1, then release popped it and
+        # unsubscribed. Final state clean.
+        self.assertNotIn(("org", "r1"), ps._ref_counts)
+        self.assertNotIn(("org", "r1"), ps._subscribed)
         await ps.stop()
 
 
