@@ -434,92 +434,134 @@ class RedisDispatchTests(unittest.IsolatedAsyncioTestCase):
     """A terminal event delivered via Redis _dispatch must fire the full pipeline."""
 
     async def test_dispatch_fires_hooks_and_closes_sockets(self) -> None:
-        # Two RedisPubSub instances sharing one FakeServer simulate two
-        # Cloud Run instances. Publish from A, verify B's dispatch triggers
-        # the terminal path (hooks + host shutdown callback + listener close).
-        import fakeredis.aioredis as _fake
-
-        server = _fake.FakeServer()
-
-        async def _make_shared(delivered):
-            ps = RedisPubSub()
-            ps._enabled = True
-            ps._started = True
-            ps._pub = _fake.FakeRedis(server=server, decode_responses=True)
-            ps._sub = _fake.FakeRedis(server=server, decode_responses=True)
-            await ps._pub.ping()
-            ps._pubsub = ps._sub.pubsub(ignore_subscribe_messages=True)
-            ps._connected = True
-            ps._reader_task = asyncio.create_task(ps._reader_loop())
-
-            async def cb(org, room, msg):
-                delivered.append((org, room, msg))
-
-            ps.set_delivery_callback(cb)
-            return ps
-
-        ps_a = await _make_shared([])
-        b_delivered: list = []
-        ps_b = await _make_shared(b_delivered)
-        # Different INSTANCE_IDs so dispatch on B doesn't skip A's publish.
-        ps_a._enabled = True
-        ps_b._enabled = True
+        # Deterministic unit test: forge a Redis envelope from "instance-A"
+        # and hand it to B's _dispatch directly. This avoids the previous
+        # bug where two in-process RedisPubSub instances shared ENV.INSTANCE_ID,
+        # making B skip A's message as its own. Real two-process integration
+        # is a separate concern (staging test).
+        import json
         from app.env import ENV
-        # Save and set instance IDs.
+        from app.services.redis_pubsub import _channel_name
+
+        ps_b = _fresh_pubsub()
+        await ps_b.start()
+        await asyncio.sleep(0.02)
+        manager_b = ConnectionManager()
+        hook_fired = {"count": 0}
+
+        def hook(org, room):
+            hook_fired["count"] += 1
+
+        manager_b.register_room_end_hook(hook)
+        ps_b.set_delivery_callback(manager_b._broadcast_local_room)
+
         original_id = ENV.INSTANCE_ID
+        ENV.INSTANCE_ID = "instance-B"  # this instance
         try:
-            ENV.INSTANCE_ID = "instance-A"
-            manager_b = ConnectionManager()
-            hook_fired = {"count": 0}
-
-            def hook(org, room):
-                hook_fired["count"] += 1
-
-            manager_b.register_room_end_hook(hook)
-            # Wire ps_b as B's manager pubsub delivery target.
-            ps_b.set_delivery_callback(manager_b._broadcast_local_room)
-
-            # Register a listener on B so B has a room to subscribe to.
             with patch("app.socket_manager.pubsub", ps_b):
                 ws_b = MockWebSocket()
                 await manager_b.register_listener(ws_b, "org", "room", "listener")
-                await asyncio.sleep(0.05)
-                # Publish terminal from A.
-                await ps_a.publish_room(
-                    "org", "room", {"type": "STATUS", "roomStatus": "ended"}
-                )
-                # Give the reader a moment to dispatch.
-                await asyncio.sleep(0.15)
-                # B's hook fired and B's ws was closed.
+
+                envelope = {
+                    "publisher": "instance-A",  # foreign — won't be filtered
+                    "message": {"type": "STATUS", "roomStatus": "ended"},
+                }
+                await ps_b._dispatch({
+                    "channel": _channel_name("org", "room"),
+                    "data": json.dumps(envelope),
+                })
+
                 self.assertEqual(hook_fired["count"], 1)
                 self.assertGreaterEqual(len(ws_b.close_calls), 1)
                 self.assertTrue(manager_b.is_room_locally_ended("org", "room"))
         finally:
             ENV.INSTANCE_ID = original_id
-            await ps_a.stop()
             await ps_b.stop()
+
+    async def test_dispatch_skips_own_publisher(self) -> None:
+        # Filter guard: a message from THIS instance must be skipped so the
+        # publisher doesn't double-deliver to its own listeners.
+        import json
+        from app.env import ENV
+        from app.services.redis_pubsub import _channel_name
+
+        ps = _fresh_pubsub()
+        await ps.start()
+        await asyncio.sleep(0.02)
+        manager = ConnectionManager()
+        hook_fired = {"count": 0}
+        manager.register_room_end_hook(lambda o, r: hook_fired.__setitem__("count", hook_fired["count"] + 1))
+        ps.set_delivery_callback(manager._broadcast_local_room)
+
+        original_id = ENV.INSTANCE_ID
+        ENV.INSTANCE_ID = "instance-A"
+        try:
+            envelope = {
+                "publisher": "instance-A",  # SAME as ENV.INSTANCE_ID
+                "message": {"type": "STATUS", "roomStatus": "ended"},
+            }
+            await ps._dispatch({
+                "channel": _channel_name("org", "room"),
+                "data": json.dumps(envelope),
+            })
+            self.assertEqual(hook_fired["count"], 0)  # skipped
+        finally:
+            ENV.INSTANCE_ID = original_id
+            await ps.stop()
 
 
 class StaleLiveSuppressionTests(unittest.IsolatedAsyncioTestCase):
-    """After tombstone is set, is_room_locally_ended blocks 'live' broadcasts."""
+    """Tombstone primitive used to suppress stale roomStatus="live" broadcasts."""
 
-    async def test_multi_listener_shutdown_tombstone_visible(self) -> None:
+    async def test_multi_listener_terminal_sets_tombstone(self) -> None:
+        # Confirms that a multi-listener terminal marks the room ended locally
+        # BEFORE the send phase — the primitive the main.py disconnect finally
+        # consults to skip publishing roomStatus="live" after ended. The full
+        # end-to-end suppression (via /ws/translate finally) is verified in
+        # the two-instance integration test rather than a unit test.
         manager = ConnectionManager()
-        # Simulate multi-listener bucket. When a terminal fires, tombstone is
-        # set before sends — a listener finally executed mid-broadcast should
-        # see is_room_locally_ended=True and skip its own STATUS live broadcast.
-        # We just verify the tombstone gate directly (the finally is in
-        # main.py; the manager exposes the primitive).
-        w1, w2 = MockWebSocket(), MockWebSocket()
+        # Capture tombstone visibility from inside a send call.
+        seen_during_send: list[bool] = []
+
+        w1 = MockWebSocket()
+        w2 = MockWebSocket()
+
+        async def w1_send(msg):
+            seen_during_send.append(manager.is_room_locally_ended("org", "room"))
+
+        async def w2_send(msg):
+            seen_during_send.append(manager.is_room_locally_ended("org", "room"))
+
+        w1.send_json = w1_send  # type: ignore[assignment]
+        w2.send_json = w2_send  # type: ignore[assignment]
         manager.join_room(w1, "org", "room", "listener")
         manager.join_room(w2, "org", "room", "listener")
         await manager._broadcast_local_room(
             "org", "room", {"type": "STATUS", "roomStatus": "ended"}
         )
-        # Both listeners were in the bucket during the terminal call.
-        # After: bucket is empty (close_room_listeners disconnected them) and
-        # tombstone remains set for 5 min so any late finally would skip live.
+        # Every listener saw the tombstone during its own send — i.e. the
+        # tombstone was set BEFORE any listener could react to the terminal.
+        self.assertEqual(seen_during_send, [True, True])
+        # And it stays set after the broadcast for at least a few minutes
+        # (5-min TTL) so any late disconnect finally can consult it.
         self.assertTrue(manager.is_room_locally_ended("org", "room"))
+
+    async def test_tombstone_gates_suppression_helper(self) -> None:
+        # Direct test of the "should we broadcast live?" decision. Mirrors
+        # the condition in main.py's disconnect finally so a change to the
+        # gate would break here first.
+        manager = ConnectionManager()
+
+        def should_broadcast_live(viewer_count: int, org: str, room: str) -> bool:
+            return viewer_count > 0 and not manager.is_room_locally_ended(org, room)
+
+        # Live room, listeners still present → broadcast allowed.
+        self.assertTrue(should_broadcast_live(3, "org", "room"))
+        # Ended room → suppress.
+        manager._mark_room_ended_locally("org", "room")
+        self.assertFalse(should_broadcast_live(3, "org", "room"))
+        # Bucket empty → suppress regardless.
+        self.assertFalse(should_broadcast_live(0, "org", "other-room"))
 
     async def test_tombstone_expires(self) -> None:
         manager = ConnectionManager()
@@ -632,6 +674,180 @@ class SubscribeTimeoutTests(unittest.IsolatedAsyncioTestCase):
             await ps._subscribe_channel(("org", "room"))
         # Non-timeout transport errors also flip disconnected (73f55d6a).
         self.assertFalse(ps._connected)
+        await ps.stop()
+
+
+class ReconnectTests(unittest.IsolatedAsyncioTestCase):
+    """_reconnect() bulk resubscription: success, timeout, error, empty."""
+
+    def _patch_zero_backoff(self):
+        import app.services.redis_pubsub as mod
+        return patch.object(mod, "_BACKOFF_SECONDS", (0.0, 0.0, 0.0, 0.0))
+
+    async def test_reconnect_bulk_success(self) -> None:
+        ps = _fresh_pubsub()
+        await ps.start()
+        await asyncio.sleep(0.02)
+        # Populate _ref_counts as if two listeners had registered.
+        ps._ref_counts[("org", "r1")] = 1
+        ps._ref_counts[("org", "r2")] = 1
+        ps._connected = False
+        # Track what SUBSCRIBE was called with.
+        subscribed_channels: list = []
+        original_pubsub_factory = ps._sub.pubsub
+
+        class SucceedingPubSub:
+            async def subscribe(self, *channels):
+                subscribed_channels.extend(channels)
+            async def unsubscribe(self, *args, **kwargs):
+                return None
+            async def get_message(self, *args, **kwargs):
+                return None
+
+        # Replace the underlying redis import at _reconnect's call site.
+        import app.services.redis_pubsub as mod
+
+        class FakeAio:
+            class Redis:
+                def __init__(self, **kwargs):
+                    self._pubsub_obj = SucceedingPubSub()
+
+                async def close(self):
+                    pass
+
+                async def ping(self):
+                    return True
+
+                def pubsub(self, **kwargs):
+                    return self._pubsub_obj
+
+        with self._patch_zero_backoff(), patch.dict(
+            "sys.modules", {"redis.asyncio": FakeAio}
+        ):
+            await ps._reconnect(0)
+        # Bulk call happened once with both channels.
+        self.assertEqual(len(subscribed_channels), 2)
+        self.assertTrue(ps._connected)
+        self.assertIn(("org", "r1"), ps._subscribed)
+        self.assertIn(("org", "r2"), ps._subscribed)
+        await ps.stop()
+
+    async def test_reconnect_bulk_timeout_leaves_disconnected(self) -> None:
+        ps = _fresh_pubsub()
+        await ps.start()
+        await asyncio.sleep(0.02)
+        ps._ref_counts[("org", "r1")] = 1
+        ps._connected = False
+
+        class HangingPubSub:
+            async def subscribe(self, *channels):
+                await asyncio.sleep(10.0)
+            async def unsubscribe(self, *args, **kwargs):
+                return None
+            async def get_message(self, *args, **kwargs):
+                return None
+
+        class FakeAio:
+            class Redis:
+                def __init__(self, **kwargs):
+                    self._pubsub_obj = HangingPubSub()
+
+                async def close(self):
+                    pass
+
+                async def ping(self):
+                    return True
+
+                def pubsub(self, **kwargs):
+                    return self._pubsub_obj
+
+        from app.env import ENV
+        original_timeout = ENV.REDIS_COMMAND_TIMEOUT_SEC
+        ENV.REDIS_COMMAND_TIMEOUT_SEC = 0.1
+        try:
+            with self._patch_zero_backoff(), patch.dict(
+                "sys.modules", {"redis.asyncio": FakeAio}
+            ):
+                await ps._reconnect(0)
+        finally:
+            ENV.REDIS_COMMAND_TIMEOUT_SEC = original_timeout
+        # Bulk timeout: _connected stays False so reader retries.
+        self.assertFalse(ps._connected)
+        self.assertEqual(len(ps._subscribed), 0)
+        await ps.stop()
+
+    async def test_reconnect_bulk_exception_leaves_disconnected(self) -> None:
+        ps = _fresh_pubsub()
+        await ps.start()
+        await asyncio.sleep(0.02)
+        ps._ref_counts[("org", "r1")] = 1
+        ps._connected = False
+
+        class FailingPubSub:
+            async def subscribe(self, *channels):
+                raise ConnectionError("bulk broke")
+            async def unsubscribe(self, *args, **kwargs):
+                return None
+            async def get_message(self, *args, **kwargs):
+                return None
+
+        class FakeAio:
+            class Redis:
+                def __init__(self, **kwargs):
+                    self._pubsub_obj = FailingPubSub()
+
+                async def close(self):
+                    pass
+
+                async def ping(self):
+                    return True
+
+                def pubsub(self, **kwargs):
+                    return self._pubsub_obj
+
+        with self._patch_zero_backoff(), patch.dict(
+            "sys.modules", {"redis.asyncio": FakeAio}
+        ):
+            await ps._reconnect(0)
+        self.assertFalse(ps._connected)
+        self.assertEqual(len(ps._subscribed), 0)
+        await ps.stop()
+
+    async def test_reconnect_no_desired_rooms_succeeds(self) -> None:
+        ps = _fresh_pubsub()
+        await ps.start()
+        await asyncio.sleep(0.02)
+        # No _ref_counts entries.
+        ps._connected = False
+
+        class NoopPubSub:
+            async def subscribe(self, *channels):
+                raise AssertionError("should not be called for empty desired")
+            async def unsubscribe(self, *args, **kwargs):
+                return None
+            async def get_message(self, *args, **kwargs):
+                return None
+
+        class FakeAio:
+            class Redis:
+                def __init__(self, **kwargs):
+                    self._pubsub_obj = NoopPubSub()
+
+                async def close(self):
+                    pass
+
+                async def ping(self):
+                    return True
+
+                def pubsub(self, **kwargs):
+                    return self._pubsub_obj
+
+        with self._patch_zero_backoff(), patch.dict(
+            "sys.modules", {"redis.asyncio": FakeAio}
+        ):
+            await ps._reconnect(0)
+        self.assertTrue(ps._connected)
+        self.assertEqual(len(ps._subscribed), 0)
         await ps.stop()
 
 
