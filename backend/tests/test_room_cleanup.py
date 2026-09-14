@@ -49,8 +49,17 @@ class MockWebSocket:
         self.close_calls.append((code, reason))
 
 
-def _fresh_pubsub() -> RedisPubSub:
-    """A RedisPubSub wired to fakeredis. start() is a no-op — tests drive it."""
+def _fresh_pubsub(*, start_reader: bool = True) -> RedisPubSub:
+    """A RedisPubSub wired to fakeredis. start() is a no-op — tests drive it.
+
+    Tests that manipulate _connected (ReconnectTests, SubscribeTimeoutTests,
+    the disconnected-ensure_subscription test) must pass start_reader=False.
+    A background reader running alongside those tests races the assertion:
+    when the test flips _connected=False, the reader loop sees the flag on
+    its next tick and calls _reconnect() itself — creating duplicate fake
+    clients, duplicate bulk subscribe() calls, or (when aioredis.Redis is
+    not patched for that test) attempting to contact real Redis.
+    """
     ps = RedisPubSub()
     ps._enabled = True
 
@@ -62,7 +71,8 @@ def _fresh_pubsub() -> RedisPubSub:
         await ps._pub.ping()
         ps._pubsub = ps._sub.pubsub(ignore_subscribe_messages=True)
         ps._connected = True
-        ps._reader_task = asyncio.create_task(ps._reader_loop())
+        if start_reader:
+            ps._reader_task = asyncio.create_task(ps._reader_loop())
 
     ps.start = _fake_start  # type: ignore[assignment]
     return ps
@@ -363,7 +373,7 @@ class SubscriptionSemanticsTests(unittest.IsolatedAsyncioTestCase):
         await ps.stop()
 
     async def test_ensure_subscription_reports_not_ready_when_disconnected(self) -> None:
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
         # Manually force disconnected state.
@@ -625,7 +635,7 @@ class SubscribeTimeoutTests(unittest.IsolatedAsyncioTestCase):
     """SUBSCRIBE with a bounded command timeout marks disconnected on timeout."""
 
     async def test_subscribe_timeout_marks_disconnected(self) -> None:
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
 
@@ -653,7 +663,7 @@ class SubscribeTimeoutTests(unittest.IsolatedAsyncioTestCase):
         await ps.stop()
 
     async def test_subscribe_non_timeout_error_also_marks_disconnected(self) -> None:
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
 
@@ -705,7 +715,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         return FakeRedis
 
     async def test_reconnect_bulk_success(self) -> None:
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
         ps._ref_counts[("org", "r1")] = 1
@@ -732,7 +742,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         await ps.stop()
 
     async def test_reconnect_bulk_timeout_leaves_disconnected(self) -> None:
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
         ps._ref_counts[("org", "r1")] = 1
@@ -761,7 +771,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         await ps.stop()
 
     async def test_reconnect_bulk_exception_leaves_disconnected(self) -> None:
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
         ps._ref_counts[("org", "r1")] = 1
@@ -784,7 +794,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         await ps.stop()
 
     async def test_reconnect_no_desired_rooms_succeeds(self) -> None:
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
         ps._connected = False
@@ -810,7 +820,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         # _lock across the whole reconciliation so a concurrent
         # release_subscription cannot pop the last refcount for a room
         # mid-reconcile (which would orphan a Redis subscription).
-        ps = _fresh_pubsub()
+        ps = _fresh_pubsub(start_reader=False)
         await ps.start()
         await asyncio.sleep(0.02)
         ps._ref_counts[("org", "r1")] = 1
