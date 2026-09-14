@@ -264,7 +264,12 @@ class RedisPubSub:
             self._connected = False
             raise
         except Exception as exc:
+            # Any subscribe failure (ConnectionError, OSError, redis error)
+            # likely means the transport is broken. Mark disconnected so the
+            # reader rebuilds; otherwise repeated ensure_subscription would
+            # keep hitting the same dead client.
             log.warning("redis SUBSCRIBE failed key=%s: %s", key, exc)
+            self._connected = False
             raise  # caller (ensure_subscription) rolls back refcount
         self._subscribed.add(key)
 
@@ -281,7 +286,12 @@ class RedisPubSub:
             log.warning("redis UNSUBSCRIBE timeout key=%s — marking disconnected", key)
             self._connected = False
         except Exception as exc:
-            log.warning("redis UNSUBSCRIBE failed key=%s: %s", key, exc)
+            # Best-effort but still mark disconnected — a failed UNSUBSCRIBE
+            # usually means the transport is unhealthy. Without this, the last
+            # unsubscribe in an idle period could fail silently and the reader
+            # would sleep forever waiting on nothing.
+            log.warning("redis UNSUBSCRIBE failed key=%s: %s — marking disconnected", key, exc)
+            self._connected = False
 
     async def _reader_loop(self) -> None:
         """Long-lived task: read subscribed messages and dispatch to callback.
@@ -350,40 +360,41 @@ class RedisPubSub:
                 self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
                 self._subscribed.clear()
                 desired = [k for k, count in self._ref_counts.items() if count > 0]
-                failed = []
-                for key in desired:
-                    try:
-                        # Bound each resubscribe; a hung Redis would otherwise
-                        # keep _lock indefinitely with all registration paths
-                        # blocked behind it.
-                        await asyncio.wait_for(
-                            self._pubsub.subscribe(_channel_name(*key)),
-                            timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
-                        )
-                        self._subscribed.add(key)
-                    except asyncio.TimeoutError:
-                        log.warning("resubscribe timeout key=%s", key)
-                        failed.append(key)
-                    except Exception as exc:
-                        log.warning("resubscribe failed key=%s: %s", key, exc)
-                        failed.append(key)
-                # If any desired subscription failed, do NOT mark connected —
-                # the reader loop will hit _reconnect again and retry the
-                # whole set. Setting _connected=True with partial subscriptions
-                # would let those rooms silently miss terminal broadcasts.
-                if failed:
+                if not desired:
+                    self._connected = True
+                    log.info("redis pubsub reconnected; 0 rooms to resubscribe")
+                    return
+                # Single bulk SUBSCRIBE so the whole reconciliation is bounded
+                # by ONE REDIS_COMMAND_TIMEOUT_SEC, regardless of how many
+                # rooms are on this instance. Per-room timeout could stall
+                # _lock for N × timeout seconds on a hung connection.
+                channels = [_channel_name(*key) for key in desired]
+                try:
+                    await asyncio.wait_for(
+                        self._pubsub.subscribe(*channels),
+                        timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
                     log.warning(
-                        "redis pubsub partial resubscribe: %d/%d failed — will retry",
-                        len(failed),
+                        "redis pubsub bulk resubscribe timeout (%d rooms) — will retry",
                         len(desired),
                     )
                     self._connected = False
                     return
+                except Exception as exc:
+                    log.warning(
+                        "redis pubsub bulk resubscribe failed (%d rooms): %s — will retry",
+                        len(desired), exc,
+                    )
+                    self._connected = False
+                    return
+                # All-or-nothing on the bulk call: if wait_for returned, every
+                # channel was accepted. Populate _subscribed accordingly.
+                self._subscribed.update(desired)
                 self._connected = True
                 log.info(
-                    "redis pubsub reconnected; %d/%d rooms resubscribed",
+                    "redis pubsub reconnected; %d rooms resubscribed (bulk)",
                     len(self._subscribed),
-                    len(desired),
                 )
         except Exception as exc:
             log.warning("redis reconnect failed: %s", exc)
