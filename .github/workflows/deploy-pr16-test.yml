@@ -68,6 +68,9 @@ jobs:
           # describe response, a split traffic config, or a service already
           # in an unusual state could let the workflow continue and create a
           # test revision on top of a state we don't understand.
+          # Also captures the CURRENT CORS_ALLOW_ORIGINS so we can extend it
+          # for the test revision and tell the operator what to restore in
+          # cleanup.
           set -euo pipefail
           SERVICE_JSON=$(gcloud run services describe ${{ secrets.CLOUD_RUN_SERVICE }} \
             --region=${{ secrets.CLOUD_RUN_REGION }} \
@@ -81,7 +84,36 @@ jobs:
             echo "::error::Could not verify exactly one production revision at 100% traffic. Aborting before build."
             exit 1
           fi
+          PRE_LIVE_CORS=$(gcloud run revisions describe "$PRE_LIVE_REVISION" \
+            --region=${{ secrets.CLOUD_RUN_REGION }} \
+            --format=json \
+            | jq -r '.spec.containers[0].env[]? | select(.name=="CORS_ALLOW_ORIGINS") | .value // ""')
+          if [ -z "$PRE_LIVE_CORS" ] || [ "$PRE_LIVE_CORS" = "null" ]; then
+            echo "::error::CORS_ALLOW_ORIGINS not set on the live production revision. Aborting so we do not accidentally widen CORS from an empty baseline."
+            exit 1
+          fi
+          echo "Pre-deploy CORS_ALLOW_ORIGINS: $PRE_LIVE_CORS"
           echo "pre_live_revision=$PRE_LIVE_REVISION" >> "$GITHUB_OUTPUT"
+          echo "pre_live_cors=$PRE_LIVE_CORS" >> "$GITHUB_OUTPUT"
+
+      - name: Compute extended CORS for test revision
+        id: cors
+        run: |
+          # Append the Vercel preview origin to the current prod CORS list.
+          # Dedupe: skip if already present. Value is passed to the deploy
+          # step via gcloud's alternate delimiter syntax (^|^) so the commas
+          # inside CORS_ALLOW_ORIGINS are not misread as env-var separators.
+          set -euo pipefail
+          NEW_ORIGIN="https://real-time-translation-git-fix-release-6859af-nick-baes-projects.vercel.app"
+          CURRENT='${{ steps.pre_live.outputs.pre_live_cors }}'
+          if printf ',%s,' "$CURRENT" | grep -qF ",$NEW_ORIGIN,"; then
+            EXTENDED="$CURRENT"
+            echo "Vercel preview origin already in CORS_ALLOW_ORIGINS."
+          else
+            EXTENDED="$CURRENT,$NEW_ORIGIN"
+          fi
+          echo "Test revision CORS_ALLOW_ORIGINS will be: $EXTENDED"
+          echo "extended_cors=$EXTENDED" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         run: |
@@ -95,16 +127,22 @@ jobs:
           # --no-traffic: production traffic stays on the pre-deploy live revision.
           # --tag=cleanup-test: assigns a stable dedicated URL for this test.
           # --revision-suffix: recognizable revision name for later cleanup.
-          # NO env-var / secret / VPC flags: the new revision inherits the
-          #   existing service's configuration (Firestore, Redis, provider
-          #   credentials, VPC, secret mounts) verbatim. NOTE: this means the
-          #   test hits the SAME Firestore/Redis/providers as production —
-          #   run only when no real service is active.
+          # Only CORS_ALLOW_ORIGINS is overridden; all other env vars,
+          #   secrets, VPC settings, and service account inherit from the
+          #   existing service template.
+          # NOTE: this revision still uses the SAME Firestore / Redis /
+          #   provider credentials as production — run only when no real
+          #   service is active.
           # --concurrency=1 + --max-instances=6: forces the cross-instance
           #   test path so multiple viewers spread across multiple instances.
           #   The next normal production deploy from deploy-backend.yml
           #   explicitly restores --concurrency=80 --max-instances=1, so
           #   these test values do not persist for prod.
+          # --update-env-vars with ^|^ alternate delimiter: the CORS value
+          #   contains commas as origin separators, which would otherwise be
+          #   parsed by gcloud as env-var separators. IMPORTANT: this also
+          #   updates the SERVICE TEMPLATE's CORS_ALLOW_ORIGINS, so cleanup
+          #   must restore it explicitly (see summary step below).
           gcloud run deploy ${{ secrets.CLOUD_RUN_SERVICE }} \
             --image "$IMAGE" \
             --region ${{ secrets.CLOUD_RUN_REGION }} \
@@ -115,6 +153,7 @@ jobs:
             --concurrency=1 \
             --min-instances=0 \
             --max-instances=6 \
+            --update-env-vars="^|^CORS_ALLOW_ORIGINS=${{ steps.cors.outputs.extended_cors }}" \
             --quiet
 
       - name: Verify production traffic is unchanged
@@ -164,6 +203,7 @@ jobs:
           TEST_REVISION_NAME=$(echo "$SERVICE_JSON" \
             | jq -r '.status.traffic[] | select(.tag=="${{ env.TRAFFIC_TAG }}") | .revisionName')
           LIVE_REVISION="${{ steps.pre_live.outputs.pre_live_revision }}"
+          LIVE_CORS='${{ steps.pre_live.outputs.pre_live_cors }}'
           # Refuse to write a summary that would tell the operator to run
           # gcloud with a null / empty revision name or URL — an unusable
           # instruction is worse than a visible failure.
@@ -183,16 +223,30 @@ jobs:
             echo "- Traffic tag: \`${{ env.TRAFFIC_TAG }}\`"
             echo "- Tagged URL: $TAG_URL"
             echo "- Production live revision (unchanged): \`$LIVE_REVISION\`"
+            echo "- Production CORS_ALLOW_ORIGINS (for reference): \`$LIVE_CORS\`"
             echo ""
             echo "Configure Vercel preview NEXT_PUBLIC_API_BASE_URL / NEXT_PUBLIC_WS_URL"
             echo "against this URL to run the healthy-Redis and cross-instance tests."
             echo ""
             echo "NOTE: this revision uses PROD Firestore / Redis / provider credentials."
-            echo "Run the test only when no real service is active. Also verify"
-            echo "the Vercel preview origin is already in CORS_ALLOW_ORIGINS on"
-            echo "the inherited service config — do not broadly widen CORS."
+            echo "Run the test only when no real service is active."
             echo ""
             echo "### Cleanup after testing"
+            echo ""
+            echo "Rerunning this workflow creates additional cleanup-29e26180-*"
+            echo "revisions (suffix is unique per run/attempt). Step 2 below"
+            echo "deletes all matching revisions, not just this run's."
+            echo ""
+            echo "**Do NOT use --to-latest and do NOT create a CORS-restoration"
+            echo "revision during cleanup.** The pre-deploy live revision"
+            echo "\`$LIVE_REVISION\` already contains the correct prod image,"
+            echo "the original CORS_ALLOW_ORIGINS value, and the correct prod"
+            echo "settings. Routing traffic explicitly back to it restores the"
+            echo "runtime production behavior. A --to-latest or a"
+            echo "\`services update\` call would create a new revision from the"
+            echo "CURRENT template — which the test deploy has left holding the"
+            echo "PR test image and other test-only settings — and could then"
+            echo "route production traffic to that new-and-untrusted revision."
             echo ""
             echo "1. Remove the \`${{ env.TRAFFIC_TAG }}\` traffic tag:"
             echo "   \`\`\`"
@@ -200,22 +254,37 @@ jobs:
             echo "     --region=${{ secrets.CLOUD_RUN_REGION }} \\"
             echo "     --remove-tags=${{ env.TRAFFIC_TAG }}"
             echo "   \`\`\`"
-            echo "2. Delete the \`$TEST_REVISION_NAME\` revision (must run AFTER step 1):"
+            echo "2. Delete every \`cleanup-29e26180-*\` revision (must run AFTER step 1):"
             echo "   \`\`\`"
-            echo "   gcloud run revisions delete $TEST_REVISION_NAME \\"
-            echo "     --region=${{ secrets.CLOUD_RUN_REGION }}"
+            echo "   gcloud run revisions list \\"
+            echo "     --service=${{ secrets.CLOUD_RUN_SERVICE }} \\"
+            echo "     --region=${{ secrets.CLOUD_RUN_REGION }} \\"
+            echo "     --filter='metadata.name~cleanup-29e26180-' \\"
+            echo "     --format='value(metadata.name)' \\"
+            echo "   | xargs -I{} gcloud run revisions delete {} \\"
+            echo "       --region=${{ secrets.CLOUD_RUN_REGION }} --quiet"
             echo "   \`\`\`"
-            echo "3. Restore --to-latest routing so a future prod deploy on the"
-            echo "   current deploy-backend.yml (if PR #16 is never merged and"
-            echo "   the branch is deleted, main will not have the --to-latest"
-            echo "   step) does not preserve the tagged-test traffic pattern."
-            echo "   MUST run AFTER step 2 — if the test revision still exists,"
-            echo "   --to-latest could route production traffic to IT."
+            echo "3. Route 100% of untagged traffic back to the pre-deploy live"
+            echo "   revision explicitly. Runtime CORS is now correct because"
+            echo "   \`$LIVE_REVISION\` was never modified — it still carries"
+            echo "   \`CORS_ALLOW_ORIGINS=$LIVE_CORS\`."
             echo "   \`\`\`"
             echo "   gcloud run services update-traffic ${{ secrets.CLOUD_RUN_SERVICE }} \\"
             echo "     --region=${{ secrets.CLOUD_RUN_REGION }} \\"
-            echo "     --to-latest \\"
+            echo "     --to-revisions=\"$LIVE_REVISION=100\" \\"
             echo "     --quiet"
             echo "   \`\`\`"
             echo "4. Delete this workflow file before merging PR #16."
+            echo ""
+            echo "**Template-drift note (not a runtime issue):** the test deploy"
+            echo "updated the SERVICE TEMPLATE's CORS_ALLOW_ORIGINS to the"
+            echo "extended list. This does NOT affect runtime because production"
+            echo "traffic is on \`$LIVE_REVISION\`. But the NEXT normal deploy"
+            echo "from deploy-backend.yml — which does not set CORS_ALLOW_ORIGINS"
+            echo "explicitly — will build a new prod revision that inherits the"
+            echo "extended CORS from the template. If you don't want that, add"
+            echo "\`--update-env-vars=\"^|^CORS_ALLOW_ORIGINS=<prod list>\"\` to the"
+            echo "prod deploy step (ideally via a GH secret) BEFORE the next"
+            echo "prod deploy. The recorded prod list is above under"
+            echo "\"Production CORS_ALLOW_ORIGINS (for reference)\"."
           } >> "$GITHUB_STEP_SUMMARY"
