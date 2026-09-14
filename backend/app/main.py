@@ -2255,7 +2255,10 @@ async def ws_stt_deepgram(websocket: WebSocket):
     # broadcasts from siblings. Prevents the fire-and-forget subscribe race.
     try:
         await manager.register_host(websocket, org_id, room_id)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
+        # Catch cancellation too — Cloud Run can cancel the request mid-setup
+        # and Python 3.8+ CancelledError is a BaseException, not Exception.
+        # Without this, an in-flight cancellation would leak dg and the WS.
         print(f"[DG][register_host_failed] org={org_id} room={room_id} err={exc}")
         manager.unregister_host_shutdown_callback(websocket)
         try:
@@ -2266,6 +2269,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:
             pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return
 
     # Recheck AFTER host registration to close the race where End Service
@@ -4276,7 +4281,7 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
     manager.register_host_shutdown_callback(websocket, closed.set)
     try:
         await manager.register_host(websocket, org_id, room_id)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         print(f"[OAI-RT][register_host_failed] org={org_id} room={room_id} err={exc}")
         manager.unregister_host_shutdown_callback(websocket)
         try:
@@ -4287,6 +4292,8 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:
             pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return
 
     try:
@@ -4729,7 +4736,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     manager.register_host_shutdown_callback(websocket, closed.set)
     try:
         await manager.register_host(websocket, org_id, room_id)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         print(f"[GEMINI-LIVE][register_host_failed] org={org_id} room={room_id} err={exc}")
         manager.unregister_host_shutdown_callback(websocket)
         if gemini is not None:
@@ -4741,6 +4748,8 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
             await websocket.close(code=1011)
         except Exception:
             pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return
 
     try:

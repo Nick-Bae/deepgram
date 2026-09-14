@@ -214,13 +214,16 @@ class RedisPubSub:
                 return self._connected and key in self._subscribed
             try:
                 await self._subscribe_channel(key)
-            except Exception:
-                # Roll back the refcount: without this, a second attempt
-                # would see refcount > 0 and skip the actual SUBSCRIBE forever.
+            except BaseException:
+                # Roll back the refcount on ANY exception including
+                # CancelledError. Without this, a task cancelled inside
+                # ensure_subscription would leave refcount > 0, and the next
+                # call would see previous > 0 and skip the actual SUBSCRIBE
+                # forever. `except Exception` in modern Python does not catch
+                # CancelledError.
                 self._ref_counts.pop(key, None)
-                # Also drop any phantom _subscribed entry that _subscribe_channel
-                # may have added before the exception — refuse to lie about
-                # readiness on the next call.
+                # Also drop any phantom _subscribed entry — refuse to lie
+                # about readiness on the next call.
                 self._subscribed.discard(key)
                 raise
             return self._connected and key in self._subscribed
@@ -239,13 +242,13 @@ class RedisPubSub:
             await self._unsubscribe_channel(key)
 
     async def _subscribe_channel(self, key: RoomKey) -> None:
-        # We add to _subscribed even when the client is currently disconnected
-        # so the reader loop's reconnect path re-issues SUBSCRIBE for the
-        # room. Actual readiness is not "key in _subscribed" alone — it's
-        # `self._connected AND key in _subscribed`, which ensure_subscription's
-        # return value reflects.
+        # _subscribed now strictly means "confirmed SUBSCRIBE succeeded on
+        # the current live connection." Do NOT add here when disconnected —
+        # that would let ensure_subscription report a false "ready" once
+        # _connected flips true, even if the resubscribe later failed. The
+        # reader loop's reconnect path walks _ref_counts.keys() (the set of
+        # *desired* rooms) and only adds to _subscribed on actual success.
         if not self._connected or self._pubsub is None:
-            self._subscribed.add(key)
             return
         try:
             await self._pubsub.subscribe(_channel_name(*key))
@@ -290,9 +293,14 @@ class RedisPubSub:
                 break
             except Exception as exc:
                 log.warning("pubsub reader error: %s", exc)
-                # Don't flip _connected here — a transient decode error shouldn't
-                # tear down the whole pubsub. Only real connection failures
-                # (raised by ping/subscribe/publish) should trigger reconnect.
+                # get_message() raising almost always means the subscriber's
+                # transport dropped. Flip _connected so the next iteration
+                # enters _reconnect and rebuilds the client; otherwise the
+                # loop keeps calling the same broken _pubsub object forever
+                # and this instance stops receiving terminal broadcasts —
+                # provider sessions leak.
+                self._connected = False
+                attempt = min(attempt + 1, len(_BACKOFF_SECONDS) - 1)
                 await asyncio.sleep(_BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)])
 
     async def _reconnect(self, attempt: int) -> None:
@@ -315,14 +323,25 @@ class RedisPubSub:
             )
             await self._sub.ping()
             self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
-            # Resubscribe every known room.
-            for key in list(self._subscribed):
+            # Rebuild _subscribed from actual SUBSCRIBE results. Any room that
+            # someone still wants (refcount > 0) gets resubscribed here; only
+            # rooms where SUBSCRIBE actually succeeds land in _subscribed.
+            # Prevents ensure_subscription from later returning True for a
+            # room whose partial-reconnect subscribe failed silently.
+            self._subscribed.clear()
+            desired = [k for k, count in self._ref_counts.items() if count > 0]
+            for key in desired:
                 try:
                     await self._pubsub.subscribe(_channel_name(*key))
+                    self._subscribed.add(key)
                 except Exception as exc:
                     log.warning("resubscribe failed key=%s: %s", key, exc)
             self._connected = True
-            log.info("redis pubsub reconnected; %d rooms resubscribed", len(self._subscribed))
+            log.info(
+                "redis pubsub reconnected; %d/%d rooms resubscribed",
+                len(self._subscribed),
+                len(desired),
+            )
         except Exception as exc:
             log.warning("redis reconnect failed: %s", exc)
             self._connected = False

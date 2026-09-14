@@ -58,6 +58,12 @@ class ConnectionManager:
         # ended — the disconnect race that would otherwise send contradictory
         # lifecycle events to sibling instances. Bounded via TTL cleanup.
         self.ended_rooms_local: Dict[RoomKey, float] = {}
+        # Tracks which WS actually holds a Redis subscription refcount. Only
+        # a ws in this set may schedule release on disconnect — otherwise a
+        # failed/cancelled register_host that never got past the exception
+        # path could release a refcount it didn't own, decrementing a
+        # listener's live subscription.
+        self.host_subscription_owned_by_ws: Set[WebSocket] = set()
 
     def register_host_shutdown_callback(self, ws: WebSocket, callback: Callable[[], None]) -> None:
         self.host_shutdown_cb_by_ws[ws] = callback
@@ -106,6 +112,15 @@ class ConnectionManager:
         STT handler must not run a session it cannot terminate reliably
         from another instance. Presence is rolled back before raising so
         the manager stays consistent.
+
+        Ownership: this method adds `ws` to host_subscription_owned_by_ws only
+        AFTER ensure_subscription returns (whether ready or not). The
+        ensure_subscription call itself rolls back refcount on exception, so
+        an exception path here does NOT hold a refcount — note_host_disconnected
+        will see the ws is not in the ownership set and won't release. Only
+        a successful ensure_subscription (which incremented refcount) yields
+        ownership. That closes the "someone else's refcount was decremented"
+        race under cancellation/failure.
         """
         self.note_host_connected(ws, org_id, room_id)
         if pubsub.enabled:
@@ -114,15 +129,24 @@ class ConnectionManager:
                     (org_id or "").strip(),
                     (room_id or "").strip(),
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                # BaseException catches CancelledError too — a cancelled
+                # register_host must not leave presence hanging.
                 self.note_host_disconnected(ws)
-                raise RuntimeError(f"host_subscription_failed: {exc}") from exc
+                if isinstance(exc, Exception):
+                    raise RuntimeError(f"host_subscription_failed: {exc}") from exc
+                raise
+            # ensure_subscription incremented the refcount, so this ws now
+            # owns one subscription slot regardless of whether the underlying
+            # channel is actually live.
+            self.host_subscription_owned_by_ws.add(ws)
             if not ready:
                 # Redis is enabled but not currently connected. Reader will
                 # resubscribe on reconnect, but until then we cannot receive
                 # the terminal broadcast from another instance. Safer to
                 # refuse the host connection than to run without terminal
-                # reachability.
+                # reachability — note_host_disconnected will release the
+                # refcount we just acquired via the ownership check.
                 self.note_host_disconnected(ws)
                 raise RuntimeError("host_subscription_not_ready")
 
@@ -197,17 +221,19 @@ class ConnectionManager:
     def note_host_disconnected(self, ws: WebSocket) -> None:
         # Also drop any registered shutdown callback so it can't leak by ws.
         self.host_shutdown_cb_by_ws.pop(ws, None)
+        # Only release a Redis subscription that THIS ws actually acquired.
+        # register_host adds to this set only after ensure_subscription
+        # returned (either ready or not), so a failed/cancelled registration
+        # that never incremented refcount does not decrement anyone else's.
+        owned_subscription = ws in self.host_subscription_owned_by_ws
+        self.host_subscription_owned_by_ws.discard(ws)
         key = self.host_presence_by_ws.pop(ws, None)
         if not key:
             return
         self._decrement_host_presence(key)
         if self.room_host_count(key[0], key[1]) == 0:
             self.hostless_since_by_room.setdefault(key, time.monotonic())
-        # Release the Redis subscription this host acquired in
-        # note_host_connected. Listeners keep their own subscription refcount
-        # via join_room/disconnect, so this only tears down when nothing on
-        # this instance is interested in the room anymore.
-        if pubsub.enabled:
+        if pubsub.enabled and owned_subscription:
             _schedule(pubsub.release_subscription(key[0], key[1]))
 
     def _decrement_host_presence(self, key: RoomKey) -> None:
