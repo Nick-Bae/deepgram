@@ -64,6 +64,12 @@ class ConnectionManager:
         # path could release a refcount it didn't own, decrementing a
         # listener's live subscription.
         self.host_subscription_owned_by_ws: Set[WebSocket] = set()
+        # Per-listener subscription ownership. Each register_listener call
+        # holds one refcount slot for the room it registered against. Room
+        # switches transfer ownership. disconnect releases only when
+        # ownership is present. Prevents fire-and-forget ensure/release races
+        # from decrementing another listener's live subscription.
+        self.listener_subscription_owned_room_by_ws: Dict[WebSocket, RoomKey] = {}
 
     def register_host_shutdown_callback(self, ws: WebSocket, callback: Callable[[], None]) -> None:
         self.host_shutdown_cb_by_ws[ws] = callback
@@ -103,6 +109,53 @@ class ConnectionManager:
             self.ended_rooms_local.pop(key, None)
             return False
         return True
+
+    async def register_listener(
+        self,
+        ws: WebSocket,
+        org_id: str,
+        room_id: str,
+        role: str = "listener",
+    ) -> int:
+        """Async listener registration with deterministic subscription readiness.
+
+        Same rationale as register_host: without awaiting the Redis subscription,
+        a listener that just joined and is about to enter the message loop can
+        miss a terminal broadcast published from another instance during the
+        subscription window. The forgotten-viewer leak would return.
+
+        Per-ws ownership prevents a failed/cancelled join from releasing another
+        listener's live refcount. Also handles the rare room-switch case
+        (consumer_join with a different room) by releasing the old room's
+        refcount and acquiring the new one.
+        """
+        new_key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        if not new_key[0] or not new_key[1]:
+            return 0
+        prev_owned = self.listener_subscription_owned_room_by_ws.get(ws)
+        viewer_count = self.join_room(ws, org_id, room_id, role)
+        if not pubsub.enabled:
+            return viewer_count
+        # Room switch: release the previous room's refcount before acquiring
+        # the new one. Ownership transfer, not orphan release.
+        if prev_owned and prev_owned != new_key:
+            self.listener_subscription_owned_room_by_ws.pop(ws, None)
+            _schedule(pubsub.release_subscription(prev_owned[0], prev_owned[1]))
+        # Already own this exact room — nothing to do.
+        if self.listener_subscription_owned_room_by_ws.get(ws) == new_key:
+            return viewer_count
+        try:
+            await pubsub.ensure_subscription(new_key[0], new_key[1])
+        except BaseException as exc:
+            # Roll back presence. Do NOT touch ownership map — we never added
+            # to it on this failure path (ensure_subscription rolled back its
+            # own refcount).
+            self.disconnect(ws)
+            if isinstance(exc, Exception):
+                raise
+            raise
+        self.listener_subscription_owned_room_by_ws[ws] = new_key
+        return viewer_count
 
     async def register_host(self, ws: WebSocket, org_id: str, room_id: str) -> None:
         """Async host registration with deterministic subscription readiness.
@@ -180,12 +233,12 @@ class ConnectionManager:
         elif self.room_host_count(key[0], key[1]) == 0:
             self.hostless_since_by_room.setdefault(key, time.monotonic())
 
-        # Pub/Sub refcount hooks — fire and forget; pubsub uses an internal lock.
-        if pubsub.enabled:
-            if new_room_first_ws:
-                _schedule(pubsub.ensure_subscription(key[0], key[1]))
-            if prev_became_empty and prev_key:
-                _schedule(pubsub.release_subscription(prev_key[0], prev_key[1]))
+        # Pub/Sub subscription is now handled per-ws by register_listener /
+        # register_host — the callers await ensure_subscription and track
+        # per-ws ownership. Fire-and-forget from here would race with the
+        # post-join is_room_live check on the caller side (subscription may
+        # not be active yet, so a terminal broadcast from another instance
+        # could be missed).
         return self.room_viewer_count(key[0], key[1])
 
     def get_room(self, ws: WebSocket) -> RoomKey | None:
@@ -246,22 +299,25 @@ class ConnectionManager:
     def disconnect(self, ws: WebSocket):
         self.note_host_disconnected(ws)
         self.active.discard(ws)
+        # Release listener subscription only if THIS ws holds a refcount for
+        # a specific room — a fire-and-forget acquire that failed never made
+        # the ws an owner, and releasing on failure would decrement another
+        # listener's live subscription (the race ChatGPT flagged).
+        owned_listener_room = self.listener_subscription_owned_room_by_ws.pop(ws, None)
         key = self.room_by_ws.pop(ws, None)
         self.role_by_ws.pop(ws, None)
-        became_empty = False
         if key:
             bucket = self.connections_by_room.get(key)
             if bucket:
                 bucket.discard(ws)
                 if not bucket:
                     self.connections_by_room.pop(key, None)
-                    became_empty = True
             if self.room_host_count(key[0], key[1]) == 0:
                 self.hostless_since_by_room.setdefault(key, time.monotonic())
             else:
                 self.hostless_since_by_room.pop(key, None)
-            if pubsub.enabled and became_empty:
-                _schedule(pubsub.release_subscription(key[0], key[1]))
+        if pubsub.enabled and owned_listener_room:
+            _schedule(pubsub.release_subscription(owned_listener_room[0], owned_listener_room[1]))
 
     def room_viewer_count(self, org_id: str, room_id: str) -> int:
         key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())

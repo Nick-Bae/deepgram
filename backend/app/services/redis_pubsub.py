@@ -330,12 +330,27 @@ class RedisPubSub:
             # room whose partial-reconnect subscribe failed silently.
             self._subscribed.clear()
             desired = [k for k, count in self._ref_counts.items() if count > 0]
+            failed = []
             for key in desired:
                 try:
                     await self._pubsub.subscribe(_channel_name(*key))
                     self._subscribed.add(key)
                 except Exception as exc:
                     log.warning("resubscribe failed key=%s: %s", key, exc)
+                    failed.append(key)
+            # If any desired subscription failed, do NOT mark connected — the
+            # reader loop will hit _reconnect again on the next iteration and
+            # retry the whole set. Otherwise those rooms would silently stay
+            # unsubscribed forever (reader sees _connected=True and never
+            # re-enters reconnect), so terminal broadcasts for them are lost.
+            if failed:
+                log.warning(
+                    "redis pubsub partial resubscribe: %d/%d failed — will retry",
+                    len(failed),
+                    len(desired),
+                )
+                self._connected = False
+                return
             self._connected = True
             log.info(
                 "redis pubsub reconnected; %d/%d rooms resubscribed",

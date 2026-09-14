@@ -1433,11 +1433,30 @@ async def ws_translate(ws: WebSocket):
 
     if joined_org_id and joined_room_id:
         # Role already verified above — no second auth check needed.
-        viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
-        # Re-check room status AFTER join_room to close the race where End
+        # register_listener awaits Redis subscription readiness before
+        # returning so a terminal broadcast from another instance can't be
+        # missed during the subscription window (the "forgotten viewer"
+        # race, narrowed to listeners).
+        try:
+            viewer_count = await manager.register_listener(
+                ws, joined_org_id, joined_room_id, joined_role
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            with _ws_viewer_ip_lock:
+                _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
+                if _remaining <= 0:
+                    _ws_viewer_ip_conns.pop(_viewer_ip, None)
+                else:
+                    _ws_viewer_ip_conns[_viewer_ip] = _remaining
+            try:
+                await ws.close(code=1011)
+            except Exception:
+                pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return
+        # Re-check room status AFTER registration to close the race where End
         # Service fires between the initial is_room_live check and this join.
-        # Without this second check, a listener that just registered could
-        # miss both close_room_listeners snapshots.
         try:
             _still_live_after_join = multichurch_store.is_room_live(joined_org_id, joined_room_id)
         except Exception:
@@ -1796,7 +1815,20 @@ async def ws_translate(ws: WebSocket):
                             joined_role = "listener"
                     else:
                         host_authed = False
-                    viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
+                    # register_listener awaits Redis subscription readiness so
+                    # a terminal broadcast can't race a fresh consumer_join.
+                    try:
+                        viewer_count = await manager.register_listener(
+                            ws, joined_org_id, joined_room_id, joined_role
+                        )
+                    except (Exception, asyncio.CancelledError) as exc:
+                        try:
+                            await ws.close(code=1011)
+                        except Exception:
+                            pass
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        break
                     # Same protection as the initial query-string join: refuse
                     # to leave a socket registered against a room that's not
                     # live. Without this, a consumer_join with an ended room
