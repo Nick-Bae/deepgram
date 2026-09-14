@@ -66,6 +66,10 @@ class ENV:
     REDIS_CHANNEL_PREFIX: str = _env_str("REDIS_CHANNEL_PREFIX", default="worshiptranslate")
     REDIS_SEQ_TTL_SEC: int = int(os.getenv("REDIS_SEQ_TTL_SEC", "86400"))
     REDIS_CONNECT_TIMEOUT_SEC: float = float(os.getenv("REDIS_CONNECT_TIMEOUT_SEC", "5"))
+    # Per-command timeout for SUBSCRIBE / UNSUBSCRIBE (they run under _lock, so
+    # a hung Redis connection would otherwise stall all listener/host
+    # registration on this instance).
+    REDIS_COMMAND_TIMEOUT_SEC: float = float(os.getenv("REDIS_COMMAND_TIMEOUT_SEC", "5"))
     INSTANCE_ID: str = _env_str("INSTANCE_ID", default=f"inst-{uuid.uuid4().hex[:12]}")
 
     @classmethod

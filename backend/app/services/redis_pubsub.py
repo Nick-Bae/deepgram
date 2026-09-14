@@ -251,7 +251,18 @@ class RedisPubSub:
         if not self._connected or self._pubsub is None:
             return
         try:
-            await self._pubsub.subscribe(_channel_name(*key))
+            # Bounded wait: this call runs under _lock. Without the timeout,
+            # a hung Redis connection would freeze every caller waiting on
+            # _lock (listener/host registration, releases) until process
+            # restart. On timeout, mark disconnected so the reader rebuilds.
+            await asyncio.wait_for(
+                self._pubsub.subscribe(_channel_name(*key)),
+                timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            log.warning("redis SUBSCRIBE timeout key=%s", key)
+            self._connected = False
+            raise
         except Exception as exc:
             log.warning("redis SUBSCRIBE failed key=%s: %s", key, exc)
             raise  # caller (ensure_subscription) rolls back refcount
@@ -262,7 +273,13 @@ class RedisPubSub:
         if not self._connected or self._pubsub is None:
             return
         try:
-            await self._pubsub.unsubscribe(_channel_name(*key))
+            await asyncio.wait_for(
+                self._pubsub.unsubscribe(_channel_name(*key)),
+                timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            log.warning("redis UNSUBSCRIBE timeout key=%s — marking disconnected", key)
+            self._connected = False
         except Exception as exc:
             log.warning("redis UNSUBSCRIBE failed key=%s: %s", key, exc)
 
@@ -321,7 +338,7 @@ class RedisPubSub:
                 socket_connect_timeout=ENV.REDIS_CONNECT_TIMEOUT_SEC,
                 decode_responses=True,
             )
-            await self._sub.ping()
+            await asyncio.wait_for(self._sub.ping(), timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC)
             # Reconcile _subscribed against _ref_counts under _lock. Without the
             # lock, a concurrent release_subscription can pop the last refcount
             # for a room after we've snapshotted `desired` — we'd then subscribe
@@ -336,8 +353,17 @@ class RedisPubSub:
                 failed = []
                 for key in desired:
                     try:
-                        await self._pubsub.subscribe(_channel_name(*key))
+                        # Bound each resubscribe; a hung Redis would otherwise
+                        # keep _lock indefinitely with all registration paths
+                        # blocked behind it.
+                        await asyncio.wait_for(
+                            self._pubsub.subscribe(_channel_name(*key)),
+                            timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+                        )
                         self._subscribed.add(key)
+                    except asyncio.TimeoutError:
+                        log.warning("resubscribe timeout key=%s", key)
+                        failed.append(key)
                     except Exception as exc:
                         log.warning("resubscribe failed key=%s: %s", key, exc)
                         failed.append(key)
