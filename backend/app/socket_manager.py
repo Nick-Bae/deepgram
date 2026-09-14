@@ -145,7 +145,7 @@ class ConnectionManager:
         if self.listener_subscription_owned_room_by_ws.get(ws) == new_key:
             return viewer_count
         try:
-            await pubsub.ensure_subscription(new_key[0], new_key[1])
+            ready = await pubsub.ensure_subscription(new_key[0], new_key[1])
         except BaseException as exc:
             # Roll back presence. Do NOT touch ownership map — we never added
             # to it on this failure path (ensure_subscription rolled back its
@@ -154,7 +154,19 @@ class ConnectionManager:
             if isinstance(exc, Exception):
                 raise
             raise
+        # ensure_subscription incremented the refcount, so this ws now owns
+        # one slot regardless of readiness. Ownership must be recorded BEFORE
+        # the not-ready rollback so disconnect() releases it via the ownership
+        # check, keeping refcount balanced.
         self.listener_subscription_owned_room_by_ws[ws] = new_key
+        if not ready:
+            # Redis is enabled but disconnected. Reader will resubscribe on
+            # reconnect, but until then this instance can't receive the
+            # terminal broadcast — a stale forgotten viewer would linger.
+            # Refuse rather than pretend readiness. disconnect() handles the
+            # subscription refcount release via ownership.
+            self.disconnect(ws)
+            raise RuntimeError("listener_subscription_not_ready")
         return viewer_count
 
     async def register_host(self, ws: WebSocket, org_id: str, room_id: str) -> None:

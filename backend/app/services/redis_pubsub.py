@@ -322,41 +322,43 @@ class RedisPubSub:
                 decode_responses=True,
             )
             await self._sub.ping()
-            self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
-            # Rebuild _subscribed from actual SUBSCRIBE results. Any room that
-            # someone still wants (refcount > 0) gets resubscribed here; only
-            # rooms where SUBSCRIBE actually succeeds land in _subscribed.
-            # Prevents ensure_subscription from later returning True for a
-            # room whose partial-reconnect subscribe failed silently.
-            self._subscribed.clear()
-            desired = [k for k, count in self._ref_counts.items() if count > 0]
-            failed = []
-            for key in desired:
-                try:
-                    await self._pubsub.subscribe(_channel_name(*key))
-                    self._subscribed.add(key)
-                except Exception as exc:
-                    log.warning("resubscribe failed key=%s: %s", key, exc)
-                    failed.append(key)
-            # If any desired subscription failed, do NOT mark connected — the
-            # reader loop will hit _reconnect again on the next iteration and
-            # retry the whole set. Otherwise those rooms would silently stay
-            # unsubscribed forever (reader sees _connected=True and never
-            # re-enters reconnect), so terminal broadcasts for them are lost.
-            if failed:
-                log.warning(
-                    "redis pubsub partial resubscribe: %d/%d failed — will retry",
-                    len(failed),
+            # Reconcile _subscribed against _ref_counts under _lock. Without the
+            # lock, a concurrent release_subscription can pop the last refcount
+            # for a room after we've snapshotted `desired` — we'd then subscribe
+            # a room nobody wants and record it in _subscribed with no future
+            # release path (orphan Redis subscription). ensure_subscription
+            # blocks briefly during reconnect, which is acceptable: reconnect
+            # is rare and the alternative is data loss.
+            async with self._lock:
+                self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
+                self._subscribed.clear()
+                desired = [k for k, count in self._ref_counts.items() if count > 0]
+                failed = []
+                for key in desired:
+                    try:
+                        await self._pubsub.subscribe(_channel_name(*key))
+                        self._subscribed.add(key)
+                    except Exception as exc:
+                        log.warning("resubscribe failed key=%s: %s", key, exc)
+                        failed.append(key)
+                # If any desired subscription failed, do NOT mark connected —
+                # the reader loop will hit _reconnect again and retry the
+                # whole set. Setting _connected=True with partial subscriptions
+                # would let those rooms silently miss terminal broadcasts.
+                if failed:
+                    log.warning(
+                        "redis pubsub partial resubscribe: %d/%d failed — will retry",
+                        len(failed),
+                        len(desired),
+                    )
+                    self._connected = False
+                    return
+                self._connected = True
+                log.info(
+                    "redis pubsub reconnected; %d/%d rooms resubscribed",
+                    len(self._subscribed),
                     len(desired),
                 )
-                self._connected = False
-                return
-            self._connected = True
-            log.info(
-                "redis pubsub reconnected; %d/%d rooms resubscribed",
-                len(self._subscribed),
-                len(desired),
-            )
         except Exception as exc:
             log.warning("redis reconnect failed: %s", exc)
             self._connected = False
