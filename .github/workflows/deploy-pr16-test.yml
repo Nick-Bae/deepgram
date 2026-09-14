@@ -1,0 +1,221 @@
+name: Deploy PR #16 test (fix/release-room-resources)
+
+# Temporary workflow to validate PR #16's room-cleanup fixes against a real
+# Cloud Run instance without disturbing production traffic. Deploys the
+# pinned commit as a new revision of the EXISTING Cloud Run service, with
+# --no-traffic + a traffic tag so only requests to the tagged URL hit the
+# test revision. Production callers of the plain service URL continue to see
+# the current live revision.
+#
+# Trigger: a narrowly scoped push. This workflow file only ships on
+# fix/release-room-resources — it is NOT added to main — so a
+# workflow_dispatch button would not appear (GitHub requires manual-trigger
+# workflows to exist on the default branch). Instead, pushing this file (or
+# a change to this file) on the feature branch runs it exactly once per push.
+# Backend-code-only pushes on the branch do NOT trigger this workflow.
+#
+# Remove this workflow file BEFORE merging PR #16.
+
+on:
+  push:
+    branches:
+      - fix/release-room-resources
+    paths:
+      - ".github/workflows/deploy-pr16-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-pr16-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      # Pinned to the tested head of fix/release-room-resources so the deploy
+      # is reproducible regardless of any later commits on the branch.
+      COMMIT_SHA: 29e261807aee09fa80bb68d2f23a7efa4d6a18c1
+      # Revision suffix is unique per (run, attempt) so a rerun after a
+      # verification failure doesn't collide with the already-created
+      # immutable revision from the previous attempt.
+      REVISION_SUFFIX: cleanup-29e26180-${{ github.run_number }}-${{ github.run_attempt }}
+      TRAFFIC_TAG: cleanup-test
+
+    steps:
+      - name: Checkout pinned commit
+        uses: actions/checkout@v6
+        with:
+          ref: 29e261807aee09fa80bb68d2f23a7efa4d6a18c1
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3.0.1
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ secrets.CLOUD_RUN_REGION }}-docker.pkg.dev --quiet
+
+      - name: Record and validate the pre-deploy live revision
+        id: pre_live
+        run: |
+          # Snapshot which revision currently holds 100% of normal (untagged)
+          # traffic so the post-deploy verification can assert it did not move.
+          # Then refuse to proceed unless we can identify exactly one
+          # production revision at 100%. Without this guard a missing / null
+          # describe response, a split traffic config, or a service already
+          # in an unusual state could let the workflow continue and create a
+          # test revision on top of a state we don't understand.
+          set -euo pipefail
+          SERVICE_JSON=$(gcloud run services describe ${{ secrets.CLOUD_RUN_SERVICE }} \
+            --region=${{ secrets.CLOUD_RUN_REGION }} \
+            --format=json)
+          PRE_LIVE_REVISION=$(echo "$SERVICE_JSON" \
+            | jq -r '[.status.traffic[] | select((.tag // "") == "") | select((.percent // 0) > 0)] | max_by(.percent) | .revisionName')
+          PRE_LIVE_PERCENT=$(echo "$SERVICE_JSON" \
+            | jq -r '[.status.traffic[] | select((.tag // "") == "") | select((.percent // 0) > 0)] | max_by(.percent) | .percent')
+          echo "Pre-deploy live revision: $PRE_LIVE_REVISION ($PRE_LIVE_PERCENT%)"
+          if [ -z "$PRE_LIVE_REVISION" ] || [ "$PRE_LIVE_REVISION" = "null" ] || [ "$PRE_LIVE_PERCENT" != "100" ]; then
+            echo "::error::Could not verify exactly one production revision at 100% traffic. Aborting before build."
+            exit 1
+          fi
+          echo "pre_live_revision=$PRE_LIVE_REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        run: |
+          IMAGE="${{ secrets.CLOUD_RUN_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-deploy/${{ secrets.CLOUD_RUN_SERVICE }}:${{ env.REVISION_SUFFIX }}"
+          docker build -t "$IMAGE" ./backend
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy tagged revision with no traffic
+        run: |
+          # --no-traffic: production traffic stays on the pre-deploy live revision.
+          # --tag=cleanup-test: assigns a stable dedicated URL for this test.
+          # --revision-suffix: recognizable revision name for later cleanup.
+          # NO env-var / secret / VPC flags: the new revision inherits the
+          #   existing service's configuration (Firestore, Redis, provider
+          #   credentials, VPC, secret mounts) verbatim. NOTE: this means the
+          #   test hits the SAME Firestore/Redis/providers as production —
+          #   run only when no real service is active.
+          # --concurrency=1 + --max-instances=6: forces the cross-instance
+          #   test path so multiple viewers spread across multiple instances.
+          #   The next normal production deploy from deploy-backend.yml
+          #   explicitly restores --concurrency=80 --max-instances=1, so
+          #   these test values do not persist for prod.
+          gcloud run deploy ${{ secrets.CLOUD_RUN_SERVICE }} \
+            --image "$IMAGE" \
+            --region ${{ secrets.CLOUD_RUN_REGION }} \
+            --platform=managed \
+            --revision-suffix=${{ env.REVISION_SUFFIX }} \
+            --tag=${{ env.TRAFFIC_TAG }} \
+            --no-traffic \
+            --concurrency=1 \
+            --min-instances=0 \
+            --max-instances=6 \
+            --quiet
+
+      - name: Verify production traffic is unchanged
+        run: |
+          # Assert two things:
+          #   1. The pre-deploy live revision still holds 100% of untagged traffic.
+          #   2. The new tagged revision holds 0% untagged traffic (tag-only).
+          set -euo pipefail
+          SERVICE_JSON=$(gcloud run services describe ${{ secrets.CLOUD_RUN_SERVICE }} \
+            --region=${{ secrets.CLOUD_RUN_REGION }} \
+            --format=json)
+
+          POST_LIVE_REVISION=$(echo "$SERVICE_JSON" \
+            | jq -r '[.status.traffic[] | select((.tag // "") == "") | select((.percent // 0) > 0)] | max_by(.percent) | .revisionName')
+          POST_LIVE_PERCENT=$(echo "$SERVICE_JSON" \
+            | jq -r '[.status.traffic[] | select((.tag // "") == "") | select((.percent // 0) > 0)] | max_by(.percent) | .percent')
+
+          TEST_REVISION_NAME=$(echo "$SERVICE_JSON" \
+            | jq -r '.status.traffic[] | select(.tag=="${{ env.TRAFFIC_TAG }}") | .revisionName')
+          TEST_UNTAGGED_PERCENT=$(echo "$SERVICE_JSON" \
+            | jq -r --arg r "$TEST_REVISION_NAME" '[.status.traffic[] | select(.revisionName==$r) | select((.tag // "") == "") | (.percent // 0)] | add // 0')
+
+          PRE_LIVE="${{ steps.pre_live.outputs.pre_live_revision }}"
+
+          echo "Pre-deploy  live: $PRE_LIVE"
+          echo "Post-deploy live: $POST_LIVE_REVISION ($POST_LIVE_PERCENT%)"
+          echo "Test revision   : $TEST_REVISION_NAME (untagged %: $TEST_UNTAGGED_PERCENT)"
+
+          if [ "$PRE_LIVE" != "$POST_LIVE_REVISION" ] || [ "$POST_LIVE_PERCENT" != "100" ]; then
+            echo "::error::Production traffic shifted. Aborting."
+            exit 1
+          fi
+          if [ "$TEST_UNTAGGED_PERCENT" != "0" ]; then
+            echo "::error::Test revision is receiving normal (untagged) traffic. Aborting."
+            exit 1
+          fi
+          echo "Verified: prod traffic unchanged, test revision is tag-only."
+
+      - name: Emit tagged revision URL to summary
+        run: |
+          set -euo pipefail
+          SERVICE_JSON=$(gcloud run services describe ${{ secrets.CLOUD_RUN_SERVICE }} \
+            --region=${{ secrets.CLOUD_RUN_REGION }} \
+            --format=json)
+          TAG_URL=$(echo "$SERVICE_JSON" \
+            | jq -r '.status.traffic[] | select(.tag=="${{ env.TRAFFIC_TAG }}") | .url')
+          TEST_REVISION_NAME=$(echo "$SERVICE_JSON" \
+            | jq -r '.status.traffic[] | select(.tag=="${{ env.TRAFFIC_TAG }}") | .revisionName')
+          LIVE_REVISION="${{ steps.pre_live.outputs.pre_live_revision }}"
+          # Refuse to write a summary that would tell the operator to run
+          # gcloud with a null / empty revision name or URL — an unusable
+          # instruction is worse than a visible failure.
+          if [ -z "$TAG_URL" ] || [ "$TAG_URL" = "null" ]; then
+            echo "::error::Tagged URL is empty/null. Aborting summary emit."
+            exit 1
+          fi
+          if [ -z "$TEST_REVISION_NAME" ] || [ "$TEST_REVISION_NAME" = "null" ]; then
+            echo "::error::Test revision name is empty/null. Aborting summary emit."
+            exit 1
+          fi
+          {
+            echo "### PR #16 test deployment ready"
+            echo ""
+            echo "- Pinned commit: \`${{ env.COMMIT_SHA }}\`"
+            echo "- Test revision: \`$TEST_REVISION_NAME\`"
+            echo "- Traffic tag: \`${{ env.TRAFFIC_TAG }}\`"
+            echo "- Tagged URL: $TAG_URL"
+            echo "- Production live revision (unchanged): \`$LIVE_REVISION\`"
+            echo ""
+            echo "Configure Vercel preview NEXT_PUBLIC_API_BASE_URL / NEXT_PUBLIC_WS_URL"
+            echo "against this URL to run the healthy-Redis and cross-instance tests."
+            echo ""
+            echo "NOTE: this revision uses PROD Firestore / Redis / provider credentials."
+            echo "Run the test only when no real service is active. Also verify"
+            echo "the Vercel preview origin is already in CORS_ALLOW_ORIGINS on"
+            echo "the inherited service config — do not broadly widen CORS."
+            echo ""
+            echo "### Cleanup after testing"
+            echo ""
+            echo "1. Remove the \`${{ env.TRAFFIC_TAG }}\` traffic tag:"
+            echo "   \`\`\`"
+            echo "   gcloud run services update-traffic ${{ secrets.CLOUD_RUN_SERVICE }} \\"
+            echo "     --region=${{ secrets.CLOUD_RUN_REGION }} \\"
+            echo "     --remove-tags=${{ env.TRAFFIC_TAG }}"
+            echo "   \`\`\`"
+            echo "2. Delete the \`$TEST_REVISION_NAME\` revision (must run AFTER step 1):"
+            echo "   \`\`\`"
+            echo "   gcloud run revisions delete $TEST_REVISION_NAME \\"
+            echo "     --region=${{ secrets.CLOUD_RUN_REGION }}"
+            echo "   \`\`\`"
+            echo "3. Restore --to-latest routing so a future prod deploy on the"
+            echo "   current deploy-backend.yml (if PR #16 is never merged and"
+            echo "   the branch is deleted, main will not have the --to-latest"
+            echo "   step) does not preserve the tagged-test traffic pattern."
+            echo "   MUST run AFTER step 2 — if the test revision still exists,"
+            echo "   --to-latest could route production traffic to IT."
+            echo "   \`\`\`"
+            echo "   gcloud run services update-traffic ${{ secrets.CLOUD_RUN_SERVICE }} \\"
+            echo "     --region=${{ secrets.CLOUD_RUN_REGION }} \\"
+            echo "     --to-latest \\"
+            echo "     --quiet"
+            echo "   \`\`\`"
+            echo "4. Delete this workflow file before merging PR #16."
+          } >> "$GITHUB_STEP_SUMMARY"

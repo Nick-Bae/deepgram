@@ -51,3 +51,17 @@ jobs:
             --timeout=3600 \
             --cpu-boost \
             --quiet
+
+      - name: Route 100% traffic to the newly deployed revision
+        run: |
+          # Cloud Run preserves the previous traffic-split pattern across
+          # deploys. If a tagged / no-traffic revision was ever deployed
+          # (e.g. the temporary deploy-pr16-test.yml workflow), a plain
+          # `gcloud run deploy` here would create a new revision but LEAVE
+          # normal traffic on the older production revision. --to-latest
+          # explicitly shifts 100% of untagged traffic to the revision this
+          # workflow just built, restoring the expected prod behavior.
+          gcloud run services update-traffic ${{ secrets.CLOUD_RUN_SERVICE }} \
+            --region ${{ secrets.CLOUD_RUN_REGION }} \
+            --to-latest \
+            --quiet
