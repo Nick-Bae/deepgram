@@ -1229,25 +1229,17 @@ async def _room_sweeper_loop() -> None:
             print(f"[ROOM_SWEEPER] loop error: {exc}")
 
 
-async def _cleanup_live_rooms_on_startup() -> None:
-    """End all Firestore rooms still marked live from a previous server run."""
-    try:
-        stale = multichurch_store.stale_live_rooms(idle_seconds=0, max_duration_seconds=0)
-        if not stale:
-            return
-        print(f"[STARTUP] Ending {len(stale)} stale live room(s) from previous run")
-        for room in stale:
-            org_id = room.get("orgId")
-            room_id = room.get("roomId")
-            if not org_id or not room_id:
-                continue
-            try:
-                multichurch_store.end_room(org_id, room_id, reason="server_restart")
-                print(f"[STARTUP] Ended stale room org={org_id} room={room_id}")
-            except Exception as exc:
-                print(f"[STARTUP] Could not end stale room org={org_id} room={room_id}: {exc}")
-    except Exception as exc:
-        print(f"[STARTUP] stale room cleanup failed: {exc}")
+# Removed: _cleanup_live_rooms_on_startup.
+# The prior implementation invoked
+# `stale_live_rooms(idle_seconds=0, max_duration_seconds=0)` at startup,
+# which returns every live room. At `--max-instances=1` in isolation it
+# was benign because startup coincided with no live rooms; at any greater
+# instance count a starting instance would end rooms another instance is
+# actively broadcasting. Removed rather than left as unused code so a
+# future call site cannot accidentally reintroduce the multi-instance
+# blocker. See docs/03-analysis/resource-cleanup-audit.md §4a.1.
+# Stale rooms are now handled exclusively by `_room_sweeper_loop` below
+# (idle_timeout / max_duration / cap enforcement).
 
 
 @app.on_event("startup")
@@ -1272,7 +1264,11 @@ async def _on_startup():
         print(f"[REDIS_PUBSUB] enabled connected={_pubsub.connected} instance={ENV.INSTANCE_ID}")
     else:
         print("[REDIS_PUBSUB] disabled (REDIS_ENABLED=0) — local-only broadcast")
-    asyncio.create_task(_cleanup_live_rooms_on_startup())
+    # Startup no longer terminates existing Firestore-live rooms. See the
+    # note above the removed `_cleanup_live_rooms_on_startup` function.
+    # `_room_sweeper_loop` below handles all stale-room termination via
+    # idle_timeout / max_duration / cap enforcement — those paths are
+    # unchanged by this fix.
     if _room_sweeper_task is None or _room_sweeper_task.done():
         _room_sweeper_task = asyncio.create_task(_room_sweeper_loop())
 
