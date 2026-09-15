@@ -32,6 +32,99 @@ jobs:
       - name: Run pytest
         run: pytest tests/ -v
 
+  # Firestore-emulator-backed transactional-recheck test for PR-T1-B.
+  # Scoped narrowly: proves that activity committed BEFORE the termination
+  # transaction opens is respected by the recheck. Does NOT claim to validate
+  # Firestore's production optimistic-concurrency retry — that lives in the
+  # ControlledRetrySemanticsTests class (no emulator required).
+  # See docs/03-analysis/resource-cleanup-audit.md §4a.2 and
+  # docs/01-plan/features/resource-cleanup-track-1.plan.md PR-T1-B.
+  firestore-emulator-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Set up Java 21 (Firestore emulator ≥ v1.19 requires JRE 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Set up gcloud SDK with Firestore emulator
+        uses: google-github-actions/setup-gcloud@v3.0.1
+        with:
+          install_components: "cloud-firestore-emulator"
+
+      - name: Start Firestore emulator (isolated project, bounded readiness)
+        run: |
+          gcloud emulators firestore start \
+            --host-port=127.0.0.1:8085 \
+            --project=cleanup-track1-emulator \
+            > /tmp/firestore-emulator.log 2>&1 &
+          # Bounded readiness check — 45s cap.
+          for i in {1..45}; do
+            if curl -sf http://127.0.0.1:8085 > /dev/null 2>&1; then
+              echo "Firestore emulator listening on 127.0.0.1:8085"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Firestore emulator failed to start within 45s"
+          cat /tmp/firestore-emulator.log
+          exit 1
+
+      - name: Run Firestore emulator tests
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8085
+          GOOGLE_CLOUD_PROJECT: cleanup-track1-emulator
+          MULTICHURCH_STORE_MODE: firestore
+        run: |
+          pytest tests/test_sweeper_atomic.py::FirestoreAtomicIdleTerminationTests \
+            -v --junitxml=/tmp/emulator-tests.xml
+
+      - name: Fail if emulator tests skipped or none ran
+        run: |
+          python <<'EOF'
+          import xml.etree.ElementTree as ET
+          import sys
+          root = ET.parse('/tmp/emulator-tests.xml').getroot()
+          suite = root.find('testsuite') if root.tag == 'testsuites' else root
+          if suite is None:
+              sys.exit('ERROR: no test suite in junit output')
+          tests = int(suite.get('tests', '0'))
+          skipped = int(suite.get('skipped', '0'))
+          errors = int(suite.get('errors', '0'))
+          failures = int(suite.get('failures', '0'))
+          print(f'emulator suite: tests={tests} skipped={skipped} errors={errors} failures={failures}')
+          if tests < 1:
+              sys.exit('ERROR: no emulator tests were collected')
+          if skipped > 0:
+              sys.exit(f'ERROR: {skipped} emulator test(s) unexpectedly SKIPPED — the emulator must be running and the tests must not skip in CI')
+          if errors > 0 or failures > 0:
+              sys.exit(f'ERROR: emulator tests reported errors={errors} failures={failures}')
+          EOF
+
+      - name: Emulator logs on failure
+        if: failure()
+        run: cat /tmp/firestore-emulator.log || true
+
   frontend-checks:
     runs-on: ubuntu-latest
     defaults:
