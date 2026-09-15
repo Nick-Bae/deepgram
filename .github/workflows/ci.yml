@@ -125,6 +125,121 @@ jobs:
         if: failure()
         run: cat /tmp/firestore-emulator.log || true
 
+  # Two-process integration harness for Track 1 (F-15 today; F-8 and
+  # F-24 land with PR-T1-C). Brings up real Redis + a Firestore
+  # emulator, launches two backend subprocesses with distinct
+  # INSTANCE_ID, and runs cross-process scenarios end-to-end. See
+  # backend/tests/integration/resource_cleanup/README.md.
+  integration-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Set up Java 21 (Firestore emulator requires JRE 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Set up gcloud SDK with Firestore emulator
+        uses: google-github-actions/setup-gcloud@v3.0.1
+        with:
+          install_components: "cloud-firestore-emulator"
+
+      - name: Start Firestore emulator (isolated project, bounded readiness)
+        run: |
+          gcloud emulators firestore start \
+            --host-port=127.0.0.1:8085 \
+            --project=cleanup-track1-harness \
+            > /tmp/firestore-emulator-harness.log 2>&1 &
+          for i in {1..45}; do
+            if curl -sf http://127.0.0.1:8085 > /dev/null 2>&1; then
+              echo "Firestore emulator listening on 127.0.0.1:8085"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Firestore emulator failed to start within 45s"
+          cat /tmp/firestore-emulator-harness.log
+          exit 1
+
+      - name: Verify Redis reachable (service is up)
+        run: |
+          for i in {1..15}; do
+            if timeout 2 bash -c '</dev/tcp/127.0.0.1/6379' 2>/dev/null; then
+              echo "Redis reachable"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Redis service did not accept connections within 15s"
+          exit 1
+
+      - name: Run resource-cleanup integration harness
+        env:
+          HARNESS_REDIS_HOST: 127.0.0.1
+          HARNESS_REDIS_PORT: "6379"
+          HARNESS_FIRESTORE_EMULATOR_HOST: 127.0.0.1:8085
+          HARNESS_GCP_PROJECT: cleanup-track1-harness
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8085
+          GOOGLE_CLOUD_PROJECT: cleanup-track1-harness
+        run: |
+          pytest tests/integration/resource_cleanup/ \
+            -v --junitxml=/tmp/integration-tests.xml
+
+      - name: Fail if integration tests skipped or none ran
+        run: |
+          python <<'EOF'
+          import xml.etree.ElementTree as ET
+          import sys
+          root = ET.parse('/tmp/integration-tests.xml').getroot()
+          suite = root.find('testsuite') if root.tag == 'testsuites' else root
+          if suite is None:
+              sys.exit('ERROR: no test suite in junit output')
+          tests = int(suite.get('tests', '0'))
+          skipped = int(suite.get('skipped', '0'))
+          errors = int(suite.get('errors', '0'))
+          failures = int(suite.get('failures', '0'))
+          print(f'integration suite: tests={tests} skipped={skipped} errors={errors} failures={failures}')
+          if tests < 1:
+              sys.exit('ERROR: no integration tests were collected')
+          if skipped > 0:
+              sys.exit(f'ERROR: {skipped} integration test(s) unexpectedly SKIPPED — the harness prereqs must be satisfied in CI')
+          if errors > 0 or failures > 0:
+              sys.exit(f'ERROR: integration tests reported errors={errors} failures={failures}')
+          EOF
+
+      - name: Firestore emulator logs on failure
+        if: failure()
+        run: cat /tmp/firestore-emulator-harness.log || true
+
   frontend-checks:
     runs-on: ubuntu-latest
     defaults:
