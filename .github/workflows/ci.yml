@@ -146,7 +146,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       toxiproxy:
-        image: shopify/toxiproxy:2.9.0
+        image: ghcr.io/shopify/toxiproxy:2.9.0
         ports:
           - 8474:8474
           - 8666:8666

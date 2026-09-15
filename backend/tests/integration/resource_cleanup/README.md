@@ -48,7 +48,7 @@ docker run --rm -p 6379:6379 redis:7
 # Terminal 2 — Toxiproxy (the upstream name must resolve from this container)
 docker run --rm --add-host=redis:host-gateway \
     -p 8474:8474 -p 8666:8666 -p 8667:8667 \
-    shopify/toxiproxy:2.9.0
+    ghcr.io/shopify/toxiproxy:2.9.0
 
 # Terminal 3 — Firestore emulator
 gcloud emulators firestore start \
