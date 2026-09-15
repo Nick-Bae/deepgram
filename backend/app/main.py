@@ -1173,8 +1173,36 @@ async def _room_sweeper_loop() -> None:
                     f"[ROOM_SWEEPER] ending room org={org_id} room={room_id} "
                     f"reason={reason} host_count={host_count}"
                 )
+                # For the idle_timeout path, pass require_idle_seconds so
+                # end_room's transaction/lock rechecks `lastAudioAt` before
+                # committing. This prevents the stale-read termination race
+                # where the sweeper read the room 30–60s ago and audio has
+                # since resumed. Other reasons (max_duration,
+                # trial_expired, monthly_limit_reached) have authoritative
+                # signals independent of lastAudioAt and must NOT gain
+                # this recheck — see resource-cleanup-audit §4a.2 and
+                # Track 1 plan PR-T1-B.
+                require_idle_seconds = max(60, ROOM_IDLE_TIMEOUT_SEC) if reason == "idle_timeout" else None
                 try:
-                    result = multichurch_store.end_room(org_id, room_id, reason=reason)
+                    result = multichurch_store.end_room(
+                        org_id,
+                        room_id,
+                        reason=reason,
+                        require_idle_seconds=require_idle_seconds,
+                    )
+                    if result.get("skipped"):
+                        # Race won by the host: audio arrived between the
+                        # sweeper's read and the transaction body. Do NOT
+                        # run external cleanup effects — the room is still
+                        # healthy.
+                        print(
+                            f"[ROOM_SWEEPER] idle termination aborted "
+                            f"org={org_id} room={room_id} "
+                            f"skipped={result.get('skipped')} "
+                            f"idleSeconds={result.get('idleSeconds')} "
+                            f"requiredIdleSeconds={result.get('requiredIdleSeconds')}"
+                        )
+                        continue
                     if result.get("alreadyEnded"):
                         # Do NOT skip socket/state cleanup here — the previous
                         # end_room call may have flipped Firestore but failed

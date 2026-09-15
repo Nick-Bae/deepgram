@@ -2646,7 +2646,21 @@ class InMemoryMultiChurchStore:
         *,
         reason: str,
         transcript: Optional[str] = None,
+        require_idle_seconds: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Terminate a room. Idempotent — returns `alreadyEnded=True` if the
+        room is already ended.
+
+        `require_idle_seconds` is an optional precondition. When set, the
+        write is only staged if `now - lastAudioAt >= require_idle_seconds`
+        at the moment the lock is held. Prevents the stale-read termination
+        race in the sweeper's idle-timeout path (see
+        docs/03-analysis/resource-cleanup-audit.md §4a.2). Non-idle
+        callers (explicit End Service, `max_duration`, cap enforcement)
+        must NOT pass this argument — those termination reasons have
+        authoritative signals that must not be second-guessed by a
+        `lastAudioAt` recheck.
+        """
         now = _utcnow()
         with self._lock:
             room = self._rooms.get((org_id, room_id))
@@ -2654,6 +2668,19 @@ class InMemoryMultiChurchStore:
                 raise ValueError("room_not_found")
             if room.get("status") == "ended":
                 return {"orgId": org_id, "roomId": room_id, "status": "ended", "endedAt": room.get("endedAt"), "alreadyEnded": True}
+            if require_idle_seconds is not None:
+                last_audio_at = room.get("lastAudioAt") or room.get("startedAt")
+                if not isinstance(last_audio_at, datetime):
+                    return {"orgId": org_id, "roomId": room_id, "skipped": "no_last_audio_at"}
+                idle = (now - last_audio_at).total_seconds()
+                if idle < require_idle_seconds:
+                    return {
+                        "orgId": org_id,
+                        "roomId": room_id,
+                        "skipped": "no_longer_idle",
+                        "idleSeconds": idle,
+                        "requiredIdleSeconds": require_idle_seconds,
+                    }
 
             room["status"] = "ended"
             room["endedAt"] = now
@@ -5397,7 +5424,28 @@ class FirestoreMultiChurchStore:
         *,
         reason: str,
         transcript: Optional[str] = None,
+        require_idle_seconds: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Terminate a room. Idempotent — returns `alreadyEnded=True` if the
+        room is already ended.
+
+        `require_idle_seconds` is an optional precondition. When set, the
+        Firestore transaction rechecks `now - lastAudioAt >= require_idle_seconds`
+        after re-reading the room, and aborts the write if the room's
+        audio activity has resumed since the caller's earlier read.
+        Prevents the stale-read termination race in the sweeper's
+        idle-timeout path (see docs/03-analysis/resource-cleanup-audit.md
+        §4a.2). Non-idle callers (explicit End Service, `max_duration`,
+        cap enforcement) must NOT pass this argument.
+
+        Transaction-callback purity: the callback body is pure Firestore
+        (reads, staged writes). External effects — socket closes, Redis
+        publication, in-memory map cleanup — MUST run only in the caller
+        after this method returns a shape indicating the room was ended
+        by this call (`ended=True` or `alreadyEnded=True`). Firestore
+        may rerun the callback on concurrent-write retry; that is why
+        no side effects can live inside it.
+        """
         db = self._db
         room_ref = self._room_ref(org_id, room_id)
         now = _utcnow()
@@ -5410,6 +5458,23 @@ class FirestoreMultiChurchStore:
             room = room_snap.to_dict() or {}
             if room.get("status") == "ended":
                 return {"orgId": org_id, "roomId": room_id, "status": "ended", "alreadyEnded": True}
+            if require_idle_seconds is not None:
+                last_audio_at = room.get("lastAudioAt") or room.get("startedAt")
+                if not isinstance(last_audio_at, datetime):
+                    return {
+                        "orgId": org_id,
+                        "roomId": room_id,
+                        "skipped": "no_last_audio_at",
+                    }
+                idle = (now - last_audio_at).total_seconds()
+                if idle < require_idle_seconds:
+                    return {
+                        "orgId": org_id,
+                        "roomId": room_id,
+                        "skipped": "no_longer_idle",
+                        "idleSeconds": idle,
+                        "requiredIdleSeconds": require_idle_seconds,
+                    }
 
             service_key = str(room.get("serviceKey") or "")
             service_ref = self._service_ref(org_id, service_key)
