@@ -85,6 +85,9 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   const streamContext = useMemo(() => resolveStreamContext(explicitUrl), [explicitUrl]);
 
   const [connected, setConnected] = useState(false);
+  // True once the server closes with room_ended — the page uses this to
+  // switch to a terminal display without waiting on the next /resolve poll.
+  const [terminated, setTerminated] = useState(false);
 
   // live preview (KR interim)
   const [krInterim, setKrInterim] = useState("");
@@ -377,6 +380,14 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     contextRef.current = streamContext;
     if (!enabled || !resolvedUrl) return;
     stopFlag.current = false;
+    // A prior mount may have terminated on room_ended for a different room.
+    // Reset here so a new URL (e.g. next service) can connect again.
+    setTerminated(false);
+    // Local disposed flag captured by every onclose/onmessage created in this
+    // effect run. When the effect re-runs (URL change) or unmounts, we set
+    // it true — any pending onclose from the old socket short-circuits so
+    // it can't stomp state that belongs to the new room.
+    let disposedThisRun = false;
     enQueueRef.current = [];
     enDisplayRef.current = [];
     nextSlotAtRef.current = 0;
@@ -443,7 +454,27 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
             ws.send(JSON.stringify(joinPayload));
           } catch {}
         };
-        ws.onclose = () => { setConnected(false); wsRef.current = null; scheduleReconnect(); };
+        ws.onclose = (event) => {
+          // Stale onclose from a previous effect run (URL change): don't
+          // write state that belongs to the new room.
+          if (disposedThisRun) return;
+          setConnected(false);
+          wsRef.current = null;
+          // Terminal close: the server has ended the room. Do not reconnect —
+          // otherwise a forgotten viewer page would immediately establish a
+          // fresh socket, and every close_room_listeners round would re-open
+          // the exact leak we set out to fix.
+          if (event.reason === "room_ended" || event.code === 4001) {
+            stopFlag.current = true;
+            setTerminated(true);
+            if (reconnectTimerRef.current) {
+              clearTimeout(reconnectTimerRef.current);
+              reconnectTimerRef.current = null;
+            }
+            return;
+          }
+          scheduleReconnect();
+        };
         ws.onerror = () => { /* close will follow */ };
 
         ws.onmessage = (e) => {
@@ -571,6 +602,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
 
     connect();
     return () => {
+      disposedThisRun = true;
       stopFlag.current = true;
       setConnected(false);
       if (reconnectTimerRef.current) {
@@ -593,6 +625,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
 
   return {
     connected,
+    terminated,
     // live preview
     krInterim,
     // latest final (single)

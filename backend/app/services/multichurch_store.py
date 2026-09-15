@@ -2632,6 +2632,13 @@ class InMemoryMultiChurchStore:
                 "languagePair": {"source": source, "target": target},
             }
 
+    def is_room_live(self, org_id: str, room_id: str) -> bool:
+        with self._lock:
+            room = self._rooms.get((org_id, room_id))
+            if not room:
+                return False
+            return str(room.get("status") or "").lower() == "live"
+
     def end_room(
         self,
         org_id: str,
@@ -3181,6 +3188,25 @@ class FirestoreMultiChurchStore:
 
     def _room_ref(self, org_id: str, room_id: str):
         return self._org_ref(org_id).collection("rooms").document(room_id)
+
+    def is_room_live(self, org_id: str, room_id: str) -> bool:
+        """Return True only when Firestore confirms status="live".
+
+        A Firestore error (timeout, network, quota) propagates as an exception
+        so callers can fail *open* — i.e. treat unknown as "assume live" and
+        keep the client connected. Swallowing the exception here would turn a
+        transient database failure into an irreversible terminal state on the
+        frontend.
+        """
+        clean_org = _clean_token(org_id)
+        clean_room = _clean_token(room_id)
+        if not clean_org or not clean_room:
+            return False
+        snap = self._room_ref(clean_org, clean_room).get(timeout=_FS_TIMEOUT)
+        if not snap.exists:
+            return False
+        doc = snap.to_dict() or {}
+        return str(doc.get("status") or "").lower() == "live"
 
     def _usage_ref(self, org_id: str, period_key: str):
         return self._org_ref(org_id).collection("usage").document(period_key)

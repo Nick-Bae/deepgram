@@ -172,6 +172,22 @@ ROOM_BROADCAST_VOICE: Dict[Tuple[str, str], str] = {}
 # does not synthesize or broadcast audio for that room — listeners see text
 # only. Absence of an entry means "enabled" (opt-out model).
 ROOM_AUDIENCE_TTS_DISABLED: Set[Tuple[str, str]] = set()
+
+
+def _cleanup_room_local_state(org_id: str, room_id: str) -> None:
+    """Drop all per-(org, room) module-level state on room end.
+
+    Without this, ROOM_BROADCAST_VOICE and ROOM_AUDIENCE_TTS_DISABLED grow one
+    entry per unique room over the process lifetime — small per entry, but
+    unbounded across weeks of services. Called from End Service (route) and
+    the sweeper's end paths so both explicit and automatic terminations clean
+    up uniformly.
+    """
+    key = (org_id or "", room_id or "")
+    if not key[0] or not key[1]:
+        return
+    ROOM_BROADCAST_VOICE.pop(key, None)
+    ROOM_AUDIENCE_TTS_DISABLED.discard(key)
 WS_TRANSLATION_LIMITS_ENABLED = not _env_bool("DISABLE_WS_TRANSLATION_LIMITS", False)
 WS_TRANSLATION_LIMIT_WINDOW_SECONDS = _env_int("WS_TRANSLATION_LIMIT_WINDOW_SECONDS", 60, min_value=5, max_value=3600)
 WS_TRANSLATION_GLOBAL_MAX_REQUESTS_PER_WINDOW = _env_int(
@@ -1160,9 +1176,13 @@ async def _room_sweeper_loop() -> None:
                 try:
                     result = multichurch_store.end_room(org_id, room_id, reason=reason)
                     if result.get("alreadyEnded"):
-                        manager.forget_room(org_id, room_id)
-                        print(f"[ROOM_SWEEPER] room already ended — no double billing org={org_id} room={room_id}")
-                        continue
+                        # Do NOT skip socket/state cleanup here — the previous
+                        # end_room call may have flipped Firestore but failed
+                        # partway through cleanup (Redis publish, close_room_*
+                        # timeouts, etc.). Continuing lets this sweep repair
+                        # whatever the previous attempt missed. Billing is
+                        # already booked in Firestore so re-running is safe.
+                        print(f"[ROOM_SWEEPER] room already ended — running idempotent cleanup org={org_id} room={room_id}")
                 except ValueError:
                     continue
                 except Exception as exc:
@@ -1192,7 +1212,16 @@ async def _room_sweeper_loop() -> None:
                     )
                 except Exception:
                     pass
+                try:
+                    await manager.close_room_listeners(org_id, room_id, reason="room_ended")
+                except Exception:
+                    pass
+                try:
+                    await manager.close_room_hosts(org_id, room_id, reason="room_ended")
+                except Exception:
+                    pass
                 manager.forget_room(org_id, room_id)
+                _cleanup_room_local_state(org_id, room_id)
             _check_spend_alerts()
         except asyncio.CancelledError:
             break
@@ -1224,6 +1253,10 @@ async def _cleanup_live_rooms_on_startup() -> None:
 @app.on_event("startup")
 async def _on_startup():
     global _room_sweeper_task
+    # Register room-end hooks so per-room module state (TTS voice/toggle maps)
+    # is cleared on EVERY instance when a terminal broadcast arrives via
+    # Redis, not only the instance that initiated End Service.
+    manager.register_room_end_hook(_cleanup_room_local_state)
     print(f"[MULTICHURCH] store={type(multichurch_store).__name__}")
     print(
         "[ROOM_CONFIG] "
@@ -1285,6 +1318,29 @@ async def ws_translate(ws: WebSocket):
         await ws.close(code=1008)
         return
 
+    # Reject connections to rooms that are no longer live. Closes the race where
+    # a listener page tries to reconnect (or a stale client retries) after End
+    # Service has already fired — without this, the socket would linger until
+    # the next `roomStatus=ended` broadcast, or forever if none is sent.
+    try:
+        _room_still_live = multichurch_store.is_room_live(joined_org_id, joined_room_id)
+    except Exception:
+        _room_still_live = True  # Fail open — a Firestore hiccup shouldn't reject live viewers.
+    if not _room_still_live:
+        # Accept first so the browser gets a real WebSocket close frame with the
+        # reason. If we close before accept(), Starlette sends HTTP 403 and the
+        # browser reports code 1006 with no reason, which is indistinguishable
+        # from ordinary network failure and does not suppress reconnect.
+        try:
+            await ws.accept()
+        except Exception:
+            return
+        try:
+            await ws.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return
+
     # Per-IP concurrent connection limit — prevents a single client from exhausting
     # the connection manager before authentication completes.
     _viewer_ip = _security_client_ip(ws)
@@ -1297,7 +1353,20 @@ async def ws_translate(ws: WebSocket):
             return
         _ws_viewer_ip_conns[_viewer_ip] = _current + 1
 
-    await manager.connect(ws)
+    # The IP counter is incremented BEFORE ws.accept(). If accept fails (client
+    # aborted mid-handshake), the outer try/finally at the message-loop level
+    # is never reached, so decrement here to avoid a phantom-slot leak that
+    # would eventually block real listeners from this IP.
+    try:
+        await manager.connect(ws)
+    except Exception:
+        with _ws_viewer_ip_lock:
+            _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
+            if _remaining <= 0:
+                _ws_viewer_ip_conns.pop(_viewer_ip, None)
+            else:
+                _ws_viewer_ip_conns[_viewer_ip] = _remaining
+        return
     display_config = {"type": "display_config", "speed": APP_DISPLAY_SPEED["speed"]}
     try:
         await ws.send_json(display_config)
@@ -1364,7 +1433,47 @@ async def ws_translate(ws: WebSocket):
 
     if joined_org_id and joined_room_id:
         # Role already verified above — no second auth check needed.
-        viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
+        # register_listener awaits Redis subscription readiness before
+        # returning so a terminal broadcast from another instance can't be
+        # missed during the subscription window (the "forgotten viewer"
+        # race, narrowed to listeners).
+        try:
+            viewer_count = await manager.register_listener(
+                ws, joined_org_id, joined_room_id, joined_role
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            with _ws_viewer_ip_lock:
+                _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
+                if _remaining <= 0:
+                    _ws_viewer_ip_conns.pop(_viewer_ip, None)
+                else:
+                    _ws_viewer_ip_conns[_viewer_ip] = _remaining
+            try:
+                await ws.close(code=1011)
+            except Exception:
+                pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return
+        # Re-check room status AFTER registration to close the race where End
+        # Service fires between the initial is_room_live check and this join.
+        try:
+            _still_live_after_join = multichurch_store.is_room_live(joined_org_id, joined_room_id)
+        except Exception:
+            _still_live_after_join = True
+        if not _still_live_after_join:
+            manager.disconnect(ws)
+            with _ws_viewer_ip_lock:
+                _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
+                if _remaining <= 0:
+                    _ws_viewer_ip_conns.pop(_viewer_ip, None)
+                else:
+                    _ws_viewer_ip_conns[_viewer_ip] = _remaining
+            try:
+                await ws.close(code=1000, reason="room_ended")
+            except Exception:
+                pass
+            return
         try:
             multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
         except Exception:
@@ -1706,7 +1815,36 @@ async def ws_translate(ws: WebSocket):
                             joined_role = "listener"
                     else:
                         host_authed = False
-                    viewer_count = manager.join_room(ws, joined_org_id, joined_room_id, joined_role)
+                    # register_listener awaits Redis subscription readiness so
+                    # a terminal broadcast can't race a fresh consumer_join.
+                    try:
+                        viewer_count = await manager.register_listener(
+                            ws, joined_org_id, joined_room_id, joined_role
+                        )
+                    except (Exception, asyncio.CancelledError) as exc:
+                        try:
+                            await ws.close(code=1011)
+                        except Exception:
+                            pass
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
+                        break
+                    # Same protection as the initial query-string join: refuse
+                    # to leave a socket registered against a room that's not
+                    # live. Without this, a consumer_join with an ended room
+                    # would install a listener that only leaves via the next
+                    # terminal broadcast — or never, if none is coming.
+                    try:
+                        _cj_room_live = multichurch_store.is_room_live(joined_org_id, joined_room_id)
+                    except Exception:
+                        _cj_room_live = True  # fail open on Firestore error
+                    if not _cj_room_live:
+                        manager.disconnect(ws)
+                        try:
+                            await ws.close(code=1000, reason="room_ended")
+                        except Exception:
+                            pass
+                        break
                     try:
                         multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
                     except Exception:
@@ -1812,20 +1950,30 @@ async def ws_translate(ws: WebSocket):
         if room_before:
             org_id, room_id = room_before
             viewer_count = manager.room_viewer_count(org_id, room_id)
-            try:
-                await manager.broadcast_room(
-                    org_id,
-                    room_id,
-                    {
-                        "type": "STATUS",
-                        "orgId": org_id,
-                        "roomId": room_id,
-                        "roomStatus": "live",
-                        "viewerCount": viewer_count,
-                    },
-                )
-            except Exception:
-                pass
+            # Skip the "live" viewer-count broadcast when either:
+            #   1. the local bucket is empty (nothing to notify here), or
+            #   2. the room is in the local ended tombstone (multi-listener
+            #      shutdown case — other listeners are still in the bucket
+            #      briefly, so viewer_count > 0 doesn't mean the room is live).
+            # Both prevent contradictory lifecycle events (a stale "live"
+            # arriving at sibling instances after "ended"). The decision
+            # lives on the manager so the test suite can pin it — see
+            # ConnectionManager.should_broadcast_live_status.
+            if manager.should_broadcast_live_status(org_id, room_id, viewer_count):
+                try:
+                    await manager.broadcast_room(
+                        org_id,
+                        room_id,
+                        {
+                            "type": "STATUS",
+                            "orgId": org_id,
+                            "roomId": room_id,
+                            "roomStatus": "live",
+                            "viewerCount": viewer_count,
+                        },
+                    )
+                except Exception:
+                    pass
 
 # ------------------------------------------------------------------------------
 # Producer: /ws/stt/deepgram
@@ -1998,11 +2146,11 @@ async def _stt_idle_watchdog(
                 pass
             closed.set()
             try:
-                await websocket.close(code=1000)
+                await asyncio.wait_for(websocket.close(code=1000), timeout=2.0)
             except Exception:
                 pass
             try:
-                await deepgram.close()
+                await asyncio.wait_for(deepgram.close(), timeout=3.0)
             except Exception:
                 pass
             break
@@ -2051,6 +2199,22 @@ async def ws_stt_deepgram(websocket: WebSocket):
         return
 
     await websocket.accept()
+
+    # Refuse a host WS opening against a room that's already ended. Without
+    # this, a stale host reconnect (or race with End Service) would open a
+    # fresh Deepgram session — real provider cost — for a room nobody is
+    # listening to.
+    try:
+        _room_live_pre = multichurch_store.is_room_live(org_id, room_id)
+    except Exception:
+        _room_live_pre = True
+    if not _room_live_pre:
+        try:
+            await websocket.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return
+
     translation_ctx = TranslationContext()
     # Session-level script context cache (avoid recomputing on every utterance)
     _cached_script_version_dg: int = -1
@@ -2111,10 +2275,56 @@ async def ws_stt_deepgram(websocket: WebSocket):
         await websocket.send_json({"type": "error", "message": f"Deepgram connect failed: {e}"})
         await websocket.close()
         return
-    manager.note_host_connected(websocket, org_id, room_id)
-
+    # Create the closed event and register the shutdown callback BEFORE
+    # note_host_connected. Order matters: from the moment the host appears in
+    # host_presence_by_ws, close_room_hosts can iterate it — the callback must
+    # already be in place, or a concurrent End Service would fall back to the
+    # non-deterministic uvicorn close-handshake path.
     seq = 0
     closed = asyncio.Event()
+    manager.register_host_shutdown_callback(websocket, closed.set)
+    # Deterministic host registration: awaits Redis subscription readiness
+    # before returning, so the post-registration is_room_live check below
+    # can only clear when this instance is actually receiving terminal
+    # broadcasts from siblings. Prevents the fire-and-forget subscribe race.
+    try:
+        await manager.register_host(websocket, org_id, room_id)
+    except (Exception, asyncio.CancelledError) as exc:
+        # Catch cancellation too — Cloud Run can cancel the request mid-setup
+        # and Python 3.8+ CancelledError is a BaseException, not Exception.
+        # Without this, an in-flight cancellation would leak dg and the WS.
+        print(f"[DG][register_host_failed] org={org_id} room={room_id} err={exc}")
+        manager.unregister_host_shutdown_callback(websocket)
+        try:
+            await asyncio.wait_for(dg.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return
+
+    # Recheck AFTER host registration to close the race where End Service
+    # fires between the pre-connect check and register_host.
+    try:
+        _room_live_post = multichurch_store.is_room_live(org_id, room_id)
+    except Exception:
+        _room_live_post = True
+    if not _room_live_post:
+        manager.note_host_disconnected(websocket)  # also unregisters callback
+        try:
+            await asyncio.wait_for(dg.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return
+
     finalize_event = asyncio.Event()
     last_audio_touch_ts = 0.0
     last_speech_activity_ts = time.monotonic()
@@ -3943,35 +4153,46 @@ async def ws_stt_deepgram(websocket: WebSocket):
             room_id=room_id,
         )
     )
-    await closed.wait()
-    consumer.cancel()
-    producer.cancel()
-    idle_watchdog.cancel()
+    # Cleanup MUST run on every exit path — normal close, provider disconnect,
+    # exception in a background task, or Cloud Run request cancellation
+    # (CancelledError injected into `await closed.wait()`). Without try/finally,
+    # a cancellation skips dg.close() and note_host_disconnected, leaking the
+    # upstream Deepgram session and host-presence tracking.
     try:
-        await asyncio.gather(consumer, producer, idle_watchdog, return_exceptions=True)
-    except Exception:
-        pass
-    print(
-        f"[DG][session-closed] reason={session_end_reason} "
-        f"org={org_id} room={room_id} audio_bytes={total_audio_bytes}"
-    )
-    try:
-        await dg.close()
-    except Exception:
-        pass
-    manager.note_host_disconnected(websocket)
-    if org_id and total_audio_bytes > 0:
-        _audio_secs = total_audio_bytes / _DEEPGRAM_BYTES_PER_SECOND
-        _cfg = multichurch_store.get_platform_config()
-        _dg_usd = (_audio_secs / 60.0) * _cfg["deepgramCostPerMinute"]
+        await closed.wait()
+    finally:
+        closed.set()
+        consumer.cancel()
+        producer.cancel()
+        idle_watchdog.cancel()
         try:
-            multichurch_store.record_deepgram_usage(
-                org_id=org_id,
-                audio_seconds=_audio_secs,
-                estimated_usd=_dg_usd,
-            )
+            await asyncio.gather(consumer, producer, idle_watchdog, return_exceptions=True)
         except Exception:
             pass
+        print(
+            f"[DG][session-closed] reason={session_end_reason} "
+            f"org={org_id} room={room_id} audio_bytes={total_audio_bytes}"
+        )
+        # Bound the provider close — a hung upstream socket would otherwise
+        # keep this coroutine alive and hold the Cloud Run request open, which
+        # keeps the instance billing.
+        try:
+            await asyncio.wait_for(dg.close(), timeout=3.0)
+        except Exception:
+            pass
+        manager.note_host_disconnected(websocket)
+        if org_id and total_audio_bytes > 0:
+            _audio_secs = total_audio_bytes / _DEEPGRAM_BYTES_PER_SECOND
+            try:
+                _cfg = multichurch_store.get_platform_config()
+                _dg_usd = (_audio_secs / 60.0) * _cfg["deepgramCostPerMinute"]
+                multichurch_store.record_deepgram_usage(
+                    org_id=org_id,
+                    audio_seconds=_audio_secs,
+                    estimated_usd=_dg_usd,
+                )
+            except Exception:
+                pass
 
 def _target_language_for_openai_realtime(raw: Optional[str]) -> str:
     token = (raw or "en").strip().lower()
@@ -4048,6 +4269,18 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
 
     await websocket.accept()
 
+    # See Deepgram handler for rationale on the ended-room gate + recheck.
+    try:
+        _room_live_pre = multichurch_store.is_room_live(org_id, room_id)
+    except Exception:
+        _room_live_pre = True
+    if not _room_live_pre:
+        try:
+            await websocket.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return
+
     try:
         oai = await websockets.connect(
             OPENAI_REALTIME_TRANSLATE_URL,
@@ -4077,25 +4310,73 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
         await websocket.send_json({"type": "error", "message": f"OpenAI realtime translate connect failed: {exc}"})
         await websocket.close(code=1011)
         return
-    manager.note_host_connected(websocket, org_id, room_id)
+    # Register callback BEFORE register_host — see Deepgram handler.
+    closed = asyncio.Event()
+    manager.register_host_shutdown_callback(websocket, closed.set)
+    try:
+        await manager.register_host(websocket, org_id, room_id)
+    except (Exception, asyncio.CancelledError) as exc:
+        print(f"[OAI-RT][register_host_failed] org={org_id} room={room_id} err={exc}")
+        manager.unregister_host_shutdown_callback(websocket)
+        try:
+            await asyncio.wait_for(oai.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return
 
-    await oai.send(json.dumps({
-        "type": "session.update",
-        "session": {
-            "audio": {
-                "input": {
-                    "transcription": {"model": "gpt-realtime-whisper"},
-                    "noise_reduction": {"type": "near_field"},
-                },
-                "output": {
-                    "language": tgt_lang,
+    try:
+        _room_live_post = multichurch_store.is_room_live(org_id, room_id)
+    except Exception:
+        _room_live_post = True
+    if not _room_live_post:
+        manager.note_host_disconnected(websocket)
+        try:
+            await asyncio.wait_for(oai.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return
+
+    # If the initial session.update fails (network hiccup, quota, etc.), we
+    # must not leak the upstream OpenAI socket or the host-presence entry.
+    try:
+        await oai.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "audio": {
+                    "input": {
+                        "transcription": {"model": "gpt-realtime-whisper"},
+                        "noise_reduction": {"type": "near_field"},
+                    },
+                    "output": {
+                        "language": tgt_lang,
+                    },
                 },
             },
-        },
-    }))
+        }))
+    except Exception as exc:
+        print(f"[OAI-RT][session-update-failed] {exc!r}")
+        try:
+            await asyncio.wait_for(oai.close(), timeout=3.0)
+        except Exception:
+            pass
+        manager.note_host_disconnected(websocket)
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
 
     seq = 0
-    closed = asyncio.Event()
     output_buffer = ""
     source_buffer = ""
     flush_task: asyncio.Task | None = None
@@ -4355,28 +4636,33 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
 
     consumer = asyncio.create_task(from_client_to_openai())
     producer = asyncio.create_task(from_openai_to_server())
-    await closed.wait()
-    consumer.cancel()
-    producer.cancel()
-    if flush_task and not flush_task.done():
-        flush_task.cancel()
+    # Cleanup must run on cancellation/exception; see the Deepgram handler for
+    # rationale.
     try:
-        await asyncio.gather(consumer, producer, return_exceptions=True)
-    except Exception:
-        pass
-    try:
-        await _commit_output("shutdown")
-    except Exception:
-        pass
-    try:
-        await oai.close()
-    except Exception:
-        pass
-    manager.note_host_disconnected(websocket)
-    if org_id and total_audio_bytes > 0:
-        _audio_secs = total_audio_bytes / _OPENAI_REALTIME_TRANSLATE_BYTES_PER_SECOND
-        _usd = (_audio_secs / 60.0) * 0.034
-        print(f"[OAI-RT][usage] org={org_id} room={room_id} audio_secs={_audio_secs:.1f} estimated_usd={_usd:.4f}")
+        await closed.wait()
+    finally:
+        closed.set()
+        consumer.cancel()
+        producer.cancel()
+        if flush_task and not flush_task.done():
+            flush_task.cancel()
+        try:
+            await asyncio.gather(consumer, producer, return_exceptions=True)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(_commit_output("shutdown"), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(oai.close(), timeout=3.0)
+        except Exception:
+            pass
+        manager.note_host_disconnected(websocket)
+        if org_id and total_audio_bytes > 0:
+            _audio_secs = total_audio_bytes / _OPENAI_REALTIME_TRANSLATE_BYTES_PER_SECOND
+            _usd = (_audio_secs / 60.0) * 0.034
+            print(f"[OAI-RT][usage] org={org_id} room={room_id} audio_secs={_audio_secs:.1f} estimated_usd={_usd:.4f}")
 
 
 @app.websocket("/ws/stt/gemini-live-translate")
@@ -4431,6 +4717,17 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
 
     await websocket.accept()
 
+    try:
+        _room_live_pre = multichurch_store.is_room_live(org_id, room_id)
+    except Exception:
+        _room_live_pre = True
+    if not _room_live_pre:
+        try:
+            await websocket.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return
+
     gemini = None
     try:
         gemini = await websockets.connect(
@@ -4457,7 +4754,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     except Exception as exc:
         if gemini is not None:
             try:
-                await gemini.close()
+                await asyncio.wait_for(gemini.close(), timeout=3.0)
             except Exception:
                 pass
         await websocket.send_json(
@@ -4468,10 +4765,45 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         )
         await websocket.close(code=1011)
         return
-    manager.note_host_connected(websocket, org_id, room_id)
+    # Register callback BEFORE register_host — see Deepgram handler.
+    closed = asyncio.Event()
+    manager.register_host_shutdown_callback(websocket, closed.set)
+    try:
+        await manager.register_host(websocket, org_id, room_id)
+    except (Exception, asyncio.CancelledError) as exc:
+        print(f"[GEMINI-LIVE][register_host_failed] org={org_id} room={room_id} err={exc}")
+        manager.unregister_host_shutdown_callback(websocket)
+        if gemini is not None:
+            try:
+                await asyncio.wait_for(gemini.close(), timeout=3.0)
+            except Exception:
+                pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return
+
+    try:
+        _room_live_post = multichurch_store.is_room_live(org_id, room_id)
+    except Exception:
+        _room_live_post = True
+    if not _room_live_post:
+        manager.note_host_disconnected(websocket)
+        if gemini is not None:
+            try:
+                await asyncio.wait_for(gemini.close(), timeout=3.0)
+            except Exception:
+                pass
+        try:
+            await websocket.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return
 
     seq = 0
-    closed = asyncio.Event()
     output_buffer = ""
     source_buffer = ""
     flush_task: asyncio.Task | None = None
@@ -4758,31 +5090,36 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
 
     consumer = asyncio.create_task(from_client_to_gemini())
     producer = asyncio.create_task(from_gemini_to_server())
-    await closed.wait()
-    consumer.cancel()
-    producer.cancel()
-    if flush_task and not flush_task.done():
-        flush_task.cancel()
+    # Cleanup must run on cancellation/exception; see the Deepgram handler for
+    # rationale.
     try:
-        await asyncio.gather(consumer, producer, return_exceptions=True)
-    except Exception:
-        pass
-    try:
-        await _commit_output("shutdown")
-    except Exception:
-        pass
-    if gemini is not None:
+        await closed.wait()
+    finally:
+        closed.set()
+        consumer.cancel()
+        producer.cancel()
+        if flush_task and not flush_task.done():
+            flush_task.cancel()
         try:
-            await gemini.close()
+            await asyncio.gather(consumer, producer, return_exceptions=True)
         except Exception:
             pass
-    manager.note_host_disconnected(websocket)
-    if total_audio_bytes > 0:
-        audio_secs = total_audio_bytes / _GEMINI_LIVE_TRANSLATE_BYTES_PER_SECOND
-        print(
-            f"[GEMINI-LIVE][usage] org={org_id} room={room_id} "
-            f"audio_secs={audio_secs:.1f} input_rate={GEMINI_INPUT_SAMPLE_RATE}"
-        )
+        try:
+            await asyncio.wait_for(_commit_output("shutdown"), timeout=3.0)
+        except Exception:
+            pass
+        if gemini is not None:
+            try:
+                await asyncio.wait_for(gemini.close(), timeout=3.0)
+            except Exception:
+                pass
+        manager.note_host_disconnected(websocket)
+        if total_audio_bytes > 0:
+            audio_secs = total_audio_bytes / _GEMINI_LIVE_TRANSLATE_BYTES_PER_SECOND
+            print(
+                f"[GEMINI-LIVE][usage] org={org_id} room={room_id} "
+                f"audio_secs={audio_secs:.1f} input_rate={GEMINI_INPUT_SAMPLE_RATE}"
+            )
 
 
 DEFAULT_DG_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE", "ko")

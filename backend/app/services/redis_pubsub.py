@@ -191,16 +191,42 @@ class RedisPubSub:
             log.warning("redis PUBLISH failed org=%s room=%s: %s", org_id, room_id, exc)
             return None
 
-    async def ensure_subscription(self, org_id: str, room_id: str) -> None:
-        """Refcount++ for (org, room); subscribe if this is the first local listener."""
+    async def ensure_subscription(self, org_id: str, room_id: str) -> bool:
+        """Refcount++ for (org, room); subscribe if this is the first local listener.
+
+        Returns True when this instance is (or already was) actually
+        subscribed to the room's channel. Returns False if the subscription
+        is pending (Redis disconnected — reader will resubscribe on reconnect).
+        Raises if the underlying SUBSCRIBE call fails; the refcount is rolled
+        back so a caller retry is not double-counted, and _subscribed does not
+        record a phantom membership.
+        """
         if not self._enabled:
-            return
+            return True
         key: RoomKey = (org_id, room_id)
         async with self._lock:
-            self._ref_counts[key] = self._ref_counts.get(key, 0) + 1
-            if self._ref_counts[key] > 1:
-                return
-            await self._subscribe_channel(key)
+            previous = self._ref_counts.get(key, 0)
+            self._ref_counts[key] = previous + 1
+            if previous > 0:
+                # Someone else already opened this subscription. Reflect the
+                # actual state — False means Redis is currently disconnected;
+                # the reader loop's reconnect will resubscribe.
+                return self._connected and key in self._subscribed
+            try:
+                await self._subscribe_channel(key)
+            except BaseException:
+                # Roll back the refcount on ANY exception including
+                # CancelledError. Without this, a task cancelled inside
+                # ensure_subscription would leave refcount > 0, and the next
+                # call would see previous > 0 and skip the actual SUBSCRIBE
+                # forever. `except Exception` in modern Python does not catch
+                # CancelledError.
+                self._ref_counts.pop(key, None)
+                # Also drop any phantom _subscribed entry — refuse to lie
+                # about readiness on the next call.
+                self._subscribed.discard(key)
+                raise
+            return self._connected and key in self._subscribed
 
     async def release_subscription(self, org_id: str, room_id: str) -> None:
         """Refcount--; unsubscribe when the room's local listener count drops to zero."""
@@ -216,23 +242,56 @@ class RedisPubSub:
             await self._unsubscribe_channel(key)
 
     async def _subscribe_channel(self, key: RoomKey) -> None:
+        # _subscribed now strictly means "confirmed SUBSCRIBE succeeded on
+        # the current live connection." Do NOT add here when disconnected —
+        # that would let ensure_subscription report a false "ready" once
+        # _connected flips true, even if the resubscribe later failed. The
+        # reader loop's reconnect path walks _ref_counts.keys() (the set of
+        # *desired* rooms) and only adds to _subscribed on actual success.
         if not self._connected or self._pubsub is None:
-            self._subscribed.add(key)  # remember; reader loop will resubscribe on reconnect
             return
         try:
-            await self._pubsub.subscribe(_channel_name(*key))
-            self._subscribed.add(key)
+            # Bounded wait: this call runs under _lock. Without the timeout,
+            # a hung Redis connection would freeze every caller waiting on
+            # _lock (listener/host registration, releases) until process
+            # restart. On timeout, mark disconnected so the reader rebuilds.
+            await asyncio.wait_for(
+                self._pubsub.subscribe(_channel_name(*key)),
+                timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            log.warning("redis SUBSCRIBE timeout key=%s", key)
+            self._connected = False
+            raise
         except Exception as exc:
+            # Any subscribe failure (ConnectionError, OSError, redis error)
+            # likely means the transport is broken. Mark disconnected so the
+            # reader rebuilds; otherwise repeated ensure_subscription would
+            # keep hitting the same dead client.
             log.warning("redis SUBSCRIBE failed key=%s: %s", key, exc)
+            self._connected = False
+            raise  # caller (ensure_subscription) rolls back refcount
+        self._subscribed.add(key)
 
     async def _unsubscribe_channel(self, key: RoomKey) -> None:
         self._subscribed.discard(key)
         if not self._connected or self._pubsub is None:
             return
         try:
-            await self._pubsub.unsubscribe(_channel_name(*key))
+            await asyncio.wait_for(
+                self._pubsub.unsubscribe(_channel_name(*key)),
+                timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            log.warning("redis UNSUBSCRIBE timeout key=%s — marking disconnected", key)
+            self._connected = False
         except Exception as exc:
-            log.warning("redis UNSUBSCRIBE failed key=%s: %s", key, exc)
+            # Best-effort but still mark disconnected — a failed UNSUBSCRIBE
+            # usually means the transport is unhealthy. Without this, the last
+            # unsubscribe in an idle period could fail silently and the reader
+            # would sleep forever waiting on nothing.
+            log.warning("redis UNSUBSCRIBE failed key=%s: %s — marking disconnected", key, exc)
+            self._connected = False
 
     async def _reader_loop(self) -> None:
         """Long-lived task: read subscribed messages and dispatch to callback.
@@ -261,9 +320,14 @@ class RedisPubSub:
                 break
             except Exception as exc:
                 log.warning("pubsub reader error: %s", exc)
-                # Don't flip _connected here — a transient decode error shouldn't
-                # tear down the whole pubsub. Only real connection failures
-                # (raised by ping/subscribe/publish) should trigger reconnect.
+                # get_message() raising almost always means the subscriber's
+                # transport dropped. Flip _connected so the next iteration
+                # enters _reconnect and rebuilds the client; otherwise the
+                # loop keeps calling the same broken _pubsub object forever
+                # and this instance stops receiving terminal broadcasts —
+                # provider sessions leak.
+                self._connected = False
+                attempt = min(attempt + 1, len(_BACKOFF_SECONDS) - 1)
                 await asyncio.sleep(_BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)])
 
     async def _reconnect(self, attempt: int) -> None:
@@ -284,16 +348,54 @@ class RedisPubSub:
                 socket_connect_timeout=ENV.REDIS_CONNECT_TIMEOUT_SEC,
                 decode_responses=True,
             )
-            await self._sub.ping()
-            self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
-            # Resubscribe every known room.
-            for key in list(self._subscribed):
+            await asyncio.wait_for(self._sub.ping(), timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC)
+            # Reconcile _subscribed against _ref_counts under _lock. Without the
+            # lock, a concurrent release_subscription can pop the last refcount
+            # for a room after we've snapshotted `desired` — we'd then subscribe
+            # a room nobody wants and record it in _subscribed with no future
+            # release path (orphan Redis subscription). ensure_subscription
+            # blocks briefly during reconnect, which is acceptable: reconnect
+            # is rare and the alternative is data loss.
+            async with self._lock:
+                self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
+                self._subscribed.clear()
+                desired = [k for k, count in self._ref_counts.items() if count > 0]
+                if not desired:
+                    self._connected = True
+                    log.info("redis pubsub reconnected; 0 rooms to resubscribe")
+                    return
+                # Single bulk SUBSCRIBE so the whole reconciliation is bounded
+                # by ONE REDIS_COMMAND_TIMEOUT_SEC, regardless of how many
+                # rooms are on this instance. Per-room timeout could stall
+                # _lock for N × timeout seconds on a hung connection.
+                channels = [_channel_name(*key) for key in desired]
                 try:
-                    await self._pubsub.subscribe(_channel_name(*key))
+                    await asyncio.wait_for(
+                        self._pubsub.subscribe(*channels),
+                        timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "redis pubsub bulk resubscribe timeout (%d rooms) — will retry",
+                        len(desired),
+                    )
+                    self._connected = False
+                    return
                 except Exception as exc:
-                    log.warning("resubscribe failed key=%s: %s", key, exc)
-            self._connected = True
-            log.info("redis pubsub reconnected; %d rooms resubscribed", len(self._subscribed))
+                    log.warning(
+                        "redis pubsub bulk resubscribe failed (%d rooms): %s — will retry",
+                        len(desired), exc,
+                    )
+                    self._connected = False
+                    return
+                # All-or-nothing on the bulk call: if wait_for returned, every
+                # channel was accepted. Populate _subscribed accordingly.
+                self._subscribed.update(desired)
+                self._connected = True
+                log.info(
+                    "redis pubsub reconnected; %d rooms resubscribed (bulk)",
+                    len(self._subscribed),
+                )
         except Exception as exc:
             log.warning("redis reconnect failed: %s", exc)
             self._connected = False
