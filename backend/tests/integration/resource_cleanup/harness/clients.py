@@ -6,7 +6,16 @@ The primary client here is `ListenerClient`, which speaks the real
 `/ws/translate` protocol. `HostClient` speaks the real
 `/ws/stt/deepgram` protocol and streams synthetic PCM to the backend
 so the STT WS actually opens and lives long enough for the F-15
-assertions to hold."""
+assertions to hold.
+
+WebSocket API note: the `websockets` library removed the `.closed`
+attribute in the asyncio rewrite. Modern code either checks
+`ws.state` against `websockets.protocol.State.OPEN` or, more robustly,
+handles `ConnectionClosed` on send/recv. We take the second approach
+— attempts to use the socket either succeed or raise
+`ConnectionClosed`, and the harness treats a raise as "socket
+closed."
+"""
 from __future__ import annotations
 
 import asyncio
@@ -17,8 +26,43 @@ from typing import Any, List, Optional
 
 try:
     import websockets
+    from websockets.exceptions import ConnectionClosed
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError("websockets is required for the harness") from exc
+
+
+def _ws_looks_open(ws) -> bool:
+    """Best-effort `is the socket still healthy?` probe that survives
+    both the legacy websockets API (`ws.closed`) and the modern one
+    (`ws.state`). Callers that need certainty should try to send and
+    catch ConnectionClosed."""
+    if ws is None:
+        return False
+    # Modern API: websockets 15+ exposes `state` as an enum.
+    state = getattr(ws, "state", None)
+    if state is not None:
+        # State.OPEN == 1 by value; compare by name to be resilient.
+        return getattr(state, "name", "") == "OPEN"
+    # Legacy fallback for older websockets versions.
+    closed = getattr(ws, "closed", None)
+    if closed is not None:
+        return not closed
+    # If we can't tell, assume open (the caller's send will error out
+    # if it isn't; that's the safer default for our assertions).
+    return True
+
+
+async def _cancel_task(task: Optional[asyncio.Task]) -> None:
+    """Cancel a task and await its termination without leaking
+    `CancelledError` out of the harness teardown path. Suppresses
+    every exception a cancelled task can raise."""
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 class ListenerClient:
@@ -70,7 +114,7 @@ class ListenerClient:
             pass
 
     async def is_open(self) -> bool:
-        return self.ws is not None and getattr(self.ws, "closed", True) is False
+        return _ws_looks_open(self.ws)
 
     async def wait_for_frame(self, predicate, *, timeout: float = 10.0) -> dict:
         """Poll `self.received` for the first frame matching `predicate`."""
@@ -108,13 +152,15 @@ class ListenerClient:
         )
 
     async def close(self) -> None:
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._reader_task
+        # Cancellation-safe teardown. Each step is isolated so a
+        # failure in one doesn't prevent later ones from running.
+        await _cancel_task(self._reader_task)
+        self._reader_task = None
         if self.ws is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await self.ws.close()
+            except (asyncio.CancelledError, Exception):
+                pass
             self.ws = None
 
 
@@ -173,29 +219,39 @@ class HostClient:
     async def _audio_pump(self) -> None:
         """Send silent PCM frames every 100 ms so the backend's STT
         forward loop stays active. Real audio content isn't necessary
-        — the Deepgram stub returns scripted transcripts on demand."""
+        — the Deepgram stub returns scripted transcripts on demand.
+
+        The `ConnectionClosed` handling matters: on modern websockets
+        the socket has no `.closed` attribute, so a naive check would
+        loop forever. `ws.send(...)` raises `ConnectionClosed` after
+        the peer disconnects, which is our exit signal.
+        """
         # 100 ms of 16-bit 16 kHz mono silence.
         silence = b"\x00\x00" * 1600
         try:
-            while self.ws is not None and not getattr(self.ws, "closed", True):
-                await self.ws.send(silence)
+            while self.ws is not None and _ws_looks_open(self.ws):
+                try:
+                    await self.ws.send(silence)
+                except ConnectionClosed:
+                    return
+                except Exception:
+                    return
                 await asyncio.sleep(0.1)
-        except Exception:
-            pass
+        except (asyncio.CancelledError, Exception):
+            return
 
     async def is_open(self) -> bool:
-        return self.ws is not None and getattr(self.ws, "closed", True) is False
+        return _ws_looks_open(self.ws)
 
     async def close(self) -> None:
-        if self._audio_task is not None:
-            self._audio_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._audio_task
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._reader_task
+        # Cancellation-safe teardown. Each step isolated.
+        await _cancel_task(self._audio_task)
+        self._audio_task = None
+        await _cancel_task(self._reader_task)
+        self._reader_task = None
         if self.ws is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await self.ws.close()
+            except (asyncio.CancelledError, Exception):
+                pass
             self.ws = None

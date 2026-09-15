@@ -43,6 +43,7 @@ class BackendConfig:
     firestore_emulator_host: str = "127.0.0.1:8085"
     gcp_project: str = "cleanup-track1-harness"
     deepgram_endpoint: str = ""  # set to the stub's ws://... URL
+    openai_base_url: str = ""  # set to the OpenAI stub's http://... URL
     host_api_token: str = "harness-host-token"
     extra_env: dict = field(default_factory=dict)
 
@@ -82,20 +83,28 @@ class BackendProcess:
         env["REDIS_HOST"] = self.config.redis_host
         env["REDIS_PORT"] = str(self.config.redis_port)
         env["INSTANCE_ID"] = self.config.instance_id
-        # Deepgram: point at the stub instead of the paid endpoint.
+        # Provider credentials — OVERRIDE (not setdefault) so we never
+        # accidentally inherit a real key from the developer's shell
+        # and hit the paid providers in a local run of the harness.
+        env["DEEPGRAM_API_KEY"] = "harness-stub-key-not-real"
+        env["OPENAI_API_KEY"] = "harness-stub-key-not-real"
+        # Deepgram: point at the stub WS server (env var read at
+        # module import time by `app.deepgram_session`).
         if self.config.deepgram_endpoint:
             env["DEEPGRAM_ENDPOINT"] = self.config.deepgram_endpoint
+        # OpenAI: point at the local chat-completions stub via the SDK's
+        # `OPENAI_BASE_URL` env — no external network for translation.
+        if self.config.openai_base_url:
+            env["OPENAI_BASE_URL"] = self.config.openai_base_url
         # Bypass rate limits and Firebase-auth checks that would need
         # real credentials to exercise. HOST_API_TOKEN is the global
         # test-only shared secret the store accepts as host auth.
         env["HOST_API_TOKEN"] = self.config.host_api_token
         env["DISABLE_WS_TRANSLATION_LIMITS"] = "1"
         # A minimal set of the env vars app.main reads at import time —
-        # keep in sync with backend/.env.example when new ones appear.
-        env.setdefault("DEEPGRAM_API_KEY", "test-key-not-used")
+        # kept as setdefault only for non-secret operational tunables.
         env.setdefault("DEEPGRAM_MODEL", "nova-3")
         env.setdefault("DEEPGRAM_LANGUAGE", "ko")
-        env.setdefault("OPENAI_API_KEY", "test-key-not-used")
         env.setdefault("OPENAI_TRANSLATION_MODEL", "gpt-4o")
         env.setdefault("CORS_ALLOW_ORIGINS", "http://localhost")
         env.setdefault("ROOM_SWEEPER_INTERVAL_SEC", "60")
