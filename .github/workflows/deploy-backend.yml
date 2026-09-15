@@ -39,6 +39,22 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
+          # Explicit env-var overrides make production configuration
+          # reproducible instead of relying on whatever the service template
+          # happens to hold:
+          #   * REDIS_ENABLED=0 — the Memorystore Redis instance this project
+          #     claims to use does not currently exist. Prod is safe only
+          #     because it runs single-instance (--max-instances=1) and the
+          #     code falls back to local delivery when Redis is unreachable.
+          #     Keep this at 0 until Memorystore is provisioned AND the
+          #     two-instance cross-instance test has passed on a tagged
+          #     revision. Do not flip to 1 without that verification.
+          #   * CORS_ALLOW_ORIGINS pinned to the four production hostnames.
+          #     The temporary PR #16 test workflow appended a Vercel preview
+          #     origin; this line restores the prod-only baseline every deploy
+          #     so no accidental widening survives.
+          # ^|^ alternate delimiter — the CORS value contains commas as origin
+          # separators, so we can't use the default comma pair-separator.
           gcloud run deploy ${{ secrets.CLOUD_RUN_SERVICE }} \
             --image "$IMAGE" \
             --region ${{ secrets.CLOUD_RUN_REGION }} \
@@ -50,6 +66,7 @@ jobs:
             --memory=1Gi \
             --timeout=3600 \
             --cpu-boost \
+            --update-env-vars="^|^REDIS_ENABLED=0|CORS_ALLOW_ORIGINS=https://www.worshiptranslate.com,https://worshiptranslate.com,https://www.worshiptranslation.com,https://worshiptranslation.com" \
             --quiet
 
       - name: Route 100% traffic to the newly deployed revision
