@@ -8,7 +8,13 @@ import { useSubtitleSocket } from "../../../../utils/useSubtitleSocket";
 import { appendStreamContextToUrl, clearRoomInSession, persistStreamContext } from "../../../../utils/streamContext";
 import { useTTS } from "../../../../utils/useTTS";
 import { usePcmAudioPlayer } from "../../../../utils/usePcmAudioPlayer";
-import { resolveViewerDisplay, roomEndMessage, subtitleModeLines } from "../../../../utils/viewerDisplay";
+import {
+  endReasonForEndedRoom,
+  resolveViewerDisplay,
+  roomEndMessage,
+  socketTerminatedForCurrentRoom,
+  subtitleModeLines,
+} from "../../../../utils/viewerDisplay";
 import {
   isRoomShownAsEnded,
   nextEndedRoomId,
@@ -105,9 +111,19 @@ export default function ChurchServiceListenerPage() {
   // interval (each request would always be superseded by the next issue).
   const resolveReqRef = useRef(0);        // last issued request number
   const resolveAppliedRef = useRef(0);    // highest applied request number
+  // Tracks the activeRoomId in the most recently applied /resolve response.
+  // When it changes, fallback translations from the prior room must be
+  // cleared in the SAME batch as setResolveData, so no render is committed
+  // with room B's identity + room A's fallback lines. This runs even when
+  // the listener never observed room A's terminal event (a page opened
+  // late, a WS close that never delivered a room_ended reason, etc.).
+  const prevActiveRoomIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!slug || !serviceKey) return;
+    // Reset the tracker whenever the service URL itself changes so a fresh
+    // service's first /resolve is always treated as a room-identity change.
+    prevActiveRoomIdRef.current = null;
     let disposed = false;
 
     let timer: number | null = null;
@@ -133,6 +149,15 @@ export default function ChurchServiceListenerPage() {
         // A slow response is still applied if nothing newer has landed yet.
         if (myReq <= resolveAppliedRef.current) return;
         resolveAppliedRef.current = myReq;
+        // Detect a room-identity change BEFORE writing resolveData so any
+        // fallback-clear happens in the same batched render — no interim
+        // frame with room B's identity plus room A's fallback translations.
+        // This also fires when the listener never saw room A end (e.g. the
+        // WS close never carried reason=room_ended, or the page was opened
+        // after A had already been replaced with B server-side).
+        const nextActiveRoomId = data.activeRoomId ?? null;
+        const activeRoomChanged = nextActiveRoomId !== prevActiveRoomIdRef.current;
+        prevActiveRoomIdRef.current = nextActiveRoomId;
         setResolveData(data);
         setErrorMsg(null);
         persistStreamContext({
@@ -149,10 +174,11 @@ export default function ChurchServiceListenerPage() {
           endedRoomIdRef.current = transition.endedRoomId;
           setEndedRoomId(transition.endedRoomId);
         }
-        if (transition.translationsCleared) {
-          // Room identity changed (ended → new live, or first time we've seen
-          // the ended state). Wipe stale translation state so the previous
-          // room's lines don't leak into the new room's UI.
+        if (transition.translationsCleared || activeRoomChanged) {
+          // Room identity changed (ended → new live, straight A→B, first
+          // observation of the ended state, etc.). Wipe stale translation
+          // state so the previous room's lines don't leak into the new
+          // room's UI even for one render.
           setFallbackEnLines([]);
           fallbackSeqRef.current = 0;
         }
@@ -243,10 +269,9 @@ export default function ChurchServiceListenerPage() {
 
   const lastSpokenLineRef = useRef("");
 
-  useEffect(() => {
-    fallbackSeqRef.current = 0;
-    setFallbackEnLines([]);
-  }, [resolveData?.activeRoomId]);
+  // Fallback translations are cleared synchronously in fetchResolve when
+  // activeRoomId changes (see prevActiveRoomIdRef), so no separate
+  // post-commit useEffect is needed here.
 
   useEffect(() => {
     if (!slug || !serviceKey || !socketEnabled) return;
@@ -349,14 +374,35 @@ export default function ChurchServiceListenerPage() {
       : connected
         ? "Live — waiting for speech…"
         : "Connecting…";
+  // Room-scope the socket terminal signal so a stale close event for the
+  // PRIOR room can't paint "Broadcast ended." over a new live room.
+  const scopedSocketTerminated = socketTerminatedForCurrentRoom({
+    socketTerminated,
+    socketTerminatedRoomId,
+    activeRoomId: resolveData?.activeRoomId ?? null,
+    lastRoomId: resolveData?.lastRoomId ?? null,
+  });
+  // Room-scope the end reason too. /resolve's lastEndReason always refers
+  // to the most recent ended room; applying it here regardless would let
+  // an unrelated ended room's specific message ("trial minutes exhausted",
+  // etc.) leak onto a different tombstoned room. Fall back to the generic
+  // "Broadcast ended." unless the reason clearly matches the tombstone.
+  const scopedLastEndReason = endReasonForEndedRoom({
+    endedRoomId,
+    activeRoomId: resolveData?.activeRoomId ?? null,
+    roomStatus: resolveData?.roomStatus ?? "",
+    lastRoomId: resolveData?.lastRoomId ?? null,
+    lastRoomStatus: resolveData?.lastRoomStatus ?? "",
+    lastEndReason: resolveData?.lastEndReason,
+  });
   // Terminal state must take precedence over any lingering translation lines.
   // See utils/viewerDisplay.ts + its regression tests.
   const { currentEn, recentEn, isTerminal } = resolveViewerDisplay({
     serviceEnded,
-    socketTerminated,
+    socketTerminated: scopedSocketTerminated,
     displayEnLines,
     waitingMessage,
-    lastEndReason: resolveData?.lastEndReason,
+    lastEndReason: scopedLastEndReason,
   });
   const subtitleLines = subtitleModeLines(isTerminal, currentEn, displayEnLines);
 

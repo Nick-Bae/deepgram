@@ -152,23 +152,19 @@ test("old lastEndReason cannot leak into a new room: after transitioning to a li
 // These pin the invariants the reviewer flagged: what happens when signals
 // interleave (stale terminated, out-of-order resolve, room-ID reuse).
 
-test("Concern 1: a stale socketTerminated flag observed AFTER a room transition would only mistakenly tombstone the new room if the caller uses the CURRENT activeRoomId at fire time. The page snapshots wsConnectedRoomIdRef at connect, so this helper is called only with the *terminated* room ID; if the caller passes the new active room ID by mistake, the tombstone would land wrongly. Test the guard: same room ID passed twice yields no clear.", () => {
+test("Concern 1: a stale socketTerminated flag observed AFTER a room transition must not re-tombstone the new room. The identity-bearing terminal event carries the room ID that was captured inside useSubtitleSocket's onclose closure at connect time (exposed as `terminatedRoomId`), so the page tombstones the OLD room regardless of what /resolve currently reports.", () => {
   // Simulate: page tombstoned room-A. Next fetch reports room-B live.
   // In fetchResolve, we call nextEndedRoomId with prev=A, data={B, live} —
-  // this MUST clear. If instead the stale socketTerminated effect
-  // re-tombstoned to A, prev=A; if it re-tombstoned to B (bug), we'd need
-  // the helper to distinguish. This test asserts the "new live room clears"
-  // path is preferred by the caller order (transitioning to B is applied
-  // in fetchResolve; stale terminated effect ignored because wsConnected
-  // still points to A which the tombstone already holds).
+  // this MUST clear.
   const t = nextEndedRoomId("room-A", { activeRoomId: "room-B", roomStatus: "live" });
   assert.equal(t.endedRoomId, null); // A cleared
   assert.equal(t.translationsCleared, true);
-  // If the effect then fires with terminatedRoom=A (the wsConnected snapshot),
-  // it would re-tombstone A. But by then endedRoomId is null; setting it back
-  // to A would freeze the display. The page-level fix uses wsConnectedRoomIdRef
-  // to hold "A" specifically, and the effect only fires on `socketTerminated`
-  // deps (NOT on activeRoomId), so it does NOT re-run when B arrives.
+  // If the useSubtitleSocket terminal effect then fires with
+  // terminatedRoomId="room-A" (the value it captured at connect time),
+  // the page's effect on [socketTerminated, socketTerminatedRoomId] would
+  // re-tombstone A. The display gate is scoped to the current room
+  // (socketTerminatedForCurrentRoom compares against activeRoomId), so
+  // the stale terminal event for A does NOT paint terminal onto B.
   // Documented here to keep the invariant visible.
 });
 
@@ -178,8 +174,10 @@ test("Concern 2: nextEndedRoomId is a pure function of prev + snapshot — same 
   assert.equal(newer.endedRoomId, null);
   assert.equal(newer.translationsCleared, false);
   // Older response arriving later would only affect state if applied.
-  // The page-level fetchResolve now short-circuits on `myReq !== resolveReqRef.current`
-  // so the helper is not called for stale responses. Documented here.
+  // The page-level fetchResolve applies an "applied-counter" guard —
+  // `myReq <= resolveAppliedRef.current` short-circuits older-than-applied
+  // responses — so the helper is not called for stale responses.
+  // Order 4 below exercises the counter directly.
 });
 
 test("Concern 3: terminal reason is tied to the ENDED room ID. After a new room becomes live, the tombstone clears; even if resolve still carries a `lastEndReason`, isRoomShownAsEnded returns false so the terminal message is not shown.", () => {

@@ -12,7 +12,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveViewerDisplay, roomEndMessage, subtitleModeLines } from "./viewerDisplay.ts";
+import {
+  endReasonForEndedRoom,
+  resolveViewerDisplay,
+  roomEndMessage,
+  socketTerminatedForCurrentRoom,
+  subtitleModeLines,
+} from "./viewerDisplay.ts";
 
 test("terminal state replaces existing translation lines with 'Broadcast ended.'", () => {
   const { currentEn, recentEn, isTerminal } = resolveViewerDisplay({
@@ -129,4 +135,147 @@ test("subtitleModeLines passes through displayEnLines when not terminal", () => 
 test("subtitleModeLines keeps a single-element terminal array even if displayEnLines is empty", () => {
   const lines = subtitleModeLines(true, "Broadcast ended.", []);
   assert.deepEqual(lines, ["Broadcast ended."]);
+});
+
+// ── socketTerminatedForCurrentRoom ─────────────────────────────────────
+// Room-scoping the raw socketTerminated flag. Without this, a stale
+// terminal event for room A would paint "Broadcast ended." over a live
+// room B the instant it fires — the tombstone path clears one render
+// later, so the display would briefly flip terminal before flipping back.
+
+test("socketTerminatedForCurrentRoom: fires when terminated room matches the current activeRoomId", () => {
+  assert.equal(
+    socketTerminatedForCurrentRoom({
+      socketTerminated: true,
+      socketTerminatedRoomId: "room-A",
+      activeRoomId: "room-A",
+      lastRoomId: null,
+    }),
+    true,
+  );
+});
+
+test("socketTerminatedForCurrentRoom: fires when activeRoomId is null and terminated room matches lastRoomId", () => {
+  assert.equal(
+    socketTerminatedForCurrentRoom({
+      socketTerminated: true,
+      socketTerminatedRoomId: "room-A",
+      activeRoomId: null,
+      lastRoomId: "room-A",
+    }),
+    true,
+  );
+});
+
+test("socketTerminatedForCurrentRoom: does NOT fire when a new live room has taken over", () => {
+  assert.equal(
+    socketTerminatedForCurrentRoom({
+      socketTerminated: true,
+      socketTerminatedRoomId: "room-A",
+      activeRoomId: "room-B",
+      lastRoomId: "room-A",
+    }),
+    false,
+  );
+});
+
+test("socketTerminatedForCurrentRoom: does NOT fire without a terminated room ID", () => {
+  assert.equal(
+    socketTerminatedForCurrentRoom({
+      socketTerminated: true,
+      socketTerminatedRoomId: null,
+      activeRoomId: "room-A",
+      lastRoomId: null,
+    }),
+    false,
+  );
+});
+
+test("socketTerminatedForCurrentRoom: does NOT fire when socketTerminated is false", () => {
+  assert.equal(
+    socketTerminatedForCurrentRoom({
+      socketTerminated: false,
+      socketTerminatedRoomId: "room-A",
+      activeRoomId: "room-A",
+      lastRoomId: null,
+    }),
+    false,
+  );
+});
+
+// ── endReasonForEndedRoom ──────────────────────────────────────────────
+// The /resolve `lastEndReason` refers to the most recent ended room in
+// backend view. Applying it regardless would let an unrelated ended
+// room's specific message leak onto a different tombstoned room.
+
+test("endReasonForEndedRoom: reason applies when lastRoomId matches the tombstone", () => {
+  assert.equal(
+    endReasonForEndedRoom({
+      endedRoomId: "room-A",
+      activeRoomId: null,
+      roomStatus: "",
+      lastRoomId: "room-A",
+      lastRoomStatus: "ended",
+      lastEndReason: "trial_expired",
+    }),
+    "trial_expired",
+  );
+});
+
+test("endReasonForEndedRoom: reason applies when active room matches the tombstone AND status is ended", () => {
+  assert.equal(
+    endReasonForEndedRoom({
+      endedRoomId: "room-A",
+      activeRoomId: "room-A",
+      roomStatus: "ended",
+      lastRoomId: null,
+      lastRoomStatus: "",
+      lastEndReason: "host_end",
+    }),
+    "host_end",
+  );
+});
+
+test("endReasonForEndedRoom: reason does NOT apply when lastRoomId is a different (unrelated) room", () => {
+  assert.equal(
+    endReasonForEndedRoom({
+      endedRoomId: "room-A",
+      activeRoomId: null,
+      roomStatus: "",
+      lastRoomId: "room-Z",
+      lastRoomStatus: "ended",
+      lastEndReason: "monthly_limit_reached",
+    }),
+    null,
+  );
+});
+
+test("endReasonForEndedRoom: reason does NOT apply when there is no tombstone", () => {
+  assert.equal(
+    endReasonForEndedRoom({
+      endedRoomId: null,
+      activeRoomId: "room-A",
+      roomStatus: "live",
+      lastRoomId: "room-A",
+      lastRoomStatus: "ended",
+      lastEndReason: "host_end",
+    }),
+    null,
+  );
+});
+
+test("endReasonForEndedRoom: falls back to null (→ generic 'Broadcast ended.') when the reason is not room-scoped to the tombstone", () => {
+  // The socket terminated for room-A before /resolve caught up; /resolve
+  // still shows an unrelated older last room. Reason must NOT apply.
+  assert.equal(
+    endReasonForEndedRoom({
+      endedRoomId: "room-A",
+      activeRoomId: "room-A",
+      roomStatus: "live",  // /resolve hasn't observed the end yet
+      lastRoomId: "room-Z",
+      lastRoomStatus: "ended",
+      lastEndReason: "idle_timeout",
+    }),
+    null,
+  );
 });
