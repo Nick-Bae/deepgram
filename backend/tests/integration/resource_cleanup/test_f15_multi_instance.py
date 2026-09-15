@@ -198,21 +198,25 @@ async def _run_f15(admin_store):
 
         def _has_marker(marker):
             def _pred(msg):
-                # Accept the marker in any of the fields the real
-                # broadcast_room places it in.
+                expected = f"[stub-translated] {marker}"
+                # Require the OpenAI stub's translated prefix. Matching the
+                # Korean source marker would let a translation-bypass bug pass
+                # this integration gate.
                 for key in ("payload", "text"):
                     val = msg.get(key)
-                    if isinstance(val, str) and marker in val:
+                    if isinstance(val, str) and expected in val:
                         return True
                 meta = msg.get("meta") or {}
-                for key in ("source_text", "translated"):
-                    val = meta.get(key)
-                    if isinstance(val, str) and marker in val:
-                        return True
+                val = meta.get("translated")
+                if isinstance(val, str) and expected in val:
+                    return True
                 return False
             return _pred
 
         await listener_a.wait_for_frame(_has_marker(baseline_marker), timeout=20.0)
+        assert openai_stub.request_count >= 1, (
+            "baseline marker arrived without an OpenAI-stub request"
+        )
 
         # (7) Start instance B — the F-15 trigger.
         backend_b = BackendProcess(
@@ -266,6 +270,9 @@ async def _run_f15(admin_store):
         await listener_a.wait_for_frame(_has_marker(cross_marker), timeout=20.0)
         # Listener on B receives it via Redis fanout.
         await listener_b.wait_for_frame(_has_marker(cross_marker), timeout=20.0)
+        assert openai_stub.request_count >= 2, (
+            "cross-process marker arrived without a second OpenAI-stub request"
+        )
 
     finally:
         await teardown()

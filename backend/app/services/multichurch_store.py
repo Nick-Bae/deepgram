@@ -2639,6 +2639,32 @@ class InMemoryMultiChurchStore:
                 return False
             return str(room.get("status") or "").lower() == "live"
 
+    def get_room_reconcile_state(self, org_id: str, room_id: str) -> Optional[Dict[str, Any]]:
+        """Read the room fields needed by the local-resource reconciler.
+
+        ``None`` means the room document is missing.  Unknown or malformed
+        status values are returned unchanged so the reconciler can fail open
+        instead of accidentally treating them as terminal.
+        """
+        clean_org = _clean_token(org_id)
+        clean_room = _clean_token(room_id)
+        if not clean_org or not clean_room:
+            return None
+        with self._lock:
+            room = self._rooms.get((clean_org, clean_room))
+            return dict(room) if room is not None else None
+
+    def get_room_reconcile_states(
+        self,
+        room_keys: List[Tuple[str, str]],
+    ) -> Dict[Tuple[str, str], Optional[Dict[str, Any]]]:
+        with self._lock:
+            return {
+                key: dict(self._rooms[key]) if key in self._rooms else None
+                for key in room_keys
+                if _clean_token(key[0]) and _clean_token(key[1])
+            }
+
     def end_room(
         self,
         org_id: str,
@@ -3244,6 +3270,46 @@ class FirestoreMultiChurchStore:
             return False
         doc = snap.to_dict() or {}
         return str(doc.get("status") or "").lower() == "live"
+
+    def get_room_reconcile_state(self, org_id: str, room_id: str) -> Optional[Dict[str, Any]]:
+        """Read one room for reconciliation without mutating Firestore.
+
+        Firestore errors intentionally propagate.  The reconciler records a
+        ``firestore_error`` outcome and leaves local resources untouched; a
+        database outage must never be interpreted as an ended room.
+        """
+        clean_org = _clean_token(org_id)
+        clean_room = _clean_token(room_id)
+        if not clean_org or not clean_room:
+            return None
+        snap = self._room_ref(clean_org, clean_room).get(timeout=_FS_TIMEOUT)
+        if not snap.exists:
+            return None
+        return dict(snap.to_dict() or {})
+
+    def get_room_reconcile_states(
+        self,
+        room_keys: List[Tuple[str, str]],
+    ) -> Dict[Tuple[str, str], Optional[Dict[str, Any]]]:
+        """Batch-read reconciliation state with one Firestore RPC."""
+        clean_keys = [
+            (str(org_id).strip(), str(room_id).strip())
+            for org_id, room_id in room_keys
+            if _clean_token(org_id) and _clean_token(room_id)
+        ]
+        if not clean_keys:
+            return {}
+        refs = [self._room_ref(org_id, room_id) for org_id, room_id in clean_keys]
+        key_by_path = {ref.path: key for ref, key in zip(refs, clean_keys)}
+        out: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {
+            key: None for key in clean_keys
+        }
+        for snap in self._db.get_all(refs, timeout=_FS_TIMEOUT):
+            key = key_by_path.get(snap.reference.path)
+            if key is None:
+                continue
+            out[key] = dict(snap.to_dict() or {}) if snap.exists else None
+        return out
 
     def _usage_ref(self, org_id: str, period_key: str):
         return self._org_ref(org_id).collection("usage").document(period_key)

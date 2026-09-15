@@ -69,6 +69,16 @@ class RedisPubSub:
     def connected(self) -> bool:
         return self._enabled and self._connected
 
+    @property
+    def desired_room_keys(self) -> set[RoomKey]:
+        """Snapshot of room subscriptions this process intends to restore.
+
+        The reader uses ``_ref_counts`` as its reconnect source of truth.  A
+        stale entry there is therefore a real resource leak even when every
+        websocket ownership map is already empty.
+        """
+        return {key for key, count in self._ref_counts.items() if count > 0}
+
     def set_delivery_callback(self, cb: DeliveryCallback) -> None:
         """Called by ConnectionManager to receive incoming subscribed messages."""
         self._callback = cb
@@ -238,6 +248,20 @@ class RedisPubSub:
             if count > 0:
                 self._ref_counts[key] = count
                 return
+            self._ref_counts.pop(key, None)
+            await self._unsubscribe_channel(key)
+
+    async def forget_room_subscription(self, org_id: str, room_id: str) -> None:
+        """Remove every desired refcount for a confirmed-ended local room.
+
+        Normal disconnects release one owner at a time.  The reconciler uses
+        this stronger idempotent operation only after Firestore confirms the
+        room is ended and local sockets have been closed.  Popping the desired
+        key while Redis is down is what prevents reconnect from resurrecting
+        an ended room's subscription.
+        """
+        key: RoomKey = (org_id, room_id)
+        async with self._lock:
             self._ref_counts.pop(key, None)
             await self._unsubscribe_channel(key)
 

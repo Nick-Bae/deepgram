@@ -386,6 +386,20 @@ class SubscriptionSemanticsTests(unittest.IsolatedAsyncioTestCase):
         await ps.release_subscription("org", "room")
         await ps.stop()
 
+    async def test_forget_room_subscription_removes_reconnect_desire_while_down(self) -> None:
+        ps = _fresh_pubsub(start_reader=False)
+        await ps.start()
+        await ps.ensure_subscription("org", "ended-room")
+        await ps.ensure_subscription("org", "live-room")
+        ps._connected = False
+
+        await ps.forget_room_subscription("org", "ended-room")
+
+        self.assertNotIn(("org", "ended-room"), ps.desired_room_keys)
+        self.assertIn(("org", "live-room"), ps.desired_room_keys)
+        self.assertNotIn(("org", "ended-room"), ps._subscribed)
+        await ps.stop()
+
 
 class BroadcastLocalRoomTests(unittest.IsolatedAsyncioTestCase):
     """Terminal broadcast triggers close_room_listeners and hosts on this instance."""

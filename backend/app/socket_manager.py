@@ -384,6 +384,40 @@ class ConnectionManager:
             return
         self.hostless_since_by_room.pop(key, None)
 
+    def locally_owned_room_keys(self) -> Set[RoomKey]:
+        """Return every room for which this process still owns resources.
+
+        The reconciler deliberately inventories the ownership maps instead of
+        choosing one of them as a source of truth.  Host STT sockets do not
+        live in ``connections_by_room`` and a Redis subscription can briefly
+        outlive the websocket map while its asynchronous release is pending.
+        A union makes those partial-cleanup states visible and repairable.
+        """
+        keys: Set[RoomKey] = set(self.connections_by_room)
+        keys.update(self.host_presence_by_ws.values())
+        keys.update(self.host_presence_counts_by_room)
+        keys.update(self.listener_subscription_owned_room_by_ws.values())
+        for ws in self.host_subscription_owned_by_ws:
+            key = self.host_presence_by_ws.get(ws)
+            if key is not None:
+                keys.add(key)
+        for ws in self.host_shutdown_cb_by_ws:
+            key = self.host_presence_by_ws.get(ws)
+            if key is not None:
+                keys.add(key)
+        keys.update(pubsub.desired_room_keys)
+        return {key for key in keys if key[0] and key[1]}
+
+    def room_has_local_resources(self, org_id: str, room_id: str) -> bool:
+        key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
+        return key in self.locally_owned_room_keys()
+
+    async def forget_room_subscription(self, org_id: str, room_id: str) -> None:
+        await pubsub.forget_room_subscription(
+            (org_id or "").strip(),
+            (room_id or "").strip(),
+        )
+
     def forget_room(self, org_id: str, room_id: str) -> None:
         key: RoomKey = ((org_id or "").strip(), (room_id or "").strip())
         if not key[0] or not key[1]:

@@ -36,6 +36,7 @@ from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram, deepgram_model_for_language, _build_keyterm_list, _build_replace_list, DG_DEBUG
 from app.services.script_store import script_store
 from app.services.multichurch_store import multichurch_store
+from app.services.room_reconciler import RoomReconciler
 from app.services import google_tts as google_tts_service
 from app.latency_probe import LatencyProbe
 from app.utils.hangul import strip_ko_particles
@@ -148,6 +149,13 @@ ROOM_IDLE_TIMEOUT_SEC = int(os.getenv("ROOM_IDLE_TIMEOUT_SEC", "900"))  # 15 min
 ROOM_MAX_DURATION_SEC = int(os.getenv("ROOM_MAX_DURATION_SEC", "10800"))  # 3 hours
 ROOM_SWEEPER_INTERVAL_SEC = int(os.getenv("ROOM_SWEEPER_INTERVAL_SEC", "60"))
 ROOM_USAGE_TICK_SEC = int(os.getenv("ROOM_USAGE_TICK_SEC", "300"))  # 5 min
+ROOM_RECONCILER_ENABLED = _env_bool("ROOM_RECONCILER_ENABLED", False)
+ROOM_RECONCILER_INTERVAL_SEC = _env_int(
+    "ROOM_RECONCILER_INTERVAL_SEC",
+    30,
+    min_value=5,
+    max_value=3600,
+)
 ROOM_HOST_PRESENCE_GRACE_SEC = _env_int("ROOM_HOST_PRESENCE_GRACE_SEC", 300, min_value=0, max_value=3600)
 # Host WebSocket presence is process-local. In Cloud Run, another instance or
 # revision can incorrectly see zero hosts while the real producer is active.
@@ -258,6 +266,8 @@ OPENAI_REALTIME_TRANSLATE_URL = (
     f"?model={OPENAI_REALTIME_TRANSLATE_MODEL}"
 )
 _room_sweeper_task: asyncio.Task | None = None
+_room_reconciler_task: asyncio.Task | None = None
+_room_reconciler: RoomReconciler | None = None
 
 # Per-IP concurrent connection limit for unauthenticated /ws/translate viewers.
 # Prevents a single IP from exhausting the connection manager.
@@ -1272,7 +1282,7 @@ async def _room_sweeper_loop() -> None:
 
 @app.on_event("startup")
 async def _on_startup():
-    global _room_sweeper_task
+    global _room_sweeper_task, _room_reconciler_task, _room_reconciler
     # Register room-end hooks so per-room module state (TTS voice/toggle maps)
     # is cleared on EVERY instance when a terminal broadcast arrives via
     # Redis, not only the instance that initiated End Service.
@@ -1299,11 +1309,38 @@ async def _on_startup():
     # unchanged by this fix.
     if _room_sweeper_task is None or _room_sweeper_task.done():
         _room_sweeper_task = asyncio.create_task(_room_sweeper_loop())
+    if ROOM_RECONCILER_ENABLED:
+        if _room_reconciler_task is None or _room_reconciler_task.done():
+            _room_reconciler = RoomReconciler(
+                manager=manager,
+                store=multichurch_store,
+                cleanup_local_state=_cleanup_room_local_state,
+                interval_seconds=ROOM_RECONCILER_INTERVAL_SEC,
+                instance_id=ENV.INSTANCE_ID,
+            )
+            _room_reconciler_task = asyncio.create_task(
+                _room_reconciler.run_forever(),
+                name="room-reconciler",
+            )
+            print(
+                f"[ROOM_RECONCILER] enabled interval={ROOM_RECONCILER_INTERVAL_SEC}s "
+                f"instance={ENV.INSTANCE_ID}"
+            )
+    else:
+        print("[ROOM_RECONCILER] disabled (ROOM_RECONCILER_ENABLED=0)")
 
 
 @app.on_event("shutdown")
 async def _on_shutdown():
-    global _room_sweeper_task
+    global _room_sweeper_task, _room_reconciler_task, _room_reconciler
+    if _room_reconciler_task and not _room_reconciler_task.done():
+        _room_reconciler_task.cancel()
+        try:
+            await _room_reconciler_task
+        except asyncio.CancelledError:
+            pass
+    _room_reconciler_task = None
+    _room_reconciler = None
     if _room_sweeper_task and not _room_sweeper_task.done():
         _room_sweeper_task.cancel()
         try:
