@@ -40,10 +40,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Node 22 required — utils/viewerDisplay.test.ts runs under Node's
+          # built-in `--test` with `--experimental-strip-types`, which needs
+          # v22.6+ (TypeScript stripping was introduced in that release).
+          node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -55,3 +58,6 @@ jobs:
 
       - name: TypeScript type-check
         run: npx tsc --noEmit
+
+      - name: Viewer display regression tests
+        run: npm run test:viewer-display
