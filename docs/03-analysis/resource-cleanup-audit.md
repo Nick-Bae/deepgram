@@ -1032,7 +1032,7 @@ and belongs to Track 2 (introduces lease fields, deferred).
 
 | # | Scenario | Assertions | Env | Track |
 |---|---|---|---|---|
-| F-23 | Sweeper stale-`lastAudioAt` race: sweeper reads room at t=100 with `lastAudioAt` age past `ROOM_IDLE_TIMEOUT_SEC`; host resumes audio at t=101, `lastAudioAt` refreshed; sweeper's `end_room` fires at t=102 based on t=100 read | transaction re-reads `lastAudioAt` at write time; sees the refresh; abandons the write; room stays `status=live`; audio broadcasts continue; sweeper metric records the abandoned attempt. No lease fields required — this locks in the atomic-conditional pattern for the existing sweeper alone | **[E]** | **1** |
+| F-23 | Sweeper stale-`lastAudioAt` race — split into TWO evidence pieces per audit §4a.2 clarification. **F-23a (emulator):** activity committed BEFORE the termination transaction opens is respected — the transaction reads the fresh `lastAudioAt` and returns `skipped`. Scoped narrowly; does NOT claim to reproduce Firestore's production optimistic-concurrency retry (the emulator uses simplified locking per Google's docs). **F-23b (controlled retry, no emulator):** patched transactional driver forces the callback to run at least twice with different reads; assert eligibility rechecked on each rerun, callback body has no external side effects (AST). Together these are the reviewer's two distinguished pieces. See PR-T1-B in `docs/01-plan/features/resource-cleanup-track-1.plan.md` | **[E]** (F-23a) / doubles (F-23b) | **1** |
 | F-17 | Renewal-vs-expiration race (lease variant): detector reads expired lease at t=100; host renews lease at t=101; detector attempts `end_room` at t=102 | transaction detects lease renewal, abandons the write; room stays `status=live`; host session unaffected; detector metric records the abandoned attempt | **[E]** | **2** |
 
 ### Group D — provided by §5.1a reconciler
@@ -1175,10 +1175,13 @@ assigned to the step that provides their behavior.
    `lastAudioAt`; **not** applied to explicit End Service,
    duration limits, or cap enforcement — those already have
    authoritative signals and must not be gated on a
-   `lastAudioAt` recheck. **F-23 passes** (Track 1 stale-read
-   race); **transaction-retry test passes** (callback executes
-   at least twice, external effects run once for the committing
-   branch). This step is Track 1 and does not require lease
+   `lastAudioAt` recheck. **F-23a (emulator) passes** — activity
+   committed before the transaction opens is respected. **F-23b
+   (controlled retry, deterministic) passes** — callback rerun
+   rechecks eligibility, callback body has no external side
+   effects. **Emulator validation is PENDING until CI actually
+   executes the emulator job successfully with no unexpected
+   skips.** This step is Track 1 and does not require lease
    fields. Track 2 later extends the same pattern to the lease
    as **§4a.2 + §5.1b lease foundation** with F-17.
 4. **§5.1a reconciler landed** behind a config flag, default off.

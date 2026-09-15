@@ -19,7 +19,7 @@
 
 Four corrections from the review of the initial Track 1 scoping:
 
-1. **Lease-specific F-17 stays in Track 2.** Track 1's atomic-conditional-transition test uses `lastAudioAt` (the existing field) — that test is **F-23** in the audit, added specifically so Track 1 can validate the transaction pattern without introducing lease fields. F-17 (lease variant) remains gated behind Track 2.
+1. **Lease-specific F-17 stays in Track 2.** Track 1's atomic-conditional-transition tests use `lastAudioAt` (the existing field) — **F-23a** (emulator, activity-committed-before-transaction), **F-23b** (controlled retry via mock), and **F-23c** (AST). F-17 (lease variant) remains gated behind Track 2. Emulator validation itself is pending until CI's `firestore-emulator-tests` job actually runs successfully with no unexpected skips.
 2. **Redis reconnection is an explicit acceptance test.** **F-24** in the audit exercises the outage/recovery path end-to-end: end a room while Redis is unavailable, verify local cleanup completes, restore Redis, verify the ended room's channel is not resubscribed while a still-live room's channel does recover. Zeroing local owner maps is not sufficient on its own.
 3. **Transaction-retry assertion tightened.** The test asserts the callback executes **at least twice** (proving a retry actually happened), and that within the single controlled successful execution the external cleanup effects run **once for the committing branch**. This is not an exactly-once-across-crashes promise; cleanup remains idempotent so a mid-cleanup process death is safely recovered by the reconciler on any instance.
 4. **§9 rollout consistency.** No watchdog change proposed in Track 1 or Track 2 by this plan; `STT_NO_SPEECH_TIMEOUT_SEC` remains 120s.
@@ -94,7 +94,11 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 
 **Acceptance tests**
 
-- **F-23** (audit Group C, Track 1 variant): sweeper reads room at t=100 with idle-past-threshold; host resumes audio at t=101, `lastAudioAt` refreshed; sweeper `end_room` fires at t=102 based on t=100 read. Transaction re-reads and abandons the write; room stays `status=live`; broadcasts continue; sweeper metric records the abandoned attempt.
+- **F-23a (emulator)** — narrowly scoped: activity committed to Firestore BEFORE the termination transaction opens is respected. `touch_audio` writes the fresh `lastAudioAt`; end_room's transaction reads the fresh value and returns `skipped=no_longer_idle`; room stays `status=live`. **This does NOT prove Firestore's production optimistic-concurrency retry** — Google's emulator uses simplified locking and does not reproduce all production concurrency modes. That's what F-23b covers.
+- **F-23b (controlled retry, no emulator)** — deterministic proof of callback safety under retry. A patched transactional decorator forces the callback body to run twice with different reads. Assertions: callback invocation count ≥ 2, second invocation's decision reflects the second read (eligibility rechecked), no external side effects observed in either invocation. AST inspection separately verifies the transaction callback body contains no calls to `close_room_*`, `broadcast_room`, `forget_room`, `disconnect`, or `_cleanup_room_local_state`.
+- **F-23c (sweeper flow)** — AST inspection of `_room_sweeper_loop`: the `if result.get("skipped"):` branch must `continue` before any external effect fires. Locks in that a skipped termination triggers zero external cleanup effects.
+- **Idempotence test** — running local cleanup back-to-back on the same room produces no duplicate log lines, no errors, no double-decrement of Redis refcounts.
+- **Skipped-mutates-nothing test** — a skipped `end_room` result leaves every room field byte-identical.
 - **Transaction-retry test**: simulate a concurrent write to the room document during the transaction so Firestore reruns the callback. Assert:
   - Callback executes **at least twice** (proves retry happened).
   - External cleanup effects fire **once** for the committing branch during this test run.
@@ -103,6 +107,8 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 **Risk**
 
 - Medium. Touching the sweeper's write path is delicate. The transaction wrapper is a well-known Firestore pattern; the test suite is the load-bearing verification.
+
+**What PR-T1-B does NOT close.** The Redis missed-terminal-broadcast recovery (G-5) and the Redis outage/reconnect scenario (F-24) remain upcoming Track 1 work in PR-T1-C. PR-T1-B tightens the sweeper's idle-based termination against stale reads on a single instance; it does not add cross-instance reconciliation.
 
 ---
 
@@ -222,7 +228,7 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 | PR | Audit change | Acceptance tests | Env |
 |---|---|---|---|
 | PR-T1-A | §4a.1 startup safety | F-15 | [2P] |
-| PR-T1-B | §4a.2 atomic conditional (sweeper idle-timeout variant only) | F-23, transaction-retry test (≥ 2 callback invocations, external effects once per commit), cleanup-idempotence test | [E] |
+| PR-T1-B | §4a.2 atomic conditional (sweeper idle-timeout variant only) | F-23a (emulator, activity-committed-before-transaction), F-23b (controlled retry via mock, ≥ 2 callback invocations + eligibility recheck), F-23c (AST — sweeper `continue`s on skipped), skipped-mutates-nothing, cleanup-idempotence | [E] for F-23a; doubles for the rest |
 | PR-T1-C | §5.1a reconciler + the raw metric signals it needs | F-8, F-14, F-16, F-18, F-21 | mostly doubles; F-8 needs [R] [2P] |
 | PR-T1-D | §4.6 SIGTERM close code + host AND listener reconnect handling | F-9 (both host and listener reconnect paths asserted) | [2P] |
 | PR-T1-E | §8 dashboards, alert policies, external freshness alert, log→metrics adapter | F-18 alert fires in staging with seeded fixture; F-21 does not fire during a healthy long broadcast; alert policies dry-run for 24h before paging | metric harness + staging |
