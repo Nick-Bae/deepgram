@@ -8,7 +8,7 @@ import { useSubtitleSocket } from "../../../../utils/useSubtitleSocket";
 import { appendStreamContextToUrl, clearRoomInSession, persistStreamContext } from "../../../../utils/streamContext";
 import { useTTS } from "../../../../utils/useTTS";
 import { usePcmAudioPlayer } from "../../../../utils/usePcmAudioPlayer";
-import { resolveViewerDisplay, roomEndMessage } from "../../../../utils/viewerDisplay";
+import { resolveViewerDisplay, roomEndMessage, subtitleModeLines } from "../../../../utils/viewerDisplay";
 import {
   isRoomShownAsEnded,
   nextEndedRoomId,
@@ -351,13 +351,14 @@ export default function ChurchServiceListenerPage() {
         : "Connecting…";
   // Terminal state must take precedence over any lingering translation lines.
   // See utils/viewerDisplay.ts + its regression tests.
-  const { currentEn, recentEn } = resolveViewerDisplay({
+  const { currentEn, recentEn, isTerminal } = resolveViewerDisplay({
     serviceEnded,
     socketTerminated,
     displayEnLines,
     waitingMessage,
     lastEndReason: resolveData?.lastEndReason,
   });
+  const subtitleLines = subtitleModeLines(isTerminal, currentEn, displayEnLines);
 
   const isLive = connected;
   const isConnecting = socketEnabled && !connected;
@@ -617,9 +618,9 @@ export default function ChurchServiceListenerPage() {
               textAlign: "center",
             }}
           >
-            {displayEnLines.length > 0 ? (
-              displayEnLines.map((line, i) => {
-                const isCurrent = i === displayEnLines.length - 1;
+            {subtitleLines.length > 0 ? (
+              subtitleLines.map((line, i) => {
+                const isCurrent = i === subtitleLines.length - 1;
                 return (
                   <div
                     key={`${i}-${line.slice(0, 12)}`}

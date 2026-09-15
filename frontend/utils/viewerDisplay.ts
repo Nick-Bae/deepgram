@@ -62,3 +62,17 @@ export function resolveViewerDisplay(input: ViewerDisplayInputs): ViewerDisplayO
 
   return { currentEn, recentEn, isTerminal };
 }
+
+// Subtitle mode iterates a lines array (last one styled as the "current"
+// large line). When the room has ended, collapse to just the terminal
+// message so lingering translations don't mask "Broadcast ended.".
+// Extracted so the collapse behavior is directly unit-tested — the bug
+// this file was created to fix reappeared once because only fullscreen
+// mode consumed resolveViewerDisplay's output.
+export function subtitleModeLines(
+  isTerminal: boolean,
+  currentEn: string,
+  displayEnLines: readonly string[],
+): readonly string[] {
+  return isTerminal ? [currentEn] : displayEnLines;
+}

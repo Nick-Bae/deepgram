@@ -12,7 +12,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveViewerDisplay, roomEndMessage } from "./viewerDisplay.ts";
+import { resolveViewerDisplay, roomEndMessage, subtitleModeLines } from "./viewerDisplay.ts";
 
 test("terminal state replaces existing translation lines with 'Broadcast ended.'", () => {
   const { currentEn, recentEn, isTerminal } = resolveViewerDisplay({
@@ -105,4 +105,28 @@ test("roomEndMessage returns null for an unknown reason", () => {
   assert.equal(roomEndMessage(null), null);
   assert.equal(roomEndMessage(undefined), null);
   assert.equal(roomEndMessage(""), null);
+});
+
+// Subtitle-mode collapse. The listener page's default (subtitle) view
+// iterates a lines array and styles the last one as "current". Without
+// this collapse, terminal state would render currentEn correctly only in
+// fullscreen mode while subtitle mode kept showing the lingering last
+// translation (the exact regression reported after PR #17).
+
+test("subtitleModeLines collapses to [currentEn] when terminal", () => {
+  const lines = subtitleModeLines(true, "Broadcast ended.", [
+    "welcome",
+    "the last sentence",
+  ]);
+  assert.deepEqual(lines, ["Broadcast ended."]);
+});
+
+test("subtitleModeLines passes through displayEnLines when not terminal", () => {
+  const lines = subtitleModeLines(false, "unused", ["one", "two", "three"]);
+  assert.deepEqual(lines, ["one", "two", "three"]);
+});
+
+test("subtitleModeLines keeps a single-element terminal array even if displayEnLines is empty", () => {
+  const lines = subtitleModeLines(true, "Broadcast ended.", []);
+  assert.deepEqual(lines, ["Broadcast ended."]);
 });
