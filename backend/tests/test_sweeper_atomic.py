@@ -451,28 +451,25 @@ class SweeperFlowStructuralTests(unittest.TestCase):
 
 class ControlledRetrySemanticsTests(unittest.TestCase):
     """Force the Firestore transaction decorator to invoke the callback
-    twice with different reads AND exercise the billing-side branches
+    with different reads AND exercise the billing-side branches
     (period rollover + soft-cap email) that a real production
-    termination touches. Prove:
+    termination touches.
 
-    - Callback runs at least twice.
-    - Each invocation rechecks eligibility against the CURRENT read.
-    - Each invocation gets a FRESH transaction mock — so writes staged
-      on aborted attempts can be inspected independently, and never
-      leak past their own attempt.
-    - No non-transactional writes happen during any invocation
-      (`org_ref.set` outside the transaction is FORBIDDEN — it would
-      survive retry).
-    - `_dispatch_soft_cap_email` fires ZERO times when the final
-      result is `skipped`, even though the org fixture has the
-      billing state that would trigger the email on a successful
-      termination.
-
-    This is the reviewer's Test B. Deterministic; does not depend on
-    the Firestore emulator's simplified locking.
+    The reviewer's revision requirements:
+    - Separate rollover and email fixtures. A stale-month fixture
+      forces rollover but ALSO zeroes `currentMonthMinutes`, so the
+      soft-cap email path is unreachable there. A distinct email
+      fixture uses the CURRENT month with usage near the cap.
+    - Prove the email branch was reached (not merely absent by
+      trivial fixture construction).
+    - Use separate transaction mocks per attempt so staged writes
+      are attributable.
+    - Prove the successful case dispatches exactly one email.
     """
 
-    def _make_room_snapshot(self, *, status, last_audio_at):
+    def _make_room_snapshot(self, *, status, last_audio_at, last_usage_tick_at=None):
+        """Room snapshot. `last_usage_tick_at` defaults to `last_audio_at`
+        so a stale-audio room is also billable for the elapsed period."""
         snap = MagicMock()
         snap.exists = True
         snap.to_dict.return_value = {
@@ -481,80 +478,89 @@ class ControlledRetrySemanticsTests(unittest.TestCase):
             "startedAt": last_audio_at - timedelta(seconds=1),
             "hostUid": "host-uid",
             "lastAudioAt": last_audio_at,
+            "lastUsageTickAt": last_usage_tick_at or last_audio_at,
         }
         return snap
 
-    def _make_org_snapshot(self):
-        """Org fixture that WOULD trigger soft-cap email + billing
-        rollover on a successful termination — proves those side
-        effects are gated on commit, not on callback execution."""
+    def _rollover_org_snapshot(self):
+        """Rollover fixture — stale month key, forces billing period
+        roll. Soft-cap email is NOT expected here because rollover
+        zeroes `currentMonthMinutes` and the ~17 min room delta stays
+        under the 100-minute cap."""
         snap = MagicMock()
         snap.exists = True
-        # A stale `currentMonthKey` triggers billing period rollover.
-        # `currentMonthMinutes` near the cap triggers soft-cap email.
-        # `billingLimitsEnabled` + `plan=starter` (not trial) is the
-        # combination that would call _dispatch_soft_cap_email.
         snap.to_dict.return_value = {
-            "id": "org-X",
+            "id": "org-rollover",
             "plan": "starter",
             "billing": {"planKey": "starter"},
             "billingLimitsEnabled": True,
             "maxMinutesPerMonth": 100,
             "currentMonthMinutes": 99,
-            "currentMonthKey": "199901",  # stale — forces rollover
+            "currentMonthKey": "199901",  # stale — triggers rollover
             "hardCapReached": False,
             "softCapReached": False,
         }
         return snap
 
-    def test_callback_reruns_recheck_and_produce_no_billing_side_effects_on_skip(self):
-        now = _now()
-        # First read: stale audio (would terminate + trigger soft cap).
-        # Second read: fresh audio (must abort — result is `skipped`).
-        room_snaps = iter([
-            self._make_room_snapshot(status="live", last_audio_at=now - timedelta(seconds=1000)),
-            self._make_room_snapshot(status="live", last_audio_at=now),
-        ])
-        # Room ref used by both invocations. Different service_ref per
-        # invocation so writes can be inspected independently.
+    def _email_org_snapshot(self):
+        """Email fixture — CURRENT month key so rollover does NOT
+        zero `currentMonthMinutes`. Usage at 99/100; any positive
+        elapsed-minutes delta pushes total ≥ cap and (with plan !=
+        trial and softCapReached=False) triggers the soft-cap email
+        path.
+
+        The month key must match `_yyyymm(now)` at test-run time.
+        Computed dynamically so this fixture is not a time bomb.
+        """
+        current_key = f"{_now().year:04d}{_now().month:02d}"
+        snap = MagicMock()
+        snap.exists = True
+        snap.to_dict.return_value = {
+            "id": "org-email",
+            "plan": "starter",
+            "billing": {"planKey": "starter"},
+            "billingLimitsEnabled": True,
+            "maxMinutesPerMonth": 100,
+            "currentMonthMinutes": 99,
+            "currentMonthKey": current_key,  # current — no rollover
+            "hardCapReached": False,
+            "softCapReached": False,
+        }
+        return snap
+
+    def _make_store_with_mocks(
+        self,
+        *,
+        room_snapshots,
+        org_snapshot,
+    ):
+        """Build a FirestoreMultiChurchStore shell whose Firestore
+        references are mocks. Each `db.transaction()` call returns a
+        FRESH transaction mock, so per-attempt writes can be
+        attributed.
+
+        Returns (store, org_ref, transactions_used).
+        """
+        room_snaps = iter(room_snapshots)
         room_ref = MagicMock()
-        room_ref.get.side_effect = lambda *args, **kwargs: next(room_snaps)
-        # Track ANY non-transactional writes to org_ref — those would
-        # be the smoking-gun regression. `_roll_billing_period_if_needed`
-        # calls `org_ref.set(...)` directly.
+        room_ref.get.side_effect = lambda *a, **k: next(room_snaps)
+
         org_ref = MagicMock()
-        org_ref.get.return_value = self._make_org_snapshot()
+        org_ref.get.return_value = org_snapshot
 
         service_ref = MagicMock()
         service_ref.get.return_value = MagicMock(exists=False)
         usage_ref = MagicMock()
 
-        # Fresh transaction mock per invocation so we can attribute
-        # staged writes to a specific attempt.
         transactions_used = []
 
-        fake_db = MagicMock()
         def make_new_transaction():
             tx = MagicMock(name=f"transaction-{len(transactions_used)}")
             transactions_used.append(tx)
             return tx
+
+        fake_db = MagicMock()
         fake_db.transaction.side_effect = make_new_transaction
-
-        invocation_count = {"n": 0}
-
-        def controlled_transactional(fn):
-            def wrapper(transaction):
-                # Each invocation gets its own fresh transaction mock
-                # (simulating how Firestore constructs a new one on
-                # each retry).
-                results = []
-                for _ in range(2):
-                    invocation_count["n"] += 1
-                    if invocation_count["n"] > 1:
-                        transaction = make_new_transaction()
-                    results.append(fn(transaction))
-                return results[-1]
-            return wrapper
 
         store = store_mod.FirestoreMultiChurchStore.__new__(
             store_mod.FirestoreMultiChurchStore
@@ -564,67 +570,253 @@ class ControlledRetrySemanticsTests(unittest.TestCase):
         store._service_ref = lambda org_id, service_key: service_ref
         store._org_ref = lambda org_id: org_ref
         store._usage_ref = lambda org_id, period: usage_ref
+        return store, org_ref, transactions_used, make_new_transaction
 
-        # Spy on the module-level email helper. If it is called ANY
-        # number of times when the result is skipped, this test fails —
-        # that is exactly the regression the reviewer flagged.
-        with patch.object(store_mod.gcf_firestore, "transactional", controlled_transactional), \
-             patch.object(store_mod, "_dispatch_soft_cap_email") as email_spy:
-            result = store.end_room(
-                "org-X",
-                "room-X",
+    def _run_with_forced_retry(
+        self,
+        store,
+        make_new_transaction,
+        *,
+        invocations,
+        org_id,
+        room_id,
+        require_idle_seconds,
+    ):
+        """Invoke `store.end_room` with a patched transactional
+        decorator that runs the callback `invocations` times, each
+        with a fresh transaction mock. Return (result, per_attempt_results,
+        invocation_count).
+        """
+        per_attempt_results = []
+
+        def controlled_transactional(fn):
+            def wrapper(transaction):
+                nonlocal_first_tx = transaction
+                for i in range(invocations):
+                    if i > 0:
+                        nonlocal_first_tx = make_new_transaction()
+                    outcome = fn(nonlocal_first_tx)
+                    per_attempt_results.append(outcome)
+                return per_attempt_results[-1]
+            return wrapper
+
+        with patch.object(
+            store_mod.gcf_firestore, "transactional", controlled_transactional
+        ), patch.object(store_mod, "_dispatch_soft_cap_email") as email_spy:
+            final = store.end_room(
+                org_id,
+                room_id,
                 reason="idle_timeout",
-                require_idle_seconds=900,
+                require_idle_seconds=require_idle_seconds,
             )
+        return final, per_attempt_results, email_spy
 
-        # (1) Callback ran at least twice.
-        self.assertGreaterEqual(
-            invocation_count["n"],
-            2,
-            "controlled retry harness must invoke the callback at "
-            "least twice — proves the callback code is safe against "
-            "Firestore's retry semantics.",
+    # -------------------------------------------------------------------
+    # (A) Rollover fixture: prove staged-via-transaction rollover write
+    # -------------------------------------------------------------------
+
+    def test_rollover_fixture_stages_write_via_transaction_no_direct_org_set(self):
+        """Stale month key forces rollover. The rollover write MUST
+        be staged via `transaction.set(org_ref, ...)`, not via a
+        direct `org_ref.set(...)`. Zero direct writes are permitted.
+        """
+        now = _now()
+        room_snapshots = [
+            self._make_room_snapshot(
+                status="live",
+                last_audio_at=now - timedelta(seconds=1000),
+            ),
+        ]
+        store, org_ref, transactions_used, mk_tx = self._make_store_with_mocks(
+            room_snapshots=room_snapshots,
+            org_snapshot=self._rollover_org_snapshot(),
         )
-
-        # (2) Final result reflects the SECOND read (skipped).
+        final, per_attempt, email_spy = self._run_with_forced_retry(
+            store, mk_tx,
+            invocations=1,
+            org_id="org-rollover",
+            room_id="room-rollover",
+            require_idle_seconds=900,
+        )
+        # Room ended successfully; no email under this fixture.
+        self.assertEqual(final.get("status"), "ended")
+        self.assertEqual(email_spy.call_count, 0)
+        # No direct writes to org_ref outside the transaction.
+        direct_org_writes = [c for c in org_ref.method_calls if c[0] == "set"]
         self.assertEqual(
-            result.get("skipped"),
-            "no_longer_idle",
-            "the second invocation saw fresh audio and must return "
-            "skipped — proves eligibility is rechecked on each rerun.",
+            direct_org_writes,
+            [],
+            f"rollover MUST be staged via transaction.set — direct "
+            f"org_ref.set calls: {direct_org_writes}",
         )
-        self.assertNotIn("status", result)
-        self.assertNotIn("alreadyEnded", result)
+        # First attempt's transaction MUST have received a set(org_ref, ...)
+        # call carrying the rollover fields.
+        self.assertEqual(len(transactions_used), 1)
+        first_tx_sets = [
+            c for c in transactions_used[0].method_calls if c[0] == "set"
+        ]
+        rollover_set = None
+        for call in first_tx_sets:
+            _, args, _ = call
+            if len(args) >= 2 and args[0] is org_ref:
+                update = args[1]
+                if "currentMonthKey" in update:
+                    rollover_set = update
+                    break
+        self.assertIsNotNone(
+            rollover_set,
+            "transaction did not stage a rollover write against "
+            "org_ref — see transactions_used[0].method_calls.",
+        )
+        # Rollover reset `currentMonthMinutes` to 0, then the cap-add
+        # block layered the ~17-minute room-usage delta on top. The
+        # final staged value is that delta, not zero. What we're
+        # asserting here is that the rollover *fields* landed:
+        current_key = f"{_now().year:04d}{_now().month:02d}"
+        self.assertEqual(
+            rollover_set["currentMonthKey"],
+            current_key,
+            "rollover must write the CURRENT month key, replacing "
+            "the stale '199901' from the fixture.",
+        )
+        # currentMonthMinutes should reflect JUST the new-period usage
+        # (rollover reset then usage-add), well under the cap.
+        self.assertLess(
+            rollover_set["currentMonthMinutes"],
+            100,
+            f"post-rollover usage should be well under the 100-minute "
+            f"cap; got {rollover_set['currentMonthMinutes']}",
+        )
+        # softCapReached must stay False under this fixture (rollover
+        # cleared it and the added delta didn't cross the cap).
+        self.assertFalse(rollover_set["softCapReached"])
+        self.assertFalse(rollover_set["hardCapReached"])
 
-        # (3) No email dispatched — even though the org fixture had
-        # the billing state (near-cap, non-trial, stale month key)
-        # that WOULD trigger the email on a successful termination.
+    # -------------------------------------------------------------------
+    # (B) Email fixture: prove branch was reached, then skipped on retry
+    # -------------------------------------------------------------------
+
+    def test_email_fixture_first_attempt_reaches_branch_then_skipped_dispatches_zero(self):
+        """First invocation reads stale audio + email-fixture org:
+        the callback reaches the soft-cap email branch and returns
+        with `_pending_soft_cap_email_org` in its result payload
+        (proves the branch was reached, not trivially bypassed).
+
+        Second invocation reads fresh audio: returns skipped. The
+        caller sees the second result. No email dispatched.
+        """
+        now = _now()
+        room_snapshots = [
+            # First read: stale audio, would terminate + reach cap.
+            self._make_room_snapshot(
+                status="live",
+                last_audio_at=now - timedelta(seconds=1000),
+            ),
+            # Second read: fresh audio — must return skipped.
+            self._make_room_snapshot(
+                status="live",
+                last_audio_at=now,
+            ),
+        ]
+        store, org_ref, transactions_used, mk_tx = self._make_store_with_mocks(
+            room_snapshots=room_snapshots,
+            org_snapshot=self._email_org_snapshot(),
+        )
+        final, per_attempt, email_spy = self._run_with_forced_retry(
+            store, mk_tx,
+            invocations=2,
+            org_id="org-email",
+            room_id="room-email",
+            require_idle_seconds=900,
+        )
+        # First attempt: proves the email branch was reached — the
+        # callback captured pending-email data before returning.
+        self.assertEqual(len(per_attempt), 2)
+        self.assertIn(
+            "_pending_soft_cap_email_org",
+            per_attempt[0],
+            "first attempt did NOT reach the soft-cap email branch — "
+            "the email fixture is misconstructed. Without this, "
+            "asserting `email_spy.call_count == 0` is trivial and does "
+            "not demonstrate suppression of a pending email.",
+        )
+        # Second attempt: skipped.
+        self.assertEqual(per_attempt[1].get("skipped"), "no_longer_idle")
+        self.assertNotIn("_pending_soft_cap_email_org", per_attempt[1])
+        # Final result is the second attempt's outcome.
+        self.assertEqual(final.get("skipped"), "no_longer_idle")
+        self.assertNotIn("_pending_soft_cap_email_org", final)
+        # No email dispatched.
         self.assertEqual(
             email_spy.call_count,
             0,
             f"_dispatch_soft_cap_email fired {email_spy.call_count} "
-            f"time(s) on a skipped result — this is the exact side-"
-            f"effect leak PR-T1-B's post-commit dispatch is meant "
-            f"to prevent. See audit §4a.2 transaction callback purity.",
+            f"time(s) on a skipped result despite the branch having "
+            f"been reached on the first attempt. This is the exact "
+            f"regression PR-T1-B must prevent.",
         )
-
-        # (4) No non-transactional writes to org_ref. `org_ref.set(...)`
-        # (called by the OLD `_roll_billing_period_if_needed`) would
-        # survive an aborted retry.
-        # `org_ref.get(...)` is expected; `org_ref.set(...)` is not.
-        set_call_names = [c[0] for c in org_ref.method_calls if c[0] == "set"]
+        # First attempt STAGED writes; second attempt (skipped)
+        # staged NONE. Prove via the fresh-per-attempt transaction mocks.
+        self.assertEqual(len(transactions_used), 2)
+        first_tx_sets = [c for c in transactions_used[0].method_calls if c[0] == "set"]
+        second_tx_sets = [c for c in transactions_used[1].method_calls if c[0] == "set"]
+        self.assertGreater(
+            len(first_tx_sets),
+            0,
+            "first attempt reached the write staging phase — its "
+            "transaction should carry ≥ 1 set(...) call.",
+        )
         self.assertEqual(
-            set_call_names,
+            second_tx_sets,
             [],
-            f"org_ref.set was called directly {len(set_call_names)} "
-            f"time(s) — the billing rollover write must go through "
-            f"transaction.set (staged, discarded on retry), not "
-            f"org_ref.set (survives retry).",
+            f"skipped second attempt must stage zero writes — got "
+            f"{second_tx_sets}. If the second transaction saw ANY "
+            f"set(...) call, the skip guard failed and writes leaked.",
         )
+        # No direct writes to org_ref outside the transaction.
+        direct_org_writes = [c for c in org_ref.method_calls if c[0] == "set"]
+        self.assertEqual(direct_org_writes, [])
 
-        # (5) Aborted attempts cannot leak the internal pending-email
-        # signal back to the caller.
-        self.assertNotIn("_pending_soft_cap_email_org", result)
+    # -------------------------------------------------------------------
+    # (C) Email fixture, successful termination: exactly one email
+    # -------------------------------------------------------------------
+
+    def test_email_fixture_successful_termination_dispatches_exactly_one_email(self):
+        """Under identical fixture but no retry (both reads stale),
+        the callback commits and the caller dispatches exactly ONE
+        email. Confirms the pending-email pathway is correctly wired
+        — proves the previous test's "zero emails" assertion is
+        meaningful because this test shows it CAN dispatch when
+        commit succeeds.
+        """
+        now = _now()
+        room_snapshots = [
+            self._make_room_snapshot(
+                status="live",
+                last_audio_at=now - timedelta(seconds=1000),
+            ),
+        ]
+        store, org_ref, transactions_used, mk_tx = self._make_store_with_mocks(
+            room_snapshots=room_snapshots,
+            org_snapshot=self._email_org_snapshot(),
+        )
+        final, per_attempt, email_spy = self._run_with_forced_retry(
+            store, mk_tx,
+            invocations=1,
+            org_id="org-email",
+            room_id="room-email",
+            require_idle_seconds=900,
+        )
+        self.assertEqual(final.get("status"), "ended")
+        self.assertEqual(
+            email_spy.call_count,
+            1,
+            f"expected exactly one soft-cap email on successful "
+            f"termination; got {email_spy.call_count}. "
+            f"per_attempt={per_attempt}",
+        )
+        # The internal signal must not leak to callers.
+        self.assertNotIn("_pending_soft_cap_email_org", final)
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +892,47 @@ class FirestoreAtomicIdleTerminationTests(unittest.TestCase):
         self.assertEqual(result.get("skipped"), "no_longer_idle")
         snap = self.store._room_ref(self.org_id, self.room_id).get()
         self.assertEqual(snap.to_dict().get("status"), "live")
+
+    def test_skipped_result_does_not_write_finalTranscript_firestore(self):
+        """Reviewer's Firestore-side transcript guard test.
+
+        Supply `transcript` on a call that will be race-aborted by
+        the idle precondition. The Firestore path writes transcripts
+        via `room_ref.collection("finalTranscript").document("latest").set(...)`
+        AFTER the transaction returns. That write is gated on
+        `did_terminate_now`, so a skipped result must produce NO
+        finalTranscript document. The InMemory test cannot catch a
+        regression in this Firestore-side guard — this one does.
+        """
+        # Step 1: fresh-audio room. Sweeper's earlier read had it
+        # stale; between then and now, audio resumed.
+        self._write_live_room(last_audio_offset_sec=0)
+        # Step 2: end_room with idle precondition + transcript payload.
+        result = self.store.end_room(
+            self.org_id,
+            self.room_id,
+            reason="idle_timeout",
+            require_idle_seconds=60,
+            transcript="Sunday sermon transcript that must not be persisted on skipped",
+        )
+        # Skipped as expected.
+        self.assertEqual(result.get("skipped"), "no_longer_idle")
+        # Now verify no finalTranscript document was written. The
+        # Firestore emulator returns a doc snapshot with exists=False
+        # if it was never written.
+        transcript_snap = (
+            self.store._room_ref(self.org_id, self.room_id)
+            .collection("finalTranscript")
+            .document("latest")
+            .get()
+        )
+        self.assertFalse(
+            transcript_snap.exists,
+            "finalTranscript/latest was persisted despite the "
+            "termination being race-aborted (skipped). This leaks a "
+            "caller-supplied write past the did_terminate_now guard "
+            "in Firestore end_room.",
+        )
 
 
 if __name__ == "__main__":
