@@ -127,22 +127,36 @@ jobs:
           # --no-traffic: production traffic stays on the pre-deploy live revision.
           # --tag=cleanup-test: assigns a stable dedicated URL for this test.
           # --revision-suffix: recognizable revision name for later cleanup.
-          # Only CORS_ALLOW_ORIGINS is overridden; all other env vars,
-          #   secrets, VPC settings, and service account inherit from the
-          #   existing service template.
-          # NOTE: this revision still uses the SAME Firestore / Redis /
-          #   provider credentials as production — run only when no real
-          #   service is active.
-          # --concurrency=1 + --max-instances=6: forces the cross-instance
-          #   test path so multiple viewers spread across multiple instances.
+          # Two env-var overrides on the new revision (all other env vars,
+          # secrets, VPC settings, and service account inherit from the
+          # existing service template):
+          #   * CORS_ALLOW_ORIGINS extended to include the Vercel preview.
+          #   * REDIS_ENABLED=0 — the Memorystore Redis instance that this
+          #     project claims to use (REDIS_HOST=10.193.110.211) does not
+          #     exist. Prod's live revision silently falls back to local-only
+          #     broadcast, but PR #16 is strict: register_host and
+          #     register_listener refuse when pubsub.enabled=True and
+          #     _connected=False (a safety check flagged during review, so
+          #     an untrusted-terminal-reachability session cannot leak).
+          #     Turning REDIS_ENABLED off here lets the local-cleanup test run.
+          #     Cross-instance / Redis-fanout behavior is NOT exercised — that
+          #     requires a working Redis instance and is a separable follow-up.
+          # NOTE: this revision still uses the SAME Firestore / provider
+          #   credentials as production — run only when no real service is
+          #   active.
+          # --concurrency=80 + --max-instances=1: force every long-lived WS
+          #   and the End Service request onto a SINGLE instance. Without a
+          #   working Redis, Cloud Run instances cannot broadcast between
+          #   themselves, so multiple instances would invalidate the test.
           #   The next normal production deploy from deploy-backend.yml
-          #   explicitly restores --concurrency=80 --max-instances=1, so
-          #   these test values do not persist for prod.
+          #   restores --concurrency=80 --max-instances=1 too, so these
+          #   values already match prod for future deploys.
           # --update-env-vars with ^|^ alternate delimiter: the CORS value
           #   contains commas as origin separators, which would otherwise be
           #   parsed by gcloud as env-var separators. IMPORTANT: this also
-          #   updates the SERVICE TEMPLATE's CORS_ALLOW_ORIGINS, so cleanup
-          #   must restore it explicitly (see summary step below).
+          #   updates the SERVICE TEMPLATE's CORS_ALLOW_ORIGINS and
+          #   REDIS_ENABLED, so cleanup must restore both explicitly (see
+          #   summary step below).
           gcloud run deploy ${{ secrets.CLOUD_RUN_SERVICE }} \
             --image "$IMAGE" \
             --region ${{ secrets.CLOUD_RUN_REGION }} \
@@ -150,10 +164,10 @@ jobs:
             --revision-suffix=${{ env.REVISION_SUFFIX }} \
             --tag=${{ env.TRAFFIC_TAG }} \
             --no-traffic \
-            --concurrency=1 \
+            --concurrency=80 \
             --min-instances=0 \
-            --max-instances=6 \
-            --update-env-vars="^|^CORS_ALLOW_ORIGINS=${{ steps.cors.outputs.extended_cors }}" \
+            --max-instances=1 \
+            --update-env-vars="^|^CORS_ALLOW_ORIGINS=${{ steps.cors.outputs.extended_cors }}|REDIS_ENABLED=0" \
             --quiet
 
       - name: Verify production traffic is unchanged
@@ -216,7 +230,18 @@ jobs:
             exit 1
           fi
           {
-            echo "### PR #16 test deployment ready"
+            echo "### PR #16 test deployment ready — SINGLE-INSTANCE / LOCAL-CLEANUP ONLY"
+            echo ""
+            echo "This tagged revision runs with **REDIS_ENABLED=0**,"
+            echo "**--concurrency=80**, **--max-instances=1**. It validates the"
+            echo "original forgotten-viewer / host-STT / provider cleanup path"
+            echo "against a single instance. It does **NOT** validate Redis"
+            echo "subscription refcount, cross-instance broadcast fanout, or the"
+            echo "release-vs-reconnect race — those require a functioning Redis"
+            echo "service (Memorystore \`worshiptranslate-redis\` currently does"
+            echo "not exist in the project; the REDIS_HOST env var points at a"
+            echo "phantom IP). See docs/03-analysis/redis-pubsub-cloudrun-runbook.md"
+            echo "for the Memorystore setup needed before the multi-instance test."
             echo ""
             echo "- Pinned commit: \`${{ env.COMMIT_SHA }}\`"
             echo "- Test revision: \`$TEST_REVISION_NAME\`"
@@ -225,10 +250,33 @@ jobs:
             echo "- Production live revision (unchanged): \`$LIVE_REVISION\`"
             echo "- Production CORS_ALLOW_ORIGINS (for reference): \`$LIVE_CORS\`"
             echo ""
-            echo "Configure Vercel preview NEXT_PUBLIC_API_BASE_URL / NEXT_PUBLIC_WS_URL"
-            echo "against this URL to run the healthy-Redis and cross-instance tests."
+            echo "**Template configuration note:**"
+            echo "This no-traffic test deployment sets the Cloud Run service"
+            echo "template to \`REDIS_ENABLED=0\`. The currently serving production"
+            echo "revision remains unchanged and still has \`REDIS_ENABLED=1\`. The"
+            echo "next production deployment will inherit \`REDIS_ENABLED=0\` unless"
+            echo "explicitly overridden. Keep it disabled while production is"
+            echo "single-instance; re-enable it only after a working Redis service"
+            echo "and cross-instance test are complete."
             echo ""
-            echo "NOTE: this revision uses PROD Firestore / Redis / provider credentials."
+            echo "What THIS test exercises (single-instance):"
+            echo "- Host STT / upstream provider cleanup on End Service"
+            echo "- Foreground listener close via server-sent 1000/room_ended"
+            echo "- Backgrounded listener close (tab throttled) via same path"
+            echo "- Frontend \`terminated\` state + no reconnect"
+            echo "- /resolve polling stops on ended"
+            echo "- Ended-room join rejection (query-string + consumer_join)"
+            echo ""
+            echo "What this test does NOT cover:"
+            echo "- Cross-instance host / listener cleanup via Redis pub/sub"
+            echo "- Redis subscription refcount balance"
+            echo "- Reconnect / release race under _lock"
+            echo "- The ensure_subscription readiness guard (skipped when REDIS_ENABLED=0)"
+            echo ""
+            echo "Configure Vercel preview NEXT_PUBLIC_API_BASE_URL / NEXT_PUBLIC_WS_URL"
+            echo "against this URL to run the single-instance browser tests."
+            echo ""
+            echo "NOTE: this revision uses PROD Firestore / provider credentials."
             echo "Run the test only when no real service is active."
             echo ""
             echo "### Cleanup after testing"
@@ -278,13 +326,21 @@ jobs:
             echo ""
             echo "**Template-drift note (not a runtime issue):** the test deploy"
             echo "updated the SERVICE TEMPLATE's CORS_ALLOW_ORIGINS to the"
-            echo "extended list. This does NOT affect runtime because production"
-            echo "traffic is on \`$LIVE_REVISION\`. But the NEXT normal deploy"
-            echo "from deploy-backend.yml — which does not set CORS_ALLOW_ORIGINS"
-            echo "explicitly — will build a new prod revision that inherits the"
-            echo "extended CORS from the template. If you don't want that, add"
-            echo "\`--update-env-vars=\"^|^CORS_ALLOW_ORIGINS=<prod list>\"\` to the"
-            echo "prod deploy step (ideally via a GH secret) BEFORE the next"
-            echo "prod deploy. The recorded prod list is above under"
-            echo "\"Production CORS_ALLOW_ORIGINS (for reference)\"."
+            echo "extended list AND REDIS_ENABLED to 0. This does NOT affect"
+            echo "runtime because production traffic is on \`$LIVE_REVISION\`."
+            echo "But the NEXT normal deploy from deploy-backend.yml — which"
+            echo "does not set CORS_ALLOW_ORIGINS or REDIS_ENABLED explicitly —"
+            echo "will build a new prod revision that inherits BOTH from the"
+            echo "template. If you don't want that, decide the intended prod"
+            echo "config first, then pass \`--update-env-vars\` on the next prod"
+            echo "deploy (ideally via GH secrets), for example:"
+            echo "  - Stay single-instance: REDIS_ENABLED=0 (matches reality;"
+            echo "    prod has been silently in local-only mode for weeks)."
+            echo "  - Move to multi-instance: create Memorystore, restore"
+            echo "    REDIS_ENABLED=1, and verify VPC networking."
+            echo "The recorded pre-deploy prod CORS list is above under"
+            echo "\"Production CORS_ALLOW_ORIGINS (for reference)\". The"
+            echo "pre-deploy prod REDIS_ENABLED value was \`1\` (though Redis"
+            echo "was already unreachable — that is the config bug PR #16"
+            echo "exposed, unrelated to the room-cleanup fixes)."
           } >> "$GITHUB_STEP_SUMMARY"
