@@ -88,6 +88,12 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   // True once the server closes with room_ended — the page uses this to
   // switch to a terminal display without waiting on the next /resolve poll.
   const [terminated, setTerminated] = useState(false);
+  // The specific room ID the terminated socket was attached to. Set in the
+  // WS `onclose` handler using a value captured from the effect's closure at
+  // connect time. Callers must use this — not `resolveData.activeRoomId` —
+  // to attribute the terminal event to the correct room, because /resolve
+  // may already have moved to a NEW room by the time onclose fires.
+  const [terminatedRoomId, setTerminatedRoomId] = useState<string | null>(null);
 
   // live preview (KR interim)
   const [krInterim, setKrInterim] = useState("");
@@ -383,11 +389,17 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     // A prior mount may have terminated on room_ended for a different room.
     // Reset here so a new URL (e.g. next service) can connect again.
     setTerminated(false);
+    setTerminatedRoomId(null);
     // Local disposed flag captured by every onclose/onmessage created in this
     // effect run. When the effect re-runs (URL change) or unmounts, we set
     // it true — any pending onclose from the old socket short-circuits so
     // it can't stomp state that belongs to the new room.
     let disposedThisRun = false;
+    // Snapshot the room ID this effect run is opening a WS against. Captured
+    // into the `onclose` closures below so the terminal event carries the
+    // correct room ID even if /resolve later transitions to a new room and
+    // this run's closures fire late.
+    const effectRoomId: string | null = streamContext.roomId ?? null;
     enQueueRef.current = [];
     enDisplayRef.current = [];
     nextSlotAtRef.current = 0;
@@ -467,6 +479,11 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
           if (event.reason === "room_ended" || event.code === 4001) {
             stopFlag.current = true;
             setTerminated(true);
+            // `effectRoomId` was captured from streamContext at the moment
+            // THIS ws was opened. Even if the parent has since moved to a
+            // new room, this event correctly identifies the room the old
+            // socket belonged to.
+            setTerminatedRoomId(effectRoomId);
             if (reconnectTimerRef.current) {
               clearTimeout(reconnectTimerRef.current);
               reconnectTimerRef.current = null;
@@ -626,6 +643,7 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
   return {
     connected,
     terminated,
+    terminatedRoomId,
     // live preview
     krInterim,
     // latest final (single)
