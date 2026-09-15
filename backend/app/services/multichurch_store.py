@@ -2796,10 +2796,20 @@ class InMemoryMultiChurchStore:
                 last_audio_at: datetime = room.get("lastAudioAt") or started_at
                 age = (now - started_at).total_seconds()
                 idle = (now - last_audio_at).total_seconds()
-                if idle >= idle_seconds:
-                    out.append({"orgId": org_id, "roomId": room_id, "reason": "idle_timeout"})
-                elif age >= max_duration_seconds:
+                # max_duration takes precedence over idle_timeout when
+                # both thresholds are exceeded. The sweeper's idle path
+                # applies an atomic recheck against `lastAudioAt`
+                # (PR-T1-B); if audio resumes just before termination,
+                # that recheck would keep an idle-flagged room alive
+                # forever even though it has passed the hard duration
+                # cap. Choosing `max_duration` here lets the sweeper
+                # invoke `end_room(reason="max_duration")` without the
+                # idle recheck, ensuring the duration cap always
+                # enforces. See resource-cleanup-audit §4a.2.
+                if age >= max_duration_seconds:
                     out.append({"orgId": org_id, "roomId": room_id, "reason": "max_duration"})
+                elif idle >= idle_seconds:
+                    out.append({"orgId": org_id, "roomId": room_id, "reason": "idle_timeout"})
         return out
 
     def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
@@ -5483,8 +5493,24 @@ class FirestoreMultiChurchStore:
             org_ref = self._org_ref(org_id)
             org_snap = org_ref.get(transaction=transaction)
             org = org_snap.to_dict() or {}
+            # Billing-period rollover: INLINED here so it stages via
+            # `transaction.set` and thus survives / is discarded atomically
+            # with the rest of the write set. Calling
+            # `_roll_billing_period_if_needed` directly would perform a
+            # non-transactional `org_ref.set()` that survives an aborted
+            # retry — see docs/03-analysis/resource-cleanup-audit.md §4a.2
+            # transaction callback purity.
+            billing_period_rollover_pending = False
             if org_snap.exists:
-                org = self._roll_billing_period_if_needed(org_id, org, now=now)
+                current_key = _yyyymm(now)
+                if str(org.get("currentMonthKey") or "") != current_key:
+                    billing_period_rollover_pending = True
+                    org = dict(org)
+                    org["currentMonthKey"] = current_key
+                    org["currentMonthMinutes"] = 0
+                    org["hardCapReached"] = False
+                    org["softCapReached"] = False
+                    org["softCapEmailSentKey"] = None
             billing = _normalize_org_billing(org, now=now) if org_snap.exists else {}
             billing_limits_enabled = _org_billing_limits_enabled(org) if org_snap.exists else False
             has_monthly_cap = billing_limits_enabled and int(org.get("maxMinutesPerMonth") or 0) > 0
@@ -5519,8 +5545,19 @@ class FirestoreMultiChurchStore:
                     },
                     merge=True,
                 )
+            # Pending email data captured for post-commit dispatch. Email
+            # send is a side effect that MUST NOT fire on aborted attempts.
+            pending_soft_cap_email_org: Optional[Dict[str, Any]] = None
+            org_update: Dict[str, Any] = {}
+            if billing_period_rollover_pending:
+                org_update.update({
+                    "currentMonthKey": org["currentMonthKey"],
+                    "currentMonthMinutes": 0,
+                    "hardCapReached": False,
+                    "softCapReached": False,
+                    "softCapEmailSentKey": None,
+                })
             if org_snap.exists and translated_delta_minutes > 0:
-                org_update: Dict[str, Any] = {"updatedAt": gcf_firestore.SERVER_TIMESTAMP}
                 if has_monthly_cap:
                     next_month_minutes = int(org.get("currentMonthMinutes") or 0) + translated_delta_minutes
                     org_update["currentMonthMinutes"] = next_month_minutes
@@ -5530,11 +5567,19 @@ class FirestoreMultiChurchStore:
                             org_update["hardCapReached"] = True
                         elif not org.get("softCapReached"):
                             org_update["softCapReached"] = True
-                            _dispatch_soft_cap_email(org_id, {**org, "currentMonthMinutes": next_month_minutes, "billing": billing})
+                            # Defer email dispatch — the caller fires it
+                            # only after the transaction commits.
+                            pending_soft_cap_email_org = {
+                                **org,
+                                "currentMonthMinutes": next_month_minutes,
+                                "billing": billing,
+                            }
                 if has_trial_cap:
                     _consume_billing_trial_seconds(billing, remainder_seconds)
                     billing["updatedAt"] = now
                     org_update["billing"] = dict(billing)
+            if org_update:
+                org_update["updatedAt"] = gcf_firestore.SERVER_TIMESTAMP
                 transaction.set(org_ref, org_update, merge=True)
             usage_ref = self._usage_ref(org_id, _yyyymm(now))
             usage_update: Dict[str, Any] = {
@@ -5546,16 +5591,42 @@ class FirestoreMultiChurchStore:
             if translated_delta_minutes > 0:
                 usage_update["minutesTranslated"] = gcf_firestore.Increment(translated_delta_minutes)
             transaction.set(usage_ref, usage_update, merge=True)
-            return {"orgId": org_id, "roomId": room_id, "status": "ended"}
+            result_payload: Dict[str, Any] = {
+                "orgId": org_id,
+                "roomId": room_id,
+                "status": "ended",
+            }
+            if pending_soft_cap_email_org is not None:
+                # Signal to the caller (after commit) to dispatch the email.
+                # Stored on the returned dict so the caller sees it only
+                # when the transaction actually commits.
+                result_payload["_pending_soft_cap_email_org"] = pending_soft_cap_email_org
+            return result_payload
 
         tx = db.transaction()
         result = _tx(tx)
-        if transcript:
+        # Post-commit side effects: only fire when the transaction
+        # actually ended the room during THIS call. Skipped and
+        # alreadyEnded results must trigger NO writes and NO emails.
+        did_terminate_now = (
+            result.get("status") == "ended"
+            and not result.get("alreadyEnded")
+            and not result.get("skipped")
+        )
+        if did_terminate_now and transcript:
             room_ref.collection("finalTranscript").document("latest").set(
                 {"text": transcript, "createdAt": gcf_firestore.SERVER_TIMESTAMP},
                 merge=True,
                 timeout=_FS_TIMEOUT,
             )
+        if did_terminate_now:
+            pending_email_org = result.pop("_pending_soft_cap_email_org", None)
+            if pending_email_org is not None:
+                _dispatch_soft_cap_email(org_id, pending_email_org)
+        else:
+            # On skipped/alreadyEnded, ensure the internal signal never
+            # leaks to callers.
+            result.pop("_pending_soft_cap_email_org", None)
         return result
 
     def append_translation_segment(
@@ -5690,10 +5761,12 @@ class FirestoreMultiChurchStore:
                     continue
                 age = (now - started_at).total_seconds()
                 idle = (now - last_audio_at).total_seconds() if isinstance(last_audio_at, datetime) else age
-                if idle >= idle_seconds:
-                    out.append({"orgId": org_id, "roomId": room_snap.id, "reason": "idle_timeout"})
-                elif age >= max_duration_seconds:
+                # max_duration precedence: see comment on the InMemory
+                # variant at InMemoryMultiChurchStore.stale_live_rooms.
+                if age >= max_duration_seconds:
                     out.append({"orgId": org_id, "roomId": room_snap.id, "reason": "max_duration"})
+                elif idle >= idle_seconds:
+                    out.append({"orgId": org_id, "roomId": room_snap.id, "reason": "idle_timeout"})
         return out
 
     def enforce_live_usage_caps(self, *, tick_seconds: int) -> List[Dict[str, Any]]:
