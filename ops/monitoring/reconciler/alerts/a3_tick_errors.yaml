@@ -1,15 +1,16 @@
 # A3 — Reconciler tick errors.
 #
-# Fires when a large fraction of reconciler ticks in a rolling window
-# end in an error outcome (firestore_error, loop_error, or
-# cleanup_error). We alert on the counter of error-outcome ticks
-# (labeled), not the ratio, because Cloud Monitoring's arithmetic
-# over log-based counter metrics is limited.
+# Fires when reconciler ticks in a rolling window end in an error
+# outcome (firestore_error, loop_error, or cleanup_error). We alert
+# on the counter of error-outcome ticks (labeled), not the ratio,
+# because Cloud Monitoring's arithmetic over log-based counter
+# metrics is limited.
 #
-# Threshold: > 3 error ticks in a 5-minute rolling window at the
-# default 30s interval — roughly 30% of ticks. A single transient
-# Firestore error is noise; a persistent trend indicates something
-# is actually broken.
+# Threshold: > 3 error ticks aggregated over a 10-minute window
+# (four error observations at the default 30s interval). Same
+# window semantics as A2. A single transient Firestore error is
+# noise; four aggregated across 10 minutes indicates a persistent
+# trend.
 displayName: "Reconciler tick errors — Firestore / loop / cleanup"
 combiner: OR
 enabled: true
@@ -34,9 +35,9 @@ conditions:
       filter: |-
         resource.type="cloud_run_revision"
         AND metric.type="logging.googleapis.com/user/reconciler_tick_outcomes"
-        AND (metric.label.outcome="firestore_error"
-             OR metric.label.outcome="loop_error"
-             OR metric.label.outcome="cleanup_error")
+        AND (metric.labels.outcome="firestore_error"
+             OR metric.labels.outcome="loop_error"
+             OR metric.labels.outcome="cleanup_error")
       comparison: COMPARISON_GT
       thresholdValue: 3
       # See A2 for the duration=0s / alignmentPeriod=600s rationale.

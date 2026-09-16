@@ -21,18 +21,22 @@ enabled: true
 documentation:
   mimeType: text/markdown
   content: |
-    The reconciler has observed a Firestore-terminal room whose
-    local resources (listener sockets, host STT session, Redis
-    subscription refcount) remain held on this Cloud Run instance
-    for multiple consecutive ticks.
+    The reconciler observed a Firestore-terminal room whose local
+    resources (listener sockets, host STT session, Redis
+    subscription refcount) remained held on this Cloud Run service
+    across four or more ticks aggregated over a 10-minute rolling
+    window (not necessarily consecutive — the alert fires on the
+    aggregated count, not on continuous violation).
 
     Dashboard signals to inspect:
       - `reconciler_oldest_overdue_seconds` distribution — how long
         the oldest offender has been overdue.
-      - `reconciler_cleanup_inflight` distribution — if > 0, a
-        cleanup is in progress but not completing (blocked); if 0,
-        the reconciler tried to attempt cleanup and the attempt
-        crashed (check `reconciler_action` events with
+      - "Recent tick snapshots" logs panel — read the raw
+        `cleanup_inflight` field from recent tick JSON bodies. If
+        > 0 across the window, a cleanup is in progress but not
+        completing (blocked); if 0 while the overdue counter is
+        rising, the reconciler tried to attempt cleanup and the
+        attempt crashed (check `reconciler_action` events with
         `reason="cleanup_error"`).
 
     This condition is the direct symptom of G-5 recovery failing on

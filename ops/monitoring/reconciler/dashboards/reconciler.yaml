@@ -14,6 +14,9 @@ mosaicLayout:
     - width: 6
       height: 4
       widget:
+        # ALIGN_SUM per minute gives "successful ticks per minute"
+        # directly. ALIGN_RATE would emit per-second values and
+        # mislabel the chart.
         title: Freshness heartbeat — successful ticks per minute
         xyChart:
           dataSets:
@@ -24,14 +27,14 @@ mosaicLayout:
                     AND metric.type="logging.googleapis.com/user/reconciler_success_ticks"
                   aggregation:
                     alignmentPeriod: 60s
-                    perSeriesAligner: ALIGN_RATE
+                    perSeriesAligner: ALIGN_SUM
                     crossSeriesReducer: REDUCE_SUM
               plotType: LINE
     - xPos: 6
       width: 6
       height: 4
       widget:
-        title: Tick outcomes — grouped by outcome
+        title: Tick outcomes per minute — grouped by outcome
         xyChart:
           dataSets:
             - timeSeriesQuery:
@@ -41,7 +44,7 @@ mosaicLayout:
                     AND metric.type="logging.googleapis.com/user/reconciler_tick_outcomes"
                   aggregation:
                     alignmentPeriod: 60s
-                    perSeriesAligner: ALIGN_RATE
+                    perSeriesAligner: ALIGN_SUM
                     crossSeriesReducer: REDUCE_SUM
                     groupByFields:
                       - "metric.label.outcome"
@@ -50,7 +53,7 @@ mosaicLayout:
       width: 6
       height: 4
       widget:
-        title: Overdue ticks — rate
+        title: Overdue ticks — count per minute
         xyChart:
           dataSets:
             - timeSeriesQuery:
@@ -60,7 +63,7 @@ mosaicLayout:
                     AND metric.type="logging.googleapis.com/user/reconciler_overdue_ticks"
                   aggregation:
                     alignmentPeriod: 60s
-                    perSeriesAligner: ALIGN_RATE
+                    perSeriesAligner: ALIGN_SUM
                     crossSeriesReducer: REDUCE_SUM
               plotType: LINE
     - yPos: 4
@@ -68,9 +71,23 @@ mosaicLayout:
       width: 6
       height: 4
       widget:
-        title: Oldest overdue cleanup — distribution
+        # Three overlaid series (p50/p95/p99) so the chart matches
+        # its label — a single p95 line was misleading given the
+        # metric description promises full distribution visibility.
+        title: Oldest overdue cleanup — p50 / p95 / p99
         xyChart:
           dataSets:
+            - timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: |-
+                    resource.type="cloud_run_revision"
+                    AND metric.type="logging.googleapis.com/user/reconciler_oldest_overdue_seconds"
+                  aggregation:
+                    alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_PERCENTILE_50
+                    crossSeriesReducer: REDUCE_MAX
+              plotType: LINE
+              legendTemplate: p50
             - timeSeriesQuery:
                 timeSeriesFilter:
                   filter: |-
@@ -81,11 +98,23 @@ mosaicLayout:
                     perSeriesAligner: ALIGN_PERCENTILE_95
                     crossSeriesReducer: REDUCE_MAX
               plotType: LINE
+              legendTemplate: p95
+            - timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: |-
+                    resource.type="cloud_run_revision"
+                    AND metric.type="logging.googleapis.com/user/reconciler_oldest_overdue_seconds"
+                  aggregation:
+                    alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_PERCENTILE_99
+                    crossSeriesReducer: REDUCE_MAX
+              plotType: LINE
+              legendTemplate: p99
     - yPos: 8
       width: 6
       height: 4
       widget:
-        title: Recovery actions — grouped by reason
+        title: Recovery actions per minute — grouped by reason
         xyChart:
           dataSets:
             - timeSeriesQuery:
@@ -95,7 +124,7 @@ mosaicLayout:
                     AND metric.type="logging.googleapis.com/user/reconciler_actions"
                   aggregation:
                     alignmentPeriod: 60s
-                    perSeriesAligner: ALIGN_RATE
+                    perSeriesAligner: ALIGN_SUM
                     crossSeriesReducer: REDUCE_SUM
                     groupByFields:
                       - "metric.label.reason"

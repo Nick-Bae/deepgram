@@ -191,7 +191,8 @@ not sed — multi-line YAML values would corrupt under sed.
 operator's shell. `backend/requirements-dev.txt` guarantees it in
 CI, but a fresh terminal on an operator's laptop may not have it —
 the script checks `python3 -c 'import yaml'` on startup and prints
-a concrete install line if the import fails.
+`pip install PyYAML>=6.0` (or the homebrew equivalent for macOS
+system Python) if the import fails.
 
 Every resource is `describe`-emitted immediately after apply, so
 copy-and-paste from the output is the deployment evidence.

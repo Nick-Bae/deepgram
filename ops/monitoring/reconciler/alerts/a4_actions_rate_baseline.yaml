@@ -41,7 +41,7 @@ conditions:
       filter: |-
         resource.type="cloud_run_revision"
         AND metric.type="logging.googleapis.com/user/reconciler_actions"
-        AND metric.label.reason="ended_room_local_cleanup"
+        AND metric.labels.reason="ended_room_local_cleanup"
       comparison: COMPARISON_GT
       # Deliberately impossible threshold so an accidental
       # `enabled: true` flip without a real baseline still can't

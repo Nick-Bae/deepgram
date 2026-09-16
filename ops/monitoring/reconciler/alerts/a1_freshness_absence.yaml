@@ -36,9 +36,10 @@ documentation:
     Debug steps:
       1. Confirm `ROOM_RECONCILER_ENABLED=1` in the running revision.
       2. Check Cloud Logging for `component="room_reconciler"`
-         entries — look for `reconciler_tick` events with any
-         outcome, and for `event="reconciler_diagnostic"` entries
-         with kind=`loop_error` traces.
+         entries — look for `reconciler_tick` events with
+         `outcome` in {firestore_error, loop_error, cleanup_error};
+         both `loop_error` and `firestore_error` are surfaced on
+         the tick event itself, not on `reconciler_diagnostic`.
       3. Check Firestore reachability from Cloud Run.
 
     Caveat: an absence policy cannot fire until it has first

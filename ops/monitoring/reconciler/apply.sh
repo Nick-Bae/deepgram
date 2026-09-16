@@ -54,11 +54,13 @@ if ! python3 -c 'import yaml' > /dev/null 2>&1; then
 PyYAML is required for placeholder substitution but is not importable
 by `python3` on this shell's PATH.
 
-Install one of:
-  pip install PyYAML>=6.0
-  pipx install PyYAML                    # if using pipx
-  brew install libyaml && pip install PyYAML   # macOS via Homebrew python
+Install with:
+  pip install "PyYAML>=6.0"
+  # macOS via Homebrew python:
+  brew install libyaml && pip install "PyYAML>=6.0"
 Then re-run this script.
+
+(PyYAML is a library, not a CLI, so `pipx` is not applicable.)
 EOF
   exit 2
 fi
@@ -143,9 +145,8 @@ apply_metric() {
   rm -f "${tmp}"
 }
 
-# Look up a managed resource by (managed_by, resource_id) userLabels
-# rather than by displayName. Returns 0 matches (creates), 1 match
-# (updates), or fails on >= 2 matches.
+# Look up a managed alert policy by (managed_by, resource_id)
+# userLabels. AlertPolicy exposes `userLabels`.
 _lookup_alert_by_labels() {
   local resource_id="$1"
   gcloud alpha monitoring policies list \
@@ -154,12 +155,74 @@ _lookup_alert_by_labels() {
     --format="value(name)"
 }
 
+# Dashboard resources expose top-level `labels`, NOT `userLabels`.
+# Reference: cloud.google.com/monitoring/dashboards/api-dashboard —
+# the Dashboard message has a `labels` map at the top level. Filtering
+# by `userLabels.*` would return zero matches even when a managed
+# dashboard exists, and the next apply would create a duplicate.
 _lookup_dashboard_by_labels() {
   local resource_id="$1"
   gcloud monitoring dashboards list \
     --project="${GCP_PROJECT}" \
-    --filter="userLabels.managed_by=\"reconciler-monitoring\" AND userLabels.resource_id=\"${resource_id}\"" \
+    --filter="labels.managed_by=\"reconciler-monitoring\" AND labels.resource_id=\"${resource_id}\"" \
     --format="value(name)"
+}
+
+# Merge the existing policy's condition NAMES into the new policy
+# body, matched by condition displayName. Cloud Monitoring treats a
+# --policy-from-file update with unnamed conditions as "these are
+# NEW conditions" and deletes the existing ones — the "second apply
+# is a no-op" property breaks. Preserving names by displayName
+# match makes updates in-place edits.
+_merge_alert_condition_names() {
+  local policy_id="$1"
+  local new_body_file="$2"
+  # shellcheck disable=SC2016
+  EXISTING_ID="${policy_id}" NEW_BODY_FILE="${new_body_file}" \
+  PROJECT="${GCP_PROJECT}" \
+  python3 - <<'PY'
+import json, os, subprocess, sys
+
+existing_id = os.environ["EXISTING_ID"]
+new_body_file = os.environ["NEW_BODY_FILE"]
+project = os.environ["PROJECT"]
+
+with open(new_body_file, "r") as fh:
+    new_body = json.load(fh)
+
+# Describe the existing policy to pull current condition names.
+result = subprocess.run(
+    ["gcloud", "alpha", "monitoring", "policies", "describe",
+     existing_id, "--project", project, "--format", "json"],
+    capture_output=True, text=True, check=True,
+)
+existing = json.loads(result.stdout)
+name_by_display = {}
+for cond in existing.get("conditions", []) or []:
+    display = cond.get("displayName")
+    name = cond.get("name")
+    if display and name:
+        name_by_display[display] = name
+
+# Attach the existing name to any new condition sharing the same
+# displayName. Unmatched new conditions are treated as truly new
+# (created without a `name` field).
+matched = 0
+for cond in new_body.get("conditions", []) or []:
+    display = cond.get("displayName")
+    if display in name_by_display:
+        cond["name"] = name_by_display[display]
+        matched += 1
+
+# Also carry forward the policy `name` so gcloud knows what to update
+# (some `--policy-from-file` codepaths care).
+new_body["name"] = existing_id
+
+json.dump(new_body, sys.stdout)
+sys.stderr.write(
+    f"merged {matched} existing condition name(s) into new policy body\n"
+)
+PY
 }
 
 apply_alert() {
@@ -187,8 +250,15 @@ apply_alert() {
   if [[ "${count}" -eq 1 ]]; then
     local existing_id
     existing_id=$(printf '%s\n' "${matches}" | sed '/^$/d' | head -1)
+    # Preserve condition names — without this, --policy-from-file
+    # deletes every existing condition and recreates them, so the
+    # "second apply is a no-op" invariant breaks.
+    local merged
+    merged=$(mktemp --suffix=.json)
+    _merge_alert_condition_names "${existing_id}" "${tmp}" > "${merged}"
     gcloud alpha monitoring policies update "${existing_id}" \
-      --policy-from-file="${tmp}" --project="${GCP_PROJECT}"
+      --policy-from-file="${merged}" --project="${GCP_PROJECT}"
+    rm -f "${merged}"
     gcloud alpha monitoring policies describe "${existing_id}" --project="${GCP_PROJECT}"
   else
     local created
@@ -200,11 +270,46 @@ apply_alert() {
   rm -f "${tmp}"
 }
 
+# Merge the current dashboard's etag into the new config before
+# calling update. gcloud rejects a dashboard update whose body's
+# `etag` field does not match the server's current value — the
+# check exists specifically to prevent lost-update overwrites when
+# two operators race. Fetching-and-embedding closes that gap for a
+# single-operator apply.sh flow.
+_merge_dashboard_etag() {
+  local dashboard_id="$1"
+  local new_body_file="$2"
+  # shellcheck disable=SC2016
+  DASH_ID="${dashboard_id}" NEW_BODY_FILE="${new_body_file}" \
+  PROJECT="${GCP_PROJECT}" \
+  python3 - <<'PY'
+import json, os, subprocess, sys
+
+with open(os.environ["NEW_BODY_FILE"], "r") as fh:
+    body = json.load(fh)
+
+result = subprocess.run(
+    ["gcloud", "monitoring", "dashboards", "describe",
+     os.environ["DASH_ID"], "--project", os.environ["PROJECT"],
+     "--format", "json"],
+    capture_output=True, text=True, check=True,
+)
+existing = json.loads(result.stdout)
+etag = existing.get("etag")
+if etag:
+    body["etag"] = etag
+# gcloud also expects the dashboard `name` field on updates.
+body["name"] = os.environ["DASH_ID"]
+
+json.dump(body, sys.stdout)
+sys.stderr.write(f"merged existing dashboard etag={etag!r}\n")
+PY
+}
+
 apply_dashboard() {
   local file="$1"
   local resource_id
-  # Dashboards must also carry the same labels; the YAML file adds
-  # them alongside displayName.
+  # Dashboards use top-level `labels`, NOT `userLabels`.
   resource_id=$(python3 -c "import sys,yaml;d=yaml.safe_load(open('${file}'));print((d.get('labels') or {}).get('resource_id') or d.get('displayName'))")
   local displayName
   displayName=$(python3 -c "import sys,yaml;print(yaml.safe_load(open('${file}'))['displayName'])")
@@ -226,8 +331,13 @@ apply_dashboard() {
   if [[ "${count}" -eq 1 ]]; then
     local existing_id
     existing_id=$(printf '%s\n' "${matches}" | sed '/^$/d' | head -1)
+    # Fetch the current etag and merge it in — updates require it.
+    local merged
+    merged=$(mktemp --suffix=.json)
+    _merge_dashboard_etag "${existing_id}" "${tmp}" > "${merged}"
     gcloud monitoring dashboards update "${existing_id}" \
-      --config-from-file="${tmp}" --project="${GCP_PROJECT}"
+      --config-from-file="${merged}" --project="${GCP_PROJECT}"
+    rm -f "${merged}"
     gcloud monitoring dashboards describe "${existing_id}" --project="${GCP_PROJECT}"
   else
     local created

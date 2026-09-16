@@ -139,6 +139,22 @@ def _extractor_matches_enum(doc: dict, kind: str, allowed: set[str]) -> None:
                 )
 
 
+def _condition_filter_uses_correct_label_selector(filt: str) -> tuple[bool, str]:
+    """Cloud Monitoring filter syntax:
+      - `metric.labels.<name>` in FILTER expressions (plural).
+      - `metric.label.<name>` ONLY in groupByFields.
+    Return (ok, reason). This check runs against alert-policy
+    condition FILTER strings; groupByFields is validated separately."""
+    if re.search(r"\bmetric\.label\.[a-zA-Z_]+", filt):
+        return (
+            False,
+            "condition filter uses `metric.label.<name>` (singular); "
+            "filter syntax requires `metric.labels.<name>` (plural). "
+            "The singular form is valid only inside groupByFields.",
+        )
+    return (True, "")
+
+
 def _agg_reduces_across_revisions(condition: dict) -> bool:
     """The condition must aggregate every revision-scoped series
     into ONE service-level series before evaluating. If it doesn't,
@@ -205,7 +221,27 @@ def validate_alerts(metrics: dict[str, dict]) -> None:
                 f"deploy time"
             )
 
+        cond_display_names: set[str] = set()
         for condition in doc.get("conditions", []):
+            cond_display = condition.get("displayName")
+            if not cond_display:
+                raise Fail(
+                    f"{path}: every condition needs a displayName — the "
+                    f"apply script uses displayName to preserve the "
+                    f"condition's server-assigned `name` across updates. "
+                    f"Without a stable displayName, an update recreates "
+                    f"the condition and breaks the second-apply-is-noop "
+                    f"invariant."
+                )
+            if cond_display in cond_display_names:
+                raise Fail(
+                    f"{path}: duplicate condition displayName "
+                    f"{cond_display!r}; condition displayNames must be "
+                    f"unique within a policy so the apply script can "
+                    f"match them to existing conditions by name."
+                )
+            cond_display_names.add(cond_display)
+
             filt = ""
             if "conditionThreshold" in condition:
                 filt = condition["conditionThreshold"].get("filter", "")
@@ -220,9 +256,14 @@ def validate_alerts(metrics: dict[str, dict]) -> None:
                     f"{path}: references undefined metric.type={mtype!r}. "
                     f"Known metrics: {sorted(metric_types)}"
                 )
+            ok, reason = _condition_filter_uses_correct_label_selector(filt)
+            if not ok:
+                raise Fail(
+                    f"{path}: condition {cond_display!r} — {reason}"
+                )
             if not _agg_reduces_across_revisions(condition):
                 raise Fail(
-                    f"{path}: condition {condition.get('displayName')!r} "
+                    f"{path}: condition {cond_display!r} "
                     f"must aggregate across revision-scoped series "
                     f"(crossSeriesReducer + groupByFields = "
                     f"['resource.label.service_name']). Without this, "
@@ -255,6 +296,17 @@ def validate_dashboards() -> None:
         layout = doc.get("mosaicLayout") or doc.get("gridLayout")
         if layout is None:
             raise Fail(f"{path}: needs mosaicLayout or gridLayout")
+        # Cloud Monitoring Dashboard uses top-level `labels`, NOT
+        # `userLabels`. A YAML that puts management labels under
+        # `userLabels` would apply, but the apply-script lookup
+        # (filter on `labels.*`) would miss it and create a
+        # duplicate on the next apply.
+        if "userLabels" in doc:
+            raise Fail(
+                f"{path}: Dashboard uses top-level `labels`, not "
+                f"`userLabels`. Move `managed_by` / `resource_id` "
+                f"under `labels`."
+            )
         labels = doc.get("labels") or {}
         if labels.get("managed_by") != "reconciler-monitoring":
             raise Fail(
@@ -285,16 +337,58 @@ def validate_dashboards() -> None:
 
 
 def validate_apply_script() -> None:
-    """bash -n on apply.sh — catches syntax errors that would only
-    show up at deploy time."""
+    """Structural checks over apply.sh:
+      - `bash -n` catches shell syntax errors.
+      - Presence of the etag-preservation helper on dashboard
+        updates (without it, the second apply fails because the
+        server rejects a stale/missing etag).
+      - Presence of the condition-name-preservation helper on
+        alert-policy updates (without it, --policy-from-file
+        deletes existing conditions and recreates them, breaking
+        the "second apply is a no-op" invariant).
+      - Dashboard lookup uses top-level `labels.*`, not
+        `userLabels.*`.
+    """
     import subprocess
+    apply_path = ROOT / "apply.sh"
     result = subprocess.run(
-        ["bash", "-n", str(ROOT / "apply.sh")],
+        ["bash", "-n", str(apply_path)],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         raise Fail(f"apply.sh: bash -n failed:\n{result.stderr}")
+    src = apply_path.read_text()
+    # Word-boundary regex so `_merge_dashboard_etag_disabled` (or any
+    # accidental rename that keeps the identifier as a substring)
+    # does not silently satisfy the check.
+    if not re.search(r"\b_merge_dashboard_etag\b", src):
+        raise Fail(
+            "apply.sh: missing _merge_dashboard_etag helper — "
+            "dashboard updates require the current server etag."
+        )
+    if not re.search(r"\b_merge_alert_condition_names\b", src):
+        raise Fail(
+            "apply.sh: missing _merge_alert_condition_names helper — "
+            "alert-policy updates via --policy-from-file discard the "
+            "existing condition names, so the API treats submitted "
+            "conditions as new and deletes the old ones. Merge names "
+            "in by matching condition displayName before updating."
+        )
+    # Both helpers must ACTUALLY be called from the update path, not
+    # just defined. A quick way to prove that: look for the call
+    # forms (they exist inside apply_dashboard / apply_alert).
+    if not re.search(r"\b_merge_dashboard_etag\b[^_]", src):
+        raise Fail("apply.sh: _merge_dashboard_etag is defined but never called")
+    if not re.search(r"\b_merge_alert_condition_names\b[^_]", src):
+        raise Fail("apply.sh: _merge_alert_condition_names is defined but never called")
+    # Dashboard lookup must use `labels.*`, not `userLabels.*`.
+    if re.search(r"dashboards list.*userLabels\.", src, re.DOTALL):
+        raise Fail(
+            "apply.sh: dashboards list filter uses `userLabels.*`; "
+            "Dashboard resources expose top-level `labels`. Change "
+            "the filter to `labels.managed_by` / `labels.resource_id`."
+        )
 
 
 def main() -> int:
