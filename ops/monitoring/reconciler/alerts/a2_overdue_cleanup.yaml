@@ -1,0 +1,83 @@
+# A2 — Overdue cleanup (single alert covering both signals).
+#
+# terminal_rooms_with_resources > 0 and oldest_overdue_cleanup_seconds
+# past deadline describe the same underlying condition — a
+# Firestore-terminal room whose local cleanup has not finished. We
+# combine them into ONE alert on the derived counter
+# `reconciler_overdue_ticks`, which the reconciler increments each
+# tick that observes an overdue room. The dashboard shows both raw
+# signals (terminal-rooms count and oldest-age distribution) for
+# investigation.
+#
+# Threshold: > 3 overdue ticks over a 10-minute rolling window.
+# Described as "four overdue observations, aggregated over 10
+# minutes" — NOT "90 seconds of continuous failure." Log-based
+# metric latency (up to ~10 minutes per Google's guidance) means a
+# shorter window would fire on ingestion jitter alone; the 10-minute
+# window matches A1's alignment for the same reason.
+displayName: "Reconciler overdue cleanup — terminal room resources not released"
+combiner: OR
+enabled: true
+documentation:
+  mimeType: text/markdown
+  content: |
+    The reconciler observed a Firestore-terminal room whose local
+    resources (listener sockets, host STT session, Redis
+    subscription refcount) remained held on this Cloud Run service
+    across four or more ticks aggregated over a 10-minute rolling
+    window (not necessarily consecutive — the alert fires on the
+    aggregated count, not on continuous violation).
+
+    Dashboard signals to inspect:
+      - `reconciler_oldest_overdue_seconds` distribution — how long
+        the oldest offender has been overdue.
+      - "Recent reconciler events" logs panel — look for a
+        `reconciler_diagnostic` entry with
+        `kind="cleanup_started"` whose (`org_id`, `room_id`) has
+        NO matching `kind="cleanup_finished"`. That's a hung
+        in-flight cleanup — the reconciler cannot emit a tick
+        while a cleanup is awaiting, which is why an unmatched
+        started/finished pair is the correct signal, not a
+        counter in the tick payload.
+      - `reconciler_action` events with `reason="cleanup_error"`
+        show cleanups that ran to completion but raised — these
+        will have a matching `cleanup_finished` with
+        `outcome="error"`.
+
+    This condition is the direct symptom of G-5 recovery failing
+    on a specific instance. Fast-path Redis fanout may still be
+    working elsewhere — check other instances' overdue-tick rates
+    before rolling back.
+conditions:
+  - displayName: reconciler_overdue_ticks — four observations over 10m (service-level)
+    conditionThreshold:
+      filter: |-
+        resource.type="cloud_run_revision"
+        AND metric.type="logging.googleapis.com/user/reconciler_overdue_ticks"
+      comparison: COMPARISON_GT
+      thresholdValue: 3
+      # `duration: 0s` — evaluate the aligned window immediately.
+      # `alignmentPeriod: 600s` already aggregates observations over
+      # 10 minutes; adding a non-zero `duration` would require the
+      # threshold to STAY violated for that additional retest window
+      # (Google's Cloud Monitoring semantics), delaying the alert
+      # by up to another window. The documented intent is "four
+      # overdue observations inside a 10-minute aligned window",
+      # which is `alignmentPeriod=600s`, `thresholdValue=3`, and
+      # `duration=0s`.
+      duration: 0s
+      aggregations:
+        - alignmentPeriod: 600s
+          perSeriesAligner: ALIGN_SUM
+          # Aggregate across revisions so a rolling deploy doesn't
+          # dilute observations across two series and hide the
+          # condition.
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - "resource.label.service_name"
+alertStrategy:
+  autoClose: 86400s
+userLabels:
+  managed_by: reconciler-monitoring
+  resource_id: a2_overdue_cleanup
+notificationChannels: __NOTIFICATION_CHANNELS__

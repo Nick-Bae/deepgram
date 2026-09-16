@@ -50,8 +50,15 @@ jobs:
           #     two-instance cross-instance test has passed on a tagged
           #     revision. Do not flip to 1 without that verification.
           #   * ROOM_RECONCILER_ENABLED=0 — PR-T1-C ships the Firestore
-          #     reconciler dark. Enable only after F-8/F-24 are green and the
-          #     production dark-metric baseline has been reviewed.
+          #     reconciler dark. While this flag is 0 the reconciler task is
+          #     not scheduled and NOTHING is emitted, so there is no
+          #     "dark-metric baseline" that can exist at this stage. To
+          #     enable safely, deploy PR-T1-E's monitoring stack
+          #     (ops/monitoring/reconciler/apply.sh), then flip this to 1
+          #     in a subsequent reviewed config PR so a first successful
+          #     reconciler tick actually lands. Choose the A4 recovery-
+          #     rate threshold from the observed baseline after that; do
+          #     not flip A4 to enabled without one.
           #   * CORS_ALLOW_ORIGINS pinned to the four production hostnames.
           #     The temporary PR #16 test workflow appended a Vercel preview
           #     origin; this line restores the prod-only baseline every deploy

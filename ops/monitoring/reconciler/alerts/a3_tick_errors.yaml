@@ -1,0 +1,57 @@
+# A3 — Reconciler tick errors.
+#
+# Fires when reconciler ticks in a rolling window end in an error
+# outcome (firestore_error, loop_error, or cleanup_error). We alert
+# on the counter of error-outcome ticks (labeled), not the ratio,
+# because Cloud Monitoring's arithmetic over log-based counter
+# metrics is limited.
+#
+# Threshold: > 3 error ticks aggregated over a 10-minute window
+# (four error observations at the default 30s interval). Same
+# window semantics as A2. A single transient Firestore error is
+# noise; four aggregated across 10 minutes indicates a persistent
+# trend.
+displayName: "Reconciler tick errors — Firestore / loop / cleanup"
+combiner: OR
+enabled: true
+documentation:
+  mimeType: text/markdown
+  content: |
+    The reconciler is producing error-outcome ticks at an elevated
+    rate. Root causes vary by outcome:
+
+      - `firestore_error`: Firestore read failed. The reconciler
+        correctly fails open (rooms stay in local state), but if
+        this persists the freshness alert (A1) will eventually
+        fire because no `ok` ticks are landing.
+      - `loop_error`: an unhandled exception escaped `run_once`.
+        This is a bug in the reconciler itself.
+      - `cleanup_error`: one or more per-room cleanups raised. The
+        `reconciler_action` events with `reason="cleanup_error"`
+        carry the room ID and error class for investigation.
+conditions:
+  - displayName: reconciler_tick_outcomes error rate — four errors over 10m (service-level)
+    conditionThreshold:
+      filter: |-
+        resource.type="cloud_run_revision"
+        AND metric.type="logging.googleapis.com/user/reconciler_tick_outcomes"
+        AND (metric.labels.outcome="firestore_error"
+             OR metric.labels.outcome="loop_error"
+             OR metric.labels.outcome="cleanup_error")
+      comparison: COMPARISON_GT
+      thresholdValue: 3
+      # See A2 for the duration=0s / alignmentPeriod=600s rationale.
+      # Intent: "four error observations aggregated over 10 minutes".
+      duration: 0s
+      aggregations:
+        - alignmentPeriod: 600s
+          perSeriesAligner: ALIGN_SUM
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - "resource.label.service_name"
+alertStrategy:
+  autoClose: 86400s
+userLabels:
+  managed_by: reconciler-monitoring
+  resource_id: a3_tick_errors
+notificationChannels: __NOTIFICATION_CHANNELS__

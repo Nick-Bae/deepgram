@@ -253,5 +253,313 @@ class OwnershipInventoryTests(unittest.TestCase):
             )
 
 
+class EventSchemaTests(unittest.IsolatedAsyncioTestCase):
+    """Lock the emitted-event schema (the contract the PR-T1-E log-based
+    metrics filter on). If any of these fail, the monitoring stack in
+    `ops/monitoring/reconciler/` will silently stop matching."""
+
+    REQUIRED_FIELDS = {
+        "event",
+        "schema_version",
+        "severity",
+        "message",
+        "component",
+        "instance_id",
+    }
+    ALLOWED_EVENTS = {
+        "reconciler_tick",
+        "reconciler_action",
+        "reconciler_diagnostic",
+    }
+    ALLOWED_SEVERITIES = {"DEBUG", "INFO", "NOTICE", "WARNING", "ERROR"}
+    TICK_OUTCOMES = {
+        "ok",
+        "cleanup_error",
+        "firestore_error",
+        "loop_error",
+        "skipped_overlap",
+    }
+    ACTION_REASONS = {"ended_room_local_cleanup", "cleanup_error"}
+
+    async def _capture(self, coro):
+        """Run `coro` with `builtins.print` patched; return the list of
+        parsed JSON payloads."""
+        import builtins
+        import json as _json
+        captured: list[dict] = []
+        real_print = builtins.print
+
+        def fake_print(*args, **kwargs):
+            if not args:
+                return
+            first = args[0]
+            if isinstance(first, str):
+                try:
+                    captured.append(_json.loads(first))
+                except _json.JSONDecodeError:
+                    real_print(*args, **kwargs)
+            else:
+                real_print(*args, **kwargs)
+
+        with patch("builtins.print", side_effect=fake_print):
+            await coro
+        return captured
+
+    def _assert_required_fields(self, payload: dict) -> None:
+        missing = self.REQUIRED_FIELDS - set(payload)
+        self.assertFalse(
+            missing,
+            f"emission missing required schema fields: {missing} in {payload}",
+        )
+        self.assertIn(payload["event"], self.ALLOWED_EVENTS)
+        self.assertEqual(payload["schema_version"], "1")
+        self.assertIn(payload["severity"], self.ALLOWED_SEVERITIES)
+        self.assertEqual(payload["component"], "room_reconciler")
+        self.assertIsInstance(payload["message"], str)
+
+    async def test_healthy_tick_emits_schema_conforming_event(self):
+        manager = FakeManager(rooms={("org", "r")})
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        ticks = [p for p in payloads if p["event"] == "reconciler_tick"]
+        self.assertEqual(len(ticks), 1)
+        tick = ticks[0]
+        self._assert_required_fields(tick)
+        self.assertIn(tick["outcome"], self.TICK_OUTCOMES)
+        self.assertEqual(tick["outcome"], "ok")
+        # Snapshot fields required by the metric filters:
+        for field in (
+            "duration_seconds",
+            "owned_rooms",
+            "terminal_rooms_with_resources",
+            "oldest_overdue_cleanup_seconds",
+            "actions_total",
+            "overdue",
+        ):
+            self.assertIn(field, tick, f"tick missing snapshot field {field}")
+        self.assertIsInstance(tick["overdue"], bool)
+        # cleanup_inflight must NOT be in the tick payload. See the
+        # comment on _emit_tick in room_reconciler.py — it is always
+        # 0 at emit time (all cleanups have finished or crashed
+        # before the tick fires), so including it would mislead
+        # operators. The cleanup_started / cleanup_finished
+        # diagnostic events carry that information instead.
+        self.assertNotIn(
+            "cleanup_inflight",
+            tick,
+            "tick payload must not carry cleanup_inflight — it is "
+            "always 0 by emit time. Use cleanup_started / "
+            "cleanup_finished diagnostic events.",
+        )
+
+    async def test_cleanup_emits_started_and_finished_diagnostics(self):
+        """Every cleanup attempt must be bracketed by a
+        `cleanup_started` and a `cleanup_finished` diagnostic — an
+        unmatched `cleanup_started` in Cloud Logging is the signal
+        that a cleanup is hung mid-flight (the tick payload cannot
+        surface this because it emits only after cleanup returns).
+        """
+        manager = FakeManager(rooms={("org", "r")})
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        started = [
+            p for p in payloads
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_started"
+        ]
+        finished = [
+            p for p in payloads
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_finished"
+        ]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(started[0]["org_id"], "org")
+        self.assertEqual(started[0]["room_id"], "r")
+        self.assertEqual(finished[0]["org_id"], "org")
+        self.assertEqual(finished[0]["room_id"], "r")
+        self.assertEqual(finished[0]["outcome"], "ok")
+
+    async def test_cleanup_finished_reports_error_outcome_on_failure(self):
+        """A failed cleanup still emits `cleanup_finished`, with
+        `outcome=error`. Otherwise an operator would see an
+        unmatched `cleanup_started` and misdiagnose it as hung
+        when it actually crashed."""
+        manager = FakeManager(rooms={("org", "r")})
+        manager.fail_cleanup_for = {("org", "r")}
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        finished = [
+            p for p in payloads
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_finished"
+        ]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["outcome"], "error")
+
+    async def test_cancellation_during_cleanup_reports_cancelled_not_ok(self):
+        """asyncio.CancelledError inherits from BaseException, not
+        Exception, so it slips past `except Exception` while
+        `finally` still runs. The old code initialized outcome to
+        "ok" before the await, so a mid-cleanup cancellation
+        recorded `cleanup_finished outcome=ok` — a lie: the
+        cleanup did NOT complete. This test locks the corrected
+        behavior:
+          - CancelledError propagates out of run_once (loop must
+            not silently absorb it).
+          - cleanup_finished carries outcome=cancelled.
+          - cleanup_inflight is decremented back to zero.
+        """
+        cleanup_started = asyncio.Event()
+
+        class BlockingManager(FakeManager):
+            async def _broadcast_local_room(self, org_id, room_id, message):
+                # Signal that we've reached the cleanup path, then
+                # block forever until cancelled.
+                cleanup_started.set()
+                await asyncio.Event().wait()
+
+        manager = BlockingManager(rooms={("org", "r")})
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+
+        # Capture emissions across the whole run — patch `print`
+        # inside the async block so both the pre- and post-cancel
+        # emissions are recorded.
+        import builtins
+        import json as _json
+        captured: list[dict] = []
+        real_print = builtins.print
+
+        def fake_print(*args, **kwargs):
+            if args and isinstance(args[0], str):
+                try:
+                    captured.append(_json.loads(args[0]))
+                    return
+                except _json.JSONDecodeError:
+                    pass
+            real_print(*args, **kwargs)
+
+        with patch("builtins.print", side_effect=fake_print):
+            task = asyncio.create_task(reconciler.run_once())
+            await cleanup_started.wait()
+            # Cancel while `_broadcast_local_room` is still awaiting.
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        finished = [
+            p for p in captured
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_finished"
+        ]
+        self.assertEqual(
+            len(finished),
+            1,
+            f"expected exactly one cleanup_finished emission; got "
+            f"{len(finished)}. captured={captured!r}",
+        )
+        self.assertEqual(
+            finished[0]["outcome"],
+            "cancelled",
+            f"cleanup was cancelled mid-flight; the diagnostic must "
+            f"say so, not silently report ok. Got: {finished[0]!r}",
+        )
+        # The `finally` block must decrement cleanup_inflight even
+        # under CancelledError.
+        self.assertEqual(
+            reconciler.metrics.cleanup_inflight,
+            0,
+            f"cleanup_inflight leaked past cancellation: "
+            f"{reconciler.metrics.cleanup_inflight}",
+        )
+        # And actions_total should NOT have incremented (a
+        # cancelled cleanup is not a successful action).
+        self.assertEqual(reconciler.metrics.actions_total, 0)
+
+    async def test_action_events_carry_bounded_reason_and_ids_in_body(self):
+        manager = FakeManager(rooms={("org", "r")})
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        actions = [p for p in payloads if p["event"] == "reconciler_action"]
+        self.assertEqual(len(actions), 1)
+        action = actions[0]
+        self._assert_required_fields(action)
+        self.assertIn(action["reason"], self.ACTION_REASONS)
+        # Room + org IDs are in the log body for debugging.
+        self.assertEqual(action["org_id"], "org")
+        self.assertEqual(action["room_id"], "r")
+
+    async def test_cleanup_error_emits_action_with_error_reason(self):
+        manager = FakeManager(rooms={("org", "r")})
+        manager.fail_cleanup_for = {("org", "r")}
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        actions = [p for p in payloads if p["event"] == "reconciler_action"]
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["reason"], "cleanup_error")
+        self.assertIn("error", actions[0])
+        self.assertEqual(actions[0]["severity"], "ERROR")
+
+    async def test_firestore_error_tick_carries_outcome_and_error_type(self):
+        manager = FakeManager(rooms={("org", "r")})
+        store = FakeStore(states={("org", "r"): _ended()})
+        store.failures.add(("org", "r"))
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        ticks = [p for p in payloads if p["event"] == "reconciler_tick"]
+        self.assertEqual(ticks[-1]["outcome"], "firestore_error")
+        self.assertEqual(ticks[-1]["severity"], "ERROR")
+        self.assertEqual(ticks[-1]["error"], "TimeoutError")
+
+    async def test_diagnostic_events_are_debug_severity_and_never_metric_driving(self):
+        # A room whose Firestore doc is missing yields a diagnostic
+        # emission; it must not be classified as tick/action (those
+        # are what metrics count).
+        manager = FakeManager(rooms={("org", "gone")})
+        store = FakeStore(states={("org", "gone"): None})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        diags = [p for p in payloads if p["event"] == "reconciler_diagnostic"]
+        self.assertGreaterEqual(len(diags), 1)
+        for d in diags:
+            self._assert_required_fields(d)
+            self.assertEqual(d["severity"], "DEBUG")
+            self.assertIn("kind", d)
+
+    async def test_all_emitted_events_are_valid_single_line_json(self):
+        # Log-based metrics require valid single-line JSON on stdout.
+        # This asserts every emission from a representative run parses
+        # cleanly (no multiline pretty-printing, no stray newlines).
+        manager = FakeManager(rooms={("org", "r"), ("org", "gone")})
+        store = FakeStore(states={
+            ("org", "r"): _ended(),
+            ("org", "gone"): None,
+        })
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        self.assertGreater(len(payloads), 0)
+        for p in payloads:
+            self._assert_required_fields(p)
+
+
+def _make_reconciler_shell(manager, store):
+    """Factory used by both the tests above and the schema tests."""
+    local_cleanup: list[tuple[str, str]] = []
+    reconciler = RoomReconciler(
+        manager=manager,
+        store=store,
+        cleanup_local_state=lambda o, r: local_cleanup.append((o, r)),
+        interval_seconds=30,
+        instance_id="test-instance",
+    )
+    return reconciler, local_cleanup
+
+
 if __name__ == "__main__":
     unittest.main()

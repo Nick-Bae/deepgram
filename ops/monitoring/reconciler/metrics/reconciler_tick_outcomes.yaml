@@ -1,0 +1,26 @@
+# Per-outcome tick counter. Labeled by `outcome` (bounded enum:
+# ok, cleanup_error, firestore_error, loop_error, skipped_overlap)
+# and by `revision_name` (Cloud Run's resource label — bounded to the
+# number of live revisions).
+#
+# The A3 tick-errors alert filters this metric on the error outcomes.
+name: reconciler_tick_outcomes
+description: >-
+  Reconciler tick counter, labeled by outcome. Drives the tick-error
+  alert (outcomes firestore_error / loop_error / cleanup_error) and
+  the dashboard's outcome-breakdown chart.
+filter: |-
+  resource.type="cloud_run_revision"
+  AND resource.labels.service_name="__CLOUD_RUN_SERVICE__"
+  AND jsonPayload.component="room_reconciler"
+  AND jsonPayload.event="reconciler_tick"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: outcome
+      valueType: STRING
+      description: One of {ok, cleanup_error, firestore_error, loop_error, skipped_overlap}.
+labelExtractors:
+  outcome: EXTRACT(jsonPayload.outcome)

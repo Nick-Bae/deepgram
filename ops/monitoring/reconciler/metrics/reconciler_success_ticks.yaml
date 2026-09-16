@@ -1,0 +1,20 @@
+# Freshness heartbeat. Each successful reconciler pass increments this
+# counter. A15-minute absence policy (see alerts/a1_freshness_absence.yaml)
+# fires when this counter stops incrementing.
+#
+# `metricKind: DELTA` + `valueType: INT64` is the standard shape for a
+# log-based counter metric in Cloud Monitoring.
+name: reconciler_success_ticks
+description: >-
+  Reconciler pass completed with outcome=ok. Used by the freshness
+  absence alert as the sole liveness signal.
+filter: |-
+  resource.type="cloud_run_revision"
+  AND resource.labels.service_name="__CLOUD_RUN_SERVICE__"
+  AND jsonPayload.component="room_reconciler"
+  AND jsonPayload.event="reconciler_tick"
+  AND jsonPayload.outcome="ok"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
