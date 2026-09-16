@@ -31,16 +31,21 @@ documentation:
     Dashboard signals to inspect:
       - `reconciler_oldest_overdue_seconds` distribution — how long
         the oldest offender has been overdue.
-      - "Recent tick snapshots" logs panel — read the raw
-        `cleanup_inflight` field from recent tick JSON bodies. If
-        > 0 across the window, a cleanup is in progress but not
-        completing (blocked); if 0 while the overdue counter is
-        rising, the reconciler tried to attempt cleanup and the
-        attempt crashed (check `reconciler_action` events with
-        `reason="cleanup_error"`).
+      - "Recent reconciler events" logs panel — look for a
+        `reconciler_diagnostic` entry with
+        `kind="cleanup_started"` whose (`org_id`, `room_id`) has
+        NO matching `kind="cleanup_finished"`. That's a hung
+        in-flight cleanup — the reconciler cannot emit a tick
+        while a cleanup is awaiting, which is why an unmatched
+        started/finished pair is the correct signal, not a
+        counter in the tick payload.
+      - `reconciler_action` events with `reason="cleanup_error"`
+        show cleanups that ran to completion but raised — these
+        will have a matching `cleanup_finished` with
+        `outcome="error"`.
 
-    This condition is the direct symptom of G-5 recovery failing on
-    a specific instance. Fast-path Redis fanout may still be
+    This condition is the direct symptom of G-5 recovery failing
+    on a specific instance. Fast-path Redis fanout may still be
     working elsewhere — check other instances' overdue-tick rates
     before rolling back.
 conditions:

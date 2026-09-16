@@ -359,29 +359,85 @@ def validate_apply_script() -> None:
     if result.returncode != 0:
         raise Fail(f"apply.sh: bash -n failed:\n{result.stderr}")
     src = apply_path.read_text()
-    # Word-boundary regex so `_merge_dashboard_etag_disabled` (or any
-    # accidental rename that keeps the identifier as a substring)
-    # does not silently satisfy the check.
-    if not re.search(r"\b_merge_dashboard_etag\b", src):
+
+    # Extract a shell-function body by balanced braces. Each helper
+    # must be CALLED from inside the function that owns its update
+    # path — not merely defined. The earlier substring check missed
+    # the case where a call site is deleted but the function
+    # definition (which contains the identifier) remains.
+    def _function_body(name: str) -> str | None:
+        m = re.search(rf"^{re.escape(name)}\(\)\s*\{{", src, re.MULTILINE)
+        if not m:
+            return None
+        depth = 0
+        start = m.end() - 1  # position of opening `{`
+        for i in range(start, len(src)):
+            c = src[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return src[start + 1 : i]
+        return None
+
+    # A call site inside a function body looks like the identifier
+    # followed by a space or a double quote (bash function-call
+    # form): `_merge_dashboard_etag "$existing_id" "$tmp"`. A
+    # definition line looks like `_merge_dashboard_etag() {` and
+    # is by construction outside its own body.
+    _CALL_RE = r"\b{name}\b[ \"]"
+
+    def _strip_bash_comments(body: str) -> str:
+        """Remove bash line-comments so a commented-out call
+        (`# _merge_dashboard_etag "$a" "$b"`) does not look like a
+        live invocation to the regex below. The strip is
+        line-oriented and does not attempt to preserve quoted `#`
+        characters — good enough for the narrow contract this
+        validator enforces (a helper is called somewhere inside
+        the function's active body)."""
+        out_lines = []
+        for line in body.splitlines():
+            # Strip everything after the first `#` that is not
+            # inside a bash single-quoted string. Simple heuristic:
+            # if there's a `#` with a leading space or start-of-line,
+            # cut it. This misses `#` inside quotes but our apply.sh
+            # doesn't have those in the paths we care about.
+            i = line.find("#")
+            if i == 0:
+                continue
+            if i > 0 and line[i - 1] in (" ", "\t"):
+                out_lines.append(line[:i])
+                continue
+            out_lines.append(line)
+        return "\n".join(out_lines)
+
+    apply_dashboard = _function_body("apply_dashboard")
+    if apply_dashboard is None:
+        raise Fail("apply.sh: apply_dashboard function not found")
+    apply_dashboard_active = _strip_bash_comments(apply_dashboard)
+    if not re.search(_CALL_RE.format(name="_merge_dashboard_etag"), apply_dashboard_active):
         raise Fail(
-            "apply.sh: missing _merge_dashboard_etag helper — "
-            "dashboard updates require the current server etag."
+            "apply.sh: apply_dashboard does not call _merge_dashboard_etag "
+            "in its update path (searched with bash comments stripped so a "
+            "commented-out call does not satisfy the check). Without merging "
+            "the current server etag into the submitted body, the dashboard "
+            "update fails on the second apply."
         )
-    if not re.search(r"\b_merge_alert_condition_names\b", src):
+
+    apply_alert = _function_body("apply_alert")
+    if apply_alert is None:
+        raise Fail("apply.sh: apply_alert function not found")
+    apply_alert_active = _strip_bash_comments(apply_alert)
+    if not re.search(_CALL_RE.format(name="_merge_alert_condition_names"), apply_alert_active):
         raise Fail(
-            "apply.sh: missing _merge_alert_condition_names helper — "
-            "alert-policy updates via --policy-from-file discard the "
-            "existing condition names, so the API treats submitted "
-            "conditions as new and deletes the old ones. Merge names "
-            "in by matching condition displayName before updating."
+            "apply.sh: apply_alert does not call _merge_alert_condition_names "
+            "in its update path (searched with bash comments stripped so a "
+            "commented-out call does not satisfy the check). Without merging "
+            "existing condition names, --policy-from-file treats every "
+            "submitted condition as new and deletes the existing ones — the "
+            "'second apply is a no-op' invariant breaks."
         )
-    # Both helpers must ACTUALLY be called from the update path, not
-    # just defined. A quick way to prove that: look for the call
-    # forms (they exist inside apply_dashboard / apply_alert).
-    if not re.search(r"\b_merge_dashboard_etag\b[^_]", src):
-        raise Fail("apply.sh: _merge_dashboard_etag is defined but never called")
-    if not re.search(r"\b_merge_alert_condition_names\b[^_]", src):
-        raise Fail("apply.sh: _merge_alert_condition_names is defined but never called")
     # Dashboard lookup must use `labels.*`, not `userLabels.*`.
     if re.search(r"dashboards list.*userLabels\.", src, re.DOTALL):
         raise Fail(

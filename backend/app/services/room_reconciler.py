@@ -243,6 +243,17 @@ class RoomReconciler:
             severity = "ERROR"
         elif outcome == "skipped_overlap":
             severity = "WARNING"
+        # NOTE: cleanup_inflight is deliberately NOT included in tick
+        # payload. The reconciler increments cleanup_inflight,
+        # awaits cleanup, decrements it in finally, and only THEN
+        # emits the tick — so cleanup_inflight is always 0 by the
+        # time the tick is written. An in-progress cleanup that
+        # never completes never produces a tick at all (A1 catches
+        # that via freshness absence). To see per-cleanup state,
+        # follow the `reconciler_diagnostic` events with kinds
+        # `cleanup_started` / `cleanup_finished` — an unmatched
+        # `cleanup_started` in Cloud Logging means the cleanup is
+        # still in flight or has crashed inside the loop.
         fields: Dict[str, Any] = {
             "outcome": outcome,
             "duration_seconds": round(duration_seconds, 6),
@@ -251,7 +262,6 @@ class RoomReconciler:
             "oldest_overdue_cleanup_seconds": round(
                 self.metrics.oldest_overdue_cleanup_seconds, 3,
             ),
-            "cleanup_inflight": self.metrics.cleanup_inflight,
             "actions_total": self.metrics.actions_total,
             "last_successful_reconciliation_at": self.metrics.last_successful_reconciliation_at,
             "overdue": overdue,
@@ -367,7 +377,16 @@ class RoomReconciler:
 
             cleanup_errors = 0
             for key, state in terminal.items():
+                # cleanup_started emitted BEFORE the await so Cloud
+                # Logging captures an in-flight cleanup that never
+                # returns (no matching cleanup_finished follows).
+                self._emit_diagnostic(
+                    kind="cleanup_started",
+                    org_id=key[0],
+                    room_id=key[1],
+                )
                 self.metrics.cleanup_inflight += 1
+                outcome_for_finished = "ok"
                 try:
                     await self._cleanup_ended_room(key, state)
                     self.metrics.actions_total += 1
@@ -378,6 +397,7 @@ class RoomReconciler:
                     )
                 except Exception as exc:
                     cleanup_errors += 1
+                    outcome_for_finished = "error"
                     self._emit_action(
                         reason="cleanup_error",
                         org_id=key[0],
@@ -386,6 +406,16 @@ class RoomReconciler:
                     )
                 finally:
                     self.metrics.cleanup_inflight -= 1
+                    # cleanup_finished paired with the cleanup_started
+                    # above. Absence of this event in Cloud Logging
+                    # for a given (org_id, room_id) is the signal
+                    # that the cleanup is hung mid-flight.
+                    self._emit_diagnostic(
+                        kind="cleanup_finished",
+                        org_id=key[0],
+                        room_id=key[1],
+                        outcome=outcome_for_finished,
+                    )
 
             remaining = {
                 key: state

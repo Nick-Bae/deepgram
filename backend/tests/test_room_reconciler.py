@@ -334,12 +334,71 @@ class EventSchemaTests(unittest.IsolatedAsyncioTestCase):
             "owned_rooms",
             "terminal_rooms_with_resources",
             "oldest_overdue_cleanup_seconds",
-            "cleanup_inflight",
             "actions_total",
             "overdue",
         ):
             self.assertIn(field, tick, f"tick missing snapshot field {field}")
         self.assertIsInstance(tick["overdue"], bool)
+        # cleanup_inflight must NOT be in the tick payload. See the
+        # comment on _emit_tick in room_reconciler.py — it is always
+        # 0 at emit time (all cleanups have finished or crashed
+        # before the tick fires), so including it would mislead
+        # operators. The cleanup_started / cleanup_finished
+        # diagnostic events carry that information instead.
+        self.assertNotIn(
+            "cleanup_inflight",
+            tick,
+            "tick payload must not carry cleanup_inflight — it is "
+            "always 0 by emit time. Use cleanup_started / "
+            "cleanup_finished diagnostic events.",
+        )
+
+    async def test_cleanup_emits_started_and_finished_diagnostics(self):
+        """Every cleanup attempt must be bracketed by a
+        `cleanup_started` and a `cleanup_finished` diagnostic — an
+        unmatched `cleanup_started` in Cloud Logging is the signal
+        that a cleanup is hung mid-flight (the tick payload cannot
+        surface this because it emits only after cleanup returns).
+        """
+        manager = FakeManager(rooms={("org", "r")})
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        started = [
+            p for p in payloads
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_started"
+        ]
+        finished = [
+            p for p in payloads
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_finished"
+        ]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(started[0]["org_id"], "org")
+        self.assertEqual(started[0]["room_id"], "r")
+        self.assertEqual(finished[0]["org_id"], "org")
+        self.assertEqual(finished[0]["room_id"], "r")
+        self.assertEqual(finished[0]["outcome"], "ok")
+
+    async def test_cleanup_finished_reports_error_outcome_on_failure(self):
+        """A failed cleanup still emits `cleanup_finished`, with
+        `outcome=error`. Otherwise an operator would see an
+        unmatched `cleanup_started` and misdiagnose it as hung
+        when it actually crashed."""
+        manager = FakeManager(rooms={("org", "r")})
+        manager.fail_cleanup_for = {("org", "r")}
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+        payloads = await self._capture(reconciler.run_once())
+        finished = [
+            p for p in payloads
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_finished"
+        ]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["outcome"], "error")
 
     async def test_action_events_carry_bounded_reason_and_ids_in_body(self):
         manager = FakeManager(rooms={("org", "r")})
