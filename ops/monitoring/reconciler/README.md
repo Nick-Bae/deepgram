@@ -56,11 +56,23 @@ overdue" rather than a gauge of "how many overdue right now").
 | `reconciler_overdue_ticks` | Counter | A2 overdue alert |
 | `reconciler_oldest_overdue_seconds` | Distribution | Dashboard trend |
 
-The dashboard shows the raw `cleanup_inflight` snapshot via a **logs
-panel** (recent tick JSON bodies) rather than a derived metric. The
-snapshot is mostly 0 or 1 during normal operation, so a p95/p99
-distribution over ticks would be misleading — the raw log body is
-more useful for operators debugging a stuck-cleanup incident.
+The dashboard's "Recent reconciler events" tile is a **logs panel**
+(not a derived metric) that shows the raw JSON of recent
+`reconciler_tick` events plus the `reconciler_diagnostic` events
+with `kind="cleanup_started"` and `kind="cleanup_finished"`. That
+pairing is what surfaces an in-flight cleanup — a `cleanup_started`
+with no matching `cleanup_finished` for the same `(org_id,
+room_id)` means the cleanup is hung mid-flight. `cleanup_inflight`
+is deliberately NOT in the tick payload: the reconciler decrements
+it in `finally` before emitting the tick, so it would always read
+0 in tick bodies.
+
+`cleanup_finished.outcome` is one of `ok`, `error`, or `cancelled`.
+An unmatched `cleanup_started` (no `cleanup_finished` event ever
+follows) means the process was terminated while a cleanup was
+still running — the pairing is emitted from a `finally` block so a
+graceful cancellation still records outcome=cancelled, but a
+process kill can leave the pair unmatched.
 
 ### Filter scoping
 

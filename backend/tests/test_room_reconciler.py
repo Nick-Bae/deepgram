@@ -400,6 +400,86 @@ class EventSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(finished), 1)
         self.assertEqual(finished[0]["outcome"], "error")
 
+    async def test_cancellation_during_cleanup_reports_cancelled_not_ok(self):
+        """asyncio.CancelledError inherits from BaseException, not
+        Exception, so it slips past `except Exception` while
+        `finally` still runs. The old code initialized outcome to
+        "ok" before the await, so a mid-cleanup cancellation
+        recorded `cleanup_finished outcome=ok` — a lie: the
+        cleanup did NOT complete. This test locks the corrected
+        behavior:
+          - CancelledError propagates out of run_once (loop must
+            not silently absorb it).
+          - cleanup_finished carries outcome=cancelled.
+          - cleanup_inflight is decremented back to zero.
+        """
+        cleanup_started = asyncio.Event()
+
+        class BlockingManager(FakeManager):
+            async def _broadcast_local_room(self, org_id, room_id, message):
+                # Signal that we've reached the cleanup path, then
+                # block forever until cancelled.
+                cleanup_started.set()
+                await asyncio.Event().wait()
+
+        manager = BlockingManager(rooms={("org", "r")})
+        store = FakeStore(states={("org", "r"): _ended()})
+        reconciler, _ = _make_reconciler_shell(manager, store)
+
+        # Capture emissions across the whole run — patch `print`
+        # inside the async block so both the pre- and post-cancel
+        # emissions are recorded.
+        import builtins
+        import json as _json
+        captured: list[dict] = []
+        real_print = builtins.print
+
+        def fake_print(*args, **kwargs):
+            if args and isinstance(args[0], str):
+                try:
+                    captured.append(_json.loads(args[0]))
+                    return
+                except _json.JSONDecodeError:
+                    pass
+            real_print(*args, **kwargs)
+
+        with patch("builtins.print", side_effect=fake_print):
+            task = asyncio.create_task(reconciler.run_once())
+            await cleanup_started.wait()
+            # Cancel while `_broadcast_local_room` is still awaiting.
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        finished = [
+            p for p in captured
+            if p["event"] == "reconciler_diagnostic"
+            and p.get("kind") == "cleanup_finished"
+        ]
+        self.assertEqual(
+            len(finished),
+            1,
+            f"expected exactly one cleanup_finished emission; got "
+            f"{len(finished)}. captured={captured!r}",
+        )
+        self.assertEqual(
+            finished[0]["outcome"],
+            "cancelled",
+            f"cleanup was cancelled mid-flight; the diagnostic must "
+            f"say so, not silently report ok. Got: {finished[0]!r}",
+        )
+        # The `finally` block must decrement cleanup_inflight even
+        # under CancelledError.
+        self.assertEqual(
+            reconciler.metrics.cleanup_inflight,
+            0,
+            f"cleanup_inflight leaked past cancellation: "
+            f"{reconciler.metrics.cleanup_inflight}",
+        )
+        # And actions_total should NOT have incremented (a
+        # cancelled cleanup is not a successful action).
+        self.assertEqual(reconciler.metrics.actions_total, 0)
+
     async def test_action_events_carry_bounded_reason_and_ids_in_body(self):
         manager = FakeManager(rooms={("org", "r")})
         store = FakeStore(states={("org", "r"): _ended()})

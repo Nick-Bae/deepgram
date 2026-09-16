@@ -386,15 +386,32 @@ class RoomReconciler:
                     room_id=key[1],
                 )
                 self.metrics.cleanup_inflight += 1
-                outcome_for_finished = "ok"
+                # Default to "cancelled" — asyncio.CancelledError
+                # inherits from BaseException (not Exception) and
+                # would slip past `except Exception` while still
+                # running `finally`. Without this default the
+                # diagnostic would falsely record outcome=ok on a
+                # mid-flight task cancellation (Cloud Run SIGTERM,
+                # test cancellation, etc.). We flip to "ok" only
+                # AFTER the await successfully returns.
+                outcome_for_finished = "cancelled"
                 try:
                     await self._cleanup_ended_room(key, state)
+                    outcome_for_finished = "ok"
                     self.metrics.actions_total += 1
                     self._emit_action(
                         reason="ended_room_local_cleanup",
                         org_id=key[0],
                         room_id=key[1],
                     )
+                except asyncio.CancelledError:
+                    # Preserve the default outcome=cancelled and
+                    # let the cancellation propagate — the loop
+                    # must not silently absorb it. `finally` will
+                    # still emit the paired cleanup_finished with
+                    # outcome=cancelled before the CancelledError
+                    # unwinds.
+                    raise
                 except Exception as exc:
                     cleanup_errors += 1
                     outcome_for_finished = "error"
@@ -409,7 +426,8 @@ class RoomReconciler:
                     # cleanup_finished paired with the cleanup_started
                     # above. Absence of this event in Cloud Logging
                     # for a given (org_id, room_id) is the signal
-                    # that the cleanup is hung mid-flight.
+                    # that the cleanup is hung mid-flight. Outcome
+                    # values: ok, error, cancelled.
                     self._emit_diagnostic(
                         kind="cleanup_finished",
                         org_id=key[0],
