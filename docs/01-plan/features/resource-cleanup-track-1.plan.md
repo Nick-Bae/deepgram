@@ -119,7 +119,7 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 - New module `backend/app/services/room_reconciler.py`.
 - Background task started from `_on_startup` behind a config flag `ROOM_RECONCILER_ENABLED` (default 0). Interval configurable via `ROOM_RECONCILER_INTERVAL_SEC` (default 30).
 - Each tick:
-  1. Build ownership inventory by unioning owner-map keys: `connections_by_room`, `host_presence_by_ws` (mapped through), `host_subscription_owned_by_ws`, `listener_subscription_owned_room_by_ws`, and rooms with active STT background tasks. Set union naturally deduplicates.
+  1. Build ownership inventory by unioning owner-map keys: `connections_by_room`, `host_presence_by_ws` (mapped through), `host_subscription_owned_by_ws`, `listener_subscription_owned_room_by_ws`, rooms with active STT background tasks, and Redis Pub/Sub's desired-room refcount keys. Set union naturally deduplicates. Including Redis's reconnect source of truth lets reconciliation repair a subscription whose websocket ownership was already lost.
   2. Batch-read Firestore docs for that set.
   3. For each returned doc, apply the explicit terminal-state predicate (audit §5.1a): `status == "ended"` → confirmed terminal; `status == "live"` → skip; missing / malformed / unrecognized → skip + log at warn; read failure → skip + increment `reconciler_tick_total{outcome=firestore_error}` and never treat as terminal.
   4. For confirmed-terminal rooms, run the idempotent local cleanup path — same operations PR-T1-B's transaction wrapper triggers on commit, but here fired unconditionally because Firestore already reflects the terminal state.
@@ -129,7 +129,7 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
   - `terminal_rooms_with_resources` (gauge, per instance).
   - `oldest_overdue_cleanup_seconds` (gauge, per instance).
   - `cleanup_inflight` (gauge, per instance).
-  - `reconciler_tick_total{outcome}` counter (outcome ∈ {ok, firestore_error, skipped_overlap}).
+  - `reconciler_tick_total{outcome}` counter (outcome ∈ {ok, firestore_error, cleanup_error, skipped_overlap, loop_error}).
   - `reconciler_actions_total{reason=ended_room_local_cleanup}` counter.
   - `last_successful_reconciliation_at` timestamp.
   - Exposition: structured log lines (JSON) tagged for Cloud Logging (see §7 answer 1); adapter to Cloud Monitoring lives in PR-T1-E.

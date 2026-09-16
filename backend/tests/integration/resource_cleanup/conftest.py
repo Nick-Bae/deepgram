@@ -10,6 +10,7 @@ unexpected skips):
   - Redis reachable at REDIS_HOST:REDIS_PORT (default 127.0.0.1:6379).
   - Firestore emulator reachable at FIRESTORE_EMULATOR_HOST
     (default 127.0.0.1:8085).
+  - Toxiproxy control API at HARNESS_TOXIPROXY_API_URL for F-8/F-24.
 
 Locally:
 
@@ -38,6 +39,11 @@ FIRESTORE_EMULATOR_HOST = os.getenv(
     "HARNESS_FIRESTORE_EMULATOR_HOST", "127.0.0.1:8085",
 )
 GCP_PROJECT = os.getenv("HARNESS_GCP_PROJECT", "cleanup-track1-harness")
+TOXIPROXY_API_URL = os.getenv("HARNESS_TOXIPROXY_API_URL", "http://127.0.0.1:8474")
+TOXIPROXY_REDIS_UPSTREAM = os.getenv(
+    "HARNESS_TOXIPROXY_REDIS_UPSTREAM",
+    "redis:6379",
+)
 
 
 def _harness_infra_ready() -> tuple[bool, str]:
@@ -89,3 +95,37 @@ def admin_store(harness_config):
         emulator_host=harness_config["firestore_emulator_host"],
         project_id=harness_config["gcp_project"],
     )
+
+
+@pytest.fixture(scope="session")
+def redis_outage_proxies():
+    """Two independently switchable paths to the same real Redis server."""
+    from .harness.toxiproxy import RedisToxiProxy, toxiproxy_reachable
+
+    if not toxiproxy_reachable(TOXIPROXY_API_URL):
+        pytest.skip(f"Toxiproxy not reachable at {TOXIPROXY_API_URL}")
+
+    proxies = (
+        RedisToxiProxy(
+            api_url=TOXIPROXY_API_URL,
+            name="resource-cleanup-a",
+            listen_port=8666,
+            upstream=TOXIPROXY_REDIS_UPSTREAM,
+        ),
+        RedisToxiProxy(
+            api_url=TOXIPROXY_API_URL,
+            name="resource-cleanup-b",
+            listen_port=8667,
+            upstream=TOXIPROXY_REDIS_UPSTREAM,
+        ),
+    )
+    for proxy in proxies:
+        proxy.create()
+    try:
+        yield proxies
+    finally:
+        for proxy in proxies:
+            try:
+                proxy.delete()
+            except Exception:
+                pass

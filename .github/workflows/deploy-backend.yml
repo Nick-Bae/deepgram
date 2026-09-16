@@ -49,6 +49,9 @@ jobs:
           #     Keep this at 0 until Memorystore is provisioned AND the
           #     two-instance cross-instance test has passed on a tagged
           #     revision. Do not flip to 1 without that verification.
+          #   * ROOM_RECONCILER_ENABLED=0 — PR-T1-C ships the Firestore
+          #     reconciler dark. Enable only after F-8/F-24 are green and the
+          #     production dark-metric baseline has been reviewed.
           #   * CORS_ALLOW_ORIGINS pinned to the four production hostnames.
           #     The temporary PR #16 test workflow appended a Vercel preview
           #     origin; this line restores the prod-only baseline every deploy
@@ -66,7 +69,7 @@ jobs:
             --memory=1Gi \
             --timeout=3600 \
             --cpu-boost \
-            --update-env-vars="^|^REDIS_ENABLED=0|CORS_ALLOW_ORIGINS=https://www.worshiptranslate.com,https://worshiptranslate.com,https://www.worshiptranslation.com,https://worshiptranslation.com" \
+            --update-env-vars="^|^REDIS_ENABLED=0|ROOM_RECONCILER_ENABLED=0|CORS_ALLOW_ORIGINS=https://www.worshiptranslate.com,https://worshiptranslate.com,https://www.worshiptranslation.com,https://worshiptranslation.com" \
             --quiet
 
       - name: Route 100% traffic to the newly deployed revision

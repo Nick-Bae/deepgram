@@ -1,15 +1,16 @@
 # Resource-cleanup integration harness
 
-Two-process integration harness for the Track 1 resource-cleanup work
-(audit F-15, and later F-8 / F-24 as those close in PR-T1-C).
-
-Currently in scope: **F-15 only** — proving that starting a second
-backend instance does not disrupt an active broadcast on the first.
+Two-process integration harness for the Track 1 resource-cleanup work:
+F-15 startup safety, F-8 missed-terminal recovery, and F-24 Redis
+outage/restore subscription reconciliation.
 
 ## What runs where
 
 - **Redis**: real, on `127.0.0.1:6379` by default. Two backends
   subscribe/publish through it.
+- **Toxiproxy**: independently cuts each backend's connection to the
+  real Redis server for F-8/F-24, then restores it without restarting
+  either backend.
 - **Firestore emulator**: real emulator (needs JRE 21) on
   `127.0.0.1:8085` by default. Both backends read/write the same
   documents through it.
@@ -44,20 +45,27 @@ Then run the harness:
 # Terminal 1 — Redis
 docker run --rm -p 6379:6379 redis:7
 
-# Terminal 2 — Firestore emulator
+# Terminal 2 — Toxiproxy (the upstream name must resolve from this container)
+docker run --rm --add-host=redis:host-gateway \
+    -p 8474:8474 -p 8666:8666 -p 8667:8667 \
+    ghcr.io/shopify/toxiproxy:2.9.0
+
+# Terminal 3 — Firestore emulator
 gcloud emulators firestore start \
     --host-port=127.0.0.1:8085 \
     --project=cleanup-track1-harness
 
-# Terminal 3 — the tests
+# Terminal 4 — the tests
 cd backend
+export HARNESS_TOXIPROXY_REDIS_UPSTREAM=redis:6379
 pytest tests/integration/resource_cleanup/ -v
 ```
 
-If either Redis or the emulator isn't reachable at collection time,
-the whole suite skips with a clear message. CI's harness job fails
-the run on any unexpected skip, so this cannot hide a broken harness
-in green CI.
+If Redis or the emulator isn't reachable at collection time, the whole
+suite skips with a clear message. The outage tests also require the
+Toxiproxy control API and skip explicitly when it is absent. CI's harness
+job fails the run on any unexpected skip, so neither condition can hide a
+broken harness in green CI.
 
 ## Acceptance gate for F-15
 
@@ -76,11 +84,16 @@ pre-PR-T1-A code — restore
 That bisection is the "harness catches the actual defect" acceptance
 criterion the reviewer required.
 
-## Not in scope for this PR
+## Covered recovery gates
 
-- F-8 (missed terminal broadcast recovery via the reconciler).
-- F-24 (Redis outage → cleanup → recovery).
+- **F-8:** instance B loses Redis before the terminal fanout. Instance A
+  receives the Redis fast-path message; B does not. B later observes
+  `status=ended` in Firestore and closes its local listener.
+- **F-24:** Redis is unavailable while a room ends. Local cleanup still
+  completes. After Redis returns, `PUBSUB NUMSUB` proves the ended-room
+  channel stays unsubscribed while an unrelated live-room channel is
+  restored.
+
+## Still not in scope
+
 - F-9 (SIGTERM close-code semantics).
-
-Those land alongside PR-T1-C / PR-T1-D and will reuse this harness's
-Deepgram stub + subprocess launcher + Firestore seeding.

@@ -116,6 +116,11 @@ class ListenerClient:
     async def is_open(self) -> bool:
         return _ws_looks_open(self.ws)
 
+    async def wait_closed(self, *, timeout: float = 10.0) -> None:
+        if self.ws is None:
+            return
+        await asyncio.wait_for(self.ws.wait_closed(), timeout=timeout)
+
     async def wait_for_frame(self, predicate, *, timeout: float = 10.0) -> dict:
         """Poll `self.received` for the first frame matching `predicate`."""
         deadline = time.monotonic() + timeout
