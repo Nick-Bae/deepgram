@@ -1,0 +1,69 @@
+# A1 — Reconciler freshness absence.
+#
+# Fires when reconciler_success_ticks has no data for 15 minutes.
+# NOT 3 × interval_seconds (30s * 3 = 90s): Cloud Monitoring log-based
+# metrics can be delayed up to ~10 minutes, and Google recommends a
+# rolling window of at least 10 minutes for absence alerts. 15 minutes
+# gives operational headroom past that documented delay.
+#
+# Cross-revision aggregation matters here. Cloud Run log-based
+# metrics produce one time series per (service, revision). If A1
+# watched each revision series independently, every deploy would
+# make the retired revision appear "absent" once traffic finished
+# migrating, and A1 would page ops on healthy rollouts. The
+# aggregation below reduces all revision-scoped series into ONE
+# service-level series (grouped only by service_name), so a healthy
+# service with any recent successful tick — regardless of which
+# revision emitted it — keeps this alert quiet.
+#
+# Caveat documented in the description: an absence condition never
+# fires until the metric has received at least one data point. If
+# the reconciler is disabled since deploy time, this policy will
+# stay silent forever until the flag is flipped and a first
+# successful tick lands.
+displayName: "Reconciler freshness — no successful ticks in 15m"
+combiner: OR
+enabled: true
+documentation:
+  mimeType: text/markdown
+  content: |
+    The room reconciler has not emitted a `reconciler_tick` with
+    `outcome=ok` for 15 minutes. Either the reconciler task has
+    crashed, the process is unhealthy, or Firestore has been
+    unreachable long enough that every tick during the window
+    fell into an error outcome.
+
+    Debug steps:
+      1. Confirm `ROOM_RECONCILER_ENABLED=1` in the running revision.
+      2. Check Cloud Logging for `component="room_reconciler"`
+         entries — look for `reconciler_tick` events with any
+         outcome, and for `event="reconciler_diagnostic"` entries
+         with kind=`loop_error` traces.
+      3. Check Firestore reachability from Cloud Run.
+
+    Caveat: an absence policy cannot fire until it has first
+    received a data point. If this alert appears never to fire in
+    a healthy deploy, verify the reconciler is enabled (metric
+    filter uses `outcome="ok"`).
+conditions:
+  - displayName: reconciler_success_ticks absent for 15m (service-level)
+    conditionAbsent:
+      filter: |-
+        resource.type="cloud_run_revision"
+        AND metric.type="logging.googleapis.com/user/reconciler_success_ticks"
+      duration: 900s
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_RATE
+          # Reduce every revision-scoped series into ONE
+          # service-level series so retiring a revision on deploy
+          # doesn't create a false absence.
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - "resource.label.service_name"
+alertStrategy:
+  autoClose: 86400s
+userLabels:
+  managed_by: reconciler-monitoring
+  resource_id: a1_freshness_absence
+notificationChannels: __NOTIFICATION_CHANNELS__

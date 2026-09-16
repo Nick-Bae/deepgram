@@ -5,3 +5,10 @@
 pytest>=8.0
 pytest-asyncio>=0.23
 fakeredis>=2.20
+# Explicit: ops/monitoring/reconciler/validate.py imports PyYAML.
+# It is present transitively via requirements.txt today, but
+# declaring it here decouples the validator from that transitive
+# hop — the monitoring stack must not silently break when a
+# production dep is reshuffled.
+PyYAML>=6.0
+

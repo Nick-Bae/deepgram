@@ -1,0 +1,27 @@
+# Per-action counter. Labeled by `reason`, a bounded enum
+# {ended_room_local_cleanup, cleanup_error}.
+#
+# Room ID and org ID appear ONLY in the log body — not as labels.
+# Cloud Monitoring rejects high-cardinality labels, and unbounded
+# per-room labels would exceed the limit within a few live rooms.
+name: reconciler_actions
+description: >-
+  Per-cleanup action counter, labeled by bounded reason. Feeds the
+  dashboard's recovery-frequency chart. NOT used as an alert source
+  in this PR — the recovery-rate alert (alerts/a4_actions_rate.yaml)
+  ships disabled until a production baseline is observed.
+filter: |-
+  resource.type="cloud_run_revision"
+  AND resource.labels.service_name="__CLOUD_RUN_SERVICE__"
+  AND jsonPayload.component="room_reconciler"
+  AND jsonPayload.event="reconciler_action"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: reason
+      valueType: STRING
+      description: One of {ended_room_local_cleanup, cleanup_error}.
+labelExtractors:
+  reason: EXTRACT(jsonPayload.reason)

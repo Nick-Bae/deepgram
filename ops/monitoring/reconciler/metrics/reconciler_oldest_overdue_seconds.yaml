@@ -1,0 +1,25 @@
+# Distribution of the oldest-overdue-cleanup age reported per tick.
+# Log-based metrics do NOT support true gauges; a distribution over
+# ticks lets the dashboard show percentile trends while accepting
+# that each data point represents a specific tick's observation.
+name: reconciler_oldest_overdue_seconds
+description: >-
+  Distribution of the reconciler's oldest-overdue-cleanup age
+  (seconds) per tick. Dashboard shows p50 / p95 / p99. NOT used as an
+  alert source directly — the overdue alert is on the counter of
+  overdue ticks, and this distribution is for trend visibility.
+filter: |-
+  resource.type="cloud_run_revision"
+  AND resource.labels.service_name="__CLOUD_RUN_SERVICE__"
+  AND jsonPayload.component="room_reconciler"
+  AND jsonPayload.event="reconciler_tick"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: DISTRIBUTION
+  unit: "s"
+valueExtractor: EXTRACT(jsonPayload.oldest_overdue_cleanup_seconds)
+bucketOptions:
+  exponentialBuckets:
+    numFiniteBuckets: 12
+    growthFactor: 2.0
+    scale: 1.0

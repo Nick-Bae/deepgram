@@ -1,0 +1,22 @@
+# Counter of ticks whose snapshot reported at least one
+# terminal-with-resources room past the cleanup deadline.
+#
+# We use a counter (not a gauge) because Cloud Logging log-based
+# metrics don't support true gauges. The reconciler emits `overdue:
+# true` on every tick where `terminal_rooms_with_resources > 0`; this
+# metric counts those ticks. The A2 alert fires on this counter's
+# rate.
+name: reconciler_overdue_ticks
+description: >-
+  Ticks that observed at least one Firestore-terminal room whose
+  local cleanup has not completed. Drives the overdue-cleanup alert.
+filter: |-
+  resource.type="cloud_run_revision"
+  AND resource.labels.service_name="__CLOUD_RUN_SERVICE__"
+  AND jsonPayload.component="room_reconciler"
+  AND jsonPayload.event="reconciler_tick"
+  AND jsonPayload.overdue="true"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"

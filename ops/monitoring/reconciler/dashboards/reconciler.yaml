@@ -1,0 +1,124 @@
+# One-page reconciler dashboard. Operators view this while
+# investigating any of the alert policies in ../alerts/.
+#
+# Layout: 6 tiles in a 2×3 grid. Freshness heartbeat top-left;
+# overdue metrics side-by-side; per-outcome and per-reason
+# breakdowns below.
+displayName: "Room Reconciler — Track 1"
+labels:
+  managed_by: reconciler-monitoring
+  resource_id: reconciler_dashboard
+mosaicLayout:
+  columns: 12
+  tiles:
+    - width: 6
+      height: 4
+      widget:
+        title: Freshness heartbeat — successful ticks per minute
+        xyChart:
+          dataSets:
+            - timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: |-
+                    resource.type="cloud_run_revision"
+                    AND metric.type="logging.googleapis.com/user/reconciler_success_ticks"
+                  aggregation:
+                    alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_RATE
+                    crossSeriesReducer: REDUCE_SUM
+              plotType: LINE
+    - xPos: 6
+      width: 6
+      height: 4
+      widget:
+        title: Tick outcomes — grouped by outcome
+        xyChart:
+          dataSets:
+            - timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: |-
+                    resource.type="cloud_run_revision"
+                    AND metric.type="logging.googleapis.com/user/reconciler_tick_outcomes"
+                  aggregation:
+                    alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_RATE
+                    crossSeriesReducer: REDUCE_SUM
+                    groupByFields:
+                      - "metric.label.outcome"
+              plotType: STACKED_BAR
+    - yPos: 4
+      width: 6
+      height: 4
+      widget:
+        title: Overdue ticks — rate
+        xyChart:
+          dataSets:
+            - timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: |-
+                    resource.type="cloud_run_revision"
+                    AND metric.type="logging.googleapis.com/user/reconciler_overdue_ticks"
+                  aggregation:
+                    alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_RATE
+                    crossSeriesReducer: REDUCE_SUM
+              plotType: LINE
+    - yPos: 4
+      xPos: 6
+      width: 6
+      height: 4
+      widget:
+        title: Oldest overdue cleanup — distribution
+        xyChart:
+          dataSets:
+            - timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: |-
+                    resource.type="cloud_run_revision"
+                    AND metric.type="logging.googleapis.com/user/reconciler_oldest_overdue_seconds"
+                  aggregation:
+                    alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_PERCENTILE_95
+                    crossSeriesReducer: REDUCE_MAX
+              plotType: LINE
+    - yPos: 8
+      width: 6
+      height: 4
+      widget:
+        title: Recovery actions — grouped by reason
+        xyChart:
+          dataSets:
+            - timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: |-
+                    resource.type="cloud_run_revision"
+                    AND metric.type="logging.googleapis.com/user/reconciler_actions"
+                  aggregation:
+                    alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_RATE
+                    crossSeriesReducer: REDUCE_SUM
+                    groupByFields:
+                      - "metric.label.reason"
+              plotType: STACKED_BAR
+    - yPos: 8
+      xPos: 6
+      width: 6
+      height: 4
+      widget:
+        title: Recent tick snapshots (cleanup_inflight in body)
+        # Logs panel intentionally — a distribution over the
+        # `cleanup_inflight` snapshot (mostly 0 or 1 during normal
+        # operation) would return misleading p95/p99 values.
+        # Operators looking at "is cleanup actually running?"
+        # should read the raw JSON bodies of recent ticks; the
+        # `cleanup_inflight` field is captured in every tick event.
+        logsPanel:
+          # Scoped to the same Cloud Run service the metrics are —
+          # the __CLOUD_RUN_SERVICE__ placeholder is substituted at
+          # apply time. Without it the panel would show ticks from
+          # every service in the project.
+          filter: |-
+            resource.type="cloud_run_revision"
+            AND resource.labels.service_name="__CLOUD_RUN_SERVICE__"
+            AND jsonPayload.component="room_reconciler"
+            AND jsonPayload.event="reconciler_tick"

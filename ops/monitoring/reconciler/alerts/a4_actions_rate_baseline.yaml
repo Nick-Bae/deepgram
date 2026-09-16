@@ -1,0 +1,63 @@
+# A4 — Recovery-frequency baseline. DISABLED at deploy time.
+#
+# Ships disabled deliberately: no production baseline for
+# `reconciler_actions{reason="ended_room_local_cleanup"}` exists
+# yet, and Cloud Monitoring rejects thresholds picked without one
+# as noise. Reviewer requirement: create the policy, observe the
+# first production window, then re-enable with a chosen threshold.
+#
+# When enabling:
+#   1. Flip `enabled: true`.
+#   2. Set `thresholdValue` from the observed p95 of the recovery
+#      rate during a healthy window.
+#   3. Update the documentation section with the observed baseline.
+#
+# The `enabled: false` here IS the acceptance condition — the apply
+# script uploads this definition but the policy stays quiet.
+displayName: "Reconciler recovery actions — abnormally high rate (DISABLED PLACEHOLDER)"
+combiner: OR
+enabled: false
+documentation:
+  mimeType: text/markdown
+  content: |
+    Placeholder policy. Records the shape a future rate alert on
+    `reconciler_actions{reason=ended_room_local_cleanup}` will
+    take. NOT active in production.
+
+    Enable only after:
+      1. The reconciler has been enabled in production for at
+         least one week.
+      2. The observed p95 of the recovery-action rate has been
+         reviewed and a defensible threshold chosen.
+      3. This documentation section has been updated with the
+         chosen threshold and its rationale.
+
+    A `reconciler_action` firing during normal operation means a
+    primary path (End Service → Redis fanout) silently failed. A
+    healthy production baseline should be near zero.
+conditions:
+  - displayName: reconciler_actions rate — placeholder (disabled)
+    conditionThreshold:
+      filter: |-
+        resource.type="cloud_run_revision"
+        AND metric.type="logging.googleapis.com/user/reconciler_actions"
+        AND metric.label.reason="ended_room_local_cleanup"
+      comparison: COMPARISON_GT
+      # Deliberately impossible threshold so an accidental
+      # `enabled: true` flip without a real baseline still can't
+      # page ops on noise.
+      thresholdValue: 1000000
+      # See A2 for the duration=0s / alignmentPeriod=600s rationale.
+      duration: 0s
+      aggregations:
+        - alignmentPeriod: 600s
+          perSeriesAligner: ALIGN_SUM
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - "resource.label.service_name"
+alertStrategy:
+  autoClose: 86400s
+userLabels:
+  managed_by: reconciler-monitoring
+  resource_id: a4_actions_rate_baseline
+notificationChannels: __NOTIFICATION_CHANNELS__
