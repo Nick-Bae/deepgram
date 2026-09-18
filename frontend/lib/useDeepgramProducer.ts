@@ -8,6 +8,7 @@ import {
   type StreamContext,
 } from "../utils/streamContext";
 import { enforceSecureProtocol } from "../utils/urls";
+import { isTerminalRoomClose } from "./wsCloseClassify";
 
 type StartOptions = {
   sourceLang?: string;
@@ -314,12 +315,34 @@ export function useDeepgramProducer(): DeepgramProducerController {
 
       ws.onclose = (event) => {
         if (wsRef.current === ws) wsRef.current = null;
+        // Terminal (room_ended / 4001) vs transient (1001, 1006,
+        // 1012 SIGTERM from Uvicorn, network drops). Classify BEFORE
+        // the shouldRunRef / terminalErrorRef checks so a room_ended
+        // close doesn't fall through into a reconnect loop.
+        const isTerminalRoom = isTerminalRoomClose({ code: event.code, reason: event.reason });
         console.warn("[FE][DG][socket-closed]", {
           code: event.code,
           reason: event.reason || "",
           wasClean: event.wasClean,
-          reconnecting: shouldRunRef.current && !terminalErrorRef.current,
+          isTerminalRoom,
+          reconnecting: !isTerminalRoom
+            && shouldRunRef.current
+            && !terminalErrorRef.current,
         });
+        if (isTerminalRoom) {
+          // The room is over. Stop producing, release mic + audio
+          // pipeline, do not reconnect. Without this, a host whose
+          // room ended would loop reconnecting forever (or bounce
+          // between reconnect and backend re-closes).
+          shouldRunRef.current = false;
+          terminalErrorRef.current = false;
+          clearReconnectTimer();
+          releaseMediaPipeline();
+          applyInputMuted(false);
+          setStatus("stopped");
+          setPartial("");
+          return;
+        }
         if (terminalErrorRef.current) {
           setStatus("error");
           return;
@@ -328,6 +351,9 @@ export function useDeepgramProducer(): DeepgramProducerController {
           setStatus("stopped");
           return;
         }
+        // Transient close (1001, 1006, 1012, other). Preserve the
+        // running intent AND the media pipeline — reconnect uses
+        // the existing mic stream without re-prompting the browser.
         scheduleReconnect();
       };
 

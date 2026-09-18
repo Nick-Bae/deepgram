@@ -121,6 +121,16 @@ class ListenerClient:
             return
         await asyncio.wait_for(self.ws.wait_closed(), timeout=timeout)
 
+    def close_code(self) -> Optional[int]:
+        """Close code observed after `wait_closed()`. `None` if the
+        socket is still open (or never opened)."""
+        return getattr(self.ws, "close_code", None) if self.ws is not None else None
+
+    def close_reason(self) -> str:
+        """Close reason observed after `wait_closed()`. Empty string
+        if there is none."""
+        return getattr(self.ws, "close_reason", "") or "" if self.ws is not None else ""
+
     async def wait_for_frame(self, predicate, *, timeout: float = 10.0) -> dict:
         """Poll `self.received` for the first frame matching `predicate`."""
         deadline = time.monotonic() + timeout
@@ -247,6 +257,17 @@ class HostClient:
 
     async def is_open(self) -> bool:
         return _ws_looks_open(self.ws)
+
+    async def wait_closed(self, *, timeout: float = 10.0) -> None:
+        if self.ws is None:
+            return
+        await asyncio.wait_for(self.ws.wait_closed(), timeout=timeout)
+
+    def close_code(self) -> Optional[int]:
+        return getattr(self.ws, "close_code", None) if self.ws is not None else None
+
+    def close_reason(self) -> str:
+        return getattr(self.ws, "close_reason", "") or "" if self.ws is not None else ""
 
     async def close(self) -> None:
         # Cancellation-safe teardown. Each step isolated.

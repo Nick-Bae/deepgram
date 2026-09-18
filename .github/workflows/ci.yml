@@ -287,5 +287,5 @@ jobs:
       - name: TypeScript type-check
         run: npx tsc --noEmit
 
-      - name: Viewer display regression tests
-        run: npm run test:viewer-display
+      - name: Frontend regression tests
+        run: npm test

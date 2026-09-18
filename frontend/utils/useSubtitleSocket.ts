@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { appendStreamContextToUrl, resolveStreamContext, type StreamContext } from "./streamContext";
 import { API_URL, enforceSecureProtocol } from "./urls";
+import { isTerminalRoomClose } from "../lib/wsCloseClassify";
 
 type InterimKR = { type: "interim_kr"; text: string };
 type FinalKR   = { type: "final_kr";  text: string };
@@ -475,8 +476,10 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
           // Terminal close: the server has ended the room. Do not reconnect —
           // otherwise a forgotten viewer page would immediately establish a
           // fresh socket, and every close_room_listeners round would re-open
-          // the exact leak we set out to fix.
-          if (event.reason === "room_ended" || event.code === 4001) {
+          // the exact leak we set out to fix. Uvicorn's 1012 SIGTERM close
+          // must NOT reach this branch — it falls through to reconnect via
+          // isTerminalRoomClose's classification.
+          if (isTerminalRoomClose({ code: event.code, reason: event.reason })) {
             stopFlag.current = true;
             setTerminated(true);
             // `effectRoomId` was captured from streamContext at the moment

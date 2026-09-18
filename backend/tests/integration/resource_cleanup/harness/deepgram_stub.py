@@ -133,13 +133,31 @@ class DeepgramStub:
                 pass
         return delivered
 
-    async def wait_for_client(self, *, timeout: float = 10.0) -> None:
-        """Block until at least one backend has connected."""
+    async def client_count(self) -> int:
+        """Return the number of currently connected provider clients."""
+        async with self._lock:
+            return len(self._clients)
+
+    async def wait_for_client_count(
+        self, expected: int, *, timeout: float = 10.0
+    ) -> None:
+        """Block until exactly ``expected`` provider clients are connected."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            async with self._lock:
-                if self._clients:
-                    return
+            if await self.client_count() == expected:
+                return
+            await asyncio.sleep(0.05)
+        raise TimeoutError(
+            f"Deepgram-stub client count did not become {expected} within "
+            f"{timeout:.1f}s (observed {await self.client_count()})"
+        )
+
+    async def wait_for_client(self, *, timeout: float = 10.0) -> None:
+        """Backward-compatible helper: block until at least one client connects."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if await self.client_count() >= 1:
+                return
             await asyncio.sleep(0.05)
         raise TimeoutError(
             "no Deepgram-stub client connected within "
