@@ -31,9 +31,9 @@ What this test locks in:
      we get SIGKILL and lose the pubsub `stop()` cleanup. A short exit
      time here is the smoke test for a fast, clean shutdown.
 
-  5. **Redis pubsub subscriber count drops.** Once A has exited, the
-     room's channel has exactly one subscriber (instance B). Proves A's
-     Redis connection went away — no lingering ghost socket.
+  5. **Redis pubsub subscriber count drops from two to one.** A listener
+     remains connected directly to B throughout both observations, so
+     the exact decrement proves A's connection went away.
 
   6. **A fresh listener connects to B and receives translations.** The
      "reconnect after 1012" side of the contract: transient closes are
@@ -137,10 +137,16 @@ async def _run_f9(admin_store):
     backend_b = None
     host_client = None
     listener_a = None
+    listener_b_sentinel = None
     listener_b_post = None
 
     async def teardown():
-        for target in (listener_b_post, listener_a, host_client):
+        for target in (
+            listener_b_post,
+            listener_b_sentinel,
+            listener_a,
+            host_client,
+        ):
             if target is not None:
                 try:
                     await target.close()
@@ -214,8 +220,9 @@ async def _run_f9(admin_store):
 
         channel = _room_channel(org_id, room_id)
 
-        # (5) Attach a listener + a host to instance A. No client on B
-        # yet — B is just running as a Redis subscriber standby.
+        # (5) Attach a listener + a host to instance A, plus a sentinel
+        # listener directly to B. The sentinel stays connected through
+        # both Redis assertions, making the expected counts exact.
         listener_a = ListenerClient(
             backend_a.ws_url,
             org_id=org_id,
@@ -229,6 +236,19 @@ async def _run_f9(admin_store):
             timeout=15.0,
         )
 
+        listener_b_sentinel = ListenerClient(
+            backend_b.ws_url,
+            org_id=org_id,
+            room_id=room_id,
+            service_key=service_key,
+            church_slug=slug,
+        )
+        await listener_b_sentinel.connect()
+        await listener_b_sentinel.wait_for_frame(
+            lambda m: m.get("type") == "JOINED" and m.get("roomId") == room_id,
+            timeout=15.0,
+        )
+
         host_client = HostClient(
             backend_a.ws_url,
             org_id=org_id,
@@ -238,18 +258,18 @@ async def _run_f9(admin_store):
             host_token=HOST_TOKEN,
         )
         await host_client.connect()
-        await deepgram_stub.wait_for_client(timeout=15.0)
+        await deepgram_stub.wait_for_client_count(1, timeout=15.0)
 
         # Give A's subscriber time to actually register on Redis (the
         # subscribe happens on first broadcast, so this poll gives it
         # a chance to appear). Failing to see A here would mean the
         # broadcast pipeline never armed — pipeline bug, not F-9.
-        def _pred_a_subscribed():
-            return _numsub(channel) >= 1
+        def _pred_both_subscribed():
+            return _numsub(channel) == 2
 
-        assert _wait_for(_pred_a_subscribed, timeout=10.0), (
-            f"instance A did not appear in Redis PUBSUB NUMSUB for {channel!r}. "
-            f"The subscribe pathway is broken; F-9 cannot observe a drop."
+        assert _wait_for(_pred_both_subscribed, timeout=10.0), (
+            f"expected exactly two Redis subscribers for {channel!r} before "
+            f"SIGTERM (A listener + B sentinel), observed {_numsub(channel)}."
         )
 
         # (6) Baseline: a marker delivered through A proves the whole
@@ -275,6 +295,9 @@ async def _run_f9(admin_store):
             return _pred
 
         await listener_a.wait_for_frame(_has_marker(baseline_marker), timeout=20.0)
+        await listener_b_sentinel.wait_for_frame(
+            _has_marker(baseline_marker), timeout=20.0
+        )
 
         # Snapshot the listener frame count so we can prove NO further
         # terminal frame arrived during shutdown.
@@ -284,7 +307,19 @@ async def _run_f9(admin_store):
         # helper, no _on_shutdown hook invocation from Python — the
         # kernel delivers SIGTERM to the uvicorn PID exactly as Cloud
         # Run does on instance restart.
+        sigterm_at = time.monotonic()
         os.kill(backend_a.proc.pid, signal.SIGTERM)
+
+        # Bound the real process exit at the signal boundary. The wait
+        # runs in a worker so the event loop remains free to service the
+        # WebSocket clients and provider stub close handshake.
+        await asyncio.to_thread(backend_a.proc.wait, timeout=9.5)
+        exited_at = time.monotonic()
+        shutdown_elapsed = exited_at - sigterm_at
+        assert shutdown_elapsed < 10.0, (
+            f"backend A took {shutdown_elapsed:.3f}s to exit after SIGTERM; "
+            "Cloud Run may SIGKILL the process at approximately 10s"
+        )
 
         # (8) The client-side WebSockets must close. Uvicorn 0.34
         # closes them with code 1012 (Service Restart) before its own
@@ -345,15 +380,9 @@ async def _run_f9(admin_store):
         # an empty-list bug can't quietly pass the loop above.
         assert pre_signal_frame_count >= 1, "no baseline frames received"
 
-        # (9) Instance A must actually exit — not just close sockets.
-        # If _on_shutdown hangs, Cloud Run's SIGKILL after 10 s means
-        # we lose the graceful pubsub stop(). Give it a generous
-        # window (Cloud Run's is ~10 s) plus slack for CI slowness.
-        assert backend_a.proc.wait(timeout=20.0) is not None, (
-            "backend A did not exit within 20 s of SIGTERM. Uvicorn or "
-            "the _on_shutdown handler is hanging; Cloud Run would SIGKILL "
-            "and skip pubsub cleanup."
-        )
+        # (9) The provider socket is a paid resource. A's connection must
+        # be gone before B establishes a replacement session.
+        await deepgram_stub.wait_for_client_count(0, timeout=5.0)
 
         # (10) Firestore room stays live. The reconciler on B, or on a
         # fresh A instance later, is the authority on cleanup. The
@@ -367,18 +396,15 @@ async def _run_f9(admin_store):
             f"See test_on_shutdown_structural.py for the static guard."
         )
 
-        # (11) Redis subscriber count for the room channel drops. A had
-        # subscribed; A is gone; only B remains — and B may or may not
-        # be subscribed depending on whether it's seen a broadcast yet.
-        # The invariant we can assert: A is no longer counted. We
-        # subscribe B by publishing through it first (via a fresh
-        # listener), then assert count is exactly 1.
+        # (11) Redis subscriber count drops exactly from two to one.
+        # B's sentinel has remained open, so one cannot be a false pass
+        # caused by A leaking while B was never subscribed.
         def _pred_a_dropped():
-            return _numsub(channel) <= 1
+            return _numsub(channel) == 1
 
         assert _wait_for(_pred_a_dropped, timeout=10.0), (
             f"Redis subscriber count for {channel!r} did not drop after "
-            f"SIGTERM (still {_numsub(channel)}). Instance A left a "
+            f"SIGTERM (observed {_numsub(channel)}, expected 1). Instance A left a "
             f"lingering subscriber; either its connection wasn't closed "
             f"or Redis hasn't cleaned it up. Cloud Run production would "
             f"leak this on every rolling restart."
@@ -414,13 +440,15 @@ async def _run_f9(admin_store):
         )
         try:
             await host_b.connect()
-            await deepgram_stub.wait_for_client(timeout=15.0)
+            await deepgram_stub.wait_for_client_count(1, timeout=15.0)
 
             post_marker = f"post-sigterm-{uuid.uuid4().hex[:6]}"
             delivered = await deepgram_stub.send_transcript(
                 f"안녕하세요 {post_marker}", is_final=True
             )
-            assert delivered >= 1, "Deepgram stub had no client attached (post-SIGTERM host)"
+            assert delivered == 1, (
+                f"expected exactly host B's provider connection, delivered to {delivered}"
+            )
             await listener_b_post.wait_for_frame(
                 _has_marker(post_marker), timeout=20.0
             )
