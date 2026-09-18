@@ -34,7 +34,9 @@ except ImportError:  # pragma: no cover
 # a hex marker like "cross-process-abc123" in the transcript it pushes
 # through the Deepgram stub; that same token must appear in the
 # translated payload the listener receives.
-_MARKER_RE = re.compile(r"(cross-process-[a-f0-9]{4,})|(baseline-[a-f0-9]{4,})")
+_MARKER_RE = re.compile(
+    r"(?:cross-process|baseline|post-sigterm)-[a-f0-9]{4,}"
+)
 
 
 def _extract_marker(text: str) -> str:
