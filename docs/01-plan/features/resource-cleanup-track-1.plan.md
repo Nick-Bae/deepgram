@@ -11,6 +11,13 @@
 
 **Source commit at planning time:** `e63c5d4b` (main, "fix(viewer): resume listener when a new room starts (#18)"). Line-number citations must be re-verified against HEAD before each PR.
 
+**Implementation status (2026-09-17):** PR-T1-A through PR-T1-E are merged. The
+production revision containing PR-T1-D is deployed with
+`ROOM_RECONCILER_ENABLED=0`, `REDIS_ENABLED=0`, and `--max-instances=1`.
+The PR-T1-E monitoring stack was applied on 2026-09-17 with notifications
+routed to a disabled rollout-observation channel. The staged validation in
+§4 remains in progress; Track 1 is not yet complete.
+
 **Companion audit:** [`docs/03-analysis/resource-cleanup-audit.md`](../../03-analysis/resource-cleanup-audit.md) v5. This plan is scoped to the audit's Track 1 (§9a). Track 2 items — host lease, abandonment detector, watchdog behavior changes, real-Redis provisioning, multi-instance scaling — are deliberately outside this plan and remain in the audit's §9a Track 2 list.
 
 ---
@@ -157,7 +164,11 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 
 **What changes**
 
-- Backend: extend `_on_shutdown` in `main.py`. Cancel background tasks (already done); stop pubsub (already done); **new:** iterate `connections_by_room` and `host_presence_by_ws`, close each ws with code `4002` reason `instance_shutdown`. Bounded concurrency and a shared deadline inside the 10-second Cloud Run drain window.
+- Backend: rely on Uvicorn 0.34's real shutdown ordering. Uvicorn closes active
+  WebSockets with code `1012` (Service Restart) before the application shutdown
+  hook runs; `_on_shutdown` then cancels background tasks and stops pubsub. Do
+  not add a second app-level socket-close loop: it races Uvicorn and cannot
+  deterministically replace the already-sent close frame.
 - Frontend, listener side: `useSubtitleSocket` onclose handler distinguishes:
   - `event.code === 1000 && event.reason === "room_ended"` → terminal (existing PR #18 behavior; unchanged).
   - `event.code === 4002` OR `event.code === 1012` → infrastructure reconnect; do NOT tombstone the room; **reuse the existing transient-reconnect policy** (jittered backoff, bounded retries), not a separate mechanism.
@@ -172,15 +183,27 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 **Why this shape**
 
 - `close(1000, "room_ended")` on SIGTERM would make PR #18's client tombstone a room that is actually still live on a sibling instance. That would break rolling deploys once multi-instance is on.
-- `1006` (current) leaves the client reconnecting immediately, which may hit the same shutting-down instance depending on Cloud Run drain timing. A deliberate `4002` with reconnect logic keyed on the code makes the behavior deterministic.
+- Uvicorn's `1012` is the infrastructure-restart signal observed on the real
+  SIGTERM path. Client handling keys it to the existing transient reconnect
+  policy. `4002` remains classified as transient for forward compatibility but
+  is not emitted by the current backend shutdown path.
 
 **Acceptance test**
 
-- **F-9** (Group F, [2P]): send SIGTERM to instance A while it holds active listener and host WSs. Within the drain window, all WSs receive close code 4002 (not `room_ended`); pubsub stopped; provider close attempts logged with outcome; Firestore untouched. Client reconnects and lands on instance B, which is still serving the room. Test the full server shutdown sequence, not `_on_shutdown()` in isolation.
+- **F-9** (Group F, [2P]): send SIGTERM to instance A while it holds active
+  listener and host WSs. Require process exit in under 10 seconds; both clients
+  receive `1012` (never `room_ended`); Redis `NUMSUB` drops exactly 2 → 1 while
+  B's sentinel stays connected; the provider-client count transitions exactly
+  1 → 0 → 1; Firestore remains live; and a fresh listener and host reconnect to
+  B and deliver one post-SIGTERM marker. Test the full server shutdown sequence,
+  not `_on_shutdown()` in isolation.
 
 **Risk**
 
-- Medium. Backend change is small; frontend change touches the terminal-detection logic PR #18 introduced and PR #16 depends on. Test coverage in `useSubtitleSocket` must include both existing terminal cases (room_ended, 4001) and the new infrastructure case (4002) to prevent regression of PR #18.
+- Medium. The frontend change touches the terminal-detection logic PR #18
+  introduced and PR #16 depends on. Test coverage in `useSubtitleSocket` and
+  the host hook includes both existing terminal cases (`room_ended`, `4001`),
+  Uvicorn's `1012`, and the reserved `4002` infrastructure code.
 
 ---
 
@@ -188,19 +211,22 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 
 **What changes**
 
-- **Complementary metrics** not yet emitted by PR-T1-C:
-  - `reconciler_lag_seconds` histogram (recorded on completion; complement to `oldest_overdue_cleanup_seconds`, which fires without needing a completion event).
-  - `stt_provider_close_total{provider, outcome}` counter (provider close success/timeout observation on the disconnect path).
-  - `sigterm_client_close_total{code}` counter (sanity check that PR-T1-D closes go out as `4002`, never `room_ended`).
-  - Owner-map size gauges: `connections_by_room_size`, `host_presence_by_ws_size`, `host_shutdown_cb_by_ws_size`, `redis_subscription_refcount`, `locally_owned_rooms_size` — the baseline-leak surface, alerted on monotonic growth over hours, NOT on "> 0" (F-21).
-- **Cloud Logging → Cloud Monitoring adapter** for all Track 1 metrics: log-based metrics or a small metrics-writer helper that pulls from the structured log lines PR-T1-C already emits. Alert policies configured against these.
-- **Dashboards.** One-page operator view: overdue-cleanup gauges, reconciler ticks by outcome, owner-map sizes, SIGTERM close-code distribution, last-successful-reconciliation-at freshness.
+- **Cloud Logging → Cloud Monitoring adapter** for the bounded structured
+  events emitted by PR-T1-C. Cloud Logging has counters and distributions, not
+  true gauges, so the deployed contract is five log-based metrics:
+  `reconciler_success_ticks`, `reconciler_tick_outcomes{outcome}`,
+  `reconciler_actions{reason}`, `reconciler_overdue_ticks`, and
+  `reconciler_oldest_overdue_seconds`.
+- **Dashboards.** One-page operator view: successful-tick freshness, tick
+  outcomes, overdue observations, overdue-age percentiles, recovery actions,
+  and raw cleanup lifecycle logs. An unmatched `cleanup_started` /
+  `cleanup_finished` pair is the in-flight-stall signal.
 - **Alert policies:**
   - `terminal_rooms_with_resources ≥ 1` sustained past the 60s acceptance target → page.
   - `oldest_overdue_cleanup_seconds` above target → page.
-  - `last_successful_reconciliation_at` not advancing for > 3 × interval (i.e., > 90s at default 30s interval) → page. **External check, not driven by the process's own log absence** (a wedged process may stop emitting; the alert must catch that). Cloud Monitoring's "absence" condition or a separate Cloud Scheduler-driven ping.
-  - `sigterm_client_close_total{code=1000}` with reason room_ended during a deploy → page (would indicate PR-T1-D regressed).
-  - `owner_map_*_size` monotonic increase over 6h without matching decreases → page (baseline leak).
+  - `reconciler_success_ticks` absent for 15 minutes → page. This is an
+    external Cloud Monitoring absence condition aggregated across revisions;
+    the 15-minute threshold accommodates log-based metric ingestion latency.
   - `reconciler_actions_total{reason=ended_room_local_cleanup}` rate > SLO threshold during *normal* operation → page (primary paths silently failing). **NOT a rollback trigger; alert for investigation.**
 - **Cleanup deadline** for `oldest_overdue_cleanup_seconds` starts from Firestore `endedAt` (fallback: from the moment a cleanup was requested if that predates the write).
 
@@ -211,7 +237,11 @@ Each PR has a single purpose, its own acceptance tests, and can be merged and de
 
 **Acceptance criteria (not tests — production readiness evidence)**
 
-- All alert policies deployed and their dry-run/silent-alert channels observed for 24h before any of them are wired to paging.
+- All alert policies deployed and routed to a disabled rollout channel for a
+  24-hour observation period before any channel is enabled for paging. While
+  `ROOM_RECONCILER_ENABLED=0`, no reconciler ticks exist and the absence alert
+  cannot start its clock until its first data point; this period validates
+  resource configuration and accidental-alert behavior, not runtime liveness.
 - Dashboard reviewed by whoever will actually be on-call for Track 1 changes; questions from that review answered before production reconciler enable (§4 step 4).
 - F-18 alert fires in staging with the seeded stuck-cleanup fixture; F-21 does not fire under a long healthy broadcast.
 
@@ -248,13 +278,23 @@ Reconciler and SIGTERM close-code both ship dark. Order of enable:
 
 1. **Local + CI.** All doubles-based tests (F-15, F-23, F-16, F-18, F-21, transaction-retry, cleanup-idempotence) pass on every PR. CI harness for metrics assertions in place.
 2. **Docker-compose integration environment.** Real Redis + two uvicorn workers + Firestore emulator. Manual + scripted runs of F-8, F-9, F-14, F-24. Instance IDs recorded in log lines so tests can prove traffic actually crossed processes.
-3. **Production, dark.** All PRs merged and deployed with reconciler flag `ROOM_RECONCILER_ENABLED=0`. Metrics emitting. Verify baseline: `terminal_rooms_with_resources` reads 0 during normal operation; owner-map size gauges look stable over 24h.
+3. **Production, dark.** All PRs merged and deployed with reconciler flag
+   `ROOM_RECONCILER_ENABLED=0`. Apply the PR-T1-E monitoring stack and route it
+   to a disabled rollout channel for 24 hours; review the dashboard and policy
+   configuration. A disabled reconciler emits no ticks, so no runtime metric
+   baseline is claimed at this stage.
 4. **Production, reconciler enabled.** Flip `ROOM_RECONCILER_ENABLED=1`. Success criteria over the next 24h:
    - `reconciler_actions_total{reason=ended_room_local_cleanup}` is near-zero. If it's not, the primary paths are silently failing and Track 1 has surfaced a pre-existing bug — investigate before proceeding.
    - `terminal_rooms_with_resources` stays 0 or returns to 0 within the acceptance deadline whenever it briefly rises.
    - `oldest_overdue_cleanup_seconds` p99 stays under the acceptance target (proposed 60s).
    - No false terminations (compare against Firestore audit log).
-5. **SIGTERM close code verified in production.** Trigger a deploy; observe `sigterm_client_close_total{code=4002}` fires (not `code=1006`) and that frontend clients reconnect against `/resolve` and land on the newly serving instance without tombstoning.
+5. **SIGTERM behavior verified in production.** Trigger a controlled deploy
+   while a host and listener are active. Confirm both reconnect against
+   `/resolve`, the room is not tombstoned, and service continues on the new
+   revision. Uvicorn `1012` is the tested close contract; current production
+   monitoring does not expose a server-side close-code counter, so retain the
+   CI F-9 contract as the automated close-code guard and record browser/network
+   evidence for this production gate.
 
 Track 1 exit criteria are met when steps 1–5 all show green over a 7-day soak period.
 
@@ -267,7 +307,9 @@ Track 1 exit criteria are met when steps 1–5 all show green over a 7-day soak 
 Per-change rollbacks:
 
 - **Reconciler (PR-T1-C):** `ROOM_RECONCILER_ENABLED=0`. Immediate.
-- **SIGTERM close code (PR-T1-D):** revert PR-T1-D. Client-side reverts to treating 4002 as an unknown close, which its existing "abnormal close, retry with backoff" branch handles cleanly. The host STT hook reverts similarly.
+- **SIGTERM close handling (PR-T1-D):** revert PR-T1-D. This removes the shared
+  close classifier and returns host/listener handling to their prior paths;
+  validate `1012` reconnect behavior explicitly before taking that action.
 - **Startup safety (PR-T1-A):** revert PR-T1-A. Restores current behavior. Only meaningful if Track 1 has also flipped multi-instance — which it does not — so revert is low-consequence.
 - **Sweeper transaction wrapper (PR-T1-B):** revert PR-T1-B. Restores the current stale-read behavior. Undesirable but not a regression from today.
 - **Monitoring (PR-T1-E):** revert PR-T1-E. No runtime effect other than losing observability. PR-T1-C's minimum-required signals remain since they are in a separate PR.
@@ -298,7 +340,11 @@ Rollback dependencies to remember: **flag flip first (reconciler), reverts secon
 
 1. **Metric backend.** Structured JSON log lines feeding Cloud Logging initially. PR-T1-C emits the raw signals as log lines; PR-T1-E's adapter turns them into Cloud Monitoring log-based metrics with alert policies. **The `last_successful_reconciliation_at` freshness alert MUST be an external check** (Cloud Monitoring absence condition, or a small Cloud Scheduler ping) — a wedged process that stops logging must still trigger the alert, and it can't do that via its own log stream.
 2. **Reconciler interval.** Configurable, default 30s (`ROOM_RECONCILER_INTERVAL_SEC`). Acceptance target: cleanup within 60s of confirmed termination under healthy Firestore, **including during Redis outages** (reconciler is Redis-independent by design). Supported load: single-digit rooms per instance in current production; tests must confirm this under 50 concurrent rooms as a headroom check.
-3. **Client reconnect backoff after 4002.** Reuse the existing transient-reconnect policy in `useSubtitleSocket` (jittered exponential backoff, bounded retries). No new mechanism unless F-9's assertions reveal one is needed. Test coverage must confirm that **neither host nor listener treats 4002 (or 1012) as terminal**, and that both reconnect via `/resolve` rather than tombstoning.
+3. **Client reconnect backoff after infrastructure shutdown.** Reuse the
+   existing transient-reconnect policy in `useSubtitleSocket` (jittered
+   exponential backoff, bounded retries). Test coverage confirms that neither
+   host nor listener treats Uvicorn `1012` (or reserved code `4002`) as terminal,
+   and that both reconnect via `/resolve` rather than tombstoning.
 4. **Integration harness location.** `backend/tests/integration/resource_cleanup/`. Docker-compose file with:
    - One Redis service.
    - Two backend uvicorn processes with distinct `INSTANCE_ID` env vars, distinct host ports.
