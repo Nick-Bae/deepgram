@@ -49,16 +49,10 @@ jobs:
           #     Keep this at 0 until Memorystore is provisioned AND the
           #     two-instance cross-instance test has passed on a tagged
           #     revision. Do not flip to 1 without that verification.
-          #   * ROOM_RECONCILER_ENABLED=0 — PR-T1-C ships the Firestore
-          #     reconciler dark. While this flag is 0 the reconciler task is
-          #     not scheduled and NOTHING is emitted, so there is no
-          #     "dark-metric baseline" that can exist at this stage. To
-          #     enable safely, deploy PR-T1-E's monitoring stack
-          #     (ops/monitoring/reconciler/apply.sh), then flip this to 1
-          #     in a subsequent reviewed config PR so a first successful
-          #     reconciler tick actually lands. Choose the A4 recovery-
-          #     rate threshold from the observed baseline after that; do
-          #     not flip A4 to enabled without one.
+          #   * ROOM_RECONCILER_ENABLED=1 — enabled after PR-T1-E's monitoring
+          #     stack completed its 24-hour silent observation gate. The first
+          #     successful production tick starts the A1 freshness clock. Keep
+          #     A4 disabled until the documented production baseline exists.
           #   * CORS_ALLOW_ORIGINS pinned to the four production hostnames.
           #     The temporary PR #16 test workflow appended a Vercel preview
           #     origin; this line restores the prod-only baseline every deploy
@@ -76,7 +70,7 @@ jobs:
             --memory=1Gi \
             --timeout=3600 \
             --cpu-boost \
-            --update-env-vars="^|^REDIS_ENABLED=0|ROOM_RECONCILER_ENABLED=0|CORS_ALLOW_ORIGINS=https://www.worshiptranslate.com,https://worshiptranslate.com,https://www.worshiptranslation.com,https://worshiptranslation.com" \
+            --update-env-vars="^|^REDIS_ENABLED=0|ROOM_RECONCILER_ENABLED=1|CORS_ALLOW_ORIGINS=https://www.worshiptranslate.com,https://worshiptranslate.com,https://www.worshiptranslation.com,https://worshiptranslation.com" \
             --quiet
 
       - name: Route 100% traffic to the newly deployed revision
