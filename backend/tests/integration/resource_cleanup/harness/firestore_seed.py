@@ -126,16 +126,26 @@ def read_room(
 ) -> Optional[Dict[str, Any]]:
     """Read the room's Firestore state via the emulator.
 
-    `timeout` is passed straight through to the Firestore client's
-    per-RPC timeout. That bounds the underlying gRPC call — not just
-    the async await on the wrapper. Wrapping this in
-    `asyncio.wait_for(asyncio.to_thread(...))` cancels the WORKER
-    but leaves the RPC socket stalled, so the RPC timeout is the
-    real safety net.
+    Both `timeout` and `retry=None` are passed through to the
+    Firestore client's `.get()`:
+
+      - `timeout` bounds the underlying gRPC call.
+      - `retry=None` disables the SDK's default retry policy so the
+        deadline isn't extended silently by transparent retries.
+        The outer polling loop already handles retry semantics.
+
+    Design note on cancellation: wrapping this in
+    `asyncio.wait_for(asyncio.to_thread(...))` abandons the AWAIT
+    on the wrapper but does NOT interrupt the worker thread — the
+    thread continues running until the RPC returns or times out on
+    its own. That's why the per-RPC `timeout` + `retry=None` is
+    the real bound; the outer `wait_for` is only a belt-and-braces
+    guard for the exceptional case where the thread hangs OUTSIDE
+    the RPC.
 
     Returns None if the room does not exist.
     """
-    snap = store._room_ref(org_id, room_id).get(timeout=timeout)
+    snap = store._room_ref(org_id, room_id).get(timeout=timeout, retry=None)
     if not snap.exists:
         return None
     return snap.to_dict()
