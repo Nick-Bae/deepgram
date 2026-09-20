@@ -18,7 +18,7 @@ counts and derived statistics appear here.
 | `--max-instances` | `1` (Track 1 constraint) |
 | A4 recovery-rate alert | disabled (no baseline yet) |
 
-## Gate #1 — 24-hour enabled observation
+## Gate 1 — 24-hour enabled observation
 
 **Window:** `2026-09-19T03:24:15Z` → `2026-09-20T03:24:03Z` (24.00 h span).
 
@@ -37,20 +37,29 @@ counts and derived statistics appear here.
 | Gaps > 60 s | **0** | 0 | ✓ |
 | Gaps > 900 s (A1 threshold) | **0** | 0 | ✓ |
 
-Observed mean (35.3 s) exceeds the configured 30 s interval because the
-tick loop is *sleep-then-work*, not *fixed-cadence*: each tick's own
-duration (0–1.1 s in this window) and Cloud Run CPU throttling during
-idle periods extend the effective inter-tick gap. All 65 elevated gaps
-(45–50 s) fit that pattern — no gap approached the A1 15-minute
-absence threshold.
+Observed mean (35.3 s) exceeds the configured 30 s interval. The
+timing is consistent with a *sleep-after-work* loop (each tick's own
+duration was 0–1.1 s in this window) and variable Cloud Run CPU
+scheduling during idle periods. All 65 elevated gaps sat in a narrow
+45–50 s band, and no gap exceeded 49.9 s — well under the A1
+15-minute absence threshold.
 
-### Instance recycling
+### Instance appearance
 
-3 instance IDs appeared in the window, but only one served 97% of it
-(2,381 of 2,449 ticks over 23.36 h). The other two IDs owned a brief
-handover at 04:02 UTC — Cloud Run recycled instances once, no manual
-intervention. `--max-instances=1` was never exceeded because Cloud Run
-serialized the handover.
+Three instance IDs appeared in the window. One served 97% of it
+(2,381 of 2,449 ticks over 23.36 h). During a handover at 04:02–04:03
+UTC, the timestamps show two instances ticking in parallel for about
+62 s before Cloud Run converged on the long-serving instance; no
+overlap was observed at any other point. The 40 s boundary gap on
+either side of that handover is included in the global gap statistics
+above; the max within-instance gap is 49.9 s.
+
+Cloud Run's `--max-instances=1` setting is a steady-state concurrency
+limit, not an absolute-uniqueness guarantee — brief overlap during
+revision or instance transition is expected behavior. Track 1's
+resource-cleanup design is safe under this pattern (`REDIS_ENABLED=0`
+means each instance's local socket map is private, and the reconciler
+gates cleanup on Firestore `status == "ended"` reads).
 
 ### Tick outcomes and telemetry
 
@@ -83,27 +92,28 @@ ticked at 30–31 s cadence continuously through the resource-active
 service (host produced audio, then disconnected, then room ended, then
 reconciler cleaned local state) — no gap in that window exceeded 32 s.
 
-### No false terminations
+### No reconciler-induced false termination
 
 Structural guarantee: the reconciler emits `ended_room_local_cleanup`
 only after reading Firestore `status == "ended"`. It never itself
 writes terminal state (see `test_on_shutdown_structural.py` and the
-`multichurch_store` audit trail). The single cleanup action correlates
-in time with a `[DG] reason=browser_disconnect` event 3 m 38 s earlier
-— a legitimate host-initiated termination.
+`multichurch_store` audit trail). The single cleanup action was
+authorized by Firestore `status == "ended"` and followed an observed
+host WebSocket disconnect (`[DG] reason=browser_disconnect`) 3 m 38 s
+earlier. This is not evidence of reconciler-induced false termination.
 
-### Gate #1 verdict
+### Gate 1 verdict
 
 All four reviewer criteria met:
 
 - No inter-tick gap exceeded the A1 15-minute absence threshold (max 49.9 s).
 - Ticks advanced whenever local WebSocket resources existed (30–31 s cadence in resource-active windows).
 - No cleanup was unmatched or overdue (0 overdue ticks; single action 1:1 with cleanup lifecycle diagnostics).
-- The sole cleanup was authorized by Firestore `status == "ended"` (structural guarantee + correlated `browser_disconnect` precondition).
+- The sole cleanup was authorized by Firestore `status == "ended"` and followed an observed host WebSocket disconnect. No evidence of reconciler-induced false termination.
 
-**Gate #1: PASSED.**
+**Gate 1: PASSED.**
 
-## Gate #2 — Controlled deploy reconnect evidence
+## Gate 2 — Controlled deploy reconnect evidence
 
 **Pending.** Requires triggering a real backend redeploy while a host
 and listener are actively connected, then recording that both
@@ -111,7 +121,7 @@ transparently reconnect (`1012` transient close, `/resolve` polling,
 no `terminated` tombstone). Best scheduled during a low-traffic window
 or paired with the next production release.
 
-## Gate #3 — 7-day soak
+## Gate 3 — 7-day soak
 
-**Pending gate #2.** Track 1 exit criteria per §4 of the plan require
+**Pending gate 2.** Track 1 exit criteria per §4 of the plan require
 all five staged-validation steps green across a 7-day soak.
