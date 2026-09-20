@@ -173,6 +173,9 @@ async def _run_f25(admin_store):
             admin_store,
             org_id=org_id, slug=slug,
             service_key=service_key, host_token=HOST_TOKEN,
+            # Not strictly needed for F-25 (no HTTP End Service here),
+            # but seeded to match F-26's baseline exactly.
+            e2e_host_uid="e2e-host-uid",
         )
 
         await deepgram_stub.start()
@@ -274,6 +277,15 @@ async def _run_f25(admin_store):
             timeout=15.0,
         )
 
+        # BEFORE the absence window: the reader task must exist and
+        # be running. A dead reader would silently swallow any frame
+        # the isolation window would have observed, so this check
+        # anchors the "listener_b is healthy right now" claim.
+        assert listener_b_post_handover.reader_alive(), (
+            "listener_b's reader task was not alive before the "
+            "isolation window — the absence check would be meaningless"
+        )
+
         # FRESH MARKER while REDIS_ENABLED=0 on both instances.
         isolation_marker = f"isolation-{uuid.uuid4().hex[:6]}"
         pre_isolation_translations = openai_stub.request_count
@@ -328,6 +340,16 @@ async def _run_f25(admin_store):
         assert not _received_any_terminal_frame(listener_b_post_handover), (
             "listener B received a terminal frame during the isolation "
             "window — the server signalled ended when it shouldn't have"
+        )
+        # AFTER the absence window: the reader must STILL be running.
+        # A reader that finished mid-window (task cancelled, exception
+        # raised) would look identical to isolation from the test's
+        # perspective — no frames arrive — but the cause would be
+        # completely different.
+        assert listener_b_post_handover.reader_alive(), (
+            "listener_b's reader task ended during the isolation "
+            "window — the missing marker could be the reader dying "
+            "rather than the isolation hypothesis"
         )
 
         # LIFECYCLE CHECK — the room is not supposed to have moved.

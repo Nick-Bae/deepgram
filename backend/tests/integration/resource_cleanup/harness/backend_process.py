@@ -109,6 +109,14 @@ class BackendProcess:
         env.setdefault("CORS_ALLOW_ORIGINS", "http://localhost")
         env.setdefault("ROOM_SWEEPER_INTERVAL_SEC", "60")
         env.setdefault("ROOM_IDLE_TIMEOUT_SEC", "900")
+        # E2E test auth bootstrap (see firebase_auth.py:verify_id_token_value).
+        # Only propagates when the caller has set the vars; the gate in
+        # firebase_auth also requires FIRESTORE_EMULATOR_HOST to be set
+        # AND K_SERVICE to be unset — both true inside the harness.
+        for e2e_key in ("E2E_TEST_AUTH_TOKEN", "E2E_TEST_AUTH_UID"):
+            outer = os.environ.get(e2e_key)
+            if outer:
+                env[e2e_key] = outer
         env.update(self.config.extra_env)
         return env
 

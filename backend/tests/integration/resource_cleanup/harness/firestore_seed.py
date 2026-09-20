@@ -40,8 +40,16 @@ def seed_org_and_service(
     slug: str,
     service_key: str,
     host_token: str = "harness-host-token",
+    e2e_host_uid: Optional[str] = None,
 ) -> None:
-    """Write a minimal org + service into the emulator."""
+    """Write a minimal org + service into the emulator.
+
+    If `e2e_host_uid` is given, also seed a `members/<uid>` document
+    with role=host so `authorize_host(host_uid=e2e_host_uid)` returns
+    True — which is what the End Service HTTP endpoint needs when a
+    test bearer token bootstraps a stub authenticated user via
+    `firebase_auth.verify_id_token_value`.
+    """
     now = datetime.now(tz=timezone.utc)
     # Direct writes against the store's Firestore client — the
     # normal signup HTTP path expects Firebase auth we don't have
@@ -70,6 +78,13 @@ def seed_org_and_service(
         "createdAt": now,
         "updatedAt": now,
     })
+    if e2e_host_uid:
+        store._org_ref(org_id).collection("members").document(e2e_host_uid).set({
+            "uid": e2e_host_uid,
+            "role": "host",
+            "createdAt": now,
+            "updatedAt": now,
+        })
 
 
 def start_room(

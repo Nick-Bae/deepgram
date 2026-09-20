@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from hmac import compare_digest
 import logging
 import os
 from threading import Lock
@@ -155,6 +156,38 @@ def verify_id_token_value(id_token: Optional[str]) -> Optional[AuthenticatedUser
     token = (id_token or "").strip()
     if not token:
         return None
+    # ---------------------------------------------------------------
+    # E2E-test-only auth bootstrap. GATE is deliberately narrow so
+    # this branch is impossible on Cloud Run:
+    #
+    #   1. `K_SERVICE` must be UNSET — Cloud Run always sets this env
+    #      var (`_IS_PRODUCTION` in main.py uses the same signal).
+    #   2. `FIRESTORE_EMULATOR_HOST` must be set — proves we are
+    #      pointing at the Firestore emulator, never real Firestore.
+    #   3. `E2E_TEST_AUTH_TOKEN` must be set AND the bearer token in
+    #      the request must equal it exactly (constant-time compare).
+    #
+    # If ANY of those fail, the normal Firebase Admin SDK path runs.
+    # The returned stub identity carries `E2E_TEST_AUTH_UID`, and
+    # `isSuper=False` — the E2E test seeds a `members/<uid>` document
+    # with role=host so `multichurch_store.authorize_host` will grant
+    # host access via the same code path production uses.
+    # ---------------------------------------------------------------
+    e2e_expected = (os.getenv("E2E_TEST_AUTH_TOKEN") or "").strip()
+    if (
+        not os.getenv("K_SERVICE")
+        and (os.getenv("FIRESTORE_EMULATOR_HOST") or "").strip()
+        and e2e_expected
+        and compare_digest(token.encode("utf-8"), e2e_expected.encode("utf-8"))
+    ):
+        stub_uid = (os.getenv("E2E_TEST_AUTH_UID") or "").strip()
+        if stub_uid:
+            return AuthenticatedUser(
+                uid=stub_uid,
+                email=None,
+                displayName=None,
+                isSuper=False,
+            )
     try:
         initialized = _ensure_firebase_app()
     except Exception as exc:
