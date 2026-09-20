@@ -1,40 +1,40 @@
-"""F-25 — reproduce Track 1 Gate 2's cross-revision isolation defect.
+"""F-25 — test the leading hypothesis for the Track 1 Gate 2 failure.
 
 Reference: defect issue #29, Track 1 Gate 2 failure record on issue #26.
 
-The observed failure pattern from the 2026-09-20 Gate 2 attempt:
+The leading (not proven) hypothesis behind the 2026-09-20 Gate 2
+failure is cross-instance resource separation when `REDIS_ENABLED=0`:
+during a Cloud Run revision transition the producer socket may remain
+on one instance while the listener's reconnect lands on another, and
+without Redis fanout the cross-instance broadcast path is not
+available. F-25 models that end state directly in the harness — no
+SIGTERM, no revision transition — by:
 
-  1. The deploy replaced the serving revision, but the OLD revision
-     stayed alive because Cloud Run keeps instances up while WebSocket
-     requests are still in flight.
-  2. The host's producer WebSocket therefore continued to talk to the
-     OLD revision.
-  3. The listener's transient-close reconnect (after Uvicorn's 1012 on
-     the old revision) landed on the NEW revision — that revision
-     served 100% of traffic once the deploy completed.
-  4. Because `REDIS_ENABLED=0`, `ConnectionManager.broadcast_room` on
-     the OLD revision delivered only to its own local sockets. The
-     translation never crossed to the NEW revision, so the listener
-     stayed black.
+  1. Starting the host + a listener on backend A.
+  2. Verifying a baseline marker reaches the listener on A.
+  3. Handing the listener over to backend B (disconnect, reconnect
+     to B), while the original host and A continue running.
+  4. Sending a fresh marker while both backends are up with
+     `REDIS_ENABLED=0`.
+  5. Requiring that the fresh marker still reaches an A-side
+     listener (proves the A pipeline is still armed).
+  6. Requiring that the fresh marker does NOT reach the handover
+     listener on B within a bounded timeout.
+  7. Confirming during the absence window that backend B is alive,
+     the listener's socket + reader are healthy, and no terminal
+     frame arrived.
 
-F-25 models this end-state directly WITHOUT any SIGTERM: two backend
-instances are both healthy, the host is attached to A, the listener is
-attached to B, both instances run with `REDIS_ENABLED=0`. A transcript
-pushed through A must fail to reach B — because it *cannot* reach B in
-that configuration. This is a "prove the bug is reproducible in the
-harness" test, not a regression test for a fix; a companion F-26 will
-prove the same setup succeeds when `REDIS_ENABLED=1`.
+If the hypothesis is correct, this test passes; if the same
+configuration somehow delivers cross-instance without Redis, this
+test fails and the hypothesis is falsified.
 
-Acceptance:
-  - No SIGTERM, no revision transition — this test intentionally isolates
-    the isolation problem from all shutdown-race concerns.
-  - Baseline via listener-on-A confirms the A pipeline itself works
-    (rules out any confounding pipeline failure).
-  - Listener-on-B does NOT receive the same marker within a bounded
-    timeout. Timeout is deliberately generous (12 s) so a slow CI does
-    not mask a real recovery.
-  - Room stays live in Firestore throughout; the isolation is a delivery
-    problem, not a termination problem.
+Companion F-26 flips `REDIS_ENABLED=1` and requires the fresh marker
+to reach the handover listener.
+
+Note on the production incident:
+This test does NOT assert that Uvicorn emitted 1012 or that Cloud
+Run drained a specific socket during the Gate 2 failure — those were
+not directly established. F-25 tests only the end-state isolation.
 """
 from __future__ import annotations
 
@@ -64,9 +64,8 @@ def _config(
     *,
     redis_enabled: str,
 ) -> BackendConfig:
-    """Build a BackendConfig with an explicit REDIS_ENABLED override
-    (the harness defaults to '1'; `extra_env` runs last in
-    BackendProcess.env(), so this actually takes effect)."""
+    """extra_env runs last in BackendProcess.env(), so this override
+    actually takes effect regardless of the harness default."""
     return BackendConfig(
         instance_id=instance_id,
         redis_host=REDIS_HOST,
@@ -80,8 +79,40 @@ def _config(
     )
 
 
+def _has_marker_predicate(marker: str):
+    expected = f"[stub-translated] {marker}"
+    def _pred(msg):
+        for key in ("payload", "text"):
+            val = msg.get(key)
+            if isinstance(val, str) and expected in val:
+                return True
+        meta = msg.get("meta") or {}
+        val = meta.get("translated")
+        if isinstance(val, str) and expected in val:
+            return True
+        return False
+    return _pred
+
+
+def _received_any_terminal_frame(listener: ListenerClient) -> bool:
+    """Detect any terminal signal in the received frames — used during
+    the isolation window to distinguish "quiet because isolated" from
+    "quiet because the server sent an ended signal we shouldn't have
+    trusted." A production Gate 2 pass requires zero terminal signals
+    on the listener."""
+    for msg in listener.received:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") == "STATUS" and msg.get("roomStatus") == "ended":
+            return True
+        if msg.get("reason") == "room_ended":
+            return True
+        if msg.get("code") == 4001:
+            return True
+    return False
+
+
 def test_f25_cross_instance_isolation_with_redis_disabled(admin_store):
-    """Sync wrapper — mirrors the F-15 / F-9 structure."""
     asyncio.run(_run_f25(admin_store))
 
 
@@ -96,11 +127,17 @@ async def _run_f25(admin_store):
     backend_a = None
     backend_b = None
     host_client = None
-    listener_a = None
-    listener_b = None
+    listener_a_persistent = None
+    listener_migrating_on_a = None
+    listener_b_post_handover = None
 
     async def teardown():
-        for target in (listener_b, listener_a, host_client):
+        for target in (
+            listener_b_post_handover,
+            listener_migrating_on_a,
+            listener_a_persistent,
+            host_client,
+        ):
             if target is not None:
                 try:
                     await target.close()
@@ -134,17 +171,14 @@ async def _run_f25(admin_store):
     try:
         seed_org_and_service(
             admin_store,
-            org_id=org_id,
-            slug=slug,
-            service_key=service_key,
-            host_token=HOST_TOKEN,
+            org_id=org_id, slug=slug,
+            service_key=service_key, host_token=HOST_TOKEN,
         )
 
         await deepgram_stub.start()
         await openai_stub.start()
 
-        # Both backends run with REDIS_ENABLED=0 — this is the
-        # production Track 1 configuration on 2026-09-20.
+        # Both backends run with REDIS_ENABLED=0.
         backend_a = BackendProcess(_config(
             "inst-a", deepgram_stub.endpoint, openai_stub.base_url,
             redis_enabled="0",
@@ -159,15 +193,15 @@ async def _run_f25(admin_store):
         backend_b.start()
         backend_b.wait_ready(timeout=45.0)
 
-        # Room seeded after both backends are ready. Startup safety
-        # (PR-T1-A) is not the subject of this test — F-15 covers it.
         start_room(
             admin_store,
-            org_id=org_id,
-            service_key=service_key,
-            room_id=room_id,
+            org_id=org_id, service_key=service_key, room_id=room_id,
         )
 
+        # Host + BOTH listeners initially on A. The migrating listener
+        # will move to B after the baseline. The persistent listener
+        # stays on A so we can assert A-side delivery still works when
+        # we later send a fresh marker.
         host_client = HostClient(
             backend_a.ws_url,
             org_id=org_id, room_id=room_id,
@@ -175,104 +209,133 @@ async def _run_f25(admin_store):
             host_token=HOST_TOKEN,
         )
         await host_client.connect()
-        await deepgram_stub.wait_for_client(timeout=15.0)
+        await deepgram_stub.wait_for_client_count(1, timeout=15.0)
 
-        # BASELINE — a listener on the SAME instance as the host must
-        # receive translations. If this fails, the A pipeline itself is
-        # broken and the assertion below would falsely "pass" for the
-        # wrong reason. Fail-loudly guard.
-        listener_a = ListenerClient(
+        listener_a_persistent = ListenerClient(
             backend_a.ws_url,
             org_id=org_id, room_id=room_id,
             service_key=service_key, church_slug=slug,
         )
-        await listener_a.connect()
-        await listener_a.wait_for_frame(
+        await listener_a_persistent.connect()
+        await listener_a_persistent.wait_for_frame(
             lambda m: m.get("type") == "JOINED" and m.get("roomId") == room_id,
             timeout=15.0,
         )
 
+        listener_migrating_on_a = ListenerClient(
+            backend_a.ws_url,
+            org_id=org_id, room_id=room_id,
+            service_key=service_key, church_slug=slug,
+        )
+        await listener_migrating_on_a.connect()
+        await listener_migrating_on_a.wait_for_frame(
+            lambda m: m.get("type") == "JOINED" and m.get("roomId") == room_id,
+            timeout=15.0,
+        )
+
+        # BASELINE — both A-side listeners must receive the marker.
+        # baseline- prefix is one of the openai_stub-supported names
+        # AND also matches the broader regex the stub now accepts.
         baseline_marker = f"baseline-{uuid.uuid4().hex[:6]}"
+        pre_baseline_translations = openai_stub.request_count
         delivered = await deepgram_stub.send_transcript(
             f"안녕하세요 {baseline_marker}", is_final=True,
         )
         assert delivered >= 1, "Deepgram stub had no client attached"
 
-        def _has_marker(marker):
-            expected = f"[stub-translated] {marker}"
-            def _pred(msg):
-                for key in ("payload", "text"):
-                    val = msg.get(key)
-                    if isinstance(val, str) and expected in val:
-                        return True
-                meta = msg.get("meta") or {}
-                val = meta.get("translated")
-                if isinstance(val, str) and expected in val:
-                    return True
-                return False
-            return _pred
-
-        await listener_a.wait_for_frame(
-            _has_marker(baseline_marker), timeout=20.0,
+        await listener_a_persistent.wait_for_frame(
+            _has_marker_predicate(baseline_marker), timeout=20.0,
+        )
+        await listener_migrating_on_a.wait_for_frame(
+            _has_marker_predicate(baseline_marker), timeout=20.0,
+        )
+        assert openai_stub.request_count > pre_baseline_translations, (
+            "baseline translation did not hit the OpenAI stub — a "
+            "later A-side delivery check for the fresh marker would "
+            "be meaningless."
         )
 
-        # Now attach a listener to backend B — NOT A. This is the
-        # exact production configuration during the Gate 2 failure:
-        # producer stuck on the old revision, listener reconnected to
-        # the new revision.
-        listener_b = ListenerClient(
+        # HANDOVER — migrating listener disconnects from A, a fresh
+        # ListenerClient with the same room+service context attaches
+        # to B. In production, this is what happens when a listener's
+        # transient-close reconnect lands on a different revision
+        # than the producer.
+        await listener_migrating_on_a.close()
+        listener_migrating_on_a = None
+
+        listener_b_post_handover = ListenerClient(
             backend_b.ws_url,
             org_id=org_id, room_id=room_id,
             service_key=service_key, church_slug=slug,
         )
-        await listener_b.connect()
-        await listener_b.wait_for_frame(
+        await listener_b_post_handover.connect()
+        await listener_b_post_handover.wait_for_frame(
             lambda m: m.get("type") == "JOINED" and m.get("roomId") == room_id,
             timeout=15.0,
         )
 
-        # Send a fresh marker. With REDIS_ENABLED=0, the A instance
-        # only delivers locally — listener_a will receive it, but
-        # listener_b MUST NOT.
+        # FRESH MARKER while REDIS_ENABLED=0 on both instances.
         isolation_marker = f"isolation-{uuid.uuid4().hex[:6]}"
+        pre_isolation_translations = openai_stub.request_count
         delivered = await deepgram_stub.send_transcript(
             f"안녕하세요 {isolation_marker}", is_final=True,
         )
         assert delivered >= 1, "Deepgram stub had no client attached"
 
-        # A must still receive (proves the pipeline is otherwise fine).
-        await listener_a.wait_for_frame(
-            _has_marker(isolation_marker), timeout=20.0,
+        # A-SIDE DELIVERY CHECK — the persistent listener on A must
+        # still receive the fresh marker. This rules out "quiet
+        # because the whole pipeline stopped" as a false-pass
+        # explanation for the isolation assertion below.
+        await listener_a_persistent.wait_for_frame(
+            _has_marker_predicate(isolation_marker), timeout=20.0,
+        )
+        assert openai_stub.request_count > pre_isolation_translations, (
+            "fresh marker did not trigger a translation call — the "
+            "A-side broadcast pipeline is not firing, so the isolation "
+            "assertion below cannot be trusted."
         )
 
-        # B must NOT receive the same marker within a generous window.
-        # If this assertion trips a TimeoutError, the isolation defect
-        # is reproduced and F-25 passes.
+        # ISOLATION ASSERTION — listener on B must NOT receive the
+        # fresh marker within a bounded window. Timeout is generous
+        # so a slow CI does not mask a real cross-instance recovery.
         try:
-            await listener_b.wait_for_frame(
-                _has_marker(isolation_marker), timeout=12.0,
+            await listener_b_post_handover.wait_for_frame(
+                _has_marker_predicate(isolation_marker), timeout=12.0,
             )
             raise AssertionError(
-                "listener on instance B received the marker despite "
-                "REDIS_ENABLED=0 on both instances — cross-instance "
-                "fanout should be impossible in this configuration. "
-                "This means either (a) Redis was actually running "
-                "somewhere the tests didn't expect, (b) the code path "
-                "in socket_manager changed, or (c) the harness leaked "
-                "a channel between processes. Investigate before "
-                "trusting F-26."
+                "listener on instance B received the fresh marker "
+                "despite REDIS_ENABLED=0 on both instances — cross-"
+                "instance fanout should be impossible in this "
+                "configuration. Investigate before trusting F-26."
             )
         except asyncio.TimeoutError:
-            pass  # This is the expected defect signature.
+            pass  # expected — the isolation hypothesis holds
 
-        # Room stays live throughout — this is an isolation defect,
-        # not a termination defect.
+        # DEAD-LISTENER CHECK — the isolation timeout must be caused
+        # by "message never arrived across the instance boundary,"
+        # NOT by "the listener's socket died and its reader stopped
+        # collecting frames." Verify backend B is alive, the socket
+        # is still open, and no terminal frame was received.
+        assert backend_b.proc is not None and backend_b.proc.poll() is None, (
+            "backend B exited during the isolation window — the timeout "
+            "cannot be attributed to isolation without a live server"
+        )
+        assert await listener_b_post_handover.is_open(), (
+            "listener B's WebSocket closed during the isolation window — "
+            "the missing marker could be the server tearing the socket "
+            "down rather than the isolation hypothesis"
+        )
+        assert not _received_any_terminal_frame(listener_b_post_handover), (
+            "listener B received a terminal frame during the isolation "
+            "window — the server signalled ended when it shouldn't have"
+        )
+
+        # LIFECYCLE CHECK — the room is not supposed to have moved.
         room_state = read_room(admin_store, org_id=org_id, room_id=room_id)
         assert room_state is not None, "room disappeared from Firestore"
         assert room_state.get("status") == "live", (
             f"room status flipped to {room_state.get('status')!r} — "
-            "F-25 does not exercise any termination path, so a flip "
-            "here indicates a spurious cleanup or an unrelated bug"
+            "F-25 does not exercise any termination path"
         )
 
     finally:

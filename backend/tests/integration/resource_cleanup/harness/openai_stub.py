@@ -29,13 +29,17 @@ except ImportError:  # pragma: no cover
     )
 
 
-# Extract the last unique-looking marker token from the transcript so
-# the test can assert it survived the pipeline. The F-15 test embeds
-# a hex marker like "cross-process-abc123" in the transcript it pushes
-# through the Deepgram stub; that same token must appear in the
-# translated payload the listener receives.
+# Extract a unique-looking marker token from the transcript so the
+# test can assert it survived the pipeline. Marker shape is any
+# lowercase-with-dashes prefix followed by a hex tail — the specific
+# prefix identifies which test emitted the marker (baseline-,
+# cross-process-, post-sigterm-, isolation-, cross-, handover-…),
+# but the stub does not need an allowlist. A prefix allowlist would
+# silently drop tests that use a new marker name (e.g. F-25's
+# `isolation-*` and F-26's `cross-*` were both dropped by an earlier
+# regex, making their assertions impossible to satisfy).
 _MARKER_RE = re.compile(
-    r"(?:cross-process|baseline|post-sigterm)-[a-f0-9]{4,}"
+    r"[a-z][a-z-]*-[a-f0-9]{4,}"
 )
 
 
