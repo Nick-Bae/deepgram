@@ -19,20 +19,21 @@ rejected:
      broadcast. F-26 tests the primary path exclusively.
 
   2. **End Service is invoked through the real HTTP endpoint on
-     backend B**, with authentication provided by the harness's
-     E2E test bootstrap (`E2E_TEST_AUTH_TOKEN` +
-     `E2E_TEST_AUTH_UID`; see `firebase_auth.verify_id_token_value`).
-     `admin_store.end_room()` bypasses the broadcast + socket close
-     path production uses, so it cannot answer "did the terminal
-     event actually cross the instance boundary and terminate both
-     sides?"
+     backend B**, using authentication substitution isolated to the
+     harness. See
+     `backend/tests/integration/resource_cleanup/harness/e2e_uvicorn_bootstrap.py` —
+     that module launches uvicorn against the real `app.main:app`
+     and monkey-patches only `firebase_auth.verify_id_token_value`
+     in-process before the first request. Production auth code is
+     untouched.
 
 Assertions after End Service:
 
   - Listener on B receives a terminal `STATUS(ended)` frame AND its
     WebSocket closes.
   - Host WebSocket on A closes (the terminal broadcast from B must
-    have reached A via Redis fanout — the only path available).
+    have reached A via Redis fanout — the only path available with
+    the reconciler disabled).
   - Deepgram provider stub's `client_count` returns to 0 (the host's
     STT session released).
   - Redis room-channel subscriber count returns to 0 (both backends
@@ -41,13 +42,22 @@ Assertions after End Service:
     cleanup, not shutdown.
 
 The room's Firestore document reaches `status=ended` with the
-whitelisted `endReason=host_end` (the End Service endpoint's default
-when the client did not override).
+whitelisted `endReason=host_end`.
+
+BEFORE the authorised End Service, F-26 also verifies that
+misconfigured auth is rejected without touching room state:
+
+  - Missing Authorization header → 401.
+  - Wrong bearer token → 401.
+  - Right bearer whose stub uid has no `members/<uid>` document → 403.
+
+None of those calls may flip Firestore to `status=ended`.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 
 import httpx
@@ -67,9 +77,20 @@ from .harness.openai_stub import OpenAIStub
 
 
 HOST_TOKEN = "harness-host-token"
-E2E_AUTH_TOKEN = "harness-e2e-test-bearer"
-E2E_HOST_UID = "e2e-host-uid"
+# Two bearer tokens, each mapped to a different stub uid. HOST_BEARER
+# maps to a uid whose org membership will be seeded (role=host).
+# NON_MEMBER_BEARER maps to a uid that never gets a membership record.
+HOST_BEARER = "harness-e2e-host-bearer"
+NON_MEMBER_BEARER = "harness-e2e-outsider-bearer"
+HOST_UID = "e2e-host-uid"
+NON_MEMBER_UID = "e2e-outsider-uid"
+STUB_MAPPING = {HOST_BEARER: HOST_UID, NON_MEMBER_BEARER: NON_MEMBER_UID}
+
 REDIS_CHANNEL_PREFIX = "worshiptranslate"
+# Bounded socket timeouts so the polling loop's outer deadline is
+# actually enforceable — reviewer's second remaining blocker.
+REDIS_SOCKET_TIMEOUT_SEC = 2.0
+FIRESTORE_READ_TIMEOUT_SEC = 3.0
 
 
 def _config(
@@ -90,9 +111,7 @@ def _config(
         deepgram_endpoint=deepgram_endpoint,
         openai_base_url=openai_base_url,
         host_api_token=HOST_TOKEN,
-        extra_env={
-            "ROOM_RECONCILER_ENABLED": "0",
-        },
+        extra_env={"ROOM_RECONCILER_ENABLED": "0"},
     )
 
 
@@ -100,9 +119,17 @@ def _room_channel(org_id: str, room_id: str) -> str:
     return f"{REDIS_CHANNEL_PREFIX}:org:{org_id}:room:{room_id}"
 
 
-def _numsub(channel: str) -> int:
-    """PUBSUB NUMSUB for one Redis channel."""
-    r = redis_sync.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+def _numsub_blocking(channel: str) -> int:
+    """Synchronous NUMSUB call — must run inside asyncio.to_thread
+    so the async polling loop's deadline check is not blocked by a
+    stalled Redis socket."""
+    r = redis_sync.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+        socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SEC,
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SEC,
+    )
     try:
         result = r.pubsub_numsub(channel)
         for name, count in result:
@@ -112,6 +139,20 @@ def _numsub(channel: str) -> int:
     finally:
         with contextlib.suppress(Exception):
             r.close()
+
+
+async def _numsub(channel: str) -> int:
+    return await asyncio.to_thread(_numsub_blocking, channel)
+
+
+async def _read_room_bounded(admin_store, *, org_id, room_id):
+    """Wrap read_room in a bounded to_thread call. The Firestore
+    emulator can hang on a rare startup race; a stalled read must not
+    prevent the polling loop's outer deadline from firing."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(read_room, admin_store, org_id=org_id, room_id=room_id),
+        timeout=FIRESTORE_READ_TIMEOUT_SEC,
+    )
 
 
 def _has_marker_predicate(marker: str):
@@ -153,10 +194,11 @@ def test_f26_redis_fanout_recovers_cross_instance_delivery(admin_store, monkeypa
 
 
 async def _run_f26(admin_store, monkeypatch):
-    # Export the E2E auth env vars into the parent process so the
-    # backend subprocesses inherit them via BackendProcess.env().
-    monkeypatch.setenv("E2E_TEST_AUTH_TOKEN", E2E_AUTH_TOKEN)
-    monkeypatch.setenv("E2E_TEST_AUTH_UID", E2E_HOST_UID)
+    # Provide the mapping to backend subprocesses via env. The
+    # bootstrap module reads E2E_STUB_AUTH_MAPPING and installs the
+    # monkey-patch inside the child process. Neither the mapping nor
+    # this env var is recognised by production code.
+    monkeypatch.setenv("E2E_STUB_AUTH_MAPPING", json.dumps(STUB_MAPPING))
 
     slug = f"church-{uuid.uuid4().hex[:8]}"
     org_id = f"org-{uuid.uuid4().hex[:8]}"
@@ -209,13 +251,13 @@ async def _run_f26(admin_store, monkeypatch):
 
     try:
         # Seed the org + service AND a `members/{uid}=host` document
-        # for the E2E stub uid so authorize_host grants access via the
-        # normal production code path.
+        # for HOST_UID only. NON_MEMBER_UID is intentionally NOT
+        # given a membership record.
         seed_org_and_service(
             admin_store,
             org_id=org_id, slug=slug,
             service_key=service_key, host_token=HOST_TOKEN,
-            e2e_host_uid=E2E_HOST_UID,
+            e2e_host_uid=HOST_UID,
         )
 
         await deepgram_stub.start()
@@ -273,8 +315,7 @@ async def _run_f26(admin_store, monkeypatch):
             "baseline translation did not hit the OpenAI stub"
         )
 
-        # HANDOVER — close the A-side listener and reconnect a fresh
-        # one against B.
+        # HANDOVER
         await listener_on_a.close()
         listener_on_a = None
 
@@ -289,7 +330,7 @@ async def _run_f26(admin_store, monkeypatch):
             timeout=15.0,
         )
 
-        # CROSS-INSTANCE DELIVERY — via Redis fanout only.
+        # CROSS-INSTANCE DELIVERY
         cross_marker = f"cross-instance-{uuid.uuid4().hex[:6]}"
         pre_cross_translations = openai_stub.request_count
         delivered = await deepgram_stub.send_transcript(
@@ -303,66 +344,103 @@ async def _run_f26(admin_store, monkeypatch):
             "cross-instance marker did not trigger a translation call"
         )
 
-        # PRE-CLEANUP INVARIANTS — both backends alive, both
-        # subscribed to the room's Redis channel (host on A, listener
-        # on B).
+        # PRE-CLEANUP INVARIANTS
         assert backend_a.proc is not None and backend_a.proc.poll() is None
         assert backend_b.proc is not None and backend_b.proc.poll() is None
         channel = _room_channel(org_id, room_id)
 
         async def _wait_for_numsub(expected: int, timeout: float = 10.0) -> int:
             deadline = asyncio.get_event_loop().time() + timeout
-            observed = _numsub(channel)
+            observed = await _numsub(channel)
             while asyncio.get_event_loop().time() < deadline:
-                observed = _numsub(channel)
+                observed = await _numsub(channel)
                 if observed == expected:
                     return observed
                 await asyncio.sleep(0.2)
             return observed
+
         pre_sub = await _wait_for_numsub(2, timeout=10.0)
         assert pre_sub == 2, (
-            f"expected NUMSUB=2 on {channel!r} before End Service "
-            f"(host on A + listener on B); got {pre_sub}"
+            f"expected NUMSUB=2 on {channel!r} before End Service; got {pre_sub}"
         )
         assert await deepgram_stub.client_count() == 1, (
             f"expected deepgram_stub client_count=1 pre-End Service; "
             f"got {await deepgram_stub.client_count()}"
         )
 
-        # END SERVICE via real HTTP through backend B. The endpoint
-        # requires Firebase auth; the harness's E2E bootstrap
-        # accepts a bearer token equal to E2E_AUTH_TOKEN and returns
-        # a stub AuthenticatedUser(uid=E2E_HOST_UID). The org's
-        # `members/{E2E_HOST_UID}` doc has role=host (seeded above)
-        # so authorize_host grants access.
+        # ------- NEGATIVE AUTH TESTS — must NOT end the room. -------
         end_url = f"{backend_b.base_url}/api/org/{org_id}/room/{room_id}/end"
+        end_body = {"reason": "host_end"}
+
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp_missing = await http.post(end_url, json=end_body)
+            resp_wrong = await http.post(
+                end_url,
+                headers={"Authorization": "Bearer this-token-is-not-in-the-mapping"},
+                json=end_body,
+            )
+            resp_nonmember = await http.post(
+                end_url,
+                headers={"Authorization": f"Bearer {NON_MEMBER_BEARER}"},
+                json=end_body,
+            )
+        assert resp_missing.status_code == 401, (
+            f"missing Authorization must return 401; got {resp_missing.status_code}"
+        )
+        assert resp_wrong.status_code == 401, (
+            f"unknown bearer token must return 401; got {resp_wrong.status_code}"
+        )
+        assert resp_nonmember.status_code == 403, (
+            f"authenticated but non-member uid must return 403; "
+            f"got {resp_nonmember.status_code} body={resp_nonmember.text[:200]}"
+        )
+        # None of the rejected calls may have ended the room.
+        state_after_rejections = await _read_room_bounded(
+            admin_store, org_id=org_id, room_id=room_id,
+        )
+        assert (
+            state_after_rejections is not None
+            and state_after_rejections.get("status") == "live"
+        ), (
+            f"rejected auth calls somehow ended the room; got "
+            f"status={state_after_rejections and state_after_rejections.get('status')!r}"
+        )
+
+        # ------- AUTHORISED END SERVICE — must succeed + cleanup. -------
         async with httpx.AsyncClient(timeout=15.0) as http:
             resp = await http.post(
                 end_url,
-                headers={"Authorization": f"Bearer {E2E_AUTH_TOKEN}"},
-                json={"reason": "host_end"},
+                headers={"Authorization": f"Bearer {HOST_BEARER}"},
+                json=end_body,
             )
         assert resp.status_code == 200, (
-            f"End Service HTTP returned {resp.status_code}: "
-            f"{resp.text[:200]}"
+            f"End Service HTTP returned {resp.status_code}: {resp.text[:200]}"
         )
 
-        # WAIT + POLL — cleanup is asynchronous. Poll until all
-        # required conditions hold or a bounded deadline expires.
+        # WAIT + POLL — bounded Redis + Firestore reads. The outer
+        # deadline is enforced regardless of individual read latency.
         deadline = asyncio.get_event_loop().time() + 30.0
+        firestore_ended = listener_got_terminal = listener_closed = False
+        host_closed = provider_zero = redis_zero = False
         while asyncio.get_event_loop().time() < deadline:
-            room_state = read_room(admin_store, org_id=org_id, room_id=room_id)
+            try:
+                room_state = await _read_room_bounded(
+                    admin_store, org_id=org_id, room_id=room_id,
+                )
+            except asyncio.TimeoutError:
+                room_state = None
             firestore_ended = (
                 room_state is not None
                 and room_state.get("status") == "ended"
             )
-            listener_got_terminal = _received_terminal_status(
-                listener_b_post_handover,
-            )
+            listener_got_terminal = _received_terminal_status(listener_b_post_handover)
             listener_closed = not await listener_b_post_handover.is_open()
             host_closed = not await host_client.is_open()
             provider_zero = await deepgram_stub.client_count() == 0
-            redis_zero = _numsub(channel) == 0
+            try:
+                redis_zero = (await _numsub(channel)) == 0
+            except asyncio.TimeoutError:
+                redis_zero = False
             if (
                 firestore_ended
                 and listener_got_terminal
@@ -374,8 +452,9 @@ async def _run_f26(admin_store, monkeypatch):
                 break
             await asyncio.sleep(0.25)
 
-        # Fetch final observations for assertion messages.
-        room_state = read_room(admin_store, org_id=org_id, room_id=room_id)
+        room_state = await _read_room_bounded(
+            admin_store, org_id=org_id, room_id=room_id,
+        )
         assert room_state is not None, "room disappeared from Firestore"
         assert room_state.get("status") == "ended", (
             f"Firestore status did not become 'ended'; got {room_state.get('status')!r}"
@@ -383,41 +462,30 @@ async def _run_f26(admin_store, monkeypatch):
         assert room_state.get("endReason") == "host_end", (
             f"endReason must be 'host_end' (End Service default); got {room_state.get('endReason')!r}"
         )
-        # Terminal notification AND close on the listener.
         assert _received_terminal_status(listener_b_post_handover), (
-            "listener_b never received a terminal STATUS/room_ended/"
-            "4001 frame after End Service — the terminal broadcast "
-            "did not reach B (Redis fanout or same-instance send "
-            "path missed the delivery)"
+            "listener_b never received a terminal STATUS/room_ended/4001 "
+            "frame after End Service — the terminal broadcast did not "
+            "reach B"
         )
         assert not await listener_b_post_handover.is_open(), (
-            "listener_b received a terminal frame but its WebSocket "
-            "did not close — cleanup is not complete"
+            "listener_b received a terminal frame but its WebSocket did "
+            "not close — cleanup incomplete"
         )
-        # Host on A must close as a result of the terminal broadcast.
         assert not await host_client.is_open(), (
             "host WebSocket on A did not close after End Service — "
-            "the terminal broadcast did not cross the Redis boundary"
+            "terminal broadcast did not cross the Redis boundary"
         )
-        # Provider connection drops from 1 to 0.
         final_provider = await deepgram_stub.client_count()
         assert final_provider == 0, (
             f"Deepgram provider stub still reports client_count="
-            f"{final_provider} after End Service — the host STT "
-            "session was not released"
+            f"{final_provider}"
         )
-        # Redis room subscribers drop from 2 to 0.
-        final_sub = _numsub(channel)
+        final_sub = await _numsub(channel)
         assert final_sub == 0, (
-            f"Redis PUBSUB NUMSUB for {channel!r} is still {final_sub} "
-            "after End Service — one or both backends failed to "
-            "unsubscribe from the room channel"
+            f"Redis PUBSUB NUMSUB for {channel!r} is still {final_sub}"
         )
-        # Both backend PROCESSES are still alive — F-26 tests
-        # cleanup, not shutdown.
         assert backend_a.proc is not None and backend_a.proc.poll() is None, (
-            "backend A exited during End Service cleanup — F-26 "
-            "requires both backends to remain alive"
+            "backend A exited during End Service cleanup"
         )
         assert backend_b.proc is not None and backend_b.proc.poll() is None, (
             "backend B exited during End Service cleanup"
