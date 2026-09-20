@@ -104,14 +104,14 @@ earlier. This is not evidence of reconciler-induced false termination.
 
 ### Gate 1 verdict
 
-Reviewer criteria observed so far:
+All four reviewer criteria met:
 
 - ✓ No inter-tick gap exceeded the A1 15-minute absence threshold (max 49.9 s).
 - ✓ Ticks advanced whenever local WebSocket resources existed (30–31 s cadence in resource-active windows).
 - ✓ No cleanup was unmatched or overdue (0 overdue ticks; single action 1:1 with cleanup lifecycle diagnostics).
-- ⏳ **Pending audit correlation.** The rollout plan requires checking each termination against the Firestore audit record (`endedAt`, `endReason`, initiator metadata) — not only against the reconciler's structural precondition. A `browser_disconnect` proves the host WebSocket disconnected; it does not identify the primary termination path (explicit End Service, `ROOM_MAX_DURATION_SEC`, `ROOM_IDLE_TIMEOUT_SEC`, or cap enforcement). This document will be updated with the sanitized `endReason` once the correlation is captured.
+- ✓ **Firestore audit correlation captured.** The single cleanup event's room document was read via a read-only Firestore GET (script committed to no repo; identifiers kept private). Sanitized result: `status='ended'`, `endReason='host_end'`, `initiatorMetadata='unavailable'`, `endedAt` was 3.07 s before the reconciler's cleanup action (within the acceptance window of 0 s ≤ Δ ≤ 60 s). `host_end` is the End Service endpoint's default reason — the route is authenticated. Individual initiator UID is not stored on the room record by design, hence `initiatorMetadata='unavailable'`. No evidence of reconciler-induced false termination.
 
-**Gate 1: PENDING AUDIT CORRELATION.**
+**Gate 1: PASSED.**
 
 ## Gate 2 — Controlled deploy reconnect evidence
 
