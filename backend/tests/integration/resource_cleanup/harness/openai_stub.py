@@ -38,13 +38,38 @@ except ImportError:  # pragma: no cover
 # silently drop tests that use a new marker name (e.g. F-25's
 # `isolation-*` and F-26's `cross-*` were both dropped by an earlier
 # regex, making their assertions impossible to satisfy).
+#
+# CRITICAL SUBTLETY: production prompts (see app/utils/translate.py
+# around L1568-1602) look like:
+#
+#   [recent_context_block]
+#   Previous English sentence: <old translated line — contains an
+#     OLDER marker>
+#   IMPORTANT: ...
+#
+#   Current text:
+#   <the fresh input with the NEW marker>
+#
+# A naive whole-prompt regex returns the PREVIOUS marker, so the
+# stub echoes the previous translation and the test's fresh-marker
+# assertion times out. Fix: prefer the LAST `Current text:` block
+# and search only its body. Fall back to a whole-text search only
+# when the prompt has no `Current text:` section at all (matches
+# the `user_content = masked_text` branch in translate.py).
 _MARKER_RE = re.compile(
     r"[a-z][a-z-]*-[a-f0-9]{4,}"
+)
+_CURRENT_TEXT_RE = re.compile(
+    r"Current text:\s*", re.IGNORECASE,
 )
 
 
 def _extract_marker(text: str) -> str:
-    m = _MARKER_RE.search(text or "")
+    body = text or ""
+    matches = list(_CURRENT_TEXT_RE.finditer(body))
+    if matches:
+        body = body[matches[-1].end():]
+    m = _MARKER_RE.search(body)
     if not m:
         return ""
     return m.group(0)

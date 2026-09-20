@@ -136,10 +136,26 @@ class BackendProcess:
         # module unchanged, monkey-patches
         # `firebase_auth.verify_id_token_value` in-process, then
         # starts uvicorn. Production code is never touched.
+        env = self.env()
         if os.environ.get("E2E_STUB_AUTH_MAPPING"):
             bootstrap = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "e2e_uvicorn_bootstrap.py",
+            )
+            # Ensure the bootstrap can `import app.*`. Without this,
+            # running `python <path>/e2e_uvicorn_bootstrap.py` puts
+            # the harness dir on sys.path[0] and `import app` fails.
+            # The bootstrap ALSO does sys.path.insert as belt-and-
+            # braces, but PYTHONPATH is the standard mechanism.
+            backend_root = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "..", "..",
+                )
+            )
+            existing = env.get("PYTHONPATH") or ""
+            env["PYTHONPATH"] = (
+                backend_root + (os.pathsep + existing if existing else "")
             )
             cmd = [
                 sys.executable,
@@ -167,11 +183,14 @@ class BackendProcess:
             ]
         # Working directory: the backend package root, so `app.main`
         # resolves. Callers ensure they run from backend/.
+        # Use the `env` we built above (may have PYTHONPATH added for
+        # the bootstrap path). Do NOT call self.env() again — that
+        # would drop the PYTHONPATH override.
         self.proc = subprocess.Popen(
             cmd,
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
-            env=self.env(),
+            env=env,
         )
 
     def wait_ready(self, *, timeout: float = 30.0) -> None:

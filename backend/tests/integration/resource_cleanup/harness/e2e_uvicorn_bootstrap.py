@@ -36,6 +36,18 @@ import os
 import sys
 from typing import Optional
 
+# CRITICAL — the bootstrap is launched via `python <path>/e2e_uvicorn_bootstrap.py`,
+# so sys.path[0] is the harness directory, not the backend root. Prepend
+# the backend directory (four levels up: harness/ → resource_cleanup/ →
+# integration/ → tests/ → backend/) so `from app.auth import firebase_auth`
+# resolves. BackendProcess also exports PYTHONPATH for defense in depth,
+# but this makes the bootstrap self-contained if run directly for debug.
+_BACKEND_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+)
+if _BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, _BACKEND_ROOT)
+
 
 def _load_mapping() -> dict:
     raw = (os.environ.get("E2E_STUB_AUTH_MAPPING") or "").strip()

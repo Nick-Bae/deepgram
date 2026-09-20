@@ -146,12 +146,28 @@ async def _numsub(channel: str) -> int:
 
 
 async def _read_room_bounded(admin_store, *, org_id, room_id):
-    """Wrap read_room in a bounded to_thread call. The Firestore
-    emulator can hang on a rare startup race; a stalled read must not
-    prevent the polling loop's outer deadline from firing."""
+    """Read the room off the event loop with an explicit per-RPC
+    timeout AND a bounded outer await.
+
+    The per-RPC `timeout` is what actually bounds the gRPC call
+    (`timeout` is a Google Cloud Firestore kwarg, forwarded to the
+    underlying transport). The outer `asyncio.wait_for` is a
+    belt-and-braces guard for the exceptionally rare case where
+    the worker thread hangs INSIDE the client library on something
+    other than the RPC socket — in that case we still cancel the
+    await so the polling loop's deadline can fire.
+    """
     return await asyncio.wait_for(
-        asyncio.to_thread(read_room, admin_store, org_id=org_id, room_id=room_id),
-        timeout=FIRESTORE_READ_TIMEOUT_SEC,
+        asyncio.to_thread(
+            read_room,
+            admin_store,
+            org_id=org_id,
+            room_id=room_id,
+            timeout=FIRESTORE_READ_TIMEOUT_SEC,
+        ),
+        # slightly larger than the RPC timeout so the RPC is what
+        # bounds latency in the normal case.
+        timeout=FIRESTORE_READ_TIMEOUT_SEC + 1.0,
     )
 
 

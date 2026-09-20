@@ -117,10 +117,25 @@ def start_room(
     return room_id
 
 
-def read_room(store, *, org_id: str, room_id: str) -> Optional[Dict[str, Any]]:
-    """Read the room's Firestore state via the emulator. Returns None
-    if it doesn't exist."""
-    snap = store._room_ref(org_id, room_id).get()
+def read_room(
+    store,
+    *,
+    org_id: str,
+    room_id: str,
+    timeout: float = 3.0,
+) -> Optional[Dict[str, Any]]:
+    """Read the room's Firestore state via the emulator.
+
+    `timeout` is passed straight through to the Firestore client's
+    per-RPC timeout. That bounds the underlying gRPC call — not just
+    the async await on the wrapper. Wrapping this in
+    `asyncio.wait_for(asyncio.to_thread(...))` cancels the WORKER
+    but leaves the RPC socket stalled, so the RPC timeout is the
+    real safety net.
+
+    Returns None if the room does not exist.
+    """
+    snap = store._room_ref(org_id, room_id).get(timeout=timeout)
     if not snap.exists:
         return None
     return snap.to_dict()
