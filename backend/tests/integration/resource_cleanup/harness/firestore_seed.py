@@ -40,8 +40,16 @@ def seed_org_and_service(
     slug: str,
     service_key: str,
     host_token: str = "harness-host-token",
+    e2e_host_uid: Optional[str] = None,
 ) -> None:
-    """Write a minimal org + service into the emulator."""
+    """Write a minimal org + service into the emulator.
+
+    If `e2e_host_uid` is given, also seed a `members/<uid>` document
+    with role=host so `authorize_host(host_uid=e2e_host_uid)` returns
+    True — which is what the End Service HTTP endpoint needs when a
+    test bearer token bootstraps a stub authenticated user via
+    `firebase_auth.verify_id_token_value`.
+    """
     now = datetime.now(tz=timezone.utc)
     # Direct writes against the store's Firestore client — the
     # normal signup HTTP path expects Firebase auth we don't have
@@ -70,6 +78,13 @@ def seed_org_and_service(
         "createdAt": now,
         "updatedAt": now,
     })
+    if e2e_host_uid:
+        store._org_ref(org_id).collection("members").document(e2e_host_uid).set({
+            "uid": e2e_host_uid,
+            "role": "host",
+            "createdAt": now,
+            "updatedAt": now,
+        })
 
 
 def start_room(
@@ -102,10 +117,35 @@ def start_room(
     return room_id
 
 
-def read_room(store, *, org_id: str, room_id: str) -> Optional[Dict[str, Any]]:
-    """Read the room's Firestore state via the emulator. Returns None
-    if it doesn't exist."""
-    snap = store._room_ref(org_id, room_id).get()
+def read_room(
+    store,
+    *,
+    org_id: str,
+    room_id: str,
+    timeout: float = 3.0,
+) -> Optional[Dict[str, Any]]:
+    """Read the room's Firestore state via the emulator.
+
+    Both `timeout` and `retry=None` are passed through to the
+    Firestore client's `.get()`:
+
+      - `timeout` bounds the underlying gRPC call.
+      - `retry=None` disables the SDK's default retry policy so the
+        deadline isn't extended silently by transparent retries.
+        The outer polling loop already handles retry semantics.
+
+    Design note on cancellation: wrapping this in
+    `asyncio.wait_for(asyncio.to_thread(...))` abandons the AWAIT
+    on the wrapper but does NOT interrupt the worker thread — the
+    thread continues running until the RPC returns or times out on
+    its own. That's why the per-RPC `timeout` + `retry=None` is
+    the real bound; the outer `wait_for` is only a belt-and-braces
+    guard for the exceptional case where the thread hangs OUTSIDE
+    the RPC.
+
+    Returns None if the room does not exist.
+    """
+    snap = store._room_ref(org_id, room_id).get(timeout=timeout, retry=None)
     if not snap.exists:
         return None
     return snap.to_dict()
