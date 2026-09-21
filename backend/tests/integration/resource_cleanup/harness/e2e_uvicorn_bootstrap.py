@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from typing import Optional
@@ -110,6 +111,28 @@ def main() -> None:
 
     mapping = _load_mapping()
     _install_stub_auth(mapping)
+
+    # Configure the ROOT logger to INFO (or whatever --log-level
+    # says) so INFO-level messages from `redis_pubsub`, `main`, etc.
+    # are actually emitted. `uvicorn.run(log_level=...)` sets ONLY
+    # uvicorn's own logger family — module-level loggers created via
+    # `logging.getLogger("redis_pubsub")` inherit from the root, which
+    # Python defaults to WARNING. Without this call, the harness sees
+    # `redis pubsub initial connect failed` (WARNING) but never sees
+    # `redis pubsub started` / `redis pubsub reconnected` (INFO), and
+    # F-27's event-driven wait on the reconnect string times out even
+    # when the reader loop repaired the connection successfully.
+    #
+    # Directed to stderr because the F-27 harness reads
+    # `BackendProcess.logs()` which captures BOTH streams — matching
+    # uvicorn's own convention of writing logs to stderr.
+    log_level = args.log_level.upper() if args.log_level else "INFO"
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,  # override anything a prior import already installed
+    )
 
     # Sanity: the monkey-patch must be in place before the FastAPI
     # app imports finish binding routes to the real dependency. We
