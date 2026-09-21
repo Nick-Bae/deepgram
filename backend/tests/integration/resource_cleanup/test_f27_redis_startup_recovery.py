@@ -3,35 +3,49 @@
 Reference: defect issue #29, PR #31 rollout proposal §2.
 
 The bug (present before the fix in this branch): `redis_pubsub.py`
-set `_started = True` at line 89 before the initial `_pub.ping()`.
-When the ping raised because Redis was unreachable, the reader
-task was never scheduled and subsequent `start()` calls
-short-circuited at the enabled/started gate. The reconnect path
-became unreachable and the instance silently degraded to local-only
-broadcast even after Redis recovered.
+set `_started = True` before the initial `_pub.ping()`. When the
+ping raised because Redis was unreachable, the reader task was
+never scheduled and subsequent `start()` calls short-circuited at
+the enabled/started gate. The reconnect path became unreachable
+and the instance silently degraded to local-only broadcast even
+after Redis recovered.
 
-F-27 exercises exactly this pathway end-to-end. Neither backend is
+Scope note: this pattern CAN produce a cross-instance isolation
+outcome similar to the one observed at Track 1 Gate 2. Whether it
+was the actual cause of that Gate 2 failure has NOT been established
+— the leading Gate 2 inference remains cross-revision resource
+separation with REDIS_ENABLED=0 (see project memory). F-27 covers
+the local defect; it does not by itself close the Gate 2 causal
+chain.
+
+F-27 exercises the local defect end-to-end. Neither backend is
 restarted. The test is event-driven — Redis is restored only AFTER
 both backends have emitted the initial-failure log line, so a fast
 CI cannot accidentally make the ping succeed on the first try.
 
+The initial-failure detection accepts BOTH the new log line
+(`redis pubsub initial connect failed`, emitted by the fixed
+adapter) AND the old one (`redis connect failed; falling back to
+local-only broadcast`, emitted by the pre-fix adapter). Without
+this, running F-27 against the pre-fix adapter would time out
+waiting for the new string BEFORE Redis restore — the test would
+appear to fail at step 3 instead of at the recovery assertion in
+step 4, hiding the actual bisection signal.
+
 Acceptance:
   1. Toxiproxy proxy is DOWN before either backend starts.
-  2. Both backends emit `redis pubsub initial connect failed` in
-     their own logs.
+  2. Both backends emit an initial-failure log line matching either
+     the fixed-adapter or pre-fix wording (see `INITIAL_FAILURE_LOG_LINES`).
   3. Toxiproxy is enabled.
   4. Both backends emit `redis pubsub reconnected` — the reader
-     loop repaired the startup failure.
+     loop repaired the startup failure.  Under the pre-fix adapter
+     this line NEVER appears (no reader task was scheduled), so a
+     bisection run reproducibly fails here.
   5. Host attaches on A; listener attaches on B (handover shape,
      same as F-25/F-26).
   6. A marker sent through A reaches the listener on B via
      cross-instance Redis fanout.
   7. Both backend processes remain alive throughout.
-
-Bisection gate (documented in PR body): removing the fix and
-running this test again must reproduce the failure — the test
-should time out waiting for the reconnect log line because the
-reader task was never scheduled.
 """
 from __future__ import annotations
 
@@ -55,7 +69,16 @@ from .harness.openai_stub import OpenAIStub
 
 HOST_TOKEN = "harness-host-token"
 
-INITIAL_FAILURE_LOG_LINE = "redis pubsub initial connect failed"
+# Accept BOTH the fixed-adapter and pre-fix wording. The bisection
+# run (revert redis_pubsub.py to main + rerun F-27) must be able to
+# reach step 4 (the recovery assertion) under the OLD adapter — with
+# only the new string listed, the test would time out at step 2
+# because the old adapter never emits it, and the bisection would
+# report the wrong failure mode.
+INITIAL_FAILURE_LOG_LINES = (
+    "redis pubsub initial connect failed",              # fixed adapter (this branch)
+    "redis connect failed; falling back to local-only",  # pre-fix adapter (main)
+)
 RECONNECT_SUCCESS_LOG_LINE = "redis pubsub reconnected"
 
 
@@ -90,17 +113,26 @@ def _config(
     )
 
 
-def _wait_for_log_line(proc: BackendProcess, needle: str, *, timeout: float) -> bool:
+def _wait_for_log_line(
+    proc: BackendProcess, needle, *, timeout: float,
+) -> bool:
     """Poll the backend's captured log until `needle` appears, or
-    give up after `timeout`. Returns True on hit, False on timeout."""
+    give up after `timeout`. `needle` is a single string OR a tuple
+    of strings — any match returns True. Returns False on timeout
+    or early crash."""
+    if isinstance(needle, str):
+        needles = (needle,)
+    else:
+        needles = tuple(needle)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             body = proc.logs()
         except Exception:
             body = ""
-        if needle in body:
-            return True
+        for n in needles:
+            if n in body:
+                return True
         # Detect early crash — no point continuing.
         if proc.proc is not None and proc.proc.poll() is not None:
             return False
@@ -109,7 +141,7 @@ def _wait_for_log_line(proc: BackendProcess, needle: str, *, timeout: float) -> 
 
 
 async def _wait_for_log_line_async(
-    proc: BackendProcess, needle: str, *, timeout: float,
+    proc: BackendProcess, needle, *, timeout: float,
 ) -> bool:
     """asyncio-friendly wrapper that doesn't block the event loop."""
     return await asyncio.to_thread(
@@ -226,16 +258,20 @@ async def _run_f27(admin_store, redis_outage_proxies):
         # fixed interval instead would race with fast CI: the first
         # ping could succeed if proxies came up before either
         # backend called _pub.ping().
+        #
+        # Accepts either the fixed or pre-fix log wording so a
+        # bisection run against reverted redis_pubsub.py can still
+        # reach step 4 (the actual regression assertion).
         assert await _wait_for_log_line_async(
-            backend_a, INITIAL_FAILURE_LOG_LINE, timeout=15.0,
+            backend_a, INITIAL_FAILURE_LOG_LINES, timeout=15.0,
         ), (
-            "backend A did not emit initial-failure log line within "
-            "15s — either Redis was already reachable (proxy still "
-            "up?) or the code path was skipped"
+            "backend A did not emit any recognised initial-failure log "
+            "line within 15s — either Redis was already reachable (proxy "
+            "still up?) or the code path was skipped"
         )
         assert await _wait_for_log_line_async(
-            backend_b, INITIAL_FAILURE_LOG_LINE, timeout=15.0,
-        ), "backend B did not emit initial-failure log line within 15s"
+            backend_b, INITIAL_FAILURE_LOG_LINES, timeout=15.0,
+        ), "backend B did not emit any recognised initial-failure log line within 15s"
 
         # STEP 4: restore Redis. The fixed code's reader-loop
         # _reconnect path should bring the subscriber up on each

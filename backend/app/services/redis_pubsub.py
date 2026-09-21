@@ -97,7 +97,15 @@ class RedisPubSub:
         subsequent `start()` calls short-circuited at the enabled/started
         gate. The reconnect path became unreachable and the instance
         silently degraded to local-only broadcast even after Redis
-        recovered — the failure signature issue #29 documents.
+        recovered. This pattern can produce a cross-instance isolation
+        outcome similar to the one seen at Track 1 Gate 2 (issue #29),
+        though the Gate 2 failure was not proven to originate here.
+
+        The initial `_pub.ping()` is wrapped in `asyncio.wait_for` with
+        `REDIS_COMMAND_TIMEOUT_SEC`. `socket_connect_timeout` bounds only
+        the TCP connect; once the socket is up, a server that accepts
+        connections but never replies to PING would otherwise hang start()
+        indefinitely and defeat the reader-loop recovery this fix installs.
         """
         if not self._enabled or self._started:
             return
@@ -138,18 +146,39 @@ class RedisPubSub:
         # line for the metric. Failure → _connected=False + a specific
         # initial-failure log line the metric alerts on; the reader
         # loop will then repair via _reconnect.
+        #
+        # `asyncio.wait_for` is REQUIRED here. `socket_connect_timeout`
+        # bounds only the TCP handshake; once the socket is up, PING
+        # can hang forever if the server accepts connections but never
+        # replies (a common failure mode when Redis is overloaded or
+        # a proxy accepts TCP but blackholes commands). Without this
+        # bound, the reader task would never be scheduled and the
+        # whole recovery path this fix installs would remain unreachable.
         try:
-            await self._pub.ping()
+            await asyncio.wait_for(
+                self._pub.ping(),
+                timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
             self._connected = True
             log.info(
                 "redis pubsub started host=%s:%s prefix=%s instance=%s",
                 ENV.REDIS_HOST, ENV.REDIS_PORT, ENV.REDIS_CHANNEL_PREFIX, ENV.INSTANCE_ID,
             )
+        except asyncio.TimeoutError:
+            self._connected = False
+            # Distinct wording so the operator can tell TCP-accepted-but-hung
+            # apart from connection-refused. Same recognizable prefix as the
+            # generic branch so the metric/filter picks up both.
+            log.warning(
+                "redis pubsub initial connect failed: PING timed out after "
+                "%.2fs (TCP accepted but no reply); reader loop will retry",
+                ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
         except Exception as exc:
             self._connected = False
-            # New, distinct log string — recognisable by both the metric
-            # filter and by tests that need to detect the initial-failure
-            # event before restoring the network path.
+            # Distinct log string — recognisable by the metric filter and
+            # by tests that need to detect the initial-failure event
+            # before restoring the network path.
             log.warning(
                 "redis pubsub initial connect failed; reader loop will retry: %s",
                 exc,
