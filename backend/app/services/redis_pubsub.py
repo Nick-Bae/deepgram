@@ -84,9 +84,31 @@ class RedisPubSub:
         self._callback = cb
 
     async def start(self) -> None:
+        """Start the pub/sub adapter.
+
+        Always schedules the reader task, even when the initial Redis
+        connect fails. The reader loop's `_reconnect` path is the ONLY
+        thing that can bring the subscriber up once Redis becomes
+        reachable, so scheduling it unconditionally is required for
+        startup-recovery.
+
+        Before the fix, `_started = True` was set before `_pub.ping()`;
+        a ping failure left `_started=True` with no reader task, and
+        subsequent `start()` calls short-circuited at the enabled/started
+        gate. The reconnect path became unreachable and the instance
+        silently degraded to local-only broadcast even after Redis
+        recovered. This pattern can produce a cross-instance isolation
+        outcome similar to the one seen at Track 1 Gate 2 (issue #29),
+        though the Gate 2 failure was not proven to originate here.
+
+        The initial `_pub.ping()` is wrapped in `asyncio.wait_for` with
+        `REDIS_COMMAND_TIMEOUT_SEC`. `socket_connect_timeout` bounds only
+        the TCP connect; once the socket is up, a server that accepts
+        connections but never replies to PING would otherwise hang start()
+        indefinitely and defeat the reader-loop recovery this fix installs.
+        """
         if not self._enabled or self._started:
             return
-        self._started = True
         try:
             import redis.asyncio as aioredis  # type: ignore
         except Exception as exc:
@@ -94,6 +116,9 @@ class RedisPubSub:
             self._enabled = False
             return
 
+        # Construct clients first. If instantiation itself fails
+        # (unlikely — this is object creation, not I/O), leave
+        # _started=False so a retry is possible.
         try:
             self._pub = aioredis.Redis(
                 host=ENV.REDIS_HOST,
@@ -109,31 +134,66 @@ class RedisPubSub:
                 socket_connect_timeout=ENV.REDIS_CONNECT_TIMEOUT_SEC,
                 decode_responses=True,
             )
-            await self._pub.ping()
             self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
+        except Exception as exc:
+            log.error("redis client construction failed; disabling: %s", exc)
+            # Clean up whatever partial state we managed to create.
+            await self._teardown_clients()
+            self._enabled = False
+            return
+
+        # Initial ping. Success → _connected=True and a "started" log
+        # line for the metric. Failure → _connected=False + a specific
+        # initial-failure log line the metric alerts on; the reader
+        # loop will then repair via _reconnect.
+        #
+        # `asyncio.wait_for` is REQUIRED here. `socket_connect_timeout`
+        # bounds only the TCP handshake; once the socket is up, PING
+        # can hang forever if the server accepts connections but never
+        # replies (a common failure mode when Redis is overloaded or
+        # a proxy accepts TCP but blackholes commands). Without this
+        # bound, the reader task would never be scheduled and the
+        # whole recovery path this fix installs would remain unreachable.
+        try:
+            await asyncio.wait_for(
+                self._pub.ping(),
+                timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
             self._connected = True
-            self._reader_task = asyncio.create_task(self._reader_loop(), name="redis-pubsub-reader")
             log.info(
                 "redis pubsub started host=%s:%s prefix=%s instance=%s",
                 ENV.REDIS_HOST, ENV.REDIS_PORT, ENV.REDIS_CHANNEL_PREFIX, ENV.INSTANCE_ID,
             )
-        except Exception as exc:
-            log.error("redis connect failed; falling back to local-only broadcast: %s", exc)
+        except asyncio.TimeoutError:
             self._connected = False
-            # Keep _enabled True so a future start() retry could work; publish/subscribe
-            # will short-circuit on _connected until then.
+            # Distinct wording so the operator can tell TCP-accepted-but-hung
+            # apart from connection-refused. Same recognizable prefix as the
+            # generic branch so the metric/filter picks up both.
+            log.warning(
+                "redis pubsub initial connect failed: PING timed out after "
+                "%.2fs (TCP accepted but no reply); reader loop will retry",
+                ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            )
+        except Exception as exc:
+            self._connected = False
+            # Distinct log string — recognisable by the metric filter and
+            # by tests that need to detect the initial-failure event
+            # before restoring the network path.
+            log.warning(
+                "redis pubsub initial connect failed; reader loop will retry: %s",
+                exc,
+            )
 
-    async def stop(self) -> None:
-        if not self._started:
-            return
-        self._started = False
-        self._connected = False
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # ALWAYS schedule the reader loop. If _connected=False, the
+        # loop's first iteration enters _reconnect and continues
+        # attempting until Redis becomes reachable.
+        self._started = True
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(), name="redis-pubsub-reader",
+        )
+
+    async def _teardown_clients(self) -> None:
+        """Close and null out the pub/sub client objects. Idempotent."""
         for obj in (self._pubsub, self._sub, self._pub):
             if obj is None:
                 continue
@@ -148,6 +208,34 @@ class RedisPubSub:
         self._pub = None
         self._sub = None
         self._pubsub = None
+
+    async def stop(self) -> None:
+        """Stop the adapter cleanly.
+
+        Handles every intermediate state the fixed `start()` can leave
+        behind:
+          - `_started=True` with a running reader task (normal case)
+          - `_started=True` with a reader task that hasn't yet observed
+            the cancel (still normal)
+          - `_started=False` with partially constructed clients but no
+            reader task — this happens when client construction itself
+            raised inside `start()`. The old `if not self._started:
+            return` early-out at the top of `stop()` would have leaked
+            those partial clients.
+        """
+        # Nothing to do only when we have neither the started flag nor
+        # any lingering client objects.
+        if not self._started and self._pub is None and self._sub is None and self._pubsub is None:
+            return
+        self._started = False
+        self._connected = False
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self._teardown_clients()
         self._reader_task = None
         self._subscribed.clear()
         self._ref_counts.clear()
