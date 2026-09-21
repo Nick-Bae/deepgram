@@ -85,6 +85,16 @@ def _start_service_for_org(
         )
     except PermissionError as exc:
         detail = str(exc)
+        if detail == "maintenance_blocked":
+            # PR #31 §4b — deploy-gate is set; refuse new starts
+            # while a maintenance window is open. 503 with
+            # Retry-After matches what browsers and load balancers
+            # already understand for transient unavailability.
+            raise HTTPException(
+                status_code=503,
+                detail=detail,
+                headers={"Retry-After": "60"},
+            ) from exc
         if detail in {
             "hard_cap_reached",
             "subscription_required",
