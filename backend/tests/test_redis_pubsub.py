@@ -260,6 +260,13 @@ class _StubRedis:
         #  - `raise`    : `publish()` raises ConnectionError.
         self.publish_mode: str = "deliver"
         self.publish_calls: list = []
+        # Optional shared pubsub holder — set by the reconnect-
+        # aware test factory. When present, `publish()` routes to
+        # `_pubsub_holder.current._inbox` and `pubsub()` returns
+        # `_pubsub_holder.current`. Swapping `holder.current`
+        # mid-test simulates Firestore giving the caller a fresh
+        # subscriber object on reconnect.
+        self._pubsub_holder = None
 
     async def ping(self):
         if self.ping_mode == "ok":
@@ -274,12 +281,16 @@ class _StubRedis:
     async def publish(self, channel: str, data):
         self.publish_calls.append((channel, data))
         if self.publish_mode == "deliver":
-            # Deliver via the sibling pubsub's inbox. `_pubsub_obj`
-            # is the same one `pubsub()` returns for this client
-            # (test uses one _StubRedis instance for both _pub and
-            # _sub, or wires them via factory; matched-inbox
-            # semantics are what tests need to see the roundtrip).
-            self._pubsub_obj._inbox.append({"channel": channel, "data": data})
+            # Route to the shared holder's current pubsub when
+            # one is attached (reconnect-aware tests); otherwise
+            # fall back to this stub's own pubsub (single-instance
+            # tests).
+            target = (
+                self._pubsub_holder.current
+                if self._pubsub_holder is not None
+                else self._pubsub_obj
+            )
+            target._inbox.append({"channel": channel, "data": data})
             return 1
         if self.publish_mode == "drop":
             return 0
@@ -291,6 +302,10 @@ class _StubRedis:
         raise RuntimeError(f"unknown publish_mode {self.publish_mode}")
 
     def pubsub(self, **_kwargs):
+        # Same routing rule — reconnect-aware tests see the
+        # holder's CURRENT pubsub, which changes after a swap.
+        if self._pubsub_holder is not None:
+            return self._pubsub_holder.current
         return self._pubsub_obj
 
     async def aclose(self):
@@ -1427,6 +1442,157 @@ class RedisPubSubRealStartProbeTests(unittest.IsolatedAsyncioTestCase):
             f"publish exception did not emit publish_failed; stdout:\n{buf.getvalue()}",
         )
         self.assertEqual(ps._probe_pending, {})
+
+    async def test_probe_survives_forced_reconnect_with_fresh_subscriber(self):
+        """Reviewer's final gap — none of the existing real-start
+        probe tests forces reconnect while probes are enabled, so
+        their green state does not prove the reconnect path
+        re-installs the probe subscription. F-27's own success
+        cannot substitute because F-27 does not enable probes.
+
+        Test shape:
+          1. Start the REAL adapter with probes enabled against
+             `_StubRedis` clients that share a pubsub via
+             `_PubsubHolder`. First tick yields `redis_probe_ok`.
+          2. Swap `holder.current` to a FRESH `_StubPubSub`. The
+             old one stays around but is disconnected from any
+             new pub or sub client — this is what proves the
+             stub can't accidentally pass the test by retaining
+             the old subscription.
+          3. Force `_connected=False` so the reader-loop enters
+             `_reconnect` on its next iteration. `_reconnect`
+             creates a NEW _sub via the factory + calls
+             `.pubsub()` → returns the new holder.current, and
+             its bulk SUBSCRIBE includes the probe channel per
+             §3 W7.
+          4. The probe loop's next tick publishes → routes to
+             holder.current (the NEW pubsub) → reader consumes
+             from the NEW pubsub → new probe_ok emitted.
+          5. Assert: probe channel appears in NEW pubsub's
+             `subscribed` list; a probe_ok emitted AFTER the
+             swap (identified by its timestamp being later than
+             the swap moment); the OLD pubsub's inbox count
+             frozen from the swap point onward.
+        """
+        import io
+        import contextlib
+        from app.services.redis_pubsub import _probe_channel_name
+
+        class _PubsubHolder:
+            def __init__(self, initial):
+                self.current = initial
+
+        from app.services.redis_pubsub import RedisPubSub
+
+        pubsub_a = _StubPubSub()
+        holder = _PubsubHolder(pubsub_a)
+        constructed: list = []
+
+        def _factory(**kwargs):
+            stub = _StubRedis(ping_mode="ok", **kwargs)
+            stub._pubsub_holder = holder  # shared, mutable
+            stub.publish_mode = "deliver"
+            constructed.append(stub)
+            return stub
+
+        import redis.asyncio as aioredis
+        self._orig_redis_cls = aioredis.Redis
+        aioredis.Redis = _factory  # type: ignore[assignment]
+        self._aioredis = aioredis
+
+        ps = RedisPubSub()
+        ps._enabled = True
+        ps.enable_probe_task()
+
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                await ps.start()
+                # Step 1 — wait for the FIRST probe_ok on pubsub_a.
+                for _ in range(60):
+                    await asyncio.sleep(0.02)
+                    if 'redis_probe_ok' in buf.getvalue():
+                        break
+                first_oks = [
+                    ln for ln in buf.getvalue().splitlines()
+                    if '"redis_probe_ok"' in ln
+                ]
+                self.assertGreaterEqual(
+                    len(first_oks), 1,
+                    "no probe_ok before reconnect; "
+                    "reconnect test needs a pre-reconnect baseline",
+                )
+                # Snapshot the pre-swap counts + probe-channel
+                # subscription state on pubsub_a.
+                pubsub_a_subscribed = list(pubsub_a.subscribed)
+                pubsub_a_inbox_len_at_swap = len(pubsub_a._inbox)
+                oks_before_swap = len([
+                    ln for ln in buf.getvalue().splitlines()
+                    if '"redis_probe_ok"' in ln
+                ])
+                self.assertIn(
+                    _probe_channel_name(ENV.INSTANCE_ID),
+                    pubsub_a_subscribed,
+                    "probe channel not on pubsub_a's subscribed list "
+                    "at start — reconnect test premise broken",
+                )
+
+                # Step 2 — swap to a fresh pubsub. Any subsequent
+                # publish or subscribe MUST touch pubsub_b, not _a.
+                pubsub_b = _StubPubSub()
+                holder.current = pubsub_b
+
+                # Step 3 — force the reader loop to reconnect.
+                ps._connected = False
+
+                # Step 4/5 — wait for a NEW probe_ok. Assert it
+                # arrives strictly AFTER the swap moment (i.e. the
+                # total count of probe_ok in stdout grew).
+                for _ in range(200):
+                    await asyncio.sleep(0.02)
+                    oks_now = len([
+                        ln for ln in buf.getvalue().splitlines()
+                        if '"redis_probe_ok"' in ln
+                    ])
+                    if oks_now > oks_before_swap:
+                        break
+                oks_after_swap = len([
+                    ln for ln in buf.getvalue().splitlines()
+                    if '"redis_probe_ok"' in ln
+                ])
+                self.assertGreater(
+                    oks_after_swap, oks_before_swap,
+                    f"no new probe_ok after forced reconnect + swap; "
+                    f"had {oks_before_swap} before, {oks_after_swap} after. "
+                    f"stdout:\n{buf.getvalue()}",
+                )
+
+                # The probe channel MUST be on pubsub_b's subscribed
+                # list — proves _reconnect included the probe
+                # channel in its bulk SUBSCRIBE.
+                self.assertIn(
+                    _probe_channel_name(ENV.INSTANCE_ID),
+                    pubsub_b.subscribed,
+                    f"probe channel not resubscribed on the fresh "
+                    f"pubsub after reconnect; pubsub_b.subscribed="
+                    f"{pubsub_b.subscribed!r}",
+                )
+
+                # The OLD pubsub's inbox must be FROZEN from the
+                # swap moment onward — any post-swap probe publish
+                # routing there would let the stub cheat the test.
+                # Even a single delta = stub retained old subscription.
+                self.assertEqual(
+                    len(pubsub_a._inbox), pubsub_a_inbox_len_at_swap,
+                    f"pubsub_a inbox grew after swap "
+                    f"({pubsub_a_inbox_len_at_swap} → {len(pubsub_a._inbox)}); "
+                    f"stub is still routing to the old subscriber",
+                )
+
+                # Pending map still clean.
+                self.assertEqual(ps._probe_pending, {})
+        finally:
+            await ps.stop()
 
     async def test_shutdown_ordering_probe_task_alive_when_teardown_begins(self):
         """Reviewer note — inspect task state at the MOMENT teardown
