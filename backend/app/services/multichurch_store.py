@@ -301,6 +301,51 @@ _HARD_INACTIVE_ORG_STATUSES: set[str] = {"inactive", "disabled", "suspended", "d
 _FS_TIMEOUT = 15.0  # seconds — prevents gRPC stalls from hanging indefinitely
 
 
+# BOOT-1 deploy-gate parsing (PR #31 §4b). Absent-document handling is
+# the CALLER's responsibility — call `_parse_deploy_gate_doc` only when
+# the document exists. The strict typing here matters because Firestore
+# will return the document dict as-is, and a misconfigured writer that
+# lands `{"blocked": null}` or `{"blocked": 0}` on the gate would
+# otherwise be treated as "unblocked" by a naive `bool(...)` — silently
+# defeating the entire gate mechanism during a maintenance window.
+class _MalformedDeployGate(PermissionError):
+    """Distinct exception so the route can translate to 503 with a
+    detail that ops can page on separately from the normal
+    `maintenance_blocked` case."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("maintenance_malformed_gate")
+        self.reason = reason
+
+
+def _parse_deploy_gate_doc(data: Optional[Dict[str, Any]]) -> bool:
+    """Return `True` iff the gate document says blocked.
+
+    Contract:
+      - `data is None` → CALLER precondition violation (they should
+        only call this when `snap.exists`). Raises `TypeError`.
+      - Missing `blocked` field → `_MalformedDeployGate` (an existing
+        document without the required field is a stop).
+      - `blocked` present but not a literal `bool` (e.g. `None`, `0`,
+        `""`, `"true"`) → `_MalformedDeployGate`.
+      - `blocked is True` → `True` (blocked).
+      - `blocked is False` → `False` (unblocked).
+    """
+    if data is None:
+        raise TypeError("_parse_deploy_gate_doc requires a dict; call only when snap.exists")
+    if "blocked" not in data:
+        raise _MalformedDeployGate("missing field `blocked`")
+    val = data["blocked"]
+    # `isinstance(True, int) is True` in Python — the isinstance(val, bool)
+    # check is deliberately BEFORE any int/str fallbacks, and there are
+    # no fallbacks. We require the literal type, not truthiness.
+    if not isinstance(val, bool):
+        raise _MalformedDeployGate(
+            f"`blocked` has wrong type {type(val).__name__}: {val!r}"
+        )
+    return val
+
+
 def _ignore_missing_adc_file_in_cloud_run() -> None:
     """Let Cloud Run use its attached service account if a stale local ADC path is configured."""
     if not (os.getenv("K_SERVICE") or (os.getenv("APP_ENV") or "").strip().lower() == "production"):
@@ -766,6 +811,83 @@ class RoomRef:
 
 
 class InMemoryMultiChurchStore:
+    def read_deploy_gate(self) -> Dict[str, Any]:
+        """Non-transactional snapshot of the in-memory gate. Mirrors
+        `FirestoreMultiChurchStore.read_deploy_gate` — including the
+        malformed-doc surface — for interface parity."""
+        with self._lock:
+            gate = dict(self._deploy_gate) if self._deploy_gate is not None else None
+        if gate is None:
+            return {"blocked": False, "exists": False, "malformed": False}
+        try:
+            blocked = _parse_deploy_gate_doc(gate)
+        except _MalformedDeployGate as exc:
+            return {
+                "blocked": True,
+                "exists": True,
+                "malformed": True,
+                "malformed_reason": exc.reason,
+                "revision": gate.get("revision"),
+                "blocked_at": gate.get("blocked_at"),
+                "reason": gate.get("reason"),
+                "blocked_by": gate.get("blocked_by"),
+            }
+        return {
+            "blocked": blocked,
+            "exists": True,
+            "malformed": False,
+            "revision": gate.get("revision"),
+            "blocked_at": gate.get("blocked_at"),
+            "reason": gate.get("reason"),
+            "blocked_by": gate.get("blocked_by"),
+        }
+
+    def _set_deploy_gate_for_test(self, *, blocked: bool, reason: str = "test", by: str = "test") -> None:
+        """TEST-ONLY: mutate the in-memory gate with well-formed data.
+
+        Illustrates the WRITE-SIDE CONTRACT the operator's set/clear
+        script must implement (bumps `revision`, sets `blocked_at`,
+        `reason`, `blocked_by`). That production writer is a separate
+        follow-on PR — see PR #33's non-goals — so the monotonic-
+        revision guarantee currently lives ONLY in this test helper.
+
+        Production writes go through the operator's set/clear script
+        against Firestore, not through the store API. DO NOT call
+        this from production code.
+        """
+        with self._lock:
+            current = self._deploy_gate or {}
+            revision = int(current.get("revision") or 0) + 1
+            if blocked:
+                self._deploy_gate = {
+                    "blocked": True,
+                    "revision": revision,
+                    "blocked_at": _utcnow(),
+                    "reason": reason,
+                    "blocked_by": by,
+                }
+            else:
+                # Cleared state is represented as an explicit
+                # `blocked: False` document (with revision) rather
+                # than an empty dict, so the operator can audit the
+                # clear event via the revision number.
+                self._deploy_gate = {
+                    "blocked": False,
+                    "revision": revision,
+                    "blocked_at": _utcnow(),
+                    "reason": reason,
+                    "blocked_by": by,
+                }
+
+    def _write_deploy_gate_raw_for_test(self, data: Dict[str, Any]) -> None:
+        """TEST-ONLY: overwrite the in-memory gate with an arbitrary
+        dict — including malformed shapes the reviewer flagged
+        (`{}`, `{"blocked": None}`, `{"blocked": 0}`, etc.). Bypasses
+        the well-formed writer above so tests can exercise the strict
+        parser's rejection paths. DO NOT call from production code."""
+        with self._lock:
+            self._deploy_gate = dict(data)
+
     def __init__(self) -> None:
         self._lock = RLock()
         self._global_host_token = (os.getenv("HOST_API_TOKEN") or "").strip()
@@ -781,6 +903,12 @@ class InMemoryMultiChurchStore:
         self._invite_audits: List[Dict[str, Any]] = []
         self._billing_events: Dict[str, Dict[str, Any]] = {}
         self._platform_config: Dict[str, Any] = {}
+        # Global deploy-gate flag (mirrors Firestore's `system/deploy_gate`).
+        # `None` = absent document (unblocked default, matches Firestore).
+        # An EMPTY dict `{}` is intentionally NOT the absent marker —
+        # `{}` represents an existing-but-malformed doc (no `blocked`
+        # field), which must be rejected by the strict parser.
+        self._deploy_gate: Optional[Dict[str, Any]] = None
         self._seed_dev_data()
 
     def _seed_dev_data(self) -> None:
@@ -2562,6 +2690,17 @@ class InMemoryMultiChurchStore:
     ) -> Dict[str, Any]:
         now = _utcnow()
         with self._lock:
+            # PR #31 §4b — deploy-gate check. The in-memory store's
+            # `_lock` provides the equivalent atomic read+create the
+            # Firestore transaction gives in production. `None` is
+            # the absent-document sentinel (unblocked default); any
+            # dict (including `{}`) is a "document exists" case and
+            # MUST pass strict parsing (an empty dict has no
+            # `blocked` field and is malformed).
+            if self._deploy_gate is not None:
+                if _parse_deploy_gate_doc(self._deploy_gate):
+                    raise PermissionError("maintenance_blocked")
+
             org = self._orgs.get(org_id)
             if not org:
                 raise ValueError("org_not_found")
@@ -3251,6 +3390,71 @@ class FirestoreMultiChurchStore:
 
     def _room_ref(self, org_id: str, room_id: str):
         return self._org_ref(org_id).collection("rooms").document(room_id)
+
+    def _deploy_gate_ref(self):
+        """Global (service-wide, not per-org) session-block flag.
+
+        Path: `system/deploy_gate`. Consulted transactionally inside
+        `start_service`. Absent document = unblocked (safe default so
+        the gate-reading code deploy is a no-op until the operator
+        writes the document).
+
+        See PR #31 §4b for the rollout-window contract.
+        """
+        return self._db.collection("system").document("deploy_gate")
+
+    def read_deploy_gate(self) -> Dict[str, Any]:
+        """Non-transactional snapshot of the gate for operator tools.
+
+        Returns a dict with `blocked` (bool) plus, when the document
+        exists, `revision`, `blocked_at`, `reason`, `blocked_by`.
+        When the document is absent, returns
+        `{"blocked": False, "exists": False, "malformed": False}`.
+
+        When the document EXISTS but its `blocked` field is missing or
+        the wrong type, the returned dict has
+        `"malformed": True, "blocked": True, "malformed_reason": <str>`.
+        Marking a malformed gate as `blocked=True` (rather than the
+        naive `bool(...)`'s `False`) prevents operator tooling from
+        reporting the maintenance-window state as safe when it is
+        actually undetermined. The set/clear script and dashboards
+        should surface the `malformed_reason` and refuse to advance
+        the deploy.
+
+        A production hot-path (`start_service`) MUST read the gate
+        INSIDE its Firestore transaction, not via this helper: the
+        transaction is what closes the check/create race described in
+        PR #31 §4b.
+        """
+        try:
+            snap = self._deploy_gate_ref().get(timeout=_FS_TIMEOUT, retry=None)
+        except TypeError:
+            snap = self._deploy_gate_ref().get()
+        if not snap.exists:
+            return {"blocked": False, "exists": False, "malformed": False}
+        data = snap.to_dict() or {}
+        try:
+            blocked = _parse_deploy_gate_doc(data)
+        except _MalformedDeployGate as exc:
+            return {
+                "blocked": True,
+                "exists": True,
+                "malformed": True,
+                "malformed_reason": exc.reason,
+                "revision": data.get("revision"),
+                "blocked_at": data.get("blocked_at"),
+                "reason": data.get("reason"),
+                "blocked_by": data.get("blocked_by"),
+            }
+        return {
+            "blocked": blocked,
+            "exists": True,
+            "malformed": False,
+            "revision": data.get("revision"),
+            "blocked_at": data.get("blocked_at"),
+            "reason": data.get("reason"),
+            "blocked_by": data.get("blocked_by"),
+        }
 
     def is_room_live(self, org_id: str, room_id: str) -> bool:
         """Return True only when Firestore confirms status="live".
@@ -5390,12 +5594,35 @@ class FirestoreMultiChurchStore:
         db = self._db
         org_ref = self._org_ref(org_id)
         service_ref = self._service_ref(org_id, service_key)
+        deploy_gate_ref = self._deploy_gate_ref()
         room_id = _new_room_id()
         room_ref = self._room_ref(org_id, room_id)
         now = _utcnow()
 
         @gcf_firestore.transactional
         def _tx(transaction):
+            # PR #31 §4b — transactional deploy-gate check. Reading the
+            # gate INSIDE the transaction closes the race between "flag
+            # checked" and "room created". If the gate is set between
+            # our read and the room-write staged below, Firestore's
+            # transaction will detect the concurrent write on
+            # `system/deploy_gate` and retry this callback (or abort
+            # the write); we cannot end up with a room created while
+            # the gate was blocked at commit time. Absent document =
+            # unblocked (the safe default for the gate-code-first
+            # BOOT-1 deploy, when the document does not exist yet).
+            gate_snap = deploy_gate_ref.get(transaction=transaction)
+            if gate_snap.exists:
+                # `_parse_deploy_gate_doc` raises `_MalformedDeployGate`
+                # (a `PermissionError` subclass) when the document
+                # exists but its `blocked` field is missing or the
+                # wrong type. A `bool(...)` coercion here would have
+                # silently treated `{"blocked": null}` or `{}` as
+                # unblocked, which would let a misconfigured gate
+                # document defeat the entire maintenance window.
+                if _parse_deploy_gate_doc(gate_snap.to_dict()):
+                    raise PermissionError("maintenance_blocked")
+
             org_snap = org_ref.get(transaction=transaction)
             if not org_snap.exists:
                 raise ValueError("org_not_found")

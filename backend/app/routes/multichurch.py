@@ -85,6 +85,21 @@ def _start_service_for_org(
         )
     except PermissionError as exc:
         detail = str(exc)
+        if detail in ("maintenance_blocked", "maintenance_malformed_gate"):
+            # PR #31 §4b — deploy-gate refuses new starts.
+            # * `maintenance_blocked` — the gate is set to `blocked=True`.
+            #   This is the normal maintenance-window response.
+            # * `maintenance_malformed_gate` — the gate document exists
+            #   but its `blocked` field is missing or the wrong type.
+            #   Distinct detail so ops can page on it separately;
+            #   BEHAVIOUR still refuses starts (the fail-closed choice)
+            #   because we cannot prove the gate's intended state.
+            #   Same Retry-After so client behaviour is uniform.
+            raise HTTPException(
+                status_code=503,
+                detail=detail,
+                headers={"Retry-After": "60"},
+            ) from exc
         if detail in {
             "hard_cap_reached",
             "subscription_required",
