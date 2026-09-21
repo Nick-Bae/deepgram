@@ -96,7 +96,9 @@ jobs:
           GOOGLE_CLOUD_PROJECT: cleanup-track1-emulator
           MULTICHURCH_STORE_MODE: firestore
         run: |
-          pytest tests/test_sweeper_atomic.py::FirestoreAtomicIdleTerminationTests \
+          pytest \
+            tests/test_sweeper_atomic.py::FirestoreAtomicIdleTerminationTests \
+            tests/test_deploy_gate_firestore.py::DeployGateFirestoreTests \
             -v --junitxml=/tmp/emulator-tests.xml
 
       - name: Fail if emulator tests skipped or none ran
