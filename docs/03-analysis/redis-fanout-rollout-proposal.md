@@ -73,8 +73,8 @@ even after Redis comes back — it silently degrades to local-only
 broadcast. That is exactly the Gate 2 failure mode we are trying to
 prevent, but from a different cause.
 
-**Fix — landed in PR #32 (`fix/redis-pubsub-startup-recovery`),
-stacked on PR #30:**
+**Fix — implemented in PR #32 (`fix/redis-pubsub-startup-recovery`,
+CI-verified, unmerged), stacked on PR #30:**
 
 - Reader task is always scheduled by `start()` regardless of
   whether the initial ping succeeded.
@@ -115,7 +115,11 @@ stacked on PR #30:**
 
 CI on commit `25b0cf3d`: backend-tests, firestore-emulator-tests,
 frontend-checks, and integration-tests (F-8, F-9, F-15, F-24,
-F-25, F-26, **F-27**) all green.
+F-25, F-26, **F-27**) all green. **PR #32 is not yet merged.**
+"Implemented and CI-verified" is accurate; "shipped" is not.
+This rollout proposal cannot advance past its own approval gate
+until PR #32 (and PR #30) merge in a confirmed no-live-room
+window.
 
 PR #30 remains a tests-only PR and its approval stands.
 
@@ -151,7 +155,8 @@ Metric names match the `ops/monitoring/reconciler/` convention
 | `redis_pubsub_reconnect_successes` | `textPayload:"redis pubsub reconnected"` | The recovery signal. If attempts rise but successes don't, the connection is broken. |
 | `redis_pubsub_reconnect_failures` | `textPayload:"redis reconnect failed"` | Direct failure counter. |
 | `redis_pubsub_reader_errors` | `textPayload:"pubsub reader error"` | Reader-loop crashes (transient socket drops). Occasional is fine; sustained is not. |
-| `redis_pubsub_active_probe_failure` | `textPayload:"redis_probe_failed"` | Emitted by the active probe endpoint (see below). Per-instance failure signal that does NOT depend on adapter internals. |
+| `redis_pubsub_active_probe_failure` | `textPayload:"redis_probe_failed"` | Emitted by the in-process active probe (see below). Per-instance failure signal that exercises the adapter's real pub + sub path. |
+| `redis_pubsub_active_probe_success` | `textPayload:"redis_probe_ok"` | Positive-heartbeat counter. Absence pages via A8 (metric-absence alarm) when the roster expects a probe from an instance and none has arrived in the last 2 min. |
 
 All six metrics filter on
 `resource.type="cloud_run_revision" AND resource.labels.service_name="worshiptranslate-backend"`.
@@ -177,56 +182,139 @@ looks healthy.
   successes on the same instance` — pages. Indicates Memorystore
   or VPC path is unhealthy for that instance.
 - `A7 active_probe_failure > 0 in 5 min` (per instance) — pages.
-  Defined below.
+  Defined below. Exercises the adapter's actual reader path so a
+  stuck subscriber cannot be masked by a fresh Redis client.
+- `A8 no active_probe_success from a rostered instance in 2 min`
+  (per instance, metric-absence alarm) — pages. Catches silent
+  instances that stopped emitting probe heartbeats altogether.
+  Depends on the §4a-1 roster to know which instances SHOULD be
+  reporting.
 - The existing A1 reconciler-freshness alert continues to page on
   its own — a Redis outage does not affect the reconciler.
 
 ### Active pub/sub probe (`A7` source signal)
 
 Log-based counters only tell us what the adapter itself emitted.
-They cannot tell us that a message we publish is actually received
-by another instance's subscriber. For that we need an active probe
-that publishes AND subscribes from inside the Cloud Run network.
+They cannot tell us that a message we publish is actually
+received by our OWN adapter's subscriber. That is the exact
+failure the startup-recovery bug (§2) produced: the adapter's
+reader task was never scheduled, so its subscribe path was
+dead — a probe using its own fresh Redis client would have
+succeeded and hidden the defect. The probe MUST exercise the
+adapter's actual reader path.
 
-Design:
+**Coverage — Cloud Run routing does not give per-instance access.**
 
-- A lightweight endpoint `/internal/redis_probe` (auth via
-  workload identity, private-network-only) that, when called,
-  publishes a randomly-marked heartbeat message on a dedicated
-  probe channel and asserts that its OWN subscriber receives it
-  within a small deadline.
-- A Cloud Scheduler job (interval: 60 s) invokes this endpoint on
-  each serving revision via the internal service URL, iterating
-  through revisions (public traffic and 0%-traffic drained
-  revisions both).
-- The endpoint logs `redis_probe_ok instance=<id>` on success and
-  `redis_probe_failed instance=<id> reason=<...>` on failure. A6
-  metric group adds a `redis_pubsub_active_probe_failure` counter
-  filtering on `textPayload:"redis_probe_failed"`.
-- The probe does NOT test cross-instance fanout on its own (that
-  requires two instances). It tests that this instance's publish
-  path AND subscribe path are healthy — the two loop halves the
-  startup-recovery fix depends on.
-- Cross-instance fanout is verified during the enablement window
-  by the F-27-style handover check the operator runs
-  (`gate2_handover.sh` in the v6 helpers).
+A request to a Cloud Run service URL selects an instance by load
+balancing; session affinity is best-effort, not guaranteed
+(https://cloud.google.com/run/docs/triggering/session-affinity).
+Polling a revision URL from Cloud Scheduler cannot guarantee
+every instance is exercised. The coverage mechanism instead runs
+INSIDE each backend process:
+
+- A background probe task starts alongside the reader loop.
+  Interval: 30 s (configurable via `REDIS_PROBE_INTERVAL_SEC`).
+- Each tick, the probe publishes a marker on a dedicated per-
+  instance channel `worshiptranslate:probe:<instance_id>` via
+  the ADAPTER'S `_pub` client. The instance's OWN adapter is
+  already subscribed to that channel via `ensure_subscription`
+  at start-up.
+- The probe waits for the adapter's reader-loop to deliver the
+  marker back through the same callback path production
+  broadcasts use. Deadline: 2 s.
+- On delivery: log
+  `redis_probe_ok instance=<id> rtt_ms=<n>` (INFO).
+- On timeout OR any exception: log
+  `redis_probe_failed instance=<id> reason=<...>` (WARNING).
+
+Because the probe runs in-process, coverage is by construction —
+every live instance emits its own probe result. Silent instance
+means silent probe means alert fires (see below).
+
+**Probe correctness — it exercises the failure surface.**
+
+- Publish path: uses `_pub` — same client production broadcasts
+  use. A stuck `_pub` fails production and fails the probe.
+- Subscribe path: uses `_pubsub` via the reader loop's
+  `_dispatch` — the same code path that delivers production
+  translations. A reader loop that never got scheduled (the §2
+  bug shape) fails the probe.
+- The probe does not open a fresh Redis client for either half;
+  a probe with its own client would pass even when the adapter
+  is stuck, defeating the purpose.
+
+Cross-instance fanout (marker published by A, delivered by B's
+reader loop) is verified during the enablement window by the
+F-27-style handover check the operator runs
+(`gate2_handover.sh` in the v6 helpers). The in-process probe
+covers the per-instance half; the handover check covers the
+cross-instance half.
+
+**Missing-probe detection.**
+
+- `redis_pubsub_probe_missing` counter — a metric absence alarm
+  (Cloud Monitoring "absence" condition) fires when no
+  `redis_probe_ok` for a given `(revision, instance_id)` pair
+  has arrived in the last 2 min while that instance is still on
+  the roster (§4a-1). Absence pages via `A8`.
+- The absence check needs the roster from §4a-1 to know which
+  instances SHOULD be reporting. In steady state the roster is
+  just "every live instance"; during a window it's the frozen
+  roster the operator entered on.
+
+**INFO-log deliverability caveat (learned from PR #32).**
+
+Cloud Run captures stdout and stderr to Cloud Logging, but
+module-level `logging.info(...)` calls only surface when the
+process's root logger is at INFO. PR #32's F-27 initially
+timed out because the harness backend ran with root at
+WARNING; the fix was to explicitly set the `redis_pubsub`
+logger to INFO in the harness bootstrap.
+
+Production applies the same discipline:
+
+- The backend's process entry point MUST set the root logger
+  (or at minimum `redis_pubsub` + `app.services.*`) to INFO
+  before `uvicorn.run(...)` so `redis pubsub started …`,
+  `redis pubsub reconnected …`, and `redis_probe_ok …` INFO
+  lines reach Cloud Logging.
+- Pre-enablement observability check §3 includes a
+  "smoke-verify INFO reaches Cloud Logging" step that flips
+  `REDIS_ENABLED=1` on a canary revision at 0 % traffic and
+  confirms the `redis pubsub started …` INFO line surfaces in
+  Cloud Logging within 60 s.
 
 ### Pre-enablement observability check
 
 Before flipping `REDIS_ENABLED=1`:
 
-1. Deploy the five log-based metrics + the probe endpoint + the
-   Cloud Scheduler probe via the same pattern used in
+1. Deploy the seven log-based metrics + the alert policies (A5–
+   A8 + reader errors) via the same pattern used in
    `ops/monitoring/reconciler/` (adapter yaml + `apply.sh`;
-   separate PR from the code fix).
-2. Verify each metric name is present in Cloud Logging and returns
-   0 samples (the adapter emits nothing while `REDIS_ENABLED=0`;
-   the probe endpoint returns 503 while disabled).
-3. On a canary revision (traffic 0%), flip `REDIS_ENABLED=1`
-   temporarily; verify the `redis pubsub started …` line appears
-   in Cloud Logging, `redis_pubsub_startup_failed` stays at 0,
-   and the probe emits `redis_probe_ok` for that instance within
-   two consecutive scheduler ticks.
+   Google Cloud resources only, no Cloud Run change).
+2. Verify each metric name is present in Cloud Logging and
+   returns 0 samples (the adapter emits nothing while
+   `REDIS_ENABLED=0`; the in-process probe task is inert while
+   disabled).
+3. **INFO-log deliverability smoke test.** On a canary revision
+   at 0 % traffic, flip `REDIS_ENABLED=1` briefly and confirm
+   the `redis pubsub started …` INFO line reaches Cloud
+   Logging within 60 s. If it does not, the production entry
+   point is not configuring the root/`redis_pubsub` logger at
+   INFO — fix that BEFORE any subsequent §4d window (this is
+   the exact defect PR #32 hit in its harness). Flip back to
+   `=0` and record the smoke-test outcome in the audit trail.
+4. On the same canary at 0 % traffic (re-flipped to
+   `REDIS_ENABLED=1`), verify:
+   - `redis_pubsub_startup_failed` for this instance stays 0
+     OR is followed by `redis_pubsub_reconnect_successes` on
+     the same instance within 5 min (A5 paired condition).
+   - The in-process probe emits `redis_probe_ok instance=<id>`
+     at least twice within 2 min.
+   - `redis_pubsub_probe_missing` for this instance stays 0.
+
+The canary must return to `REDIS_ENABLED=0` before the operator
+begins the real §4d enablement window.
 
 ## 4. Enablement gates and rollback (no-live-room-required)
 
@@ -236,151 +324,348 @@ active WebSockets). The enablement and rollback windows must be
 strictly no-live-room, AND every deploy in the window must follow
 the ordered sequence in §4d.
 
-### 4a. No-live-room detection (authoritative)
+### 4a. Acceptance-check families (three separate sets)
 
-A no-live-room window requires ALL of:
+Three check families exist. They are named separately because
+they run at DIFFERENT phases of the window and depend on
+DIFFERENT state. The reviewer flagged earlier drafts for mixing
+Redis-health checks into rollback (where Redis is being
+disabled) and into preflight (where Redis is still disabled and
+the probe endpoint returns 503).
 
-- **Firestore** — no room with `status="live"` across every
-  `organizations/*/rooms/*` document. Query executed via the same
-  admin store the reconciler uses; results counted in one pass.
-- **Per-instance reconciler ticks** — for EVERY Cloud Run instance
-  that emitted a `reconciler_tick` in the last 90 s (whether the
-  instance's revision is at 100 % traffic OR 0 % traffic while
-  draining), the last two consecutive ticks show
-  `owned_rooms=0`. Enumerate instances by pulling the last 90 s of
-  `reconciler_tick` logs, grouping by
-  `resource.labels.revision_name` × `resource.labels.instance_id`;
-  every distinct pair must have two zero-tick observations, and
-  the youngest pair must have ticked within the last 60 s (silence
-  is not an OK signal — see §4a rationale below).
+Every family shares the same authoritative identity source:
 
-  Rationale: this catches the case where a revision at 0 % public
-  traffic still holds a Cloud Run instance with an open WebSocket
-  for a room that Firestore has already marked ended. Aggregating
-  ticks by revision only would miss the older revision's instances
-  entirely if the newer revision has more ticks — that is exactly
-  the isolation shape Gate 2 observed.
+- Cloud Run's `resource.labels` for a service log carries
+  `service_name`, `revision_name`, `location` — but **no**
+  `instance_id`. The Cloud Run instance id field name shifts
+  across product surfaces and is not reliable for service logs.
+- The APPLICATION identity we use is
+  `jsonPayload.instance_id` (present on every `reconciler_tick`
+  and on the probe log lines — the value of `ENV.INSTANCE_ID`
+  auto-generated per process, see
+  `backend/app/services/room_reconciler.py:170`,
+  `backend/app/main.py:1319`).
+- Cloud Logging exposes this via an explicit extraction —
+  Log-based metrics and MQL queries reference it as
+  `EXTRACT(jsonPayload.instance_id)` and Cloud Monitoring
+  groups by that extracted label.
+- Any check below that says "per instance" means per
+  `(jsonPayload.instance_id, resource.labels.revision_name)`
+  pair, using the extraction.
 
-- **Cross-instance active probe** — the `redis_probe_ok` line
-  fired on every enumerated (revision, instance) pair inside the
-  same 90 s window. Absence indicates the probe endpoint has not
-  been polled for that instance; a `redis_probe_failed` line on
-  ANY enumerated instance disqualifies the window.
+#### 4a-1. Room-drain checks — Redis-independent
 
-All three checks must hold at the same tick moment. A helper
-script similar to `~/.gate2-helpers-v5/gate2_preflight.sh` will
-formalise this check and emit
-`no_live_rooms_verified_at=<UTC>` (with the enumerated instance
-list and the tick / probe timestamps) for the operator.
+These are the ONLY checks used inside §4d step 3 (confirm no
+live rooms before deploying either an enable or a disable flip)
+and inside §4e (rollback). They intentionally do NOT depend on
+Redis health, so they work even when Redis is off or being
+turned off.
 
-### 4b. Prevent new sessions during the window
+At window entry, enumerate the **instance roster**:
 
-Both service-start endpoints reject NEW sessions during the
-window. Missing either one lets a new host attach and create a
-live room between the no-live-room verification and the deploy.
+- Every distinct `(jsonPayload.instance_id, revision_name)` pair
+  that emitted a `reconciler_tick` in the last **10 minutes**.
+  Ten minutes covers a full sweeper cycle plus one deploy cycle;
+  90 s (the earlier draft) drops instances that go silent while
+  stuck.
+- Persist the roster to the audit trail. New pairs that appear
+  during the window are ADDED. Existing pairs stay on the roster
+  until retirement is proven (see below); disappearance is
+  treated as **unresolved**, not implicit pass.
+
+The window can proceed only when BOTH hold at the same moment:
+
+1. **Firestore** — no `organizations/*/rooms/*` document has
+   `status="live"`. One pass via the admin store the reconciler
+   uses.
+2. **Instance roster is clean** — every roster member has either:
+   - emitted two consecutive `reconciler_tick` events with
+     `owned_rooms=0` in the last 60 s AND its youngest tick is
+     within 60 s (silence during the window disqualifies), OR
+   - been proven RETIRED via a Cloud Run revision status
+     showing the instance's `revision_name` has zero live
+     instances (checked with `gcloud run revisions describe`
+     against the revision's `status.conditions[Ready]` and the
+     revision-level active-instance count published in
+     Monitoring). Retirement removes the instance from the
+     roster for the rest of the window.
+
+A helper script (successor to `~/.gate2-helpers-v5/gate2_preflight.sh`)
+formalises this and emits, for the audit trail:
+
+- `no_live_rooms_verified_at=<UTC>`
+- `roster=[(revision, instance_id, last_tick_at, last_owned_rooms), …]`
+- `firestore_live_room_count=0`
+- `retired_this_window=[(revision, instance_id, retired_at), …]`
+
+#### 4a-2. Redis-enabled acceptance — post-`REDIS_ENABLED=1` deploy
+
+Runs at §4d step 5 ONLY after a flip to `REDIS_ENABLED=1`. The
+roster used here is the post-deploy roster (new revision's new
+instances). For every roster member:
+
+- `redis pubsub started …` INFO line present within 60 s of the
+  instance's first `reconciler_tick`.
+- `redis_pubsub_startup_failed` counter for this instance is
+  either 0 for the last 5 min, OR followed by a corresponding
+  `redis_pubsub_reconnect_successes` event on the same instance
+  within 5 min. The pair is the true page signal (matches A5's
+  definition in §3); a lone startup_failed is expected during
+  transient Memorystore blips.
+- `redis_probe_ok` fired at least twice within the last 3 min
+  for this instance via the coverage mechanism in §3's active
+  probe.
+
+Absence of the probe line is FAILURE, not silent pass; §3
+specifies the `redis_pubsub_probe_missing` counter that pages
+when the probe has not landed for an instance within its
+expected polling window.
+
+#### 4a-3. Redis-disabled acceptance — post-`REDIS_ENABLED=0` deploy (rollback)
+
+Runs at §4d step 5 when the flip direction is toward disabled.
+The adapter emits nothing while disabled; verifying "off" is a
+matter of proving the FROM state left cleanly:
+
+- `redis pubsub started …` did NOT fire on any post-deploy
+  instance in the last 5 min (the adapter's `start()` early-outs
+  when `_enabled=False`).
+- No `redis_pubsub_*` metric increments on any post-deploy
+  instance in the last 5 min.
+- The `4a-1` room-drain checks continue to pass (unchanged by
+  the rollback).
+
+Do NOT run any Redis-health probe during `4a-3`; the endpoint
+returns 503 in this state by design and would fail every check.
+
+### 4b. Prevent new sessions during the window — global maintenance gate
+
+The block must (a) cover BOTH start endpoints, (b) apply to
+every organization including newly-created ones, (c) prevent a
+race between "flag checked" and "room created" for a request
+already in flight, and (d) itself be safely deployable in the
+first place. A per-org flag cannot satisfy (b), and a
+non-transactional check cannot satisfy (c).
+
+**Endpoints covered.** Both entry paths for a live room:
 
 - `POST /api/org/{orgId}/service/{serviceKey}/start` — the
-  authenticated org-scoped path (routes/multichurch.py:295).
+  authenticated org-scoped path (`routes/multichurch.py:295`).
 - `POST /api/c/{slug}/service/{service_key}/start` — the
-  public church-slug path (routes/multichurch.py:311).
+  public church-slug path (`routes/multichurch.py:311`).
 
-Mechanism: a session-blocking flag in `organizations/{orgId}`
-(or a service-level flag when only one service is affected) that
-both endpoints check before creating a room; on hit, return 503
-with `Retry-After: 60`. Setting the flag is a single Firestore
-write; the response short-circuits before any Redis or Deepgram
-call. The flag is cleared at §4d step 6 (reopen).
+Missing either lets a new host create a live room between the
+no-live-room verification and the deploy.
 
-Do not touch existing WebSocket connections — they are already
-drained by the no-live-room check in §4a. The block covers new
-starts only.
+**Mechanism — single global maintenance gate.**
+
+- Location: a single Firestore document at `system/deploy_gate`
+  (a service-level singleton outside `organizations/*`, so
+  organization creation cannot bypass it).
+- Fields:
+  - `blocked` (bool)
+  - `blocked_at` (timestamp)
+  - `reason` (string; short human-readable audit note)
+  - `blocked_by` (string; operator identity)
+  - `revision` (int; increments on every set/clear, used as
+    the transaction precondition token)
+- Both start endpoints, and any FUTURE start endpoint, MUST
+  consult `system/deploy_gate` before creating a room.
+
+**Preventing the check/create race — transactional room creation.**
+
+The block is enforced inside the SAME Firestore transaction
+that creates the room, not by an early return in the handler:
+
+```
+with client.transaction() as tx:
+    gate = tx.get(system_deploy_gate_ref)      # read inside tx
+    if gate.exists and gate.get("blocked"):
+        raise HTTPException(503, "maintenance", Retry-After=60)
+    tx.set(rooms/{room_id}, {..., status="live", ...})
+```
+
+The transaction guarantees the gate cannot flip to `blocked`
+between the read and the create. A request already in flight
+when the operator sets the gate either (a) commits the room
+before the gate change and appears on the roster (§4a-1 will
+require it to drain before proceeding) OR (b) sees the gate on
+retry and returns 503. There is no third case.
+
+**Coverage of new organizations.** The gate is a single global
+document. New organizations do NOT need any per-org gate write
+— every new-org start request reads the SAME
+`system/deploy_gate` in its transaction.
+
+**Bootstrap — deploying the block-aware code safely.**
+
+The endpoints don't consult the gate until the code that reads
+it ships. That first deploy is itself a Cloud Run revision and
+therefore must be a §4d-style deploy. Bootstrap sequence:
+
+1. **BOOT-1** — Land the gate-reading code in a separate,
+   earlier PR. It reads `system/deploy_gate`; when the
+   document is absent (default state) it treats gate as
+   unblocked and creates rooms normally. This is a no-op
+   change on the running service until the operator writes the
+   document, so it is a §4d-style deploy on its own — but
+   because the gate-aware code doesn't itself need the gate
+   yet, the FIRST §4d deploy can (and must) use the older
+   §4a-1 checks alone (no gate to consult). Merge and deploy
+   BOOT-1 during a routine no-live-room window BEFORE the
+   Redis rollout begins.
+2. **BOOT-2** — Verify BOOT-1 is on 100 % traffic and behaves
+   as no-op (`system/deploy_gate` still absent; both start
+   endpoints succeed). Now the gate mechanism exists.
+3. From this point on, every §4d deploy sets `blocked=True`
+   in step 1 and clears it in step 6.
+
+**Behaviour observed by clients.**
+
+- Blocked state: both endpoints return 503 with
+  `Retry-After: 60` before any Redis or Deepgram call. Existing
+  WebSocket connections are NOT touched — §4a-1 drains them
+  before the deploy. The block covers new starts only.
+- Cleared state: normal service.
+
+**Audit trail.** The `revision` field on `system/deploy_gate`
+gives every set/clear a monotonic sequence number that the
+window helper records in
+`no_live_rooms_verified_at=<UTC>` alongside the gate revision
+seen at check time. A post-hoc audit can prove the gate was set
+before the drain check and cleared after the post-deploy check.
 
 ### 4c. Enablement — one-time infrastructure preparation
 
-Steps 1–8 happen BEFORE the deploy window opens and are safe to
-run while rooms are live. They do not change adapter behaviour
-(`REDIS_ENABLED=0` remains pinned throughout).
+§4c covers work that does NOT change the running Cloud Run
+service. Anything that creates a new Cloud Run revision (env
+change, VPC path attachment, code deploy) is a service-affecting
+deployment and moves out of §4c into the ordered windows in §4d
+— Cloud Run configuration changes create new revisions
+(https://cloud.google.com/run/docs/managing/revisions).
 
-1. Enable `vpcaccess.googleapis.com`.
-2. **Prefer Direct VPC egress** over a Serverless VPC Access
-   Connector. Direct VPC egress skips the connector VM,
-   eliminates its cold-start cost and per-hour spend, and works
-   with Cloud Run gen2. Only fall back to a connector if Direct
-   VPC egress is unavailable in `us-central1` for the account
-   (verify with `gcloud beta run services describe`).
-   - Direct VPC path: attach an egress subnet with private
-     Google access; no separate connector to provision.
-   - Connector fallback: create a Serverless VPC Access
-     Connector in `us-central1` attached to the default network;
-     verify state=READY.
-3. Provision a new Cloud Memorystore Redis instance. **Use
-   Standard tier**, not Basic — Standard provides a replicated
-   HA setup and a documented maintenance-window guarantee.
-   Basic is cheaper but has no HA and Basic maintenance can
-   drop the instance for the duration of the patch. The
-   startup-recovery fix in §2 makes a dropped-then-restored
-   Redis survivable, but only Standard prevents the extended
-   local-only-broadcast window entirely. Note the internal IP.
-4. Update the `redis-password` secret in Secret Manager to match
-   the new instance's password (if the new instance requires auth).
-5. Update Cloud Run's `REDIS_HOST` env to the new IP; leave the
-   secret ref for `REDIS_PASSWORD` in place.
-6. Attach the VPC egress path to Cloud Run (Direct VPC egress
-   subnet, OR `--vpc-connector=<name>` for the fallback); confirm
-   `vpc-access-egress` is `private-ranges-only`.
-7. Deploy the startup-recovery fix + F-27 (PR #32).
-8. Deploy the log-based metrics + alerts + active probe endpoint
-   + Cloud Scheduler probe job (see §3).
+`REDIS_ENABLED=0`, `ROOM_RECONCILER_ENABLED=1`,
+`--max-instances=1` remain pinned throughout §4c.
 
-Keep unchanged throughout §4c: `REDIS_ENABLED=0`,
-`ROOM_RECONCILER_ENABLED=1`, `--max-instances=1`.
+**Truly out-of-band pre-work — runs anytime, no window needed:**
+
+1. Enable `vpcaccess.googleapis.com` (idempotent API enablement).
+2. Provision the VPC egress path (does not attach yet):
+   - **Direct VPC egress** preferred — reserve an egress subnet
+     with private Google access. No connector to provision, no
+     Cloud Run change until §4d attaches it.
+   - **Serverless VPC Access Connector** fallback — create the
+     connector in `us-central1` attached to the default network;
+     verify state=READY. Does not affect Cloud Run until §4d
+     attaches it.
+   - Whichever mode is chosen becomes the SINGLE networking
+     mode for the rollout; see §5 acceptance criteria.
+3. Provision a new Cloud Memorystore Redis instance. **Standard
+   tier**, not Basic — Standard provides a replicated HA setup
+   and a documented maintenance policy. **Standard does NOT
+   eliminate interruptions**: Google documents planned failover
+   at ~15 s with client-side reconnection required
+   (https://cloud.google.com/memorystore/docs/redis/failover-and-patching).
+   The startup-recovery fix in §2 (PR #32, CI-verified) is what
+   makes that 15 s survivable end-to-end. Note the internal IP.
+4. If the new Memorystore instance uses AUTH: update the
+   `redis-password` secret in Secret Manager to the new
+   instance's password. If the new instance has AUTH disabled:
+   remove the stale `REDIS_PASSWORD` secret binding from Cloud
+   Run entirely in the §4d-1 window (Cloud Run env change);
+   do not leave a dangling reference to a secret whose value no
+   longer maps to a live credential.
+5. Provision the log-based metrics + Cloud Monitoring alerts +
+   the Cloud Scheduler probe job's Google Cloud resources
+   (Scheduler job + Cloud Monitoring policies) — these do NOT
+   change Cloud Run and are safe as pre-work.
+
+Steps 1-5 above do not create new Cloud Run revisions and can be
+staged in advance. The window-required deploys live in §4d.
 
 ### 4d. Deploy window — the ordered sequence
 
-Every deploy that flips `REDIS_ENABLED` (in either direction)
-follows this sequence exactly. Skipping or reordering any step
-re-creates the Gate 2 failure shape.
+Every window-required deploy (env flip, VPC egress attachment,
+password-binding removal, code deploy affecting the running
+service) follows this sequence exactly. Skipping or reordering
+any step re-creates the Gate 2 failure shape.
 
-1. **Block new starts** — write the session-blocking flag from
-   §4b. Both endpoints must now return 503.
+Two sub-flavours share the same sequence but pick different
+post-deploy check families in step 5:
+
+- **Enable direction** — deploys that leave the service with
+  `REDIS_ENABLED=1` (either flipping from `0→1`, or a code
+  deploy while Redis is enabled). Step 5 runs §4a-2 (Redis-
+  enabled acceptance).
+- **Disable direction** — deploys that leave the service with
+  `REDIS_ENABLED=0` (either flipping from `1→0`, or any code
+  deploy while Redis is disabled). Step 5 runs §4a-3 (Redis-
+  disabled acceptance).
+
+The room-drain check in step 3 (§4a-1) is Redis-independent and
+is the SAME in both directions — it must complete before the
+deploy regardless of which side of the flip we are on.
+
+1. **Block new starts** — write `system/deploy_gate` per §4b.
+   Both endpoints will return 503 for any request whose Firestore
+   transaction reads the gate after this write commits.
 2. **Verify the block is in effect** — issue one request to each
    of the two start endpoints from outside Cloud Run and confirm
-   both return 503. A stale routing layer or forgotten preview
-   URL that still accepts starts is a stop.
-3. **Confirm no live rooms** — run the §4a check to completion:
-   Firestore query + per-instance reconciler ticks + active
-   probe on every enumerated instance. Persist
-   `no_live_rooms_verified_at=<UTC>` for the audit trail.
-4. **Deploy the env flip** — flip `REDIS_ENABLED=1` (or `=0` on
-   rollback) via the deploy workflow. Wait for the new revision
-   to reach 100 % traffic.
-5. **Verify post-deploy** — for each new instance:
-   `redis pubsub started …` log line present within 60 s,
-   `redis_pubsub_startup_failed` at 0, `redis_probe_ok` fired at
-   least twice within the last 3 min. Any per-instance
-   startup_failed occurrence rolls back to step 1 with the
-   opposite direction.
-6. **Reopen new sessions** — clear the session-blocking flag
-   from §4b. Both endpoints resume accepting starts.
-7. **Track 1 Gate 2 rerun** (enablement direction only) with the
-   v6 helpers.
+   both return 503. Also confirm the gate document's `revision`
+   matches the value the operator just wrote (rules out a stale
+   Firestore replica). A stale routing layer or forgotten
+   preview URL that still accepts starts is a stop.
+3. **Confirm no live rooms — §4a-1 room-drain checks only**.
+   Firestore live-room count zero + every rostered
+   `(revision, jsonPayload.instance_id)` pair either shows two
+   consecutive `owned_rooms=0` ticks with a fresh youngest tick
+   OR is proven retired via Cloud Run revision status. Persist
+   `no_live_rooms_verified_at=<UTC>`, the full roster, and the
+   gate revision to the audit trail. Do NOT run §4a-2 or §4a-3
+   here — they are post-deploy checks.
+4. **Deploy the change** — apply the env flip / VPC attachment /
+   password-binding change / code deploy via the deploy
+   workflow. Wait for the new revision to reach 100 % traffic
+   AND for §4a-1 to re-verify the post-deploy roster (a new
+   revision brings new instances that must be included).
+5. **Verify post-deploy — check family selected by direction:**
+   - Enable direction → run §4a-2 in full. A lone per-instance
+     `startup_failed` is expected under Memorystore Standard
+     ~15 s failover and is NOT a stop on its own; the paired
+     condition (§3 A5) — `startup_failed` with no follow-up
+     `reconnect_success` on the same instance within 5 min — IS
+     a stop and rolls back to step 1 with the opposite
+     direction.
+   - Disable direction → run §4a-3 in full. Any post-deploy
+     instance emitting `redis pubsub started …` after the flip
+     is a stop and rolls back.
+6. **Reopen new sessions** — clear `system/deploy_gate` per
+   §4b. Both endpoints resume accepting starts on the next
+   transaction that reads the cleared document.
+7. **Track 1 Gate 2 rerun** (enablement direction only) with
+   the v6 helpers.
 
 ### 4e. Rollback (no-live-room required)
 
 Rolling back `REDIS_ENABLED=1 → 0` recreates the exact isolation
 Gate 2 failed on. A live-session rollback is unsafe and must not
-be attempted. The rollback procedure follows the §4d sequence
-in reverse direction: block starts → verify block → confirm no
-live rooms → deploy `REDIS_ENABLED=0` → verify post-deploy →
-reopen. If no window is available for a critical rollback,
-terminate live rooms via the admin End Service path first, then
-run §4d.
+be attempted. The rollback procedure follows §4d disable-
+direction end-to-end: block starts → verify block → run §4a-1
+(room-drain, Redis-independent) → deploy `REDIS_ENABLED=0` →
+run §4a-3 (Redis-disabled acceptance) → reopen. If no window is
+available for a critical rollback, terminate live rooms via the
+admin End Service path first, then run §4d.
+
+Redis-health checks are NOT part of the rollback critical path.
+The adapter's probe endpoint returns nothing while disabled and
+its metrics stop incrementing; §4a-3 checks the ABSENCE of
+Redis activity, which is the correct signal in this direction.
 
 If the reason for rollback is Memorystore itself is unhealthy,
 the reconciler continues to work independently (PR-T1-C is
 Redis-independent by design) — but the cross-instance fanout
-scenario the Gate 2 rerun tests is exactly what fails. Roll back
-during no-live-room windows only.
+scenario the Gate 2 rerun tests is exactly what fails. Roll
+back during no-live-room windows only.
 
 ## 5. v6 Gate 2 helper acceptance criteria (for a later PR)
 
@@ -390,18 +675,38 @@ v6 must:
 - Accept an expected Redis state (`redis_enabled == "0" | "1"`)
   driven by a helper env `GATE2_EXPECTED_REDIS`.
 - When `GATE2_EXPECTED_REDIS=1`, additionally verify at run time:
-  - Cloud Run has a `vpc-access-connector` attached.
-  - A per-revision preflight log query shows a `redis pubsub started`
-    line for the serving revision (the fix in §2 makes this a
-    reliable signal).
-  - `redis_pubsub_startup_failed` is 0 across the deploy window.
+  - Cloud Run has the operator's chosen VPC egress path attached
+    — either a `vpc-access-connector` OR a Direct VPC egress
+    subnet. `GATE2_VPC_MODE={connector|direct}` selects which
+    field to require; the check passes when the matching field
+    is present and non-empty. Do NOT require both; the two are
+    mutually exclusive per §4c step 2.
+  - AUTH secret binding matches the Memorystore instance:
+    - If the instance has AUTH enabled, `REDIS_PASSWORD` must
+      be a Cloud Run secret ref that resolves in the current
+      revision.
+    - If the instance has AUTH disabled, `REDIS_PASSWORD` must
+      be absent from the revision's env — a stale binding to a
+      no-longer-existent secret ref is a stop.
+  - A per-revision preflight log query shows a
+    `redis pubsub started` line for the serving revision (the
+    fix in §2 makes this a reliable signal; the INFO-log
+    deliverability caveat in §3 must be satisfied by the
+    production process entry point).
+  - `redis_pubsub_startup_failed` counted paired with
+    `redis_pubsub_reconnect_successes` across the deploy window
+    per A5's paired-condition definition — a lone
+    `startup_failed` is expected under Standard-tier ~15 s
+    failover and does NOT fail the window, but a
+    `startup_failed` without a follow-up reconnect success
+    within 5 min DOES.
 - Retain every existing v5 check that would stop the run when
   evidence is missing.
 - Ship with fixture-driven tests for both the Redis-disabled
   (backward-compatible) and Redis-enabled paths.
 
 v6 lands as a review-only branch after this rollout proposal is
-approved and after the startup-recovery fix + F-27 pass in CI.
+approved and after PR #32 is merged.
 
 ## 6. Non-goals
 
@@ -423,10 +728,12 @@ Resolved in this revision (formerly items 1, 3, 4):
   flag in Firestore** (§4b). A traffic-tag approach fires a 503
   from the wrong revision and does not compose with the
   per-service scoping the flag supports.
-- F-27 Toxiproxy timing — **event-driven** (F-27 waits on log
-  strings from both backends before restoring the proxy, so
-  timing is not a fixed number). Documented in the F-27 module
-  docstring.
+- F-27 Toxiproxy timing — **event-driven** (F-27 waits for both
+  backends to log an initial-failure line — accepting both the
+  fixed and the pre-fix wording — before restoring the proxy,
+  and its hard acceptance is cross-instance marker delivery at
+  step 6, not any specific log string). Documented in the F-27
+  module docstring on PR #32.
 
 Still open:
 
@@ -434,6 +741,12 @@ Still open:
    per instance is a first-cut number. Tune after two weeks of
    Redis-enabled traffic; leave at 3/5 min for the enablement
    window.
+2. Roster retirement RTT — §4a-1 proves retirement via Cloud Run
+   revision status. What's the longest acceptable delay between
+   "last tick observed" and "retirement proven" before the
+   operator manually intervenes? First-cut: 5 min. Confirmable
+   only under real Cloud Run drain behaviour, so leave as first-
+   cut for the initial window and retune.
 
 ## 8. Audit — §9a scope amendment
 
