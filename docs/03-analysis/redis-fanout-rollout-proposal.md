@@ -357,51 +357,72 @@ when Redis is enabled — the adapter is silent when
 of scope during §4a-1 (Redis-independent room-drain) and
 §4a-3 (Redis-disabled acceptance).
 
-- **A8a — Steady-state absence** (continuous, once Redis
-  is enabled). Cloud Monitoring absence policy on
-  `redis_pubsub_active_probe_success` grouped by
-  `instance_id`. Fires when a previously-reporting series
-  goes silent for > 2 min.
-  Lifecycle handling:
-  - **Retirement handling** — an instance whose Cloud Run
-    container terminates naturally stops emitting probes;
-    A8a would page. To avoid false positives, A8a's
-    alert-policy condition adds a Cloud-Run-side
-    correlation: fire ONLY when the series is silent AND
-    `run.googleapis.com/container/instance_count` for the
-    same `revision_name` shows active+idle > 0 in the same
-    2 min window. When Cloud Run reports the revision has
-    zero live containers, the metric absence is expected
-    and A8a stays quiet. Cloud Monitoring evaluates the
-    two conditions together via an alert-policy filter
-    joining both metrics on `revision_name`.
-  - **First-probe failure for instances OUTSIDE an operator
-    window** — a newly-scaled instance in steady state
-    still has no prior data point, so A8a cannot fire for
-    it. The signal that catches it instead is A7
-    (`active_probe_failure > 0`): an instance whose in-
-    process probe raises OR times out on its own first
-    tick emits `redis_probe_failed`, which A7 pages on
-    directly. An instance where the probe task itself
-    never runs at all (e.g., CPU-throttled to the point
-    the probe coroutine never wakes) is caught by the
-    correlation above only if the instance also emits no
-    `reconciler_tick`; otherwise the correlation reports
-    the instance as live-but-silent and A8a fires after
-    the standard 2 min. This is a narrower window than
-    A8b provides, but A8b's scope (below) is deliberately
-    restricted to operator windows.
-- **A8b — First-probe deadline enforced by the window
-  helper** (operator windows ONLY). When the operator's
-  §4a-2 helper runs at the enablement-direction §4d step 5
-  (post-`REDIS_ENABLED=1` deploy), it records each new
-  instance's `first_seen_at` (the timestamp of its first
-  `reconciler_tick`) and waits up to
-  `PROBE_FIRST_DEADLINE_SEC` (default 90 s: 3× the 30 s
-  probe interval) for `redis_probe_ok` from every roster
-  member with `instance_id` matching. Any roster member
-  whose first `redis_probe_ok` does not land within the
-  deadline is UNRESOLVED and fails the window.
+Cloud Monitoring's absence policy is instance-blind: it
+groups by extracted labels, cannot enumerate an operator-
+supplied roster, and can only fire on series that have
+previously reported. Two failure modes fall OUTSIDE the
+guarantees a metric-only design can offer and are handled
+explicitly instead of pretending Cloud Monitoring covers
+them:
+
+  **Counter-example 1 — instance A retires while sibling B
+  remains on the same revision.** Revision-level
+  `container/instance_count` stays > 0 (B is still alive),
+  so a revision-correlated absence policy still pages on
+  A's now-silent probe series. Cloud Monitoring has no way
+  to distinguish A's retirement from B's continued
+  operation because the revision count aggregates them.
+
+  **Counter-example 2 — instance C runs but its probe task
+  never emits.** No prior `redis_probe_ok` series exists
+  for C, so Cloud Monitoring's absence policy cannot arm
+  against C at all. A7 (`active_probe_failure > 0`) only
+  fires if C's probe task actually ran and raised; a task
+  that never scheduled emits nothing.
+
+Given these limits, A8 is defined as follows.
+
+- **A8a — Steady-state absence, per-revision only**
+  (continuous, once Redis is enabled). Cloud Monitoring
+  absence policy on `redis_pubsub_active_probe_success`
+  grouped by `resource.labels.revision_name` (NOT
+  `instance_id`) with a Cloud-Run-side correlation on
+  `run.googleapis.com/container/instance_count` on the
+  same `revision_name`. Fires when NO
+  `redis_pubsub_active_probe_success` series for the
+  revision has reported in the last 2 min while
+  Cloud Run's active+idle count for the same revision is
+  positive.
+
+  What A8a catches:
+  - A revision where NO instance is emitting probes even
+    though Cloud Run says instances are alive. This
+    covers the whole-revision stuck state (e.g., a bad
+    build silently disabling the probe task for every
+    process on the revision).
+
+  What A8a explicitly does NOT catch:
+  - Counter-example 1 — A retires with B still emitting
+    probes. B's probes keep the revision-level series
+    alive, so A8a stays quiet by design. Per-instance
+    retirement of one process while siblings continue is
+    NOT observable from Cloud Monitoring alone. Handled
+    by the operator helper (below) during windows, and
+    accepted as a known steady-state gap otherwise.
+  - Counter-example 2 — C never emits. The
+    revision-level series is either still positive
+    (siblings emitting) or absent from the start; either
+    way the per-C absence cannot be evaluated. Handled by
+    the operator helper (below) during windows.
+
+- **A8b — Operator-window per-instance completeness**
+  (windows ONLY). At §4d step 5 in the enable direction,
+  the §4a-2 helper enumerates the roster from ticks + the
+  Cloud Run cross-check (see §4a-1). For every roster
+  member the helper waits up to `PROBE_FIRST_DEADLINE_SEC`
+  (default 90 s) for at least one `redis_probe_ok` with a
+  matching `jsonPayload.instance_id`. Missing =
+  UNRESOLVED = window fails.
 
   A8b runs ONLY at §4d step 5 in the enable direction. It
   does NOT gate §4d step 3 (pre-deploy §4a-1 room-drain
@@ -409,17 +430,30 @@ of scope during §4a-1 (Redis-independent room-drain) and
   direction (§4a-3 verifies absence of Redis activity,
   not probe success).
 
-  Instance retirement per §4a-1 removes an instance from
-  the helper's active roster; it also removes the instance
-  from A8b's obligation. The helper writes the final
-  roster membership status (`present` | `retired` |
-  `unresolved`) to the audit trail. This retirement
-  handling is separate from A8a's — the helper's roster is
-  only relevant during the window.
+  A8b resolves both counter-examples inside the window:
+  it enumerates per-instance identity directly from the
+  ticks (independent of Cloud Monitoring's grouping) and
+  waits for a per-instance first probe (no reliance on a
+  prior data point in Cloud Monitoring's series).
 
-Neither A8a nor A8b depends on native support for
-operator-supplied rosters, which Cloud Monitoring does not
-provide.
+- **Explicit steady-state gap acknowledgement.** Outside
+  operator windows, the per-instance completeness A8b
+  provides is NOT available. The paired production
+  signals are:
+  - A6 — a reconnect_attempts / reconnect_successes
+    mismatch on a specific `instance_id` still pages
+    per-instance (because the metric is per-instance,
+    not per-revision).
+  - A5 — startup_failed without a follow-up
+    reconnect_success on the same `instance_id` still
+    pages per-instance.
+  - A7 — a probe task that ran and raised still pages.
+  A steady-state stuck-probe instance where reconnects are
+  succeeding will not page from Cloud Monitoring; the
+  operator's routine health review is the compensating
+  control. This limitation is documented so ops knows the
+  audit surface, not glossed as a Cloud-Monitoring
+  guarantee.
 
 ### Pre-enablement observability check
 
@@ -530,23 +564,44 @@ Cross-checked against:
   filtered on
   `resource.labels.service_name="worshiptranslate-backend"`,
   summed over BOTH `state="active"` AND `state="idle"`,
-  grouped by `resource.labels.revision_name`. For each
-  revision the roster claims, the metric's most recent
-  sample must show `active+idle >= <tick-derived count for
-  that revision>` (fresh coverage) — a shortfall (Cloud Run
-  says more instances exist than the tick log identifies)
-  is UNRESOLVED and blocks the window until the missing
-  instance(s) either emit a tick or are proven retired.
+  grouped by `resource.labels.revision_name`. Cross-check
+  uses STRICT EQUALITY: for each revision in EITHER the
+  tick roster OR the metric (union), the metric's most
+  recent settled sample must equal the tick-derived
+  distinct-`instance_id` count for that revision at the
+  same moment.
+  - `metric > ticks` — Cloud Run reports more processes
+    than the tick log identifies. A hidden or stuck
+    process exists; UNRESOLVED.
+  - `metric < ticks` — the tick log identifies more
+    processes than Cloud Run reports alive. Almost always
+    an old-tick residue, but sample-ingestion lag can also
+    cause it transiently; UNRESOLVED and rechecked on the
+    next sample.
+  - `metric == ticks == 0` for a revision in the metric
+    union — the revision has drained.
+  - A revision that appears ONLY in the metric union (no
+    matching tick roster) is UNRESOLVED — Cloud Run says
+    processes exist for it but the application has never
+    identified them.
+  - A revision that appears ONLY in the tick roster
+    (metric reports zero for it while ticks were recent)
+    is UNRESOLVED until either the metric catches up or
+    the tick residue ages out beyond the 30 min lookback.
 
 Sampling caveats for the cross-check metric
 (https://cloud.google.com/monitoring/api/metrics_gcp — container/instance_count):
 
 - Sampled every 60 s.
 - Visibility can be delayed up to 120 s from sample time.
-- Two consecutive samples are collected 60 s apart and
-  therefore span exactly 60 s, NOT 120 s. Any window that
-  needs to observe a state persist for N seconds must count
-  ceil(N/60)+1 samples, not N/60.
+- N consecutive samples are collected (N-1)×60 s apart
+  and span exactly (N-1)×60 s of sampled evidence — two
+  consecutive samples span 60 s, three span 120 s. The
+  ingestion delay does NOT extend the SPAN of evidence;
+  it only shifts when the operator can OBSERVE the
+  samples. Any window that needs to observe a state
+  persist for N seconds must count ceil(N/60)+1 samples,
+  and the SAMPLES themselves must all report the state.
 
 The cross-check requires the metric to be alive (a fresh
 sample within the last 180 s — one full sampling interval
@@ -567,34 +622,46 @@ BOTH hold at the same moment:
      `ROOM_RECONCILER_INTERVAL_SEC`, currently 5 s) AND its
      youngest tick is within 60 s (silence during the window
      disqualifies), OR
-   - been proven RETIRED. Retirement is proven from a completed
-     observation interval — samples that have PASSED the
-     ingestion delay so we know we are looking at settled data,
-     NOT by deliberately holding back the latest sample:
-     - Use the sample-completed cutoff: the newest sample
-       whose collection timestamp is at least 120 s in the
-       past (the documented visibility ceiling). Call this
-       the "settled sample."
-     - Retirement requires TWO consecutive settled samples
-       reporting `active+idle=0` on the instance's
-       `revision_name`. Two settled samples span 60 s (one
-       sample interval) and confirm ~180 s of no-instance
-       observation once the 120 s visibility delay is added
-       back — the empty state was true from at least 180 s
-       ago through the older settled sample.
-     - Continuous freshness is still enforced by the coverage
-       cross-check above (a fresh sample within 180 s). The
-       retirement rule looks at the OLDER settled portion of
-       the same time series; a continuously reporting metric
-       satisfies BOTH: the newest sample proves the metric
-       itself is alive, the older-than-120 s settled samples
-       prove the empty state.
-     - Stale or missing metric samples are UNRESOLVED, NOT
-       retirement.
-     - Once retired, the instance is removed from the active
-       roster for the rest of the window; the audit trail
-       records `(revision, instance_id, retired_at,
-       retirement_confirmed_by="instance_count_two_settled_samples_zero")`.
+   - been proven RETIRED. Retirement is proven ONLY from a
+     window of samples that are ALL zero, including the
+     newest sample. Rules:
+     - Define the "retirement candidate window" as at least
+       four consecutive samples on the instance's
+       `revision_name`: three consecutive settled samples
+       (samples whose collection timestamp is at least
+       120 s in the past — past the documented visibility
+       ceiling) plus the newest sample. Three settled
+       samples span 120 s of sampled evidence; the newest
+       sample proves the current state.
+     - EVERY sample in that window must report
+       `active+idle=0`. A single non-zero sample anywhere
+       in the window — including a nonzero newest sample
+       after older zeros — INVALIDATES retirement. In
+       particular, a `0, 0, 1` sequence does NOT retire
+       the revision because the newest sample is 1.
+     - The window as a whole covers 120 s of sampled zero
+       evidence + a fresh confirmation. This is
+       intentionally conservative: two 60-s-apart zero
+       samples on their own only measure emptiness at two
+       moments and cannot prove continuous emptiness
+       across the interval; requiring three consecutive
+       settled zeros makes the observed window three
+       samples wide, and requiring the newest sample also
+       be zero rejects the "empty then refilled" case.
+     - Any missing/stale sample in the window is
+       UNRESOLVED, NOT retirement.
+     - Additionally, the retirement candidate must NOT be
+       contradicted by a fresh `reconciler_tick` from any
+       `instance_id` on the same `revision_name` within
+       the same window — a tick during the retirement
+       window means an application process is still
+       running, and retirement is invalidated regardless
+       of what the Cloud Run metric shows.
+     - Once retired, the instance is removed from the
+       active roster for the rest of the window; the
+       audit trail records
+       `(revision, instance_id, retired_at,
+       retirement_confirmed_by="instance_count_all_zero_window_and_no_recent_tick")`.
      - Because revision-level counts cannot identify
        individual processes, retirement of a single
        `instance_id` while another instance on the SAME
@@ -656,37 +723,83 @@ matter of proving both the deployed CONFIGURATION and the
 absence of Redis activity.
 
 - **Explicit configuration check — read the serving
-  revision, not the template.** `spec.template...env` on a
-  service describes the LATEST configured template, which
-  may differ from the revision actually receiving traffic
-  (e.g., a newer canary at 0 %, or a stalled rollout). The
-  check MUST resolve the serving revision from
-  `status.traffic` first, then query THAT revision's own
-  env:
+  revision, not the template, using validated structured
+  output.** `spec.template...env` on a service describes
+  the LATEST configured template, which may differ from
+  the revision actually receiving traffic (e.g., a newer
+  canary at 0 %, or a stalled rollout). The earlier draft
+  used a shell `for` loop, which silently succeeds when the
+  serving list is empty; the check MUST fail on empty or
+  malformed output and MUST select positive-traffic
+  revisions structurally. Reference implementation
+  (executable as-is in the helper script):
 
   ```bash
-  # 1. Resolve the revision(s) currently serving traffic.
-  serving=$(gcloud run services describe worshiptranslate-backend \
-      --region us-central1 \
-      --format='value(status.traffic.revisionName)')
+  set -euo pipefail
 
-  # 2. Query each serving revision's own env.
-  for rev in $serving; do
-      gcloud run revisions describe "$rev" \
-          --region us-central1 \
-          --format='value(spec.containers[0].env)' \
-          | grep -qE 'name=REDIS_ENABLED,value=0(\s|$)' \
-          || { echo "STOP: $rev is not REDIS_ENABLED=0"; exit 1; }
-  done
+  svc_json=$(gcloud run services describe worshiptranslate-backend \
+      --region us-central1 --format=json) \
+      || { echo "STOP: gcloud describe failed"; exit 1; }
+
+  # Parse in Python so we fail loudly on unexpected shape.
+  python3 - "$svc_json" <<'PY'
+  import json, sys, subprocess
+  svc = json.loads(sys.argv[1])
+  traffic = svc.get("status", {}).get("traffic") or []
+  # Serving revisions = entries with numeric percent > 0.
+  serving = [
+      t["revisionName"]
+      for t in traffic
+      if isinstance(t.get("percent"), int) and t["percent"] > 0
+      and t.get("revisionName")
+  ]
+  if not serving:
+      sys.exit("STOP: status.traffic reports no revisions with percent > 0")
+
+  bad = []
+  for rev in serving:
+      rev_json = json.loads(subprocess.check_output([
+          "gcloud", "run", "revisions", "describe", rev,
+          "--region", "us-central1", "--format=json",
+      ]))
+      containers = (
+          rev_json.get("spec", {})
+                  .get("containers") or []
+      )
+      if not containers:
+          bad.append((rev, "no containers in spec"))
+          continue
+      env = containers[0].get("env") or []
+      # env is a list of {"name": ..., "value": ...} or
+      # {"name": ..., "valueFrom": {...}}. Match on
+      # literal value only; a secret ref for REDIS_ENABLED
+      # is refused.
+      found = [e for e in env if e.get("name") == "REDIS_ENABLED"]
+      if not found:
+          bad.append((rev, "REDIS_ENABLED missing"))
+      elif "valueFrom" in found[0]:
+          bad.append((rev, "REDIS_ENABLED is a secret ref, expected literal 0"))
+      elif found[0].get("value") != "0":
+          bad.append((rev, f"REDIS_ENABLED={found[0].get('value')!r}"))
+
+  if bad:
+      for rev, reason in bad:
+          print(f"STOP: {rev}: {reason}", file=sys.stderr)
+      sys.exit(1)
+  print(f"OK: {len(serving)} serving revision(s) all report REDIS_ENABLED=0")
+  PY
   ```
 
-  All serving revisions must show `REDIS_ENABLED=0`; a
-  split between two revisions where only one carries the
-  flip is a stop (rollback is not complete). Absence of
-  Redis log activity alone cannot prove the flag was
-  actually flipped — a code deploy that failed to include
-  the env change would look identical from the log side.
-  This step is MANDATORY.
+  All serving revisions must show `REDIS_ENABLED=0` as a
+  literal value (not a secret ref); a split between two
+  revisions where only one carries the flip is a stop
+  (rollback is not complete). An empty serving set is
+  ALSO a stop — the service is not routing traffic and
+  the deploy is unresolved. Absence of Redis log activity
+  alone cannot prove the flag was actually flipped — a
+  code deploy that failed to include the env change would
+  look identical from the log side. This step is
+  MANDATORY.
 - **Log activity absence** — for every post-deploy roster
   member (fresh §4a-1 enumeration), NO
   `jsonPayload.event` starting with `redis_pubsub_` and NO
@@ -775,62 +888,73 @@ can still create a live room on the OLD (gate-less) code,
 which the drain check will not see because that check has
 already completed.
 
-BOOT-1 therefore uses an EXTERNAL block during its own window.
-The rollout picks ONE of the options below at BOOT-1 time; both
-are documented so the operator can select based on
-infrastructure state on the day:
+BOOT-1 needs an EXTERNAL block that (i) prevents new starts,
+(ii) preserves routing for existing sessions on the same
+underlying Cloud Run revision that was already serving them,
+and (iii) does not itself introduce a second revision — a
+second revision is the exact isolation shape §4d's transactional
+gate later prevents, and reintroducing it here would recreate
+the Gate 2 failure surface on BOOT-1's own window.
 
-- **Option A — Start-only external block via a small
-  gate-aware shim revision** (preferred if available).
-  A wholesale traffic split to a 503-everywhere revision is
-  UNSAFE: it also blocks `POST /api/…/end`, listener
-  WebSocket reconnect handshakes, and the metrics/health
-  paths §4a depends on. Blocking those routes during BOOT-1
-  is exactly the disruption BOOT-1 is trying to avoid.
+The earlier draft's `boot1-shim` revision fails (ii) and (iii):
+a shim is a separate Cloud Run revision, so a host WebSocket
+on the current revision plus a listener reconnect landing on
+the shim is exactly the split-revision isolation Gate 2 hit.
+Every request-handling process on Cloud Run is bound to its
+own revision, and reconnection is not guaranteed to land on
+the same revision as the original connection.
 
-  A safer approach ships a `boot1-shim` revision that
-  differs from the current serving revision in ONE way: the
-  two `start` endpoints return 503 with `Retry-After: 60`;
-  every other route (End Service, WebSocket, health checks,
-  metrics) forwards to the same production handlers. Effectively
-  the shim is the current serving image with a two-endpoint
-  patch applied. Ship the shim, traffic-split 100 % to the
-  shim, wait for §4a-1 drain to complete, then deploy
-  BOOT-1's real revision and cut traffic to it.
+Two options remain. Neither uses a second revision.
+
+- **Option A — External load-balancer path rule that blocks
+  the two `start` paths only** (preferred if the account has
+  Cloud Run behind Google Cloud Load Balancing).
+  A Cloud Load Balancer URL map rule (or an equivalent Cloud
+  Armor rule) matches the exact paths `/api/org/*/service/*/start`
+  and `/api/c/*/service/*/start` and returns 503 with
+  `Retry-After: 60` at the load balancer layer, BEFORE routing
+  to Cloud Run. Every other route (End Service, WebSocket
+  upgrades and reconnects, health checks, metrics) continues
+  to route unchanged to the current serving revision.
+  - Existing sessions keep talking to the same processes on
+    the same revision because the URL map does not touch
+    non-`start` paths.
+  - New starts get 503 at the LB layer with no involvement of
+    a second Cloud Run revision.
+  - Prerequisite: the account currently fronts Cloud Run with
+    Google Cloud LB. Verify with
+    `gcloud compute url-maps list --filter='defaultService~
+    worshiptranslate'` before selecting Option A. If the
+    service is exposed via its direct `run.app` URL only,
+    Option A is not available and Option B applies.
 
   Steps during BOOT-1's window:
-  1. Traffic-split `boot1-shim` to 100 %, current revision
-     to 0 %.
+  1. Add the URL-map path rule that returns 503 for the two
+     `start` paths. Verify from OUTSIDE Cloud Run that each
+     start path now returns 503 and that a non-`start` path
+     (e.g., health check) still returns 200.
   2. Wait for §4a-1 to confirm no live rooms and drained
-     roster (the shim is forwarding End Service and
-     reconnects normally throughout).
-  3. Deploy BOOT-1's revision with 0 % traffic.
-  4. Cut traffic from `boot1-shim` to BOOT-1's revision at
-     100 %.
-  5. Verify BOOT-1 is serving.
-
-  Residual risk: a start request that lands on the OLD
-  revision (0 % traffic) via routing propagation lag between
-  step 1 and its completion. Cloud Run documents traffic
-  updates as non-instantaneous
-  (https://cloud.google.com/run/docs/rollouts-rollbacks-traffic-migration).
-  Google does not publish a numeric propagation SLO; the
-  operator MUST observe traffic-split status via
-  `gcloud run services describe ... --format="value(status.traffic)"`
-  and confirm the shim is on 100 % before running §4a-1
-  drain checks. Any request that lands on the old revision
-  during the observed lag can still create a room; the
-  drain check in step 2 catches that room and blocks the
-  window until it ends.
+     roster (the LB is forwarding End Service and reconnects
+     unchanged throughout — same underlying revision, same
+     processes).
+  3. Deploy BOOT-1's revision with 100 % traffic on the
+     existing service. Because the LB rule and the URL map
+     are separate resources from the Cloud Run revision, the
+     rule remains in effect across the revision cut.
+  4. Verify BOOT-1 is serving (see BOOT-2 below).
+  5. Remove the URL-map path rule; both start endpoints
+     resume serving via BOOT-1's gate-aware handlers.
 
 - **Option B — Documented operator-controlled maintenance
-  window** (fallback if Option A cannot be arranged). Ops
-  publishes a maintenance notice to the church operators at
-  least 48 h in advance, targeting a genuinely quiet window
-  (e.g., Tuesday 02:00 CDT). During the window: (1) confirm
-  Firestore has zero live rooms AND zero rooms started in the
-  last 5 min (indicating the notice is being observed); (2)
-  deploy BOOT-1; (3) verify BOOT-1 is serving.
+  window** (fallback when Option A is not available).
+  Ops publishes a maintenance notice to the church operators
+  at least 48 h in advance, targeting a genuinely quiet
+  window (e.g., Tuesday 02:00 CDT). During the window:
+  (1) confirm Firestore has zero live rooms AND zero rooms
+  started in the last 5 min (indicating the notice is being
+  observed); (2) deploy BOOT-1 with 100 % traffic on the
+  existing service (no traffic-split, no second revision);
+  (3) verify BOOT-1 is serving.
   - Explicit residual-risk decision — NOT "self-limiting".
     Option B does NOT prevent a live room from being created
     during the window. If one is created after step 1's
@@ -841,7 +965,7 @@ infrastructure state on the day:
     subsequent §4d enablement deploy proceeds while it is
     live. Option B is a documented residual risk the
     operator accepts to ship BOOT-1 without Option A's
-    shim; it is NOT a safety guarantee.
+    LB-level block; it is NOT a safety guarantee.
   - Option B is acceptable ONLY when the operator has
     confirmed (via church-operator communication) that the
     quiet window will not include a live service and is
@@ -1111,13 +1235,16 @@ Still open:
    per instance is a first-cut number. Tune after two weeks of
    Redis-enabled traffic; leave at 3/5 min for the enablement
    window.
-2. Roster retirement RTT — §4a-1 proves retirement via two
-   consecutive zero samples of
-   `run.googleapis.com/container/instance_count` plus a 180 s
-   visibility gap. The minimum wall-clock cost is
-   2×60 s + 180 s ≈ 300 s (5 min). Confirmable only under
-   real Cloud Run drain behaviour; leave as first-cut for the
-   initial window and retune.
+2. Roster retirement RTT — §4a-1 requires three consecutive
+   settled zero samples on `run.googleapis.com/container/instance_count`
+   PLUS a zero on the newest sample PLUS no fresh
+   `reconciler_tick` from any instance on the revision
+   during the same window. Minimum wall-clock cost is the
+   settled portion (120 s of sampled evidence) + the 120 s
+   ingestion visibility ceiling = 240 s, plus operator
+   observation time. Confirmable only under real Cloud Run
+   drain behaviour; leave as first-cut for the initial
+   window and retune.
 3. Cloud Run CPU allocation mode for the enablement revision —
    §3 assumes "CPU is always allocated" so the 30 s in-process
    probe can fire reliably during idle periods. Cost impact
@@ -1131,6 +1258,25 @@ Still open:
    the reconciler's own tick cadence but generous enough for
    cold-start pubsub subscribe. Retune if enablement-window
    observations show consistent margin.
+5. BOOT-1 Option A prerequisite — the LB-level start-block
+   requires that the Cloud Run service currently sits behind
+   Google Cloud Load Balancing. If the service is exposed
+   through its `run.app` URL directly, Option A is not
+   available and BOOT-1 must use Option B (documented
+   residual-risk maintenance window). Confirm the LB fronting
+   before scheduling BOOT-1.
+6. Steady-state A8 gap OUTSIDE operator windows — §3 A8
+   explicitly acknowledges Cloud Monitoring cannot enforce
+   per-instance probe completeness in steady state (a
+   retired instance while a sibling on the same revision
+   remains alive; a probe task that never emits at all).
+   Compensating controls: A5 (per-instance), A6
+   (per-instance), A7 (probe raise/timeout). Ops's routine
+   review of `redis_probe_ok` distinct-`instance_id` counts
+   vs Cloud Run count is the current fill-in. Consider
+   whether a periodic audit query is worth automating; the
+   answer depends on how often the specific stuck-probe-
+   sibling shape actually materialises in production.
 
 ## 8. Audit — §9a scope amendment
 
