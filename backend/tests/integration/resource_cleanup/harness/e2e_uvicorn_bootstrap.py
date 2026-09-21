@@ -112,27 +112,32 @@ def main() -> None:
     mapping = _load_mapping()
     _install_stub_auth(mapping)
 
-    # Configure the ROOT logger to INFO (or whatever --log-level
-    # says) so INFO-level messages from `redis_pubsub`, `main`, etc.
-    # are actually emitted. `uvicorn.run(log_level=...)` sets ONLY
-    # uvicorn's own logger family — module-level loggers created via
-    # `logging.getLogger("redis_pubsub")` inherit from the root, which
-    # Python defaults to WARNING. Without this call, the harness sees
-    # `redis pubsub initial connect failed` (WARNING) but never sees
-    # `redis pubsub started` / `redis pubsub reconnected` (INFO), and
-    # F-27's event-driven wait on the reconnect string times out even
-    # when the reader loop repaired the connection successfully.
-    #
-    # Directed to stderr because the F-27 harness reads
-    # `BackendProcess.logs()` which captures BOTH streams — matching
-    # uvicorn's own convention of writing logs to stderr.
+    # Force INFO-level output for the module loggers F-27 needs to
+    # observe. `uvicorn.run(log_level=...)` sets uvicorn's OWN loggers;
+    # after `uvicorn.run` calls `logging.config.dictConfig(LOGGING_CONFIG)`
+    # any prior `logging.basicConfig` from us is discarded, so setting
+    # levels DIRECTLY on the named loggers is the only reliable path
+    # (the level attribute survives dictConfig on loggers dictConfig
+    # doesn't mention). We also install a StreamHandler on stderr for
+    # each of these loggers so their records reach the subprocess log
+    # even if uvicorn's dictConfig removes root handlers.
     log_level = args.log_level.upper() if args.log_level else "INFO"
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-        force=True,  # override anything a prior import already installed
+    _level = getattr(logging, log_level, logging.INFO)
+    _fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    _hdl = logging.StreamHandler(stream=sys.stderr)
+    _hdl.setFormatter(_fmt)
+    # Named loggers the harness observes. `redis_pubsub` is the
+    # critical one for F-27; other names are cheap insurance.
+    for _name in ("redis_pubsub", "app", "app.main", "app.services", "app.services.redis_pubsub"):
+        _lg = logging.getLogger(_name)
+        _lg.setLevel(_level)
+        _lg.addHandler(_hdl)
+        # Also let it propagate — belt and suspenders.
+        _lg.propagate = True
+    # Root at INFO too, in case dictConfig leaves it alone.
+    logging.getLogger().setLevel(_level)
 
     # Sanity: the monkey-patch must be in place before the FastAPI
     # app imports finish binding routes to the real dependency. We
