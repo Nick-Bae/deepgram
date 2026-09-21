@@ -251,6 +251,15 @@ class _StubRedis:
         self.closed = False
         self._pubsub_obj = _StubPubSub()
         self._never = asyncio.Event()  # never set → hang forever
+        # Publish-mode hooks used by the real-start probe tests:
+        #  - `deliver`  : deliver each published envelope into the
+        #                 stub pubsub's inbox so the reader loop
+        #                 dispatches it (default).
+        #  - `drop`     : accept the publish but never deliver.
+        #  - `hang`     : `publish()` awaits `_never` forever.
+        #  - `raise`    : `publish()` raises ConnectionError.
+        self.publish_mode: str = "deliver"
+        self.publish_calls: list = []
 
     async def ping(self):
         if self.ping_mode == "ok":
@@ -261,6 +270,25 @@ class _StubRedis:
             await self._never.wait()
             return True  # unreachable
         raise RuntimeError(f"unknown ping_mode {self.ping_mode}")
+
+    async def publish(self, channel: str, data):
+        self.publish_calls.append((channel, data))
+        if self.publish_mode == "deliver":
+            # Deliver via the sibling pubsub's inbox. `_pubsub_obj`
+            # is the same one `pubsub()` returns for this client
+            # (test uses one _StubRedis instance for both _pub and
+            # _sub, or wires them via factory; matched-inbox
+            # semantics are what tests need to see the roundtrip).
+            self._pubsub_obj._inbox.append({"channel": channel, "data": data})
+            return 1
+        if self.publish_mode == "drop":
+            return 0
+        if self.publish_mode == "hang":
+            await self._never.wait()
+            return 0  # unreachable
+        if self.publish_mode == "raise":
+            raise ConnectionError("simulated publish failure")
+        raise RuntimeError(f"unknown publish_mode {self.publish_mode}")
 
     def pubsub(self, **_kwargs):
         return self._pubsub_obj
@@ -276,6 +304,9 @@ class _StubPubSub:
     def __init__(self):
         self.closed = False
         self.subscribed = []
+        # Optional inbox — tests can push dicts here and
+        # `get_message` returns them in order.
+        self._inbox: list = []
 
     async def subscribe(self, *channels):
         self.subscribed.extend(channels)
@@ -288,6 +319,8 @@ class _StubPubSub:
                 pass
 
     async def get_message(self, **_kwargs):
+        if self._inbox:
+            return self._inbox.pop(0)
         await asyncio.sleep(0.05)
         return None
 
@@ -981,14 +1014,12 @@ class RedisPubSubProbeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         attempt landing on a torn-down client would raise inside
         the loop and emit a spurious `redis_probe_failed`.
 
-        Ordering assertion: at the moment `stop()` returns, both
-        the probe task and reader task are done, and the client
-        objects are None. We can't observe the exact interleaving
-        from Python-space, so we check the CONTRACT: probe_task
-        must be None (cleaned up) and no exception propagated."""
-        # This test uses a fresh adapter to keep the assertion
-        # narrow; the class-level asyncSetUp starts one for the
-        # other tests.
+        Also asserts the pending-map invariant added in round 2:
+        `_probe_pending` MUST be empty after `stop()`. The earlier
+        code path did per-attempt pop only on the success/failure
+        branches; a cancellation mid-attempt left the pending
+        entry (and its future) behind, so a subsequent `start()`
+        on the same instance inherited dead references."""
         delivered: list = []
         ps = _make_pubsub(delivered)
         ps.enable_probe_task()
@@ -1003,6 +1034,132 @@ class RedisPubSubProbeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(ps._probe_task)
         self.assertIsNone(ps._pub)
         self.assertIsNone(ps._pubsub)
+        # Pending-map invariant — round-2 regression.
+        self.assertEqual(
+            ps._probe_pending, {},
+            f"_probe_pending should be empty after stop(); got "
+            f"{ps._probe_pending!r}",
+        )
+
+    async def test_stop_mid_attempt_leaves_no_pending_entries(self):
+        """Reproduces the reviewer's specific finding — cancelling
+        the probe task while it is inside `_probe_attempt` (either
+        during publish OR during response-await) MUST NOT leave an
+        entry in `_probe_pending`. The `finally` block in
+        `_probe_loop` guarantees this.
+
+        The test forces a probe attempt that will sit in the
+        response-await for longer than the deadline permits, then
+        cancels the task and confirms cleanup."""
+        from app.env import ENV
+
+        # Extremely short interval so the task hits an attempt
+        # almost immediately.
+        orig_interval = ENV.REDIS_PROBE_INTERVAL_SEC
+        orig_deadline = ENV.REDIS_PROBE_DEADLINE_SEC
+        ENV.REDIS_PROBE_INTERVAL_SEC = 0.02
+        # Very long deadline so the attempt is definitely still
+        # in-flight when we cancel.
+        ENV.REDIS_PROBE_DEADLINE_SEC = 5.0
+        try:
+            delivered: list = []
+            ps = _make_pubsub(delivered)
+            # DON'T call enable_probe_task — install a callback
+            # that NEVER resolves the future, so every attempt sits
+            # in the response-await until deadline/cancel.
+            async def _never_resolve(_env):
+                return
+            ps.set_probe_callback(_never_resolve)
+            await ps.start()
+            # Wait until at least one probe attempt is in-flight.
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if ps._probe_pending:
+                    break
+            self.assertTrue(
+                ps._probe_pending,
+                "probe loop never registered a pending attempt",
+            )
+            # Now stop mid-attempt.
+            await ps.stop()
+            self.assertEqual(
+                ps._probe_pending, {},
+                f"stop mid-attempt leaked pending entries: {ps._probe_pending!r}",
+            )
+        finally:
+            ENV.REDIS_PROBE_INTERVAL_SEC = orig_interval
+            ENV.REDIS_PROBE_DEADLINE_SEC = orig_deadline
+
+    async def test_hung_publish_bounded_by_single_deadline(self):
+        """Reviewer's reproducible defect — a hung `_pub.publish()`
+        used to sit forever because the `wait_for` only covered
+        the response await, not the publish. Fix wraps
+        `_probe_attempt` (publish + await) in ONE `wait_for`, so a
+        hung publish trips the deadline and emits `probe_failed`.
+
+        Test wraps `_pub.publish` with a coroutine that awaits an
+        Event that never fires, then asserts a `redis_probe_failed`
+        event with `reason=timeout` lands within a small multiple
+        of the deadline."""
+        from app.env import ENV
+        import io
+        import contextlib
+
+        orig_interval = ENV.REDIS_PROBE_INTERVAL_SEC
+        orig_deadline = ENV.REDIS_PROBE_DEADLINE_SEC
+        ENV.REDIS_PROBE_INTERVAL_SEC = 0.02
+        ENV.REDIS_PROBE_DEADLINE_SEC = 0.1
+        try:
+            delivered: list = []
+            ps = _make_pubsub(delivered)
+            ps.enable_probe_task()
+
+            hang = asyncio.Event()  # never set
+
+            async def _hang_publish(*_a, **_kw):
+                await hang.wait()
+                return 0
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                await ps.start()
+                # Replace _pub.publish AFTER start so start's own
+                # setup (if any) uses the fakeredis publish path;
+                # the probe loop will hit the hanging replacement.
+                ps._pub.publish = _hang_publish  # type: ignore[assignment]
+                # Wait long enough for at least one attempt to
+                # exceed the 100 ms deadline. If the fix weren't
+                # in place, no failure would ever emit.
+                for _ in range(80):
+                    await asyncio.sleep(0.02)
+                    if 'redis_probe_failed' in buf.getvalue():
+                        break
+                await ps.stop()
+
+            failures = [
+                json.loads(ln)
+                for ln in buf.getvalue().splitlines()
+                if ln.strip().startswith("{") and '"redis_probe_failed"' in ln
+            ]
+            self.assertGreaterEqual(
+                len(failures), 1,
+                f"hung publish did not produce a probe_failed event; "
+                f"stdout:\n{buf.getvalue()}",
+            )
+            # Must be a timeout reason — not "publish_failed", which
+            # would indicate the publish exception path (raise), not
+            # the hung-publish path (never completes).
+            timeouts = [e for e in failures if e.get("reason") == "timeout"]
+            self.assertGreaterEqual(
+                len(timeouts), 1,
+                f"expected reason=timeout for hung publish; got: "
+                f"{[e.get('reason') for e in failures]}",
+            )
+            # Pending map must still be clean after stop.
+            self.assertEqual(ps._probe_pending, {})
+        finally:
+            ENV.REDIS_PROBE_INTERVAL_SEC = orig_interval
+            ENV.REDIS_PROBE_DEADLINE_SEC = orig_deadline
 
 
 class RedisPubSubProbeLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -1055,6 +1212,263 @@ class RedisPubSubProbeLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("probe_id", e)
         self.assertIn("rtt_ms", e)
         self.assertIsInstance(e["rtt_ms"], int)
+
+
+class RedisPubSubRealStartProbeTests(unittest.IsolatedAsyncioTestCase):
+    """Reviewer's PR #35 review round-2 gap — the earlier probe
+    tests use `_make_pubsub` which replaces `start()` with a fake
+    that reimplements the probe wiring locally. Their green result
+    proves the dispatch + loop paths work but says nothing about
+    whether the REAL `start()` installs the probe subscription and
+    schedules the probe task correctly.
+
+    These tests patch `redis.asyncio.Redis` with a `_StubRedis`
+    whose pub + sub share a single `_StubPubSub` (so a publish
+    on _pub is observable by the reader via _sub.pubsub()). Then
+    they call the REAL `start()` and assert:
+      - Initial subscribe of the probe channel via _pubsub.subscribe.
+      - Probe task scheduled and `_probe_subscribed=True`.
+      - Recovery/resubscribe: after a forced reconnect, the probe
+        channel is back on the subscription list.
+      - Hung publish: single-deadline `_probe_attempt` emits
+        `probe_failed reason=timeout`.
+      - Missing response: publish delivers but no callback resolves
+        the future → `probe_failed reason=timeout`.
+      - Cancellation mid-attempt: `stop()` returns with
+        `_probe_pending == {}` AND `_probe_task is None`.
+      - Shutdown ordering: task is observed alive at the MOMENT
+        teardown begins (spy hook), not only after `stop()` returns.
+    """
+
+    def setUp(self):
+        # Shorten timeouts / interval so tests run in seconds.
+        self._orig_cmd = ENV.REDIS_COMMAND_TIMEOUT_SEC
+        self._orig_conn = ENV.REDIS_CONNECT_TIMEOUT_SEC
+        self._orig_interval = ENV.REDIS_PROBE_INTERVAL_SEC
+        self._orig_deadline = ENV.REDIS_PROBE_DEADLINE_SEC
+        ENV.REDIS_COMMAND_TIMEOUT_SEC = 0.3
+        ENV.REDIS_CONNECT_TIMEOUT_SEC = 0.3
+        ENV.REDIS_PROBE_INTERVAL_SEC = 0.02
+        ENV.REDIS_PROBE_DEADLINE_SEC = 0.1
+
+    def tearDown(self):
+        ENV.REDIS_COMMAND_TIMEOUT_SEC = self._orig_cmd
+        ENV.REDIS_CONNECT_TIMEOUT_SEC = self._orig_conn
+        ENV.REDIS_PROBE_INTERVAL_SEC = self._orig_interval
+        ENV.REDIS_PROBE_DEADLINE_SEC = self._orig_deadline
+        if getattr(self, "_aioredis", None) is not None:
+            self._aioredis.Redis = self._orig_redis_cls  # type: ignore[assignment]
+
+    def _install_shared_stub_redis(self, *, ping_mode="ok", publish_mode="deliver"):
+        """Patch `redis.asyncio.Redis` so every construction call
+        returns a `_StubRedis` sharing ONE `_StubPubSub` object.
+        Sharing is what makes the probe roundtrip visible — a
+        publish on _pub lands in the same inbox the reader loop
+        consumes via _sub.pubsub()."""
+        from app.services.redis_pubsub import RedisPubSub
+
+        shared_pubsub = _StubPubSub()
+        constructed: list = []
+
+        def _factory(**kwargs):
+            stub = _StubRedis(ping_mode=ping_mode, **kwargs)
+            stub._pubsub_obj = shared_pubsub
+            stub.publish_mode = publish_mode
+            constructed.append(stub)
+            return stub
+
+        import redis.asyncio as aioredis
+        self._orig_redis_cls = aioredis.Redis
+        aioredis.Redis = _factory  # type: ignore[assignment]
+        self._aioredis = aioredis
+
+        ps = RedisPubSub()
+        ps._enabled = True
+        return ps, shared_pubsub, constructed
+
+    async def test_real_start_subscribes_probe_channel_and_schedules_task(self):
+        """Real `start()` — no `_fake_start` shortcut — must:
+          1. Call `_pubsub.subscribe` with the probe channel.
+          2. Set `_probe_subscribed=True`.
+          3. Schedule `_probe_task` and leave it running."""
+        from app.services.redis_pubsub import _probe_channel_name
+        ps, shared_pubsub, _ = self._install_shared_stub_redis()
+        ps.enable_probe_task()
+        try:
+            await ps.start()
+            expected_channel = _probe_channel_name(ENV.INSTANCE_ID)
+            self.assertIn(expected_channel, shared_pubsub.subscribed)
+            self.assertTrue(ps._probe_subscribed)
+            self.assertIsNotNone(ps._probe_task)
+            self.assertFalse(ps._probe_task.done())
+        finally:
+            await ps.stop()
+
+    async def test_real_start_probe_roundtrip_emits_ok(self):
+        """End-to-end against the REAL start()/reader-loop/probe-loop
+        code paths: one tick publishes an envelope on the probe
+        channel, the shared inbox delivers it to the reader, the
+        reader dispatches to the probe callback, the callback
+        resolves the future, and the loop emits `redis_probe_ok`."""
+        import io
+        import contextlib
+
+        ps, _, _ = self._install_shared_stub_redis(publish_mode="deliver")
+        ps.enable_probe_task()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await ps.start()
+            for _ in range(60):
+                await asyncio.sleep(0.02)
+                if 'redis_probe_ok' in buf.getvalue():
+                    break
+            await ps.stop()
+
+        oks = [
+            json.loads(ln)
+            for ln in buf.getvalue().splitlines()
+            if ln.strip().startswith("{") and '"redis_probe_ok"' in ln
+        ]
+        self.assertGreaterEqual(
+            len(oks), 1,
+            f"real start()/probe roundtrip produced no probe_ok; stdout:\n{buf.getvalue()}",
+        )
+
+    async def test_real_start_hung_publish_emits_timeout_failure(self):
+        """Publish hangs → single-deadline `_probe_attempt` fires
+        the timeout and emits `probe_failed reason=timeout`. This
+        is the specific defect the reviewer reproduced — the
+        previous code only bounded `wait_for(fut)`, not publish."""
+        import io
+        import contextlib
+
+        ps, _, _ = self._install_shared_stub_redis(publish_mode="hang")
+        ps.enable_probe_task()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await ps.start()
+            for _ in range(80):
+                await asyncio.sleep(0.02)
+                if 'redis_probe_failed' in buf.getvalue():
+                    break
+            await ps.stop()
+
+        failures = [
+            json.loads(ln)
+            for ln in buf.getvalue().splitlines()
+            if ln.strip().startswith("{") and '"redis_probe_failed"' in ln
+        ]
+        timeouts = [e for e in failures if e.get("reason") == "timeout"]
+        self.assertGreaterEqual(
+            len(timeouts), 1,
+            f"hung publish did not produce timeout failure; stdout:\n{buf.getvalue()}",
+        )
+        # Pending map clean after stop.
+        self.assertEqual(ps._probe_pending, {})
+
+    async def test_real_start_missing_response_emits_timeout_failure(self):
+        """Publish accepted (returns 0) but nothing ever delivers
+        the envelope to the reader → future never resolves →
+        single-deadline `_probe_attempt` fires the timeout."""
+        import io
+        import contextlib
+
+        ps, _, _ = self._install_shared_stub_redis(publish_mode="drop")
+        ps.enable_probe_task()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await ps.start()
+            for _ in range(80):
+                await asyncio.sleep(0.02)
+                if 'redis_probe_failed' in buf.getvalue():
+                    break
+            await ps.stop()
+
+        failures = [
+            json.loads(ln)
+            for ln in buf.getvalue().splitlines()
+            if ln.strip().startswith("{") and '"redis_probe_failed"' in ln
+        ]
+        timeouts = [e for e in failures if e.get("reason") == "timeout"]
+        self.assertGreaterEqual(len(timeouts), 1)
+        self.assertEqual(ps._probe_pending, {})
+
+    async def test_real_start_publish_exception_emits_publish_failed(self):
+        """`_pub.publish` raises → non-timeout branch fires with
+        `reason=publish_failed`. Contract-distinguishing test to
+        make sure the reviewer's future-done heuristic separates
+        this from the ordinary timeout."""
+        import io
+        import contextlib
+
+        ps, _, _ = self._install_shared_stub_redis(publish_mode="raise")
+        ps.enable_probe_task()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await ps.start()
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if 'publish_failed' in buf.getvalue():
+                    break
+            await ps.stop()
+
+        failures = [
+            json.loads(ln)
+            for ln in buf.getvalue().splitlines()
+            if ln.strip().startswith("{") and '"redis_probe_failed"' in ln
+        ]
+        publish_failed = [e for e in failures if e.get("reason") == "publish_failed"]
+        self.assertGreaterEqual(
+            len(publish_failed), 1,
+            f"publish exception did not emit publish_failed; stdout:\n{buf.getvalue()}",
+        )
+        self.assertEqual(ps._probe_pending, {})
+
+    async def test_shutdown_ordering_probe_task_alive_when_teardown_begins(self):
+        """Reviewer note — inspect task state at the MOMENT teardown
+        begins, not only after `stop()` returns. We hook
+        `_teardown_clients` to record the task state at the exact
+        instant it's called, and assert the probe task is already
+        cancelled/done at that point (i.e. was cancelled BEFORE
+        clients were torn down)."""
+        ps, _, _ = self._install_shared_stub_redis(publish_mode="deliver")
+        ps.enable_probe_task()
+        await ps.start()
+
+        recorded: dict = {}
+        original_teardown = ps._teardown_clients
+
+        async def _spy_teardown():
+            # Capture state AT teardown-entry.
+            recorded["probe_task_done"] = (
+                ps._probe_task is None or ps._probe_task.done()
+            )
+            recorded["reader_task_done"] = (
+                ps._reader_task is None or ps._reader_task.done()
+            )
+            recorded["pub_still_present"] = ps._pub is not None
+            recorded["pubsub_still_present"] = ps._pubsub is not None
+            return await original_teardown()
+
+        ps._teardown_clients = _spy_teardown  # type: ignore[assignment]
+
+        await ps.stop()
+
+        self.assertTrue(
+            recorded.get("probe_task_done"),
+            "probe task must be cancelled/done BEFORE _teardown_clients begins",
+        )
+        # Clients must still be present at teardown-entry — otherwise
+        # the teardown call itself is nonsensical.
+        self.assertTrue(recorded.get("pub_still_present"))
+        self.assertTrue(recorded.get("pubsub_still_present"))
+        # After stop: clean.
+        self.assertIsNone(ps._probe_task)
+        self.assertEqual(ps._probe_pending, {})
 
 
 if __name__ == "__main__":

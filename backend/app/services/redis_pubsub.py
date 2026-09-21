@@ -304,6 +304,40 @@ class RedisPubSub:
         self._probe_callback = _default_probe_callback
         self._probe_subscription_desired = True
 
+    async def _probe_attempt(
+        self, channel: str, envelope: dict, fut: asyncio.Future,
+    ) -> None:
+        """One publish + response-await round. Wrapped by the
+        caller in `asyncio.wait_for(..., timeout=deadline)` so a
+        single deadline covers publish AND response — matching
+        PR #35 review round 2. Never emits directly; the caller
+        classifies the outcome.
+
+        Contract for the caller's classification:
+          - publish raises → `fut` remains NOT-done, exception
+            propagates. Caller sees `fut.done() is False` and
+            classifies as `reason=publish_failed`.
+          - publish succeeds, callback raises later → `fut` is
+            resolved (with the exception) BEFORE the await
+            re-raises. Caller sees `fut.done() is True` and
+            classifies as `reason=exception`.
+          - timeout → `asyncio.wait_for` cancels this coroutine
+            and raises `TimeoutError` in the caller. `fut` is
+            still not-done in the current stack, but the caller
+            handles `TimeoutError` as its own branch before the
+            generic exception branch. `finally` in the caller
+            pops the pending entry and cancels the future.
+        """
+        # `self._pub` MAY be None at this point if `stop()` is
+        # racing us. Bail cleanly rather than raising AttributeError.
+        pub = self._pub
+        if pub is None:
+            raise ConnectionError("adapter shutting down; no pub client")
+        await pub.publish(
+            channel, json.dumps(envelope, ensure_ascii=False),
+        )
+        await fut
+
     async def _probe_loop(self) -> None:
         """PR #31 §3 W7 — in-process probe loop.
 
@@ -352,55 +386,78 @@ class RedisPubSub:
                 }
                 t_publish = time.monotonic()
                 try:
-                    await self._pub.publish(
-                        channel, json.dumps(envelope, ensure_ascii=False),
-                    )
-                except Exception as exc:
-                    self._probe_pending.pop(probe_id, None)
+                    # ONE deadline covers publish + response wait.
+                    # The earlier code only bounded `wait_for(fut)`,
+                    # so a hung `_pub.publish()` would sit forever
+                    # and no failure would ever emit. Wrapping the
+                    # full attempt in one `wait_for` fixes that.
+                    try:
+                        await asyncio.wait_for(
+                            self._probe_attempt(
+                                channel, envelope, fut,
+                            ),
+                            timeout=deadline,
+                        )
+                    except asyncio.TimeoutError:
+                        _emit(
+                            EVENT_PROBE_FAILED,
+                            "WARNING",
+                            reason="timeout",
+                            probe_id=probe_id,
+                            deadline_seconds=deadline,
+                            message=(
+                                f"redis probe did not round-trip within "
+                                f"{deadline:.2f}s"
+                            ),
+                        )
+                        continue
+                    except Exception as exc:
+                        # Distinguish publish-failure from
+                        # response-callback exceptions by asking
+                        # whether the future was resolved at all.
+                        # A future that never resolved AND was not
+                        # cancelled by the timeout branch above
+                        # means publish raised before we could
+                        # wait — the correlation callback would
+                        # then never fire on its own.
+                        if not fut.done():
+                            _emit(
+                                EVENT_PROBE_FAILED,
+                                "WARNING",
+                                reason="publish_failed",
+                                probe_id=probe_id,
+                                error=repr(exc),
+                                message=f"redis probe publish failed: {exc}",
+                            )
+                        else:
+                            _emit(
+                                EVENT_PROBE_FAILED,
+                                "WARNING",
+                                reason="exception",
+                                probe_id=probe_id,
+                                error=repr(exc),
+                                message=f"redis probe raised: {exc}",
+                            )
+                        continue
+                    rtt_ms = int(round((time.monotonic() - t_publish) * 1000))
                     _emit(
-                        EVENT_PROBE_FAILED,
-                        "WARNING",
-                        reason="publish_failed",
+                        EVENT_PROBE_OK,
+                        "INFO",
                         probe_id=probe_id,
-                        error=repr(exc),
-                        message=f"redis probe publish failed: {exc}",
+                        rtt_ms=rtt_ms,
+                        message=f"redis probe ok rtt_ms={rtt_ms}",
                     )
-                    continue
-                try:
-                    await asyncio.wait_for(fut, timeout=deadline)
-                except asyncio.TimeoutError:
+                finally:
+                    # ALWAYS clean up the pending entry — including
+                    # on CancelledError (which propagates through
+                    # this `finally` on its way out). Leaving
+                    # entries behind would let `stop()` return with
+                    # `_probe_pending` non-empty, and a subsequent
+                    # `start()` on the same instance would inherit
+                    # dead references.
                     self._probe_pending.pop(probe_id, None)
-                    _emit(
-                        EVENT_PROBE_FAILED,
-                        "WARNING",
-                        reason="timeout",
-                        probe_id=probe_id,
-                        deadline_seconds=deadline,
-                        message=(
-                            f"redis probe did not round-trip within "
-                            f"{deadline:.2f}s"
-                        ),
-                    )
-                    continue
-                except Exception as exc:
-                    self._probe_pending.pop(probe_id, None)
-                    _emit(
-                        EVENT_PROBE_FAILED,
-                        "WARNING",
-                        reason="exception",
-                        probe_id=probe_id,
-                        error=repr(exc),
-                        message=f"redis probe raised: {exc}",
-                    )
-                    continue
-                rtt_ms = int(round((time.monotonic() - t_publish) * 1000))
-                _emit(
-                    EVENT_PROBE_OK,
-                    "INFO",
-                    probe_id=probe_id,
-                    rtt_ms=rtt_ms,
-                    message=f"redis probe ok rtt_ms={rtt_ms}",
-                )
+                    if not fut.done():
+                        fut.cancel()
             except asyncio.CancelledError:
                 # `stop()` cancels this task; treat as a normal
                 # shutdown signal. Do NOT emit a failure event —
