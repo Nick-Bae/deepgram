@@ -1033,25 +1033,60 @@ Two options remain. Neither uses a second revision.
      ```
 
   3. No tagged revision URL or domain mapping bypasses the
-     URL map. Verify:
+     URL map. Both checks separate "the inventory query
+     succeeded" from "the inventory is empty." The earlier
+     `... || true` chain masked a failed `gcloud` call as if
+     it had returned an empty inventory; do NOT reintroduce
+     it. The Bash script must run under
+     `set -euo pipefail`.
 
      ```bash
-     # Tagged revisions:
-     gcloud run services describe worshiptranslate-backend \
-         --region us-central1 \
-         --format='value(status.traffic.tag)' \
-         | tr ';' '\n' | grep -v '^$' \
-         && { echo "STOP: tagged revisions reachable via run.app; Option A unavailable"; exit 1; } \
-         || true
+     # Tagged revisions — capture inventory; fail loudly on
+     # query error; then evaluate the successful output.
+     if ! tag_out=$(gcloud run services describe worshiptranslate-backend \
+             --region us-central1 \
+             --format='value(status.traffic.tag)' 2>&1); then
+         echo "STOP: 'gcloud run services describe' failed: $tag_out"
+         exit 1
+     fi
+     # Successful call — normalise ';'-separated tags to lines,
+     # drop empties, then treat any remaining line as a bypass.
+     tag_hits=$(printf '%s' "$tag_out" | tr ';' '\n' | grep -v '^$' || true)
+     if [ -n "$tag_hits" ]; then
+         echo "STOP: tagged revisions reachable via run.app; Option A unavailable:"
+         printf '  %s\n' $tag_hits
+         exit 1
+     fi
 
-     # Domain mappings:
-     gcloud beta run domain-mappings list --region us-central1 \
-         --filter='spec.routeName=worshiptranslate-backend' \
-         --format='value(metadata.name)' \
-         | grep -q . \
-         && { echo "STOP: domain mapping present; verify it also routes through the LB or Option A is unavailable"; exit 1; } \
-         || true
+     # Domain mappings — same shape. Query failure and
+     # nonempty inventory are distinct stops.
+     if ! dm_out=$(gcloud beta run domain-mappings list \
+             --region us-central1 \
+             --filter='spec.routeName=worshiptranslate-backend' \
+             --format='value(metadata.name)' 2>&1); then
+         echo "STOP: 'gcloud beta run domain-mappings list' failed: $dm_out"
+         exit 1
+     fi
+     dm_hits=$(printf '%s' "$dm_out" | grep -v '^$' || true)
+     if [ -n "$dm_hits" ]; then
+         echo "STOP: domain mapping(s) present; verify each routes through the LB or Option A is unavailable:"
+         printf '  %s\n' $dm_hits
+         exit 1
+     fi
      ```
+
+     Each check has three regression fixtures (added to the
+     enablement PR's helper tests, not this doc PR):
+     - **Query failure** (e.g., API disabled, IAM refused,
+       network timeout): the script exits with the
+       `STOP: 'gcloud ...' failed:` line. Prevents the
+       previous defect where a failed query was silently
+       treated as "no bypass found."
+     - **Successful empty inventory**: the script continues
+       past the check. Represents the pass case.
+     - **Successful nonempty inventory**: the script exits
+       with the `STOP: tagged revisions ...` or `STOP:
+       domain mapping(s) ...` line and lists what was found.
 
   4. From OUTSIDE Google Cloud, confirm the direct
      `https://<hash>-<region>.run.app` URL for the service
@@ -1095,8 +1130,10 @@ Two options remain. Neither uses a second revision.
   (1) confirm Firestore has zero live rooms AND zero rooms
   started in the last 5 min (indicating the notice is being
   observed); (2) deploy BOOT-1 with 100 % traffic on the
-  existing service (no traffic-split, no second revision);
-  (3) verify BOOT-1 is serving.
+  existing service (BOOT-1's deployment does create a new
+  Cloud Run revision — that is exactly the residual risk
+  Option B accepts, spelled out below); (3) verify BOOT-1
+  is serving.
   - Explicit residual-risk decision — NOT "self-limiting".
     Option B does NOT prevent a live room from being created
     during the window. If one is created after step 1's
