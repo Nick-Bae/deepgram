@@ -388,18 +388,20 @@ Given these limits, A8 is defined as follows.
   grouped by `resource.labels.revision_name` (NOT
   `instance_id`) with a Cloud-Run-side correlation on
   `run.googleapis.com/container/instance_count` on the
-  same `revision_name`. Fires when NO
+  same `revision_name`. Fires when a
   `redis_pubsub_active_probe_success` series for the
-  revision has reported in the last 2 min while
-  Cloud Run's active+idle count for the same revision is
-  positive.
+  revision has previously reported and has been silent for
+  the last 2 min while Cloud Run's active+idle count for
+  the same revision is positive.
 
   What A8a catches:
-  - A revision where NO instance is emitting probes even
-    though Cloud Run says instances are alive. This
-    covers the whole-revision stuck state (e.g., a bad
-    build silently disabling the probe task for every
-    process on the revision).
+  - A revision that WAS emitting probes and stopped. Once
+    the series has at least one prior data point, Cloud
+    Monitoring's absence policy can evaluate silence
+    against it. This covers the whole-revision-goes-stuck
+    case for a revision that started healthy (e.g., a
+    Redis outage silently disabling the probe task for
+    every process after the revision had been serving).
 
   What A8a explicitly does NOT catch:
   - Counter-example 1 — A retires with B still emitting
@@ -414,6 +416,24 @@ Given these limits, A8 is defined as follows.
     (siblings emitting) or absent from the start; either
     way the per-C absence cannot be evaluated. Handled by
     the operator helper (below) during windows.
+  - Counter-example 3 — a fresh revision that never
+    emits its FIRST probe. Cloud Monitoring's absence
+    policy needs at least one prior data point on the
+    series before it can fire
+    (https://cloud.google.com/monitoring/alerts/concepts-indepth#absence-alerts),
+    so a revision that never emits at all — for example
+    a bad build that disables the probe task before any
+    successful tick, or a revision where the entire
+    startup path is broken and no INSTANCE_ID ever
+    surfaces — is invisible to A8a. Handled by A8b
+    inside operator windows (every new revision entering
+    an enablement §4d step 5 must satisfy the first-probe
+    deadline). In steady state, a scale-up revision that
+    never emits is caught only by the compensating
+    controls listed at the end of this section (A5, A6,
+    A7 on any startup failure the revision emits before
+    it goes silent) plus the ops audit fill-in named
+    below.
 
 - **A8b — Operator-window per-instance completeness**
   (windows ONLY). At §4d step 5 in the enable direction,
@@ -619,7 +639,8 @@ BOTH hold at the same moment:
    - emitted two consecutive `reconciler_tick` events with
      `jsonPayload.owned_rooms=0` where the two ticks span at
      least the reconciler's own interval (see
-     `ROOM_RECONCILER_INTERVAL_SEC`, currently 5 s) AND its
+     `ROOM_RECONCILER_INTERVAL_SEC`, default 30 s at
+     `backend/app/main.py:155`) AND its
      youngest tick is within 60 s (silence during the window
      disqualifies), OR
    - been proven RETIRED. Retirement is proven ONLY from a
@@ -742,39 +763,75 @@ absence of Redis activity.
       || { echo "STOP: gcloud describe failed"; exit 1; }
 
   # Parse in Python so we fail loudly on unexpected shape.
+  # Every traffic entry is validated up front — an entry that
+  # is missing a required field or has a wrong type is a stop,
+  # not a silently-skipped row.
   python3 - "$svc_json" <<'PY'
   import json, sys, subprocess
   svc = json.loads(sys.argv[1])
-  traffic = svc.get("status", {}).get("traffic") or []
-  # Serving revisions = entries with numeric percent > 0.
-  serving = [
-      t["revisionName"]
-      for t in traffic
-      if isinstance(t.get("percent"), int) and t["percent"] > 0
-      and t.get("revisionName")
-  ]
-  if not serving:
+  traffic = svc.get("status", {}).get("traffic")
+  if not isinstance(traffic, list) or not traffic:
+      sys.exit("STOP: status.traffic is missing or empty")
+
+  # Step 1 — validate EVERY entry structurally.
+  bad_entries = []
+  for i, t in enumerate(traffic):
+      if not isinstance(t, dict):
+          bad_entries.append((i, "entry is not an object"))
+          continue
+      pct = t.get("percent")
+      rev = t.get("revisionName")
+      # Percent MUST be an int (not a string, not a float, not
+      # None). String "50" is a stop even though gcloud sometimes
+      # returns numeric-shaped strings in older API versions.
+      if type(pct) is not int:
+          bad_entries.append((i, f"percent has wrong type {type(pct).__name__}: {pct!r}"))
+          continue
+      if pct < 0 or pct > 100:
+          bad_entries.append((i, f"percent out of range: {pct}"))
+          continue
+      # An entry with percent > 0 MUST name a revision. An entry
+      # with percent == 0 is allowed to name a tagged non-serving
+      # revision or be a placeholder.
+      if pct > 0 and (not isinstance(rev, str) or not rev):
+          bad_entries.append((i, f"positive percent {pct} without revisionName"))
+          continue
+  if bad_entries:
+      for i, reason in bad_entries:
+          print(f"STOP: traffic[{i}] malformed: {reason}", file=sys.stderr)
+      sys.exit(1)
+
+  # Step 2 — positive-percent entries must sum to 100.
+  positive = [t for t in traffic if t["percent"] > 0]
+  total = sum(t["percent"] for t in positive)
+  if total != 100:
+      sys.exit(f"STOP: positive-percent entries sum to {total}, expected 100")
+  if not positive:
       sys.exit("STOP: status.traffic reports no revisions with percent > 0")
 
+  # Step 3 — inspect each serving revision's own env.
+  serving = [t["revisionName"] for t in positive]
   bad = []
   for rev in serving:
-      rev_json = json.loads(subprocess.check_output([
-          "gcloud", "run", "revisions", "describe", rev,
-          "--region", "us-central1", "--format=json",
-      ]))
-      containers = (
-          rev_json.get("spec", {})
-                  .get("containers") or []
-      )
+      try:
+          rev_out = subprocess.check_output([
+              "gcloud", "run", "revisions", "describe", rev,
+              "--region", "us-central1", "--format=json",
+          ])
+      except subprocess.CalledProcessError as e:
+          bad.append((rev, f"gcloud revisions describe failed: rc={e.returncode}"))
+          continue
+      try:
+          rev_json = json.loads(rev_out)
+      except json.JSONDecodeError as e:
+          bad.append((rev, f"revision JSON parse failed: {e}"))
+          continue
+      containers = (rev_json.get("spec", {}) or {}).get("containers") or []
       if not containers:
           bad.append((rev, "no containers in spec"))
           continue
       env = containers[0].get("env") or []
-      # env is a list of {"name": ..., "value": ...} or
-      # {"name": ..., "valueFrom": {...}}. Match on
-      # literal value only; a secret ref for REDIS_ENABLED
-      # is refused.
-      found = [e for e in env if e.get("name") == "REDIS_ENABLED"]
+      found = [e for e in env if isinstance(e, dict) and e.get("name") == "REDIS_ENABLED"]
       if not found:
           bad.append((rev, "REDIS_ENABLED missing"))
       elif "valueFrom" in found[0]:
@@ -800,6 +857,26 @@ absence of Redis activity.
   code deploy that failed to include the env change would
   look identical from the log side. This step is
   MANDATORY.
+
+  **Regression fixtures (planned for the helper's unit
+  tests, not this doc PR):** the parser above must be
+  covered by at least these five cases, each written as a
+  minimal `status.traffic` list:
+
+  1. Empty list → STOP `status.traffic is missing or empty`.
+  2. Valid revision at 100 % → OK when its env carries
+     `REDIS_ENABLED=0`.
+  3. Valid revision at 50 %, another entry with
+     `{"percent": 50}` and no `revisionName` → STOP
+     `positive percent 50 without revisionName` (the
+     reviewer's fixture 1; the pre-round-6 parser reported
+     OK).
+  4. Valid revision at 50 %, another entry with
+     `{"revisionName": "rev-b", "percent": "50"}` → STOP
+     `percent has wrong type str: '50'` (the reviewer's
+     fixture 2; the pre-round-6 parser reported OK).
+  5. Two valid revisions summing to 90 % → STOP
+     `positive-percent entries sum to 90, expected 100`.
 - **Log activity absence** — for every post-deploy roster
   member (fresh §4a-1 enumeration), NO
   `jsonPayload.event` starting with `redis_pubsub_` and NO
@@ -907,8 +984,9 @@ the same revision as the original connection.
 Two options remain. Neither uses a second revision.
 
 - **Option A — External load-balancer path rule that blocks
-  the two `start` paths only** (preferred if the account has
-  Cloud Run behind Google Cloud Load Balancing).
+  the two `start` paths only** (available ONLY when the
+  service already sits behind Google Cloud Load Balancing
+  AND every reachable start path routes through that LB).
   A Cloud Load Balancer URL map rule (or an equivalent Cloud
   Armor rule) matches the exact paths `/api/org/*/service/*/start`
   and `/api/c/*/service/*/start` and returns 503 with
@@ -921,28 +999,92 @@ Two options remain. Neither uses a second revision.
     non-`start` paths.
   - New starts get 503 at the LB layer with no involvement of
     a second Cloud Run revision.
-  - Prerequisite: the account currently fronts Cloud Run with
-    Google Cloud LB. Verify with
-    `gcloud compute url-maps list --filter='defaultService~
-    worshiptranslate'` before selecting Option A. If the
-    service is exposed via its direct `run.app` URL only,
-    Option A is not available and Option B applies.
+
+  **Prerequisites — no-bypass verification is MANDATORY**.
+  Having a load balancer alone does NOT establish that every
+  start request passes through it. Cloud Run distinguishes
+  multiple ingress paths, any of which can bypass an LB URL
+  rule
+  (https://cloud.google.com/run/docs/securing/ingress). All
+  of the following must be true; if any is not, Option A is
+  UNAVAILABLE and Option B applies.
+
+  1. Cloud Run ingress is set to
+     `--ingress=internal-and-cloud-load-balancing`. Verify:
+
+     ```bash
+     gcloud run services describe worshiptranslate-backend \
+         --region us-central1 \
+         --format='value(metadata.annotations.run\.googleapis\.com/ingress)'
+     # Expected: internal-and-cloud-load-balancing
+     ```
+
+     `all` (the default) or `internal` allow the direct
+     `run.app` URL to serve requests bypassing the LB;
+     neither is acceptable for Option A.
+
+  2. A URL map already fronts the service. Verify:
+
+     ```bash
+     gcloud compute url-maps list \
+         --filter='defaultService~worshiptranslate OR pathMatchers.pathRules.service~worshiptranslate' \
+         --format='table(name,defaultService)'
+     # Expected: at least one row.
+     ```
+
+  3. No tagged revision URL or domain mapping bypasses the
+     URL map. Verify:
+
+     ```bash
+     # Tagged revisions:
+     gcloud run services describe worshiptranslate-backend \
+         --region us-central1 \
+         --format='value(status.traffic.tag)' \
+         | tr ';' '\n' | grep -v '^$' \
+         && { echo "STOP: tagged revisions reachable via run.app; Option A unavailable"; exit 1; } \
+         || true
+
+     # Domain mappings:
+     gcloud beta run domain-mappings list --region us-central1 \
+         --filter='spec.routeName=worshiptranslate-backend' \
+         --format='value(metadata.name)' \
+         | grep -q . \
+         && { echo "STOP: domain mapping present; verify it also routes through the LB or Option A is unavailable"; exit 1; } \
+         || true
+     ```
+
+  4. From OUTSIDE Google Cloud, confirm the direct
+     `https://<hash>-<region>.run.app` URL for the service
+     is either unreachable (ingress restricted) or returns
+     the LB's 503 for the two start paths. A live 200 on the
+     `run.app` URL after step 1 above is a stop.
+
+  **This proposal does NOT recommend provisioning a new load
+  balancer or restricting ingress solely to enable Option A**.
+  Those changes are architectural decisions with their own
+  security and routing implications outside the scope of a
+  Redis rollout. If the four prerequisites above are not
+  already true on the day of BOOT-1, use Option B.
 
   Steps during BOOT-1's window:
-  1. Add the URL-map path rule that returns 503 for the two
+  1. Run all four prerequisite checks above. Any stop
+     result → abort Option A, use Option B.
+  2. Add the URL-map path rule that returns 503 for the two
      `start` paths. Verify from OUTSIDE Cloud Run that each
      start path now returns 503 and that a non-`start` path
-     (e.g., health check) still returns 200.
-  2. Wait for §4a-1 to confirm no live rooms and drained
+     (e.g., health check) still returns 200 — from the LB
+     URL AND from the direct `run.app` URL (which should
+     still be unreachable per prereq 4).
+  3. Wait for §4a-1 to confirm no live rooms and drained
      roster (the LB is forwarding End Service and reconnects
      unchanged throughout — same underlying revision, same
      processes).
-  3. Deploy BOOT-1's revision with 100 % traffic on the
+  4. Deploy BOOT-1's revision with 100 % traffic on the
      existing service. Because the LB rule and the URL map
      are separate resources from the Cloud Run revision, the
      rule remains in effect across the revision cut.
-  4. Verify BOOT-1 is serving (see BOOT-2 below).
-  5. Remove the URL-map path rule; both start endpoints
+  5. Verify BOOT-1 is serving (see BOOT-2 below).
+  6. Remove the URL-map path rule; both start endpoints
      resume serving via BOOT-1's gate-aware handlers.
 
 - **Option B — Documented operator-controlled maintenance
@@ -958,14 +1100,23 @@ Two options remain. Neither uses a second revision.
   - Explicit residual-risk decision — NOT "self-limiting".
     Option B does NOT prevent a live room from being created
     during the window. If one is created after step 1's
-    drain check completes and before BOOT-1 is serving, the
-    result is the ORIGINAL Gate 2 failure shape: a room
-    running on the gate-less code that could still see the
-    cross-instance isolation observed at Gate 2 if the
-    subsequent §4d enablement deploy proceeds while it is
-    live. Option B is a documented residual risk the
-    operator accepts to ship BOOT-1 without Option A's
-    LB-level block; it is NOT a safety guarantee.
+    drain check completes and before BOOT-1 is serving,
+    BOOT-1's own deployment (a new Cloud Run revision)
+    exposes it to the split-revision isolation shape at that
+    moment — a host WebSocket bound to the current
+    (pre-BOOT-1) revision plus a listener reconnect landing
+    on BOOT-1's fresh revision reproduces the Gate 2
+    scenario during BOOT-1 itself, before any Redis change
+    is even in flight. The risk is present:
+    - DURING BOOT-1's traffic cut-over: any live room
+      created between drain and cut-over experiences the
+      split as traffic moves. This is the primary risk.
+    - AFTERWARDS, if the operator also proceeds with a §4d
+      enablement deploy while such a room is still live: a
+      second isolation event stacks on top.
+    Option B is a documented residual risk the operator
+    accepts to ship BOOT-1 without Option A's LB-level
+    block; it is NOT a safety guarantee.
   - Option B is acceptable ONLY when the operator has
     confirmed (via church-operator communication) that the
     quiet window will not include a live service and is
