@@ -592,8 +592,7 @@ class RedisPubSubStructuredEmissionTests(unittest.IsolatedAsyncioTestCase):
     def test_emit_helper_shape_and_field_precedence(self):
         """Direct coverage of the `_emit` helper — captures a single
         emission and confirms every required field is present AND
-        that caller-provided fields propagate. `event`/`severity`
-        cannot be overridden by kwargs (schema fields win)."""
+        that caller-provided fields propagate."""
         from app.services.redis_pubsub import _emit
         import io
         import contextlib
@@ -619,6 +618,199 @@ class RedisPubSubStructuredEmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e["prefix"], "worshiptranslate")
         self.assertEqual(e["message"], "human-readable")
         self.assertEqual(e["extra_field"], "carried through")
+
+    def test_reserved_schema_fields_survive_kwarg_collisions(self):
+        """Reviewer finding — a caller kwarg with the same name as
+        a reserved schema field (`component`, `instance_id`,
+        `schema_version`, `ts`) MUST NOT override the emitter's
+        authoritative value. The metric filters key on these fields;
+        letting a misconfigured caller overwrite them would silently
+        poison the metric labels.
+
+        `_emit` guarantees this by merging caller-provided `**fields`
+        FIRST and the reserved fields LAST, so dict-merge order
+        drops the collision. This test attacks all four kwarg-
+        reachable reserved names simultaneously.
+
+        `event` and `severity` are positional parameters of `_emit`
+        itself — Python's own calling convention raises `TypeError`
+        for a `_emit(..., event=..., ...)` collision before the
+        function body ever runs. That is covered by the sibling
+        test `test_reserved_positional_params_python_rejects_kwarg`."""
+        from app.services.redis_pubsub import _emit
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _emit(
+                "redis_pubsub_started",
+                "INFO",
+                # Four kwarg-reachable reserved names, all attacked.
+                component="OVERRIDDEN_COMPONENT",
+                instance_id="OVERRIDDEN_INSTANCE",
+                schema_version=9999,
+                ts="OVERRIDDEN_TS",
+                # A legitimate field alongside, to prove the
+                # emitter still passes through non-reserved kwargs.
+                host="127.0.0.1",
+            )
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip().startswith("{")]
+        self.assertEqual(len(lines), 1)
+        e = json.loads(lines[0])
+        # Reserved fields keep their authoritative values.
+        self.assertEqual(e["event"], "redis_pubsub_started")
+        self.assertEqual(e["severity"], "INFO")
+        self.assertEqual(
+            e["component"], "redis_pubsub",
+            f"caller-supplied component={e['component']!r} bypassed reserved-field guard",
+        )
+        self.assertEqual(
+            e["schema_version"], 1,
+            f"caller-supplied schema_version={e['schema_version']!r} bypassed reserved-field guard",
+        )
+        # instance_id + ts are dynamic — assert their overrides did NOT land.
+        self.assertNotEqual(
+            e["instance_id"], "OVERRIDDEN_INSTANCE",
+            "caller-supplied instance_id bypassed reserved-field guard",
+        )
+        self.assertNotEqual(
+            e["ts"], "OVERRIDDEN_TS",
+            "caller-supplied ts bypassed reserved-field guard",
+        )
+        # Non-reserved kwargs still pass through.
+        self.assertEqual(e["host"], "127.0.0.1")
+
+    def test_reserved_positional_params_python_rejects_kwarg(self):
+        """`event` and `severity` are positional parameters of
+        `_emit`, so Python raises `TypeError` when a caller passes
+        them as kwargs alongside their positional counterpart. This
+        is a stronger guarantee than dict-merge-order for those two
+        specific names — the collision is impossible at the calling
+        convention level, not just corrected inside the function."""
+        from app.services.redis_pubsub import _emit
+        with self.assertRaises(TypeError):
+            _emit("redis_pubsub_started", "INFO", event="OVERRIDE")
+        with self.assertRaises(TypeError):
+            _emit("redis_pubsub_started", "INFO", severity="OVERRIDE")
+
+    def test_emit_swallows_stdout_write_failures(self):
+        """Reviewer finding — output failures MUST NOT propagate.
+        A logging failure interrupting `start()` or the reader-error
+        handler would leave the reader task unscheduled or block a
+        connection-state transition. The emitter is best-effort by
+        contract; losing one telemetry line to a broken stdout is
+        strictly better than aborting recovery."""
+        from unittest.mock import patch
+        from app.services.redis_pubsub import _emit
+
+        # Replace sys.stdout with a stream whose `write` raises.
+        class _BrokenStream:
+            def write(self, *_a, **_kw):
+                raise BrokenPipeError("simulated broken stdout")
+            def flush(self, *_a, **_kw):
+                raise BrokenPipeError("simulated broken stdout")
+
+        with patch("app.services.redis_pubsub.sys.stdout", _BrokenStream()):
+            # Must return normally, not raise.
+            try:
+                _emit(
+                    "redis_pubsub_started",
+                    "INFO",
+                    host="127.0.0.1",
+                    port=6379,
+                )
+            except Exception as exc:
+                self.fail(
+                    f"_emit propagated stdout failure ({type(exc).__name__}: {exc}); "
+                    f"telemetry must be best-effort per PR #34 review round 2"
+                )
+
+    def test_emit_swallows_serialisation_failures(self):
+        """A caller passing a non-serialisable value (e.g. an object
+        with a circular reference that `default=str` can't reduce)
+        also MUST NOT propagate. Same reason as write-failure — we
+        never let a logging bug interrupt recovery."""
+        from app.services.redis_pubsub import _emit
+
+        class _Unserialisable:
+            def __repr__(self):
+                raise RuntimeError("cannot repr")
+            def __str__(self):
+                raise RuntimeError("cannot str")
+
+        try:
+            _emit(
+                "redis_pubsub_started",
+                "INFO",
+                bad=_Unserialisable(),
+            )
+        except Exception as exc:
+            self.fail(
+                f"_emit propagated serialisation failure ({type(exc).__name__}: {exc}); "
+                f"telemetry must be best-effort per PR #34 review round 2"
+            )
+
+    async def test_start_succeeds_when_stdout_write_fails(self):
+        """Reviewer's exact reproduction — `start()` under a
+        BrokenPipeError-raising stdout used to raise and NOT schedule
+        the reader task. Fix: emit is best-effort. This regression
+        test drives the actual `start()` implementation with a
+        successful ping AND a stdout that raises, and asserts the
+        reader task IS scheduled and start() returns cleanly."""
+        from unittest.mock import patch
+
+        ps = self._install_fake_redis("ok")
+
+        class _BrokenStream:
+            def write(self, *_a, **_kw):
+                raise BrokenPipeError("simulated broken stdout")
+            def flush(self, *_a, **_kw):
+                raise BrokenPipeError("simulated broken stdout")
+
+        try:
+            with patch("app.services.redis_pubsub.sys.stdout", _BrokenStream()):
+                # Must complete normally.
+                await ps.start()
+            self.assertTrue(ps._started, "_started must flip")
+            self.assertTrue(ps._connected, "ping succeeded → _connected")
+            self.assertIsNotNone(
+                ps._reader_task,
+                "reader task MUST be scheduled even when telemetry stdout is broken; "
+                "PR #34 review round 2 regression assertion",
+            )
+            self.assertFalse(ps._reader_task.done())
+        finally:
+            await ps.stop()
+
+    async def test_reader_error_handler_survives_broken_stdout(self):
+        """The reader-loop's exception handler calls `_emit` before
+        flipping `_connected = False`. If the emit raised, the
+        adapter would never mark itself disconnected and the reader
+        would keep hitting the broken client. Fix: emit is
+        best-effort; the state transition happens unconditionally.
+
+        This test doesn't reproduce the full reader loop (that
+        requires a real pubsub stream); it exercises the emit path
+        directly with a broken stream to prove the emitter itself
+        does not propagate."""
+        from unittest.mock import patch
+        from app.services.redis_pubsub import _emit, EVENT_READER_ERROR
+
+        class _BrokenStream:
+            def write(self, *_a, **_kw):
+                raise BrokenPipeError("simulated broken stdout")
+            def flush(self, *_a, **_kw):
+                raise BrokenPipeError("simulated broken stdout")
+
+        with patch("app.services.redis_pubsub.sys.stdout", _BrokenStream()):
+            # Mimics the reader-loop's exact call.
+            _emit(
+                EVENT_READER_ERROR,
+                "WARNING",
+                error="RuntimeError('simulated pubsub reader failure')",
+                message="pubsub reader error: simulated pubsub reader failure",
+            )
+        # Reached this line → no propagation.
 
     def test_event_name_constants_match_pr31_catalogue(self):
         """The event NAMES are the metric anchor per PR #31 §3. If

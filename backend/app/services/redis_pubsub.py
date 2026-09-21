@@ -60,14 +60,35 @@ EVENT_PROBE_OK = "redis_probe_ok"
 EVENT_PROBE_FAILED = "redis_probe_failed"
 
 
+# Fields whose values are set by the emitter itself and cannot be
+# overridden by callers. Enforced by putting them LAST in the payload
+# dict so a caller-provided `**fields` mapping cannot silently
+# replace the identity/schema labels the metric filters key on.
+_EMIT_RESERVED_FIELDS = frozenset({
+    "event",
+    "severity",
+    "component",
+    "instance_id",
+    "schema_version",
+    "ts",
+})
+
+
 def _emit(event: str, severity: str, **fields: Any) -> None:
     """Emit one structured-JSON operational event line to stdout.
 
-    Fields always present: `event`, `severity`, `component`,
-    `instance_id`, `schema_version`, `ts`. `message` is populated
-    from a `message` kwarg when provided so F-27 and other consumers
-    that grep for a human-readable substring keep working during the
-    transition; metric filters key off `event` regardless.
+    Fields ALWAYS produced by the emitter itself (reserved; caller
+    cannot override): `event`, `severity`, `component`,
+    `instance_id`, `schema_version`, `ts`. If a caller passes any
+    of those names in `**fields`, the caller value is DROPPED — the
+    emitter's value wins. Silent-drop rather than raise so a
+    monitoring bug can never take down the adapter recovery path.
+
+    `message` is a caller-provided free-form string field; it is
+    populated when the caller passes a `message=` kwarg so F-27 and
+    other consumers that grep for a human-readable substring keep
+    working during the transition. Metric filters key off `event`
+    regardless.
 
     Uses `print` directly, not `logging`, so:
       1. The line reaches stdout regardless of the root logger level
@@ -80,21 +101,54 @@ def _emit(event: str, severity: str, **fields: Any) -> None:
     across a few seconds when a shutdown is in flight, and startup /
     reconnect events are exactly the ones an operator needs to see
     IMMEDIATELY during a window.
+
+    Output failures (BrokenPipeError, IOError, permission denied on
+    an alternate stream, etc.) are SUPPRESSED. The emitter is
+    best-effort by contract: a logging failure MUST NOT interrupt a
+    connection-state change or recovery scheduling. Losing one
+    telemetry line to a broken stdout is strictly better than
+    aborting `start()` and leaving the reader task unscheduled.
     """
+    # Caller fields FIRST, reserved fields LAST — dict-merge order
+    # ensures the reserved fields survive any collision.
     payload = {
+        **fields,
         "event": event,
         "severity": severity,
         "component": "redis_pubsub",
         "instance_id": ENV.INSTANCE_ID,
         "schema_version": _EVENT_SCHEMA_VERSION,
         "ts": _iso_now(),
-        **fields,
     }
-    print(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
-        file=sys.stdout,
-        flush=True,
-    )
+    try:
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        # Serialisation itself failed — e.g. a caller passed a value
+        # that even `default=str` can't reduce. Fall back to a
+        # minimal envelope so the metric filter still gets the event.
+        try:
+            line = json.dumps(
+                {
+                    "event": event,
+                    "severity": severity,
+                    "component": "redis_pubsub",
+                    "instance_id": ENV.INSTANCE_ID,
+                    "schema_version": _EVENT_SCHEMA_VERSION,
+                    "ts": _iso_now(),
+                    "message": "emit_serialisation_failed",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except Exception:
+            return  # nothing we can do
+    try:
+        print(line, file=sys.stdout, flush=True)
+    except Exception:
+        # BrokenPipeError, IOError, closed-stdout, replaced-with-
+        # raising-mock — all swallowed. See docstring: telemetry is
+        # best-effort.
+        pass
 
 
 def _channel_name(org_id: str, room_id: str) -> str:
