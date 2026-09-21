@@ -22,8 +22,15 @@ from app.env import ENV
 
 
 def _make_pubsub(delivered):
-    """Build a RedisPubSub instance patched to use fakeredis for _pub and _sub."""
-    from app.services.redis_pubsub import RedisPubSub
+    """Build a RedisPubSub instance patched to use fakeredis for _pub and _sub.
+
+    If `set_probe_callback` (or `enable_probe_task`) has been called
+    on the returned instance BEFORE `start()` is invoked, the fake
+    start will ALSO subscribe to the probe channel and schedule the
+    probe task — matching the production `start()` shape so probe
+    tests can exercise the real dispatch + loop code."""
+    from app.services.redis_pubsub import RedisPubSub, _probe_channel_name
+    from app.env import ENV
 
     ps = RedisPubSub()
     ps._enabled = True
@@ -37,6 +44,13 @@ def _make_pubsub(delivered):
         ps._pubsub = ps._sub.pubsub(ignore_subscribe_messages=True)
         ps._connected = True
         ps._reader_task = asyncio.create_task(ps._reader_loop())
+        # PR #31 §3 W7 — mirror the real start()'s probe setup so
+        # probe tests exercise the actual dispatch + loop paths
+        # rather than the `_fake_start` shortcut.
+        if ps._probe_subscription_desired:
+            await ps._pubsub.subscribe(_probe_channel_name(ENV.INSTANCE_ID))
+            ps._probe_subscribed = True
+            ps._probe_task = asyncio.create_task(ps._probe_loop())
 
     ps.start = _fake_start  # type: ignore[assignment]
 
@@ -831,6 +845,216 @@ class RedisPubSubStructuredEmissionTests(unittest.IsolatedAsyncioTestCase):
         # but not emitted yet.
         self.assertEqual(rp.EVENT_PROBE_OK, "redis_probe_ok")
         self.assertEqual(rp.EVENT_PROBE_FAILED, "redis_probe_failed")
+
+
+class RedisPubSubProbeIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """PR #31 §3 W7 — in-process probe path.
+
+    The probe channel `{prefix}:probe:{instance_id}` carves out a
+    per-instance loopback that exercises the same `_pub` and
+    `_pubsub` clients production broadcasts use. Two invariants:
+
+    1. Probe channel matches route to `_probe_callback`, NOT to the
+       production `_callback` — even when the envelope's `publisher`
+       equals `ENV.INSTANCE_ID`. Production's self-suppression check
+       does NOT apply to probe traffic; the publisher IS the intended
+       recipient here.
+
+    2. `stop()` cancels the probe task BEFORE `_teardown_clients()`
+       so no probe attempt runs against a torn-down `_pub` /
+       `_pubsub` client.
+    """
+
+    async def asyncSetUp(self):
+        self._delivered: list = []
+        self._probe_delivered: list = []
+        self.ps = _make_pubsub(self._delivered)
+
+        async def _probe_cb(envelope):
+            self._probe_delivered.append(envelope)
+
+        self.ps.set_probe_callback(_probe_cb)
+        await self.ps.start()
+        await asyncio.sleep(0.05)
+
+    async def asyncTearDown(self):
+        await self.ps.stop()
+
+    async def test_probe_channel_routes_to_probe_callback_not_production(self):
+        """A message on `{prefix}:probe:{instance_id}` goes to
+        `_probe_callback`. Production `_callback` is NOT invoked
+        for probe traffic."""
+        from app.env import ENV
+        from app.services.redis_pubsub import _probe_channel_name
+
+        # Subscribe to the probe channel via ensure/reconnect — since
+        # `set_probe_callback` flagged it desired and `start()`
+        # subscribed on ping success, it should already be live.
+        await asyncio.sleep(0.05)
+        # Publish a probe envelope directly through the adapter's
+        # own _pub client (simulating what `_probe_loop` does).
+        envelope = {
+            "v": 1,
+            "publisher": ENV.INSTANCE_ID,
+            "ts": "2026-09-21T00:00:00.000Z",
+            "is_probe": True,
+            "probe_id": "probe-test-1",
+        }
+        await self.ps._pub.publish(
+            _probe_channel_name(ENV.INSTANCE_ID),
+            json.dumps(envelope, ensure_ascii=False),
+        )
+        # Give the reader loop time to dispatch.
+        for _ in range(40):
+            if self._probe_delivered:
+                break
+            await asyncio.sleep(0.02)
+
+        self.assertEqual(len(self._probe_delivered), 1)
+        got = self._probe_delivered[0]
+        self.assertEqual(got.get("probe_id"), "probe-test-1")
+        self.assertTrue(got.get("is_probe"))
+        # Production callback MUST NOT have been called for the probe.
+        self.assertEqual(
+            self._delivered, [],
+            "probe traffic must not reach the production `_callback`",
+        )
+
+    async def test_probe_self_publish_bypasses_self_suppression(self):
+        """Production dispatch drops envelopes where
+        `publisher == ENV.INSTANCE_ID`. The probe branch MUST NOT
+        apply that check — the probe design self-publishes on
+        purpose and depends on receiving its own message."""
+        from app.env import ENV
+        from app.services.redis_pubsub import _probe_channel_name
+
+        # Same INSTANCE_ID as the adapter — the exact case
+        # production self-suppression rejects.
+        envelope = {
+            "v": 1,
+            "publisher": ENV.INSTANCE_ID,  # self-publish
+            "ts": "2026-09-21T00:00:00.000Z",
+            "is_probe": True,
+            "probe_id": "probe-self",
+        }
+        await self.ps._pub.publish(
+            _probe_channel_name(ENV.INSTANCE_ID),
+            json.dumps(envelope, ensure_ascii=False),
+        )
+        for _ in range(40):
+            if self._probe_delivered:
+                break
+            await asyncio.sleep(0.02)
+
+        self.assertEqual(len(self._probe_delivered), 1)
+        self.assertEqual(
+            self._probe_delivered[0].get("publisher"), ENV.INSTANCE_ID,
+        )
+
+    async def test_probe_envelope_without_is_probe_marker_is_dropped(self):
+        """Defence-in-depth. Channel-name discrimination is
+        sufficient for correctness, but an envelope without
+        `is_probe=True` on the probe channel is likely a
+        misconfigured production message — drop it silently rather
+        than deliver it to `_probe_callback`, which would corrupt
+        the correlation."""
+        from app.env import ENV
+        from app.services.redis_pubsub import _probe_channel_name
+
+        envelope = {
+            "v": 1,
+            "publisher": ENV.INSTANCE_ID,
+            "ts": "2026-09-21T00:00:00.000Z",
+            # missing is_probe
+            "probe_id": "probe-nomarker",
+        }
+        await self.ps._pub.publish(
+            _probe_channel_name(ENV.INSTANCE_ID),
+            json.dumps(envelope, ensure_ascii=False),
+        )
+        await asyncio.sleep(0.1)
+        self.assertEqual(self._probe_delivered, [])
+
+    async def test_stop_cancels_probe_task_before_client_teardown(self):
+        """The probe task must be cancelled BEFORE
+        `_teardown_clients()` closes `_pub` / `_pubsub`. A probe
+        attempt landing on a torn-down client would raise inside
+        the loop and emit a spurious `redis_probe_failed`.
+
+        Ordering assertion: at the moment `stop()` returns, both
+        the probe task and reader task are done, and the client
+        objects are None. We can't observe the exact interleaving
+        from Python-space, so we check the CONTRACT: probe_task
+        must be None (cleaned up) and no exception propagated."""
+        # This test uses a fresh adapter to keep the assertion
+        # narrow; the class-level asyncSetUp starts one for the
+        # other tests.
+        delivered: list = []
+        ps = _make_pubsub(delivered)
+        ps.enable_probe_task()
+        await ps.start()
+        await asyncio.sleep(0.05)
+        # Give the probe task a moment to enter its wait — this is
+        # where the cancel most likely lands.
+        self.assertIsNotNone(ps._probe_task)
+        self.assertFalse(ps._probe_task.done())
+        await ps.stop()
+        # After stop:
+        self.assertIsNone(ps._probe_task)
+        self.assertIsNone(ps._pub)
+        self.assertIsNone(ps._pubsub)
+
+
+class RedisPubSubProbeLoopTests(unittest.IsolatedAsyncioTestCase):
+    """The 30 s tick loop itself. Uses a tiny interval + deadline
+    so tests run in seconds, not minutes."""
+
+    async def asyncSetUp(self):
+        from app.env import ENV
+        self._orig_interval = ENV.REDIS_PROBE_INTERVAL_SEC
+        self._orig_deadline = ENV.REDIS_PROBE_DEADLINE_SEC
+        ENV.REDIS_PROBE_INTERVAL_SEC = 0.05
+        ENV.REDIS_PROBE_DEADLINE_SEC = 0.3
+
+    async def asyncTearDown(self):
+        from app.env import ENV
+        ENV.REDIS_PROBE_INTERVAL_SEC = self._orig_interval
+        ENV.REDIS_PROBE_DEADLINE_SEC = self._orig_deadline
+
+    async def test_probe_loop_emits_probe_ok_on_successful_roundtrip(self):
+        """Happy path — the probe task publishes, the reader-loop
+        dispatch delivers to the default callback, the callback
+        resolves the per-tick future, the loop emits
+        `redis_probe_ok`."""
+        import io
+        import contextlib
+
+        delivered: list = []
+        ps = _make_pubsub(delivered)
+        ps.enable_probe_task()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await ps.start()
+            # Wait long enough for at least one tick to complete.
+            for _ in range(100):
+                await asyncio.sleep(0.03)
+                if 'redis_probe_ok' in buf.getvalue():
+                    break
+            await ps.stop()
+
+        oks = [
+            json.loads(ln)
+            for ln in buf.getvalue().splitlines()
+            if ln.strip().startswith("{") and '"redis_probe_ok"' in ln
+        ]
+        self.assertGreaterEqual(len(oks), 1, f"no redis_probe_ok emitted; stdout:\n{buf.getvalue()}")
+        e = oks[0]
+        self.assertEqual(e["event"], "redis_probe_ok")
+        self.assertEqual(e["severity"], "INFO")
+        self.assertIn("probe_id", e)
+        self.assertIn("rtt_ms", e)
+        self.assertIsInstance(e["rtt_ms"], int)
 
 
 if __name__ == "__main__":

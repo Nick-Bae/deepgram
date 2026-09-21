@@ -155,6 +155,26 @@ def _channel_name(org_id: str, room_id: str) -> str:
     return f"{ENV.REDIS_CHANNEL_PREFIX}:org:{org_id}:room:{room_id}"
 
 
+# Probe channels are single-instance loopback (each backend
+# subscribes to its OWN probe channel; another backend never
+# subscribes here — that's why per-instance coverage of the
+# probe is by construction). See PR #31 §3 W7 + the probe task
+# design in that section.
+def _probe_channel_name(instance_id: str) -> str:
+    return f"{ENV.REDIS_CHANNEL_PREFIX}:probe:{instance_id}"
+
+
+def _parse_probe_channel(channel: str) -> str:
+    """Return the `instance_id` if `channel` matches the probe
+    shape, otherwise empty string. Called from `_dispatch` BEFORE
+    the production `_parse_channel` so probe traffic gets its own
+    callback + suppression policy."""
+    prefix = f"{ENV.REDIS_CHANNEL_PREFIX}:probe:"
+    if not channel.startswith(prefix):
+        return ""
+    return channel[len(prefix):]
+
+
 def _seq_key(org_id: str, room_id: str) -> str:
     return f"{ENV.REDIS_CHANNEL_PREFIX}:seq:{org_id}:{room_id}"
 
@@ -180,6 +200,38 @@ class RedisPubSub:
         self._lock = asyncio.Lock()
         self._connected = False
 
+        # PR #31 §3 W7 — probe path. The adapter subscribes to its
+        # OWN probe channel (`{prefix}:probe:{instance_id}`) so a
+        # per-instance in-process probe can publish + await its
+        # own message-round-trip, exercising the same `_pub` and
+        # `_pubsub` clients production broadcasts use. A separate
+        # `_probe_callback` receives the probe message so it
+        # bypasses the production self-suppression check (the
+        # publisher IS the intended recipient here, unlike
+        # production broadcasts).
+        self._probe_callback: Optional[Callable[[dict], Awaitable[None]]] = None
+        # Whether this instance's probe subscription is currently
+        # tracked as "desired" (analogous to `_ref_counts` for
+        # production channels). Set unconditionally in `start()`
+        # so `_reconnect`'s bulk resubscribe includes the probe
+        # channel from that point on.
+        self._probe_subscription_desired: bool = False
+        # Whether the current live pubsub connection has an active
+        # SUBSCRIBE for the probe channel (analogous to
+        # `_subscribed` for production channels).
+        self._probe_subscribed: bool = False
+        # The 30 s in-process probe task. Set by `start()` if the
+        # probe callback was registered; cancelled by `stop()`
+        # BEFORE `_teardown_clients()` so no attempt runs against
+        # a torn-down client.
+        self._probe_task: Optional[asyncio.Task] = None
+        # Per-tick probe_id → future map. The probe callback
+        # (installed by `enable_probe_task()` in the default case,
+        # or by the caller via `set_probe_callback` in a test/
+        # override case) resolves the matching future when a probe
+        # envelope arrives.
+        self._probe_pending: Dict[str, asyncio.Future] = {}
+
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -201,6 +253,171 @@ class RedisPubSub:
     def set_delivery_callback(self, cb: DeliveryCallback) -> None:
         """Called by ConnectionManager to receive incoming subscribed messages."""
         self._callback = cb
+
+    def set_probe_callback(self, cb: Callable[[dict], Awaitable[None]]) -> None:
+        """Register the probe-delivery callback (PR #31 §3 W7).
+
+        Called by whichever component owns the in-process probe task
+        (currently `RedisPubSub._probe_loop`, which is scheduled by
+        `start()` when the probe callback is registered before the
+        adapter is started). Receives the FULL envelope dict — the
+        probe task correlates responses by the envelope's
+        `probe_id` field, so the callback must forward the whole
+        object rather than just a payload.
+
+        Setting the probe callback also flags the probe subscription
+        as desired so `_reconnect`'s bulk resubscribe includes it.
+        Callers that want the probe active must call this BEFORE
+        `start()`, or call `start()` again after registering (which
+        no-ops because `_started=True`; the resubscribe pattern is
+        the intended re-arm)."""
+        self._probe_callback = cb
+        self._probe_subscription_desired = True
+
+    def enable_probe_task(self) -> None:
+        """Install the DEFAULT in-process probe machinery:
+          - Register a class-owned probe callback that resolves the
+            per-tick future in `_probe_pending`.
+          - Flag the probe subscription as desired so both the
+            initial `start()` and every `_reconnect` include the
+            probe channel in their SUBSCRIBE.
+
+        The 30 s probe task itself is scheduled by `start()` when
+        this flag is set. Callers that want to override the probe
+        callback (e.g. for testing) should use `set_probe_callback`
+        instead — this method's callback is a no-op override target
+        via that same setter.
+
+        Idempotent — calling twice does nothing extra."""
+        if self._probe_callback is not None:
+            self._probe_subscription_desired = True
+            return
+
+        async def _default_probe_callback(envelope: dict) -> None:
+            probe_id = envelope.get("probe_id")
+            if not isinstance(probe_id, str):
+                return
+            fut = self._probe_pending.pop(probe_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(envelope)
+
+        self._probe_callback = _default_probe_callback
+        self._probe_subscription_desired = True
+
+    async def _probe_loop(self) -> None:
+        """PR #31 §3 W7 — in-process probe loop.
+
+        On each tick:
+          1. Skip if disconnected — the reader loop's `_reconnect`
+             path will bring the connection back and re-subscribe
+             the probe channel; publishing during a known-broken
+             state would only emit a spurious failure.
+          2. Skip if the probe subscription is not currently active
+             on the live pubsub connection (`_probe_subscribed`)
+             — same reasoning.
+          3. Generate a fresh probe_id, create a per-tick future,
+             stash it in `_probe_pending`, publish the envelope on
+             this instance's own probe channel, then `wait_for` the
+             callback to resolve the future within
+             `REDIS_PROBE_DEADLINE_SEC`.
+          4. On success: emit `redis_probe_ok` with `rtt_ms`.
+          5. On timeout OR any exception: emit `redis_probe_failed`
+             with `reason`.
+
+        Cancelled cleanly by `stop()`. Handles CancelledError as a
+        normal shutdown signal — no failure emit on cancel."""
+        interval = float(ENV.REDIS_PROBE_INTERVAL_SEC)
+        deadline = float(ENV.REDIS_PROBE_DEADLINE_SEC)
+        channel = _probe_channel_name(ENV.INSTANCE_ID)
+        while self._started:
+            try:
+                await asyncio.sleep(interval)
+                if not self._started:
+                    return
+                if not self._connected or self._pub is None or not self._probe_subscribed:
+                    # Skip this tick — connection state is not
+                    # steady. Not a probe failure: the reader-loop
+                    # reconnect is what recovers it, and A5/A6 page
+                    # on THAT signal.
+                    continue
+                probe_id = f"probe-{time.monotonic_ns():x}"
+                fut: asyncio.Future = asyncio.get_running_loop().create_future()
+                self._probe_pending[probe_id] = fut
+                envelope = {
+                    "v": _ENVELOPE_VERSION,
+                    "publisher": ENV.INSTANCE_ID,
+                    "ts": _iso_now(),
+                    "is_probe": True,
+                    "probe_id": probe_id,
+                }
+                t_publish = time.monotonic()
+                try:
+                    await self._pub.publish(
+                        channel, json.dumps(envelope, ensure_ascii=False),
+                    )
+                except Exception as exc:
+                    self._probe_pending.pop(probe_id, None)
+                    _emit(
+                        EVENT_PROBE_FAILED,
+                        "WARNING",
+                        reason="publish_failed",
+                        probe_id=probe_id,
+                        error=repr(exc),
+                        message=f"redis probe publish failed: {exc}",
+                    )
+                    continue
+                try:
+                    await asyncio.wait_for(fut, timeout=deadline)
+                except asyncio.TimeoutError:
+                    self._probe_pending.pop(probe_id, None)
+                    _emit(
+                        EVENT_PROBE_FAILED,
+                        "WARNING",
+                        reason="timeout",
+                        probe_id=probe_id,
+                        deadline_seconds=deadline,
+                        message=(
+                            f"redis probe did not round-trip within "
+                            f"{deadline:.2f}s"
+                        ),
+                    )
+                    continue
+                except Exception as exc:
+                    self._probe_pending.pop(probe_id, None)
+                    _emit(
+                        EVENT_PROBE_FAILED,
+                        "WARNING",
+                        reason="exception",
+                        probe_id=probe_id,
+                        error=repr(exc),
+                        message=f"redis probe raised: {exc}",
+                    )
+                    continue
+                rtt_ms = int(round((time.monotonic() - t_publish) * 1000))
+                _emit(
+                    EVENT_PROBE_OK,
+                    "INFO",
+                    probe_id=probe_id,
+                    rtt_ms=rtt_ms,
+                    message=f"redis probe ok rtt_ms={rtt_ms}",
+                )
+            except asyncio.CancelledError:
+                # `stop()` cancels this task; treat as a normal
+                # shutdown signal. Do NOT emit a failure event —
+                # cancellation is expected.
+                raise
+            except Exception as exc:
+                # An unexpected error in the loop body itself
+                # (not in publish/await, which are handled above).
+                # Emit and continue so a single bad tick doesn't
+                # kill the loop forever.
+                _emit(
+                    EVENT_PROBE_FAILED,
+                    "WARNING",
+                    reason="loop_exception",
+                    error=repr(exc),
+                    message=f"redis probe loop iteration failed: {exc}",
+                )
 
     async def start(self) -> None:
         """Start the pub/sub adapter.
@@ -329,6 +546,49 @@ class RedisPubSub:
             self._reader_loop(), name="redis-pubsub-reader",
         )
 
+        # PR #31 §3 W7 — probe task. Scheduled whenever a probe
+        # callback has been registered (whether via
+        # `enable_probe_task()` or an explicit `set_probe_callback`).
+        # Loop skips ticks while `_connected=False`, so it's safe to
+        # start it even when the initial ping failed.
+        if self._probe_subscription_desired:
+            self._probe_task = asyncio.create_task(
+                self._probe_loop(), name="redis-pubsub-probe",
+            )
+
+        # PR #31 §3 W7 — if the probe callback has been registered
+        # AND the initial ping succeeded, subscribe to this
+        # instance's own probe channel here so the probe task can
+        # publish + receive on its first tick. On ping failure the
+        # subscribe happens on the reader loop's next `_reconnect`
+        # pass, which reads `_probe_subscription_desired` and adds
+        # the probe channel to the bulk SUBSCRIBE. Both paths write
+        # `_probe_subscribed=True` on success.
+        if self._connected and self._probe_subscription_desired:
+            try:
+                await asyncio.wait_for(
+                    self._pubsub.subscribe(_probe_channel_name(ENV.INSTANCE_ID)),
+                    timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+                )
+                self._probe_subscribed = True
+            except Exception as exc:
+                # Non-fatal — reader loop's `_reconnect` path will
+                # pick this up in the next reconnect cycle. Emit a
+                # warning so the operator can see the initial
+                # probe-subscribe failed even though `start()` did
+                # not itself fail.
+                _emit(
+                    EVENT_RECONNECT_FAILED,
+                    "WARNING",
+                    reason="probe_initial_subscribe_failed",
+                    error=repr(exc),
+                    message=(
+                        f"redis pubsub probe channel initial subscribe failed: {exc} — "
+                        f"will retry via reader loop reconnect"
+                    ),
+                )
+                self._connected = False  # force reader loop into _reconnect
+
     async def _teardown_clients(self) -> None:
         """Close and null out the pub/sub client objects. Idempotent."""
         for obj in (self._pubsub, self._sub, self._pub):
@@ -362,10 +622,28 @@ class RedisPubSub:
         """
         # Nothing to do only when we have neither the started flag nor
         # any lingering client objects.
-        if not self._started and self._pub is None and self._sub is None and self._pubsub is None:
+        if (
+            not self._started
+            and self._pub is None
+            and self._sub is None
+            and self._pubsub is None
+            and self._probe_task is None
+        ):
             return
         self._started = False
         self._connected = False
+        # PR #31 §3 W7 — probe task MUST be cancelled BEFORE
+        # `_teardown_clients()` so no probe attempt runs against a
+        # torn-down `_pub` / `_pubsub` client. Cancel before the
+        # reader task so the reader can drain any final probe
+        # dispatch it already saw without the probe task racing to
+        # publish again.
+        if self._probe_task and not self._probe_task.done():
+            self._probe_task.cancel()
+            try:
+                await self._probe_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -374,6 +652,12 @@ class RedisPubSub:
                 pass
         await self._teardown_clients()
         self._reader_task = None
+        self._probe_task = None
+        self._probe_subscribed = False
+        # Leave `_probe_subscription_desired` unchanged so a
+        # subsequent `start()` on the same instance re-arms the
+        # probe channel without a second `set_probe_callback()`
+        # call.
         self._subscribed.clear()
         self._ref_counts.clear()
 
@@ -557,7 +841,10 @@ class RedisPubSub:
                     continue
                 # Nothing subscribed yet — don't poll get_message (redis client
                 # raises when no channels are set on some versions/backends).
-                if not self._subscribed:
+                # Nothing subscribed (production OR probe) — don't
+                # poll get_message (the redis client raises on some
+                # versions when no channels are set).
+                if not self._subscribed and not self._probe_subscribed:
                     await asyncio.sleep(0.05)
                     continue
                 attempt = 0
@@ -619,8 +906,19 @@ class RedisPubSub:
             async with self._lock:
                 self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
                 self._subscribed.clear()
+                self._probe_subscribed = False
                 desired = [k for k, count in self._ref_counts.items() if count > 0]
-                if not desired:
+                # PR #31 §3 W7 — probe channel is part of the desired
+                # subscription set whenever the caller has registered
+                # a probe callback. Include it in the SAME bulk
+                # SUBSCRIBE so probe resubscription is atomic with
+                # production channel resubscription.
+                probe_channel = (
+                    _probe_channel_name(ENV.INSTANCE_ID)
+                    if self._probe_subscription_desired
+                    else None
+                )
+                if not desired and not probe_channel:
                     self._connected = True
                     _emit(
                         EVENT_RECONNECTED,
@@ -634,6 +932,8 @@ class RedisPubSub:
                 # rooms are on this instance. Per-room timeout could stall
                 # _lock for N × timeout seconds on a hung connection.
                 channels = [_channel_name(*key) for key in desired]
+                if probe_channel:
+                    channels.append(probe_channel)
                 try:
                     await asyncio.wait_for(
                         self._pubsub.subscribe(*channels),
@@ -645,6 +945,7 @@ class RedisPubSub:
                         "WARNING",
                         reason="bulk_subscribe_timeout",
                         rooms_desired=len(desired),
+                        probe_desired=bool(probe_channel),
                         message=(
                             f"redis pubsub bulk resubscribe timeout "
                             f"({len(desired)} rooms) — will retry"
@@ -658,6 +959,7 @@ class RedisPubSub:
                         "WARNING",
                         reason="bulk_subscribe_failed",
                         rooms_desired=len(desired),
+                        probe_desired=bool(probe_channel),
                         error=repr(exc),
                         message=(
                             f"redis pubsub bulk resubscribe failed ({len(desired)} rooms): "
@@ -669,6 +971,8 @@ class RedisPubSub:
                 # All-or-nothing on the bulk call: if wait_for returned, every
                 # channel was accepted. Populate _subscribed accordingly.
                 self._subscribed.update(desired)
+                if probe_channel:
+                    self._probe_subscribed = True
                 self._connected = True
                 _emit(
                     EVENT_RECONNECTED,
@@ -690,22 +994,45 @@ class RedisPubSub:
             self._connected = False
 
     async def _dispatch(self, msg: dict) -> None:
-        if self._callback is None:
-            return
         try:
             channel = msg.get("channel") or ""
             data = msg.get("data")
             if not channel or data is None:
                 return
-            org_id, room_id = _parse_channel(channel)
-            if not org_id or not room_id:
-                return
             envelope = json.loads(data) if isinstance(data, (str, bytes)) else data
             if not isinstance(envelope, dict):
                 return
+
+            # PR #31 §3 W7 — probe branch. Probe messages are
+            # self-published on `{prefix}:probe:{instance_id}` and
+            # the intended recipient IS the publisher itself, so we
+            # deliberately DO NOT apply the self-suppression check.
+            # Probe channel matched → deliver to the probe callback
+            # and return; never fall through to production dispatch.
+            probe_instance = _parse_probe_channel(channel)
+            if probe_instance:
+                if self._probe_callback is None:
+                    return
+                # `is_probe=True` marker on the envelope for defence
+                # in depth — a channel-name discriminator is
+                # sufficient for correctness but the marker makes
+                # the branch obvious in incident review.
+                if not envelope.get("is_probe"):
+                    return
+                await self._probe_callback(envelope)
+                return
+
+            # Production branch.
+            if self._callback is None:
+                return
+            org_id, room_id = _parse_channel(channel)
+            if not org_id or not room_id:
+                return
             # Skip messages we published from this instance. broadcast_room
             # already delivered them locally; re-delivering here would double
-            # up on the publisher instance (see design doc §8a).
+            # up on the publisher instance (see design doc §8a). The probe
+            # branch above deliberately bypasses this check — see PR #31
+            # §3 W7.
             if envelope.get("publisher") == ENV.INSTANCE_ID:
                 return
             payload = envelope.get("message")
