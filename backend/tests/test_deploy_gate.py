@@ -428,6 +428,230 @@ def _fake_gate_snapshot(*, exists: bool, data: dict = None):
     return snap
 
 
+class DeployGateControlledRetryTests(unittest.TestCase):
+    """Reviewer's remaining round-2 requirement — a deterministic
+    controlled-retry test that exercises BOTH transaction attempts.
+
+    The transaction-participation test earlier in this file proves
+    `.get()` receives the `transaction=` kwarg but stops at
+    `org_not_found` on the first attempt, so it never exercises
+    room-write staging or a second attempt. This test does both:
+
+    1. First attempt reads an UNBLOCKED gate. The callback then
+       reads a real org, service, and (absent) existing-room, and
+       stages `transaction.set(room_ref, ...)` +
+       `transaction.set(service_ref, ..., merge=True)` on the
+       attempt's own tx mock. That's what a normal happy-path
+       start_service would do.
+    2. The controlled decorator simulates Firestore's OCC
+       aborting attempt 1 — it discards attempt-1's tx (no
+       commit) and invokes the callback AGAIN with a fresh tx
+       mock. BEFORE the second invocation runs, the fixture
+       flips the gate snapshot to `blocked=True`, modelling
+       "another writer committed a change to system/deploy_gate
+       between our read and our commit."
+    3. Second attempt reads the now-blocked gate and raises
+       `PermissionError("maintenance_blocked")`.
+
+    Assertions (all four required by the reviewer):
+    - The gate `.get()` was called TWICE (rereads on retry).
+    - The refused start propagates `maintenance_blocked`.
+    - Attempt 1's tx has zero committed writes (the aborted
+      tx's `.set` calls are on the tx mock, not on the underlying
+      ref — Firestore never persisted them).
+    - Attempt 2's tx staged NO writes at all (the callback
+      raised before reaching the write-staging block).
+    """
+
+    def _build_store_with_two_tx_mocks(self, *, gate_snapshots):
+        """Build a `FirestoreMultiChurchStore` shell whose refs
+        return realistic snapshots for one happy-path attempt, and
+        whose `db.transaction()` yields a fresh mock per call so
+        per-attempt writes can be attributed.
+
+        `gate_snapshots` is a list of snapshot doubles; the store's
+        `_deploy_gate_ref().get(transaction=...)` returns them in
+        order, one per attempt. The list should be exactly length
+        `invocations` — the fixture asserts this.
+        """
+        from unittest.mock import MagicMock
+
+        gate_snaps = iter(gate_snapshots)
+        gate_ref = MagicMock(name="deploy_gate_ref")
+        gate_ref.get.side_effect = lambda *a, **k: next(gate_snaps)
+
+        # Realistic org snapshot: exists, current-month key so no
+        # rollover branch, no hard cap, billing enabled but not
+        # trial-expired, plan permits start.
+        current_key = _current_month_key()
+        org_ref = MagicMock(name="org_ref")
+        org_ref.get.return_value = _fake_snap(
+            exists=True,
+            data={
+                "id": "org-retry",
+                "plan": "starter",
+                "billing": {"planKey": "starter"},
+                "billingLimitsEnabled": False,  # skip billing checks
+                "currentMonthKey": current_key,
+                "hardCapReached": False,
+                "softCapReached": False,
+                "status": "active",
+                "maxConcurrentRooms": 0,  # skip concurrency query
+            },
+        )
+
+        # Service exists; no existing active room.
+        service_ref = MagicMock(name="service_ref")
+        service_ref.get.return_value = _fake_snap(
+            exists=True,
+            data={"serviceKey": "sunday"},
+        )
+
+        room_ref = MagicMock(name="room_ref")
+
+        transactions_used = []
+
+        def make_new_transaction():
+            tx = MagicMock(name=f"transaction-{len(transactions_used) + 1}")
+            transactions_used.append(tx)
+            return tx
+
+        fake_db = MagicMock(name="db")
+        fake_db.transaction.side_effect = make_new_transaction
+
+        from app.services import multichurch_store as store_mod
+
+        store = store_mod.FirestoreMultiChurchStore.__new__(
+            store_mod.FirestoreMultiChurchStore
+        )
+        store._db = fake_db
+        store._org_ref = lambda org_id: org_ref
+        store._service_ref = lambda org_id, service_key: service_ref
+        store._room_ref = lambda org_id, room_id: room_ref
+        store._deploy_gate_ref = lambda: gate_ref
+        return store, gate_ref, org_ref, service_ref, transactions_used
+
+    def test_gate_flip_between_attempts_forces_refused_start(self) -> None:
+        """The core controlled-retry scenario."""
+        from app.services import multichurch_store as store_mod
+
+        # Two attempts: first sees unblocked gate; second sees blocked.
+        gate_snapshots = [
+            _fake_gate_snapshot(exists=False),                     # attempt 1
+            _fake_gate_snapshot(exists=True,
+                                data={"blocked": True, "revision": 2}),  # attempt 2
+        ]
+        store, gate_ref, org_ref, service_ref, transactions_used = (
+            self._build_store_with_two_tx_mocks(gate_snapshots=gate_snapshots)
+        )
+
+        per_attempt_outcomes = []
+
+        def controlled_transactional(fn):
+            def wrapper(tx0):
+                # Attempt 1 — succeeds through to the write-staging
+                # block. Firestore normally COMMITS this tx here;
+                # we simulate an OCC abort by discarding it and
+                # invoking the callback again with a fresh tx.
+                try:
+                    outcome1 = fn(tx0)
+                    per_attempt_outcomes.append(("ok", outcome1))
+                except Exception as exc1:
+                    per_attempt_outcomes.append(("raise", exc1))
+                    raise
+
+                # Attempt 2 — Firestore's transaction retry. Fresh
+                # tx; the fixture's next gate-snapshot iteration
+                # returns `blocked=True`. This models "another
+                # writer committed a change to system/deploy_gate
+                # between our read and our commit," which is what
+                # OCC detects.
+                tx1 = store._db.transaction()
+                try:
+                    outcome2 = fn(tx1)
+                    per_attempt_outcomes.append(("ok", outcome2))
+                    return outcome2
+                except Exception as exc2:
+                    per_attempt_outcomes.append(("raise", exc2))
+                    raise
+            return wrapper
+
+        from unittest.mock import patch
+        with patch.object(store_mod.gcf_firestore, "transactional",
+                          controlled_transactional):
+            with self.assertRaisesRegex(PermissionError, "maintenance_blocked") as ctx:
+                store.start_service(
+                    "org-retry", "sunday",
+                    host_uid="host", source="ko", target="en",
+                )
+        # The propagated exception is exactly the second attempt's.
+        self.assertEqual(str(ctx.exception), "maintenance_blocked")
+
+        # (1) Gate was re-read on the retry.
+        self.assertEqual(
+            gate_ref.get.call_count, 2,
+            f"gate.get was called {gate_ref.get.call_count}x, expected 2 "
+            "(re-read on retry)",
+        )
+
+        # (2) Both attempts received their OWN tx mock. Two distinct
+        # transaction objects were created.
+        self.assertEqual(len(transactions_used), 2)
+        tx1, tx2 = transactions_used
+
+        # (3) Attempt 1 staged the room-creation writes on ITS tx
+        # (the "aborted" work). Firestore never commits an aborted
+        # tx — the writes live only on the mock and never touched
+        # the underlying refs.
+        # The store calls `transaction.set(room_ref, {...})` and
+        # `transaction.set(service_ref, {...}, merge=True)`. Both
+        # end up as `.set()` calls on the tx mock.
+        tx1_set_calls = tx1.set.call_args_list
+        self.assertEqual(
+            len(tx1_set_calls), 2,
+            f"attempt 1 tx should have staged 2 writes (room + service), "
+            f"got {len(tx1_set_calls)}: {tx1_set_calls!r}",
+        )
+        # Confirm one was on room_ref and the other on service_ref.
+        set_targets_1 = {call.args[0] for call in tx1_set_calls}
+        self.assertIn(store._room_ref("org-retry", "any"), set_targets_1)
+        self.assertIn(store._service_ref("org-retry", "sunday"), set_targets_1)
+
+        # (4) Attempt 2 staged NOTHING — the callback raised on the
+        # gate check before reaching the write-staging block.
+        self.assertEqual(
+            tx2.set.call_count, 0,
+            f"attempt 2 tx should have staged zero writes; got "
+            f"{tx2.set.call_args_list!r}",
+        )
+
+        # (5) The underlying refs themselves received NO direct
+        # writes (all Firestore writes go through `transaction.set`,
+        # never `ref.set`). This is the "no committed room" and "no
+        # activeRoomId change" invariant from the reviewer's ask,
+        # asserted at the mock-call layer.
+        store._room_ref("org-retry", "any").set.assert_not_called()
+        store._service_ref("org-retry", "sunday").set.assert_not_called()
+
+
+def _current_month_key() -> str:
+    """Mirrors `_yyyymm(now)` inside the store — the exact format
+    the org's `currentMonthKey` must match to avoid the rollover
+    branch during test setup."""
+    from datetime import datetime, timezone
+    now = datetime.now(tz=timezone.utc)
+    return f"{now.year:04d}{now.month:02d}"
+
+
+def _fake_snap(*, exists: bool, data: dict = None):
+    """Minimal Firestore-DocumentSnapshot double for org/service refs."""
+    from unittest.mock import MagicMock
+    snap = MagicMock()
+    snap.exists = exists
+    snap.to_dict.return_value = dict(data) if data else {}
+    return snap
+
+
 class DeployGateRouteTests(unittest.TestCase):
     """End-to-end: both start endpoints translate the store's
     `PermissionError("maintenance_blocked")` into HTTP 503 with
