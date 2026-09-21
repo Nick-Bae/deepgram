@@ -12,6 +12,7 @@ Uses fakeredis to simulate Redis without a running server. Verifies:
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 
 # fakeredis provides an in-memory redis.asyncio.Redis workalike.
@@ -422,6 +423,222 @@ class RedisPubSubRealStartTests(unittest.IsolatedAsyncioTestCase):
         for stub in self._constructed:
             self.assertTrue(stub.closed, "pub/sub client not closed on stop()")
         self.assertTrue(pubsub_stub.closed, "pubsub not closed on stop()")
+
+
+class RedisPubSubStructuredEmissionTests(unittest.IsolatedAsyncioTestCase):
+    """PR #31 §3 W1 — structured JSON event emission on stdout.
+
+    Every adapter operational event goes through the module-level
+    `_emit()` helper, which writes ONE JSON line per event via
+    `print()` so:
+      1. Cloud Run's log parser reliably produces one `jsonPayload`
+         entry with `event`, `severity`, `instance_id`,
+         `schema_version`, and `component` labels for the metric
+         adapter to extract.
+      2. The event bypasses `logging` entirely — the exact pitfall
+         PR #32's F-27 hit under uvicorn's `logging.config.dictConfig`.
+      3. The `message` field preserves the previous
+         `log.warning("redis pubsub …")` substrings so F-27's
+         log-file grep keeps working during the transition.
+
+    These tests capture stdout during the exact code paths PR #31
+    §3's event catalogue names and assert the JSON schema shape.
+    """
+
+    def setUp(self):
+        self._orig_cmd_timeout = ENV.REDIS_COMMAND_TIMEOUT_SEC
+        self._orig_connect_timeout = ENV.REDIS_CONNECT_TIMEOUT_SEC
+        ENV.REDIS_COMMAND_TIMEOUT_SEC = 0.3
+        ENV.REDIS_CONNECT_TIMEOUT_SEC = 0.3
+
+    def tearDown(self):
+        ENV.REDIS_COMMAND_TIMEOUT_SEC = self._orig_cmd_timeout
+        ENV.REDIS_CONNECT_TIMEOUT_SEC = self._orig_connect_timeout
+        if getattr(self, "_aioredis", None) is not None:
+            self._aioredis.Redis = self._orig_redis_cls  # type: ignore[assignment]
+
+    def _install_fake_redis(self, ping_mode: str):
+        """Same infra as `RedisPubSubRealStartTests` — patch
+        `redis.asyncio.Redis` with a `_StubRedis` shim so `start()`
+        can run without a real Redis instance."""
+        from app.services.redis_pubsub import RedisPubSub
+
+        ps = RedisPubSub()
+        ps._enabled = True
+
+        def _factory(**kwargs):
+            return _StubRedis(ping_mode=ping_mode, **kwargs)
+
+        import redis.asyncio as aioredis
+        self._orig_redis_cls = aioredis.Redis
+        aioredis.Redis = _factory  # type: ignore[assignment]
+        self._aioredis = aioredis
+        return ps
+
+    def _capture_stdout_json_lines(self):
+        """Context manager that captures stdout and returns the list
+        of parsed JSON lines emitted during the block. Non-JSON lines
+        are silently ignored — the harness prints its own diagnostics
+        alongside the adapter's events."""
+        import contextlib
+        import io
+        buf = io.StringIO()
+
+        class _Capture:
+            def __init__(self, buf):
+                self.buf = buf
+                self._entered = False
+
+            def __enter__(self):
+                self._cm = contextlib.redirect_stdout(self.buf)
+                self._cm.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._cm.__exit__(*args)
+
+            @property
+            def events(self):
+                out = []
+                for line in self.buf.getvalue().splitlines():
+                    line = line.strip()
+                    if not line or not line.startswith("{"):
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+                return out
+
+        return _Capture(buf)
+
+    def _assert_common_shape(self, event: dict, *, event_name: str, severity: str):
+        """Every event MUST carry the six schema-required fields.
+        Missing any of these breaks the metric-label extraction and
+        the log-based-metric filters — this shape is contract."""
+        self.assertEqual(event.get("event"), event_name)
+        self.assertEqual(event.get("severity"), severity)
+        self.assertEqual(event.get("component"), "redis_pubsub")
+        self.assertEqual(event.get("schema_version"), 1)
+        self.assertIn("instance_id", event)
+        self.assertTrue(event.get("instance_id"))
+        self.assertIn("ts", event)
+        self.assertTrue(event.get("ts"))
+
+    async def test_started_event_on_successful_ping(self):
+        ps = self._install_fake_redis("ok")
+        try:
+            with self._capture_stdout_json_lines() as cap:
+                await ps.start()
+            events = cap.events
+        finally:
+            await ps.stop()
+
+        started = [e for e in events if e.get("event") == "redis_pubsub_started"]
+        self.assertEqual(len(started), 1, f"expected 1 started event, got {len(started)}: {events!r}")
+        e = started[0]
+        self._assert_common_shape(e, event_name="redis_pubsub_started", severity="INFO")
+        # Field-level contract from PR #31 §3 W1.
+        self.assertEqual(e.get("host"), ENV.REDIS_HOST)
+        self.assertEqual(e.get("port"), ENV.REDIS_PORT)
+        self.assertEqual(e.get("prefix"), ENV.REDIS_CHANNEL_PREFIX)
+        # `message` preserves the F-27 substring.
+        self.assertIn("redis pubsub started", e.get("message", ""))
+
+    async def test_initial_connect_failed_refused_event(self):
+        """`reason=refused` shape — the ping raised. Reader task
+        still scheduled (asserted separately in
+        RedisPubSubRealStartTests); here we only check the event."""
+        ps = self._install_fake_redis("refused")
+        try:
+            with self._capture_stdout_json_lines() as cap:
+                await ps.start()
+            events = cap.events
+        finally:
+            await ps.stop()
+
+        fails = [e for e in events if e.get("event") == "redis_pubsub_initial_connect_failed"]
+        self.assertEqual(len(fails), 1, f"expected 1 initial-failure event, got {len(fails)}")
+        e = fails[0]
+        self._assert_common_shape(
+            e, event_name="redis_pubsub_initial_connect_failed", severity="WARNING",
+        )
+        self.assertEqual(e.get("reason"), "refused")
+        self.assertIn("error", e)
+        self.assertIn("redis pubsub initial connect failed", e.get("message", ""))
+
+    async def test_initial_connect_failed_timeout_event(self):
+        """`reason=timeout` shape — asyncio.wait_for aborted the
+        ping. Distinct reason label so A5 can page separately on
+        this operational mode."""
+        ps = self._install_fake_redis("hang")
+        try:
+            with self._capture_stdout_json_lines() as cap:
+                await ps.start()
+            events = cap.events
+        finally:
+            await ps.stop()
+
+        fails = [e for e in events if e.get("event") == "redis_pubsub_initial_connect_failed"]
+        self.assertEqual(len(fails), 1)
+        e = fails[0]
+        self._assert_common_shape(
+            e, event_name="redis_pubsub_initial_connect_failed", severity="WARNING",
+        )
+        self.assertEqual(e.get("reason"), "timeout")
+        self.assertIn("timeout_seconds", e)
+        self.assertIn("PING timed out", e.get("message", ""))
+
+    def test_emit_helper_shape_and_field_precedence(self):
+        """Direct coverage of the `_emit` helper — captures a single
+        emission and confirms every required field is present AND
+        that caller-provided fields propagate. `event`/`severity`
+        cannot be overridden by kwargs (schema fields win)."""
+        from app.services.redis_pubsub import _emit
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _emit(
+                "redis_pubsub_started",
+                "INFO",
+                host="127.0.0.1",
+                port=6379,
+                prefix="worshiptranslate",
+                message="human-readable",
+                extra_field="carried through",
+            )
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip().startswith("{")]
+        self.assertEqual(len(lines), 1)
+        e = json.loads(lines[0])
+        self._assert_common_shape(
+            e, event_name="redis_pubsub_started", severity="INFO",
+        )
+        self.assertEqual(e["host"], "127.0.0.1")
+        self.assertEqual(e["port"], 6379)
+        self.assertEqual(e["prefix"], "worshiptranslate")
+        self.assertEqual(e["message"], "human-readable")
+        self.assertEqual(e["extra_field"], "carried through")
+
+    def test_event_name_constants_match_pr31_catalogue(self):
+        """The event NAMES are the metric anchor per PR #31 §3. If
+        anyone renames one, this test catches it, and the metric
+        adapter in `ops/monitoring/reconciler/` must be updated in
+        the same PR."""
+        from app.services import redis_pubsub as rp
+        self.assertEqual(rp.EVENT_STARTED, "redis_pubsub_started")
+        self.assertEqual(
+            rp.EVENT_INITIAL_CONNECT_FAILED,
+            "redis_pubsub_initial_connect_failed",
+        )
+        self.assertEqual(rp.EVENT_RECONNECTING, "redis_pubsub_reconnecting")
+        self.assertEqual(rp.EVENT_RECONNECTED, "redis_pubsub_reconnected")
+        self.assertEqual(rp.EVENT_RECONNECT_FAILED, "redis_pubsub_reconnect_failed")
+        self.assertEqual(rp.EVENT_READER_ERROR, "redis_pubsub_reader_error")
+        # Probe events are declared for the follow-on PR (task #127)
+        # but not emitted yet.
+        self.assertEqual(rp.EVENT_PROBE_OK, "redis_probe_ok")
+        self.assertEqual(rp.EVENT_PROBE_FAILED, "redis_probe_failed")
 
 
 if __name__ == "__main__":

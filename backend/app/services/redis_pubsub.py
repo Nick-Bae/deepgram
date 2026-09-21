@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
@@ -30,6 +31,70 @@ DeliveryCallback = Callable[[str, str, dict], Awaitable[None]]
 
 _BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0)
 _ENVELOPE_VERSION = 1
+
+# PR #31 §3 (W1) structured-event schema. Every adapter event now
+# emits one JSON line on stdout via `_emit` so Cloud Run parses it
+# into `jsonPayload` and log-based metrics can filter on
+# `jsonPayload.event="..."` and extract `jsonPayload.instance_id` as
+# a metric label — no more textPayload regex, no more dependence on
+# whatever root-logger level uvicorn ends up applying. The `print`
+# path bypasses `logging` entirely, which is deliberate (see PR #31
+# §3 W1 and PR #32's F-27 harness log-level pitfall).
+
+_EVENT_SCHEMA_VERSION = 1
+
+# Canonical event names — used by metric filters and by tests that
+# assert the adapter emits the right event for a given code path.
+# Any change here MUST be paired with a metric-filter update in
+# `ops/monitoring/reconciler/` per PR #31 §3.
+EVENT_STARTED = "redis_pubsub_started"
+EVENT_INITIAL_CONNECT_FAILED = "redis_pubsub_initial_connect_failed"
+EVENT_RECONNECTING = "redis_pubsub_reconnecting"
+EVENT_RECONNECTED = "redis_pubsub_reconnected"
+EVENT_RECONNECT_FAILED = "redis_pubsub_reconnect_failed"
+EVENT_READER_ERROR = "redis_pubsub_reader_error"
+# Probe events (task #127) are declared here so the catalogue is
+# complete but are NOT emitted by this PR — the probe task itself
+# lands in the probe-integration branch.
+EVENT_PROBE_OK = "redis_probe_ok"
+EVENT_PROBE_FAILED = "redis_probe_failed"
+
+
+def _emit(event: str, severity: str, **fields: Any) -> None:
+    """Emit one structured-JSON operational event line to stdout.
+
+    Fields always present: `event`, `severity`, `component`,
+    `instance_id`, `schema_version`, `ts`. `message` is populated
+    from a `message` kwarg when provided so F-27 and other consumers
+    that grep for a human-readable substring keep working during the
+    transition; metric filters key off `event` regardless.
+
+    Uses `print` directly, not `logging`, so:
+      1. The line reaches stdout regardless of the root logger level
+         (the exact pitfall PR #32's F-27 hit under uvicorn's
+         `logging.config.dictConfig`).
+      2. Cloud Run's log-parser reliably sees a single JSON object
+         per line, populating `jsonPayload.event` etc.
+
+    `flush=True` because uvicorn workers can otherwise buffer stdout
+    across a few seconds when a shutdown is in flight, and startup /
+    reconnect events are exactly the ones an operator needs to see
+    IMMEDIATELY during a window.
+    """
+    payload = {
+        "event": event,
+        "severity": severity,
+        "component": "redis_pubsub",
+        "instance_id": ENV.INSTANCE_ID,
+        "schema_version": _EVENT_SCHEMA_VERSION,
+        "ts": _iso_now(),
+        **fields,
+    }
+    print(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+        file=sys.stdout,
+        flush=True,
+    )
 
 
 def _channel_name(org_id: str, room_id: str) -> str:
@@ -160,28 +225,46 @@ class RedisPubSub:
                 timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
             )
             self._connected = True
-            log.info(
-                "redis pubsub started host=%s:%s prefix=%s instance=%s",
-                ENV.REDIS_HOST, ENV.REDIS_PORT, ENV.REDIS_CHANNEL_PREFIX, ENV.INSTANCE_ID,
+            _emit(
+                EVENT_STARTED,
+                "INFO",
+                host=ENV.REDIS_HOST,
+                port=ENV.REDIS_PORT,
+                prefix=ENV.REDIS_CHANNEL_PREFIX,
+                message=(
+                    f"redis pubsub started host={ENV.REDIS_HOST}:{ENV.REDIS_PORT} "
+                    f"prefix={ENV.REDIS_CHANNEL_PREFIX} instance={ENV.INSTANCE_ID}"
+                ),
             )
         except asyncio.TimeoutError:
             self._connected = False
-            # Distinct wording so the operator can tell TCP-accepted-but-hung
-            # apart from connection-refused. Same recognizable prefix as the
-            # generic branch so the metric/filter picks up both.
-            log.warning(
-                "redis pubsub initial connect failed: PING timed out after "
-                "%.2fs (TCP accepted but no reply); reader loop will retry",
-                ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            # Distinct `reason` field so the operator (and A5) can
+            # tell TCP-accepted-but-hung apart from connection-refused.
+            # Same `event` name so the metric/filter picks up both.
+            _emit(
+                EVENT_INITIAL_CONNECT_FAILED,
+                "WARNING",
+                reason="timeout",
+                timeout_seconds=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+                message=(
+                    f"redis pubsub initial connect failed: PING timed out after "
+                    f"{ENV.REDIS_COMMAND_TIMEOUT_SEC:.2f}s "
+                    f"(TCP accepted but no reply); reader loop will retry"
+                ),
             )
         except Exception as exc:
             self._connected = False
-            # Distinct log string — recognisable by the metric filter and
-            # by tests that need to detect the initial-failure event
-            # before restoring the network path.
-            log.warning(
-                "redis pubsub initial connect failed; reader loop will retry: %s",
-                exc,
+            # `reason=refused` covers ConnectionError shape; anything
+            # else surfaces via the message field for forensic
+            # inspection (still under the same `event` name).
+            _emit(
+                EVENT_INITIAL_CONNECT_FAILED,
+                "WARNING",
+                reason="refused",
+                error=repr(exc),
+                message=(
+                    f"redis pubsub initial connect failed; reader loop will retry: {exc}"
+                ),
             )
 
         # ALWAYS schedule the reader loop. If _connected=False, the
@@ -431,7 +514,12 @@ class RedisPubSub:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.warning("pubsub reader error: %s", exc)
+                _emit(
+                    EVENT_READER_ERROR,
+                    "WARNING",
+                    error=repr(exc),
+                    message=f"pubsub reader error: {exc}",
+                )
                 # get_message() raising almost always means the subscriber's
                 # transport dropped. Flip _connected so the next iteration
                 # enters _reconnect and rebuilds the client; otherwise the
@@ -444,7 +532,13 @@ class RedisPubSub:
 
     async def _reconnect(self, attempt: int) -> None:
         delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
-        log.info("redis pubsub reconnecting in %.1fs (attempt %d)", delay, attempt + 1)
+        _emit(
+            EVENT_RECONNECTING,
+            "INFO",
+            attempt=attempt + 1,
+            delay_seconds=delay,
+            message=f"redis pubsub reconnecting in {delay:.1f}s (attempt {attempt + 1})",
+        )
         await asyncio.sleep(delay)
         try:
             import redis.asyncio as aioredis  # type: ignore
@@ -474,7 +568,12 @@ class RedisPubSub:
                 desired = [k for k, count in self._ref_counts.items() if count > 0]
                 if not desired:
                     self._connected = True
-                    log.info("redis pubsub reconnected; 0 rooms to resubscribe")
+                    _emit(
+                        EVENT_RECONNECTED,
+                        "INFO",
+                        rooms_resubscribed=0,
+                        message="redis pubsub reconnected; 0 rooms to resubscribe",
+                    )
                     return
                 # Single bulk SUBSCRIBE so the whole reconciliation is bounded
                 # by ONE REDIS_COMMAND_TIMEOUT_SEC, regardless of how many
@@ -487,16 +586,29 @@ class RedisPubSub:
                         timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
                     )
                 except asyncio.TimeoutError:
-                    log.warning(
-                        "redis pubsub bulk resubscribe timeout (%d rooms) — will retry",
-                        len(desired),
+                    _emit(
+                        EVENT_RECONNECT_FAILED,
+                        "WARNING",
+                        reason="bulk_subscribe_timeout",
+                        rooms_desired=len(desired),
+                        message=(
+                            f"redis pubsub bulk resubscribe timeout "
+                            f"({len(desired)} rooms) — will retry"
+                        ),
                     )
                     self._connected = False
                     return
                 except Exception as exc:
-                    log.warning(
-                        "redis pubsub bulk resubscribe failed (%d rooms): %s — will retry",
-                        len(desired), exc,
+                    _emit(
+                        EVENT_RECONNECT_FAILED,
+                        "WARNING",
+                        reason="bulk_subscribe_failed",
+                        rooms_desired=len(desired),
+                        error=repr(exc),
+                        message=(
+                            f"redis pubsub bulk resubscribe failed ({len(desired)} rooms): "
+                            f"{exc} — will retry"
+                        ),
                     )
                     self._connected = False
                     return
@@ -504,12 +616,23 @@ class RedisPubSub:
                 # channel was accepted. Populate _subscribed accordingly.
                 self._subscribed.update(desired)
                 self._connected = True
-                log.info(
-                    "redis pubsub reconnected; %d rooms resubscribed (bulk)",
-                    len(self._subscribed),
+                _emit(
+                    EVENT_RECONNECTED,
+                    "INFO",
+                    rooms_resubscribed=len(self._subscribed),
+                    message=(
+                        f"redis pubsub reconnected; "
+                        f"{len(self._subscribed)} rooms resubscribed (bulk)"
+                    ),
                 )
         except Exception as exc:
-            log.warning("redis reconnect failed: %s", exc)
+            _emit(
+                EVENT_RECONNECT_FAILED,
+                "WARNING",
+                reason="ping_failed",
+                error=repr(exc),
+                message=f"redis reconnect failed: {exc}",
+            )
             self._connected = False
 
     async def _dispatch(self, msg: dict) -> None:
