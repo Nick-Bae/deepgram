@@ -37,8 +37,14 @@ _REPO = Path(__file__).resolve().parents[2]
 _OPS_DIR = _REPO / "ops" / "infrastructure" / "redis-fanout"
 sys.path.insert(0, str(_OPS_DIR))
 
-import validate as _validate  # noqa: E402
-import apply as _apply  # noqa: E402
+# Renamed from `validate`/`apply` to unique module names because the
+# monitoring test suite (`test_redis_monitoring_config.py`) imports
+# its own modules under the SAME bare names from
+# `ops/monitoring/redis-fanout/`. Whichever test file ran first
+# would win the `sys.modules` cache and break the other suite in
+# CI — the bug caught between round-1 push and round-2 fix here.
+import infra_validate as _validate  # noqa: E402
+import infra_apply as _apply  # noqa: E402
 
 
 class InfraConfigValidatorTests(unittest.TestCase):

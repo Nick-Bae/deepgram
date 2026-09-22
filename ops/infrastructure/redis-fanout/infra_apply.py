@@ -38,7 +38,7 @@ except Exception as exc:  # pragma: no cover
     )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import validate as _validate  # noqa: E402
+import infra_validate as _validate  # noqa: E402
 
 
 HERE = Path(__file__).resolve().parent

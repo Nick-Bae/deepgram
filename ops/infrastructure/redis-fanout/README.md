@@ -3,7 +3,7 @@
 Declarative source-of-truth for the Cloud Run / Memorystore /
 VPC / Secret Manager configuration the Redis pub/sub rollout
 requires. Config + validator + planner only. **No writes to
-Google Cloud** happen from CI or from `apply.py`; `--apply`
+Google Cloud** happen from CI or from `infra_apply.py`; `--apply`
 returns rc=6 with a "planning only" message until task #137's
 enablement PR lands.
 
@@ -16,8 +16,8 @@ ops/infrastructure/redis-fanout/
 ├── vpc.yaml                 VPC egress path (Direct preferred)
 ├── secrets.yaml             Secret Manager bindings
 ├── manifest.yaml            Cross-reference + pinned constraints
-├── validate.py              Structural checks; CLI + library
-├── apply.py                 Plan-only default; --apply → rc=6
+├── infra_validate.py              Structural checks; CLI + library
+├── infra_apply.py                 Plan-only default; --apply → rc=6
 └── README.md
 ```
 
@@ -49,7 +49,7 @@ that MUST hold on `main` until task #137's enablement PR:
 - `cloudrun.spec.ingress = "internal-and-cloud-load-balancing"`
   — BOOT-1 session-start gate no-bypass rule.
 
-Drift on any of these fails `validate.py`, refuses `apply.py`
+Drift on any of these fails `infra_validate.py`, refuses `infra_apply.py`
 planning, and fails CI.
 
 ## Cross-resource invariants
@@ -67,7 +67,7 @@ that pairs / triples of fields across resources agree:
 ## Operator use — offline preview (default)
 
 ```
-python ops/infrastructure/redis-fanout/apply.py \
+python ops/infrastructure/redis-fanout/infra_apply.py \
     --project sturdy-dogfish-472313-k6
 ```
 
@@ -78,7 +78,7 @@ anything else refuses with rc=4 before any preview runs.
 ## Operator use — apply (gated; not in this PR)
 
 ```
-python ops/infrastructure/redis-fanout/apply.py \
+python ops/infrastructure/redis-fanout/infra_apply.py \
     --project sturdy-dogfish-472313-k6 \
     --apply --confirm 'I understand this affects production infrastructure'
 ```
