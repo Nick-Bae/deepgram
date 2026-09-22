@@ -33,16 +33,30 @@ documentation:
 conditions:
   - displayName: reconnect_attempts > 3 AND no reconnect_successes (per instance, 5 min)
     conditionPrometheusQueryLanguage:
+      # `monitored_resource="cloud_run_revision"` is a fail-closed
+      # selector — Google explicitly warns that log-based /
+      # user-defined metrics can map to multiple monitored-resource
+      # types, and an unqualified selector would let series from
+      # a stray resource enter the vector and drop or trigger the
+      # join unexpectedly. See PR #39 round-3 blocker #2.
       query: |
         (
           sum by (revision_name, instance_id) (
-            increase(logging_googleapis_com:user_redis_pubsub_reconnect_attempts[5m])
+            increase(
+              logging_googleapis_com:user_redis_pubsub_reconnect_attempts{
+                monitored_resource="cloud_run_revision"
+              }[5m]
+            )
           ) > 3
         )
         unless on (revision_name, instance_id)
         (
           sum by (revision_name, instance_id) (
-            increase(logging_googleapis_com:user_redis_pubsub_reconnect_successes[5m])
+            increase(
+              logging_googleapis_com:user_redis_pubsub_reconnect_successes{
+                monitored_resource="cloud_run_revision"
+              }[5m]
+            )
           ) > 0
         )
       duration: 60s

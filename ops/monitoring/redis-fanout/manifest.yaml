@@ -29,8 +29,11 @@ metrics:
     extracts:
       - instance_id
       - reason
-    consumed_by:
-      - a5_startup_without_recovery
+    # No alert consumes this metric directly — A5 now alerts on
+    # `redis_pubsub_recovery_deadline_missed` (see below) so the
+    # rule is deadline-aware without relying on rolling-window
+    # PromQL. The counter still exists for dashboards / audits.
+    consumed_by: []
   redis_pubsub_reconnect_attempts:
     file: metrics/redis_pubsub_reconnect_attempts.yaml
     event: redis_pubsub_reconnecting
@@ -44,7 +47,6 @@ metrics:
     extracts:
       - instance_id
     consumed_by:
-      - a5_startup_without_recovery
       - a6_reconnect_without_success
   redis_pubsub_reconnect_failures:
     file: metrics/redis_pubsub_reconnect_failures.yaml
@@ -81,24 +83,35 @@ metrics:
     extracts: []
     consumed_by:
       - a5_legacy_startup_failed
+  # PR #31 §3 alert A5 — deadline-aware signal emitted by
+  # `RedisPubSub._check_recovery_deadline` after
+  # `REDIS_RECOVERY_DEADLINE_SEC` (default 300 s) unrecovered.
+  # A5 alerts on ANY occurrence — no rolling-window PromQL.
+  redis_pubsub_recovery_deadline_missed:
+    file: metrics/redis_pubsub_recovery_deadline_missed.yaml
+    event: redis_pubsub_recovery_deadline_missed
+    extracts:
+      - instance_id
+    consumed_by:
+      - a5_startup_without_recovery
 
 alerts:
-  # A5 uses PromQL because a bare conditionAbsent on
-  # redis_pubsub_reconnect_successes cannot arm for an
-  # instance that has never reconnected (Cloud Monitoring's
-  # absence policy requires a prior data point). `unless`
-  # on (revision_name, instance_id) fires when startup_failed
-  # has a per-instance vector element that reconnect_successes
-  # does not.
+  # A5 alerts DIRECTLY on the adapter's deadline-aware event
+  # `redis_pubsub_recovery_deadline_missed`. Round-2 tried a
+  # rolling-window PromQL join on startup_failed vs
+  # reconnect_successes but Cloud Monitoring PromQL cannot
+  # reliably express "5 min after event X with no event Y since"
+  # (reviewer-flagged blocker in PR #39 round 3). Simpler +
+  # correct: emit an event when the deadline is missed and
+  # threshold-alert on any occurrence.
   a5_startup_without_recovery:
     file: alerts/a5_startup_without_recovery.yaml
-    query_kind: promql
+    query_kind: threshold
     metrics_used:
-      - redis_pubsub_startup_failed
-      - redis_pubsub_reconnect_successes
+      - redis_pubsub_recovery_deadline_missed
     group_by:
-      - revision_name
-      - instance_id
+      - resource.label.revision_name
+      - metric.label.instance_id
   a5_legacy_startup_failed:
     file: alerts/a5_legacy_startup_failed.yaml
     query_kind: threshold

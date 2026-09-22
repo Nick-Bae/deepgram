@@ -32,6 +32,7 @@ ops/monitoring/redis-fanout/
 | `metrics/redis_pubsub_active_probe_failure.yaml` | counter | §3 metrics row 6 |
 | `metrics/redis_pubsub_active_probe_success.yaml` | counter | §3 metrics row 7 |
 | `metrics/redis_pubsub_legacy_startup_failed.yaml` | counter | §3 metrics row 8 |
+| `metrics/redis_pubsub_recovery_deadline_missed.yaml` | counter | PR #31 §3 alert A5 substrate |
 | `alerts/a5_startup_without_recovery.yaml` | policy | §3 Alerts — A5 |
 | `alerts/a5_legacy_startup_failed.yaml` | policy | §3 Alerts — A5-legacy |
 | `alerts/a6_reconnect_without_success.yaml` | policy | §3 Alerts — A6 |

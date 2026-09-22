@@ -12,3 +12,11 @@ fakeredis>=2.20
 # production dep is reshuffled.
 PyYAML>=6.0
 
+# For CI-side schema validation of the redis-fanout alert
+# policies. Test parses each YAML into `monitoring_v3.AlertPolicy`
+# via `google.protobuf.json_format.ParseDict` so a field-name
+# typo, wrong enum, or misspelled key fails CI instead of only
+# failing when the operator runs `gcloud monitoring policies
+# create`. No CI credentials needed — parsing is offline.
+google-cloud-monitoring>=2.20
+

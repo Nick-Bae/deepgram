@@ -468,8 +468,13 @@ class RedisMonitoringPromQLAlertTests(unittest.TestCase):
     on any regression that drops the `unless` join semantics the
     reviewer required for A5/A6/A8a."""
 
+    # A5 was PromQL in PR #39 round 2 but the reviewer flagged
+    # that rolling-window PromQL cannot express the "5 min
+    # unrecovered" contract reliably. Round 3 moved A5 back to
+    # a simple threshold alert on the adapter's
+    # `redis_pubsub_recovery_deadline_missed` event; only A6 and
+    # A8a still use PromQL.
     PROMQL_ALERTS = (
-        "a5_startup_without_recovery",
         "a6_reconnect_without_success",
         "a8a_probe_absence_per_revision",
     )
@@ -567,6 +572,190 @@ class RedisMonitoringManifestConsistencyTests(unittest.TestCase):
                     f"alert {a!r} says metrics_used {m!r}; metric does not "
                     f"list it in consumed_by",
                 )
+
+
+try:
+    from google.cloud import monitoring_v3  # type: ignore
+    from google.protobuf import json_format as _json_format  # type: ignore
+    _MONITORING_SDK_AVAILABLE = True
+except ImportError:
+    _MONITORING_SDK_AVAILABLE = False
+
+
+@unittest.skipUnless(
+    _MONITORING_SDK_AVAILABLE,
+    "google-cloud-monitoring not installed — SDK schema tests require it; "
+    "listed in requirements-dev.txt so CI always has it.",
+)
+class RedisMonitoringAlertPolicySchemaTests(unittest.TestCase):
+    """PR #39 round-3 blocker #3: static substring checks cannot
+    tell us that Google would accept these policies. Parse each
+    alert YAML into the real `monitoring_v3.AlertPolicy`
+    protobuf via `json_format.ParseDict` — a field-name typo,
+    wrong enum, or misspelled key raises here instead of only
+    at `gcloud monitoring policies create` time.
+
+    Purely offline: no cloud credentials are used, no network
+    call is made. Google's live PromQL validator lives on the
+    Cloud Monitoring API and requires credentials; that check
+    is a manual pre-flight step documented in the README for
+    task #137's enablement PR."""
+
+    def _iter_alert_yamls(self):
+        alerts_dir = Path(_validate.MANIFEST_PATH.parent) / "alerts"
+        import yaml  # type: ignore
+        for path in sorted(alerts_dir.glob("*.yaml")):
+            with path.open("r", encoding="utf-8") as f:
+                yield path, yaml.safe_load(f)
+
+    def test_every_alert_parses_as_monitoring_v3_AlertPolicy(self):
+        checked = 0
+        for path, data in self._iter_alert_yamls():
+            with self.subTest(path=path.name):
+                # ParseDict raises `google.protobuf.json_format.ParseError`
+                # on any unknown field, wrong enum, or type mismatch.
+                # We create a fresh AlertPolicy proto per file so a
+                # bleed from one to the next cannot mask a bug.
+                policy = monitoring_v3.AlertPolicy()
+                try:
+                    _json_format.ParseDict(
+                        data, policy._pb, ignore_unknown_fields=False,
+                    )
+                except _json_format.ParseError as exc:
+                    self.fail(
+                        f"{path.name} does not parse as "
+                        f"monitoring_v3.AlertPolicy: {exc}"
+                    )
+                # Basic post-conditions the API would enforce too.
+                self.assertTrue(policy.display_name, f"{path.name}: empty display_name")
+                self.assertGreaterEqual(
+                    len(policy.conditions), 1,
+                    f"{path.name}: no conditions",
+                )
+                checked += 1
+        self.assertGreater(checked, 0, "no alert YAMLs found to parse")
+
+
+class RedisMonitoringA5TimingTests(unittest.TestCase):
+    """A5's contract is deadline-aware: fires only when the
+    adapter has emitted `redis_pubsub_recovery_deadline_missed`.
+    The alert MUST NOT reference the older
+    `redis_pubsub_startup_failed` / `redis_pubsub_reconnect_successes`
+    rolling-window pattern the reviewer flagged in round 2.
+    Regression barrier for blocker #1."""
+
+    def _a5_data(self) -> dict:
+        import yaml  # type: ignore
+        path = Path(_validate.MANIFEST_PATH.parent) / "alerts" / "a5_startup_without_recovery.yaml"
+        with path.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    def test_a5_alerts_on_deadline_missed_event(self):
+        data = self._a5_data()
+        condition = data["conditions"][0]
+        threshold = condition.get("conditionThreshold")
+        self.assertIsNotNone(
+            threshold,
+            "A5 must be a threshold alert on the adapter's deadline "
+            "event — a PromQL rolling-window design cannot express "
+            "the 5-min-unrecovered contract reliably",
+        )
+        self.assertIn(
+            "redis_pubsub_recovery_deadline_missed",
+            threshold["filter"],
+            "A5 must filter on the deadline-missed metric",
+        )
+
+    def test_a5_does_not_use_rolling_window_promql(self):
+        """The failed round-2 shape used
+        `logging_googleapis_com:user_redis_pubsub_startup_failed`
+        with `unless on reconnect_successes`. A5 MUST NOT
+        reference either name — that would silently regress to
+        the pattern the reviewer rejected."""
+        data = self._a5_data()
+        cond = data["conditions"][0]
+        promql = cond.get("conditionPrometheusQueryLanguage")
+        self.assertIsNone(
+            promql,
+            "A5 must not be PromQL — round-2 rolling-window design "
+            "is rejected as unreliable for the deadline contract",
+        )
+        threshold = cond["conditionThreshold"]
+        self.assertNotIn(
+            "redis_pubsub_startup_failed", threshold["filter"],
+            "A5 must not reference the round-2 rolling-window metric",
+        )
+        self.assertNotIn(
+            "redis_pubsub_reconnect_successes", threshold["filter"],
+            "A5 must not reference reconnect_successes — it uses "
+            "the adapter's deadline event instead",
+        )
+
+    def test_a5_groups_per_instance(self):
+        """The alert must fanout per (revision_name, instance_id).
+        A per-revision or per-service aggregate would hide a
+        single-instance stuck-adapter — the exact Gate 2 failure
+        this alert exists for."""
+        data = self._a5_data()
+        aggs = data["conditions"][0]["conditionThreshold"]["aggregations"]
+        group = set(aggs[0]["groupByFields"])
+        self.assertIn("resource.label.revision_name", group)
+        self.assertIn("metric.label.instance_id", group)
+
+
+class RedisMonitoringPromQLFailClosedSelectorTests(unittest.TestCase):
+    """Every PromQL selector must be fail-closed. Regression
+    barrier for blocker #2 — `monitored_resource="cloud_run_revision"`
+    on every log-based selector; `service_name` and `state=~`
+    on A8a's Cloud Run selector."""
+
+    def _promql_of(self, alert_name: str) -> str:
+        import yaml  # type: ignore
+        with _validate.MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            manifest = yaml.safe_load(f)
+        path = Path(_validate.MANIFEST_PATH.parent) / manifest["alerts"][alert_name]["file"]
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return "\n".join(
+            (c.get("conditionPrometheusQueryLanguage") or {}).get("query", "")
+            for c in data.get("conditions", [])
+        )
+
+    def test_a6_selectors_pin_monitored_resource(self):
+        q = self._promql_of("a6_reconnect_without_success")
+        self.assertIn('monitored_resource="cloud_run_revision"', q)
+        # Both metric references must carry the selector — otherwise
+        # a stray Cloud Run service's series could satisfy the join.
+        self.assertEqual(
+            q.count('monitored_resource="cloud_run_revision"'), 2,
+            "A6's PromQL must apply the monitored_resource selector "
+            "on BOTH reconnect_attempts and reconnect_successes",
+        )
+
+    def test_a8a_container_instance_count_has_service_and_state(self):
+        q = self._promql_of("a8a_probe_absence_per_revision")
+        self.assertIn('service_name="worshiptranslate-backend"', q)
+        self.assertIn('state=~"active|idle"', q)
+        # The selector must sit on `container_instance_count`, not
+        # on the probe-success side (probe_success has no `state`).
+        # Grep for the substring in the same line-ish block.
+        instance_count_start = q.find("container_instance_count")
+        self.assertGreater(instance_count_start, -1)
+        # The selectors should appear within ~200 chars of the metric
+        # name (same `{ ... }` block).
+        window = q[instance_count_start:instance_count_start + 300]
+        self.assertIn('service_name="worshiptranslate-backend"', window)
+        self.assertIn('state=~"active|idle"', window)
+
+    def test_a8a_probe_success_side_carries_monitored_resource(self):
+        q = self._promql_of("a8a_probe_absence_per_revision")
+        # A8a has two metric references; both must carry the
+        # monitored_resource selector.
+        self.assertGreaterEqual(
+            q.count('monitored_resource="cloud_run_revision"'), 2,
+            "A8a's PromQL must apply monitored_resource selector "
+            "on BOTH container_instance_count and active_probe_success",
+        )
 
 
 if __name__ == "__main__":

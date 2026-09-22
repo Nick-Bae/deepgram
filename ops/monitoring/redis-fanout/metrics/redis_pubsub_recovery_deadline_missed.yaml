@@ -1,0 +1,31 @@
+# Log-based metric — the adapter's deadline-aware A5 signal.
+# Emitted once per unrecovered outage window by
+# `RedisPubSub._check_recovery_deadline()` after
+# `REDIS_RECOVERY_DEADLINE_SEC` (default 300 s) elapse without
+# a `redis_pubsub_reconnected` on the same instance.
+#
+# A5 alerts DIRECTLY on this event's count — the monitoring
+# rule does not need to express "5 min unrecovered" in PromQL,
+# which the reviewer showed cannot be done reliably.
+#
+# Manifest anchor: metrics.redis_pubsub_recovery_deadline_missed
+name: redis_pubsub_recovery_deadline_missed
+description: |
+  redis pubsub adapter did not recover from a startup / connect
+  failure within `REDIS_RECOVERY_DEADLINE_SEC`. Managed by
+  ops/monitoring/redis-fanout — do NOT edit in the Cloud
+  Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  jsonPayload.event="redis_pubsub_recovery_deadline_missed"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: instance_id
+      valueType: STRING
+      description: Adapter INSTANCE_ID (per-process identity).
+labelExtractors:
+  instance_id: EXTRACT(jsonPayload.instance_id)
