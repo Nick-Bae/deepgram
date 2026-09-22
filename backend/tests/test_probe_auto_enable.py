@@ -17,10 +17,24 @@ per the reviewer's explicit direction. The helper was extracted
 from `_on_startup` so tests need not mock the surrounding sweeper
 and reconciler wiring.
 
-There is also a real-startup smoke test that patches the probe
-interval down to a fraction of a second, drives the helper against
-a fakeredis-backed pubsub, and asserts a `redis_probe_ok` event
-fires within the configured first-probe deadline.
+Three suites cover the helper at progressively less-mocked layers:
+
+  1. `ProbeAutoEnableHelperTests` — MagicMock pubsub; asserts the
+     helper's call order and idempotency contract.
+
+  2. `RealPubsubProbeAutoEnableTests` — `RedisPubSub` object real,
+     but `.start()` is replaced with a fakeredis-backed fake for
+     historical parity with `test_redis_pubsub.py::_make_pubsub`.
+     Kept because the pattern is inexpensive and easy to reason
+     about.
+
+  3. `IntegratedRealStartPubsubTests` — the FULL production path.
+     `RedisPubSub.start()` is UNTOUCHED; only `redis.asyncio.Redis`
+     (the concrete client class the real `start()` instantiates) is
+     patched to a fakeredis-backed factory. So the helper drives
+     `enable_probe_task()` → real `start()` → probe subscription →
+     scheduled `_probe_loop` → `redis_probe_ok`. This is the layer
+     that certifies the production wiring end-to-end.
 """
 from __future__ import annotations
 
@@ -379,6 +393,213 @@ class RealPubsubProbeAutoEnableTests(unittest.IsolatedAsyncioTestCase):
                     self.assertGreaterEqual(first["rtt_ms"], 0)
                 finally:
                     await ps.stop()
+
+
+@unittest.skipUnless(
+    _FAKEREDIS_AVAILABLE,
+    "fakeredis not installed — integrated real-start tests require it.",
+)
+class IntegratedRealStartPubsubTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end coverage of the FULL production path:
+
+        _start_pubsub_singleton(ps)
+          → ps.enable_probe_task()
+          → ps.start()           ← the REAL adapter start(), unpatched
+              → self._pub / self._sub / self._pubsub construction
+              → self._pub.ping()
+              → probe channel subscribe on the initial ping
+              → schedule self._probe_loop task
+          → redis_probe_ok emitted within the deadline
+
+    The reviewer flagged the earlier `RealPubsubProbeAutoEnableTests`
+    as insufficient: it replaced `RedisPubSub.start()` with a
+    fakeredis-backed `_fake_start`, so the actual production
+    `start()` was never exercised through the helper. Fix: patch
+    ONLY `redis.asyncio.Redis` — the concrete client class the real
+    `start()` instantiates — so fakeredis stands in for the network
+    without touching any adapter code."""
+
+    def _patched_redis_class(self, server):
+        """Return a callable that satisfies `redis.asyncio.Redis(...)`
+        by producing a fakeredis-backed client pinned to `server`.
+        The real `start()` passes host/port/password/socket_connect_timeout
+        — fakeredis ignores what it doesn't need."""
+        import fakeredis.aioredis as fake_aio
+
+        def _make_client(**kwargs):
+            # Fakeredis accepts a subset of the real client's kwargs;
+            # drop the ones it doesn't understand.
+            kwargs.pop("host", None)
+            kwargs.pop("port", None)
+            kwargs.pop("password", None)
+            kwargs.pop("socket_connect_timeout", None)
+            kwargs.setdefault("decode_responses", True)
+            return fake_aio.FakeRedis(server=server, **kwargs)
+
+        return _make_client
+
+    def _make_real_pubsub(self):
+        """Build a fresh `RedisPubSub` with a no-op delivery
+        callback. Enablement flag flipped on directly so we don't
+        depend on ENV state."""
+        from app.services.redis_pubsub import RedisPubSub
+
+        ps = RedisPubSub()
+        ps._enabled = True
+
+        async def _noop(org, room, msg):
+            return None
+
+        ps.set_delivery_callback(_noop)
+        return ps
+
+    async def test_real_start_via_helper_subscribes_probe_and_schedules_task(self):
+        """Drive the FULL production path once — with the real
+        `RedisPubSub.start()` untouched. Only `redis.asyncio.Redis`
+        is patched to a fakeredis-backed factory."""
+        import fakeredis.aioredis as fake_aio
+        import redis.asyncio as aioredis
+        from app.main import _start_pubsub_singleton
+
+        server = fake_aio.FakeServer()
+        make_client = self._patched_redis_class(server)
+
+        ps = self._make_real_pubsub()
+        with patch.object(aioredis, "Redis", side_effect=make_client):
+            try:
+                await _start_pubsub_singleton(ps)
+                # The real start() ran — assert side effects it must
+                # have produced on a successful initial ping.
+                self.assertTrue(ps._started)
+                self.assertTrue(ps._connected)
+                self.assertTrue(ps._probe_subscription_desired)
+                self.assertTrue(ps._probe_subscribed)
+                self.assertIsNotNone(ps._probe_task)
+                self.assertFalse(ps._probe_task.done())
+                self.assertIsNotNone(ps._reader_task)
+                self.assertFalse(ps._reader_task.done())
+            finally:
+                await ps.stop()
+
+    async def test_real_start_repeated_helper_keeps_same_probe_task(self):
+        """A second call to the helper must NOT spawn a second probe
+        task — the adapter's `_started` guard short-circuits."""
+        import fakeredis.aioredis as fake_aio
+        import redis.asyncio as aioredis
+        from app.main import _start_pubsub_singleton
+
+        server = fake_aio.FakeServer()
+        make_client = self._patched_redis_class(server)
+
+        ps = self._make_real_pubsub()
+        with patch.object(aioredis, "Redis", side_effect=make_client):
+            try:
+                await _start_pubsub_singleton(ps)
+                first_probe_task = ps._probe_task
+                self.assertIsNotNone(first_probe_task)
+                await _start_pubsub_singleton(ps)
+                self.assertIs(
+                    ps._probe_task, first_probe_task,
+                    "second helper call replaced the probe task — "
+                    "real start() should have short-circuited",
+                )
+            finally:
+                await ps.stop()
+
+    async def test_real_start_via_helper_emits_redis_probe_ok(self):
+        """`redis_probe_ok` fires within the shortened first-probe
+        deadline once the helper has run. Full path — real
+        `start()`, real `_probe_loop`, fakeredis network."""
+        import fakeredis.aioredis as fake_aio
+        import redis.asyncio as aioredis
+        from app.env import ENV
+        from app.services import redis_pubsub as rp
+        from app.main import _start_pubsub_singleton
+
+        server = fake_aio.FakeServer()
+        make_client = self._patched_redis_class(server)
+
+        test_interval = 0.2
+        test_deadline = 1.0
+        first_probe_budget = 3.0
+
+        emissions: list[dict] = []
+        real_emit = rp._emit
+
+        def _capture_emit(event, severity="INFO", **fields):
+            emissions.append({"event": event, "severity": severity, **fields})
+            return real_emit(event, severity, **fields)
+
+        ps = self._make_real_pubsub()
+        with patch.object(aioredis, "Redis", side_effect=make_client), \
+             patch.object(ENV, "REDIS_PROBE_INTERVAL_SEC", test_interval), \
+             patch.object(ENV, "REDIS_PROBE_DEADLINE_SEC", test_deadline), \
+             patch.object(rp, "_emit", side_effect=_capture_emit):
+            try:
+                await _start_pubsub_singleton(ps)
+                deadline = asyncio.get_running_loop().time() + first_probe_budget
+                while asyncio.get_running_loop().time() < deadline:
+                    if any(e["event"] == rp.EVENT_PROBE_OK for e in emissions):
+                        break
+                    await asyncio.sleep(0.05)
+                ok_events = [e for e in emissions if e["event"] == rp.EVENT_PROBE_OK]
+                self.assertTrue(
+                    ok_events,
+                    f"no {rp.EVENT_PROBE_OK} emitted within "
+                    f"{first_probe_budget:.1f}s; "
+                    f"events={[e['event'] for e in emissions]!r}",
+                )
+                self.assertIn("rtt_ms", ok_events[0])
+                self.assertGreaterEqual(ok_events[0]["rtt_ms"], 0)
+            finally:
+                await ps.stop()
+
+    async def test_real_start_stop_cancels_probe_before_client_teardown(self):
+        """Shutdown ordering invariant on the full production path:
+        `_teardown_clients()` must not run until `_probe_task` is
+        cancelled. Otherwise an in-flight probe iteration could try
+        to publish against a torn-down `_pub`."""
+        import fakeredis.aioredis as fake_aio
+        import redis.asyncio as aioredis
+        from app.main import _start_pubsub_singleton
+
+        server = fake_aio.FakeServer()
+        make_client = self._patched_redis_class(server)
+
+        ps = self._make_real_pubsub()
+        with patch.object(aioredis, "Redis", side_effect=make_client):
+            await _start_pubsub_singleton(ps)
+            self.assertIsNotNone(ps._probe_task)
+
+            events: list[str] = []
+            original_teardown = ps._teardown_clients
+            original_cancel = ps._probe_task.cancel
+
+            async def _record_teardown():
+                events.append("teardown")
+                return await original_teardown()
+
+            def _record_cancel(*args, **kwargs):
+                events.append("probe_cancel")
+                return original_cancel(*args, **kwargs)
+
+            ps._teardown_clients = _record_teardown  # type: ignore[assignment]
+            ps._probe_task.cancel = _record_cancel  # type: ignore[assignment]
+
+            await ps.stop()
+
+            self.assertIn(
+                "probe_cancel", events,
+                f"probe cancel never observed; events={events!r}",
+            )
+            self.assertIn(
+                "teardown", events,
+                f"teardown never observed; events={events!r}",
+            )
+            self.assertLess(
+                events.index("probe_cancel"), events.index("teardown"),
+                f"probe cancel MUST precede client teardown; events={events!r}",
+            )
 
 
 if __name__ == "__main__":
