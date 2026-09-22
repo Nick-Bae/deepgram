@@ -1,0 +1,117 @@
+# Cloud Run service configuration required for the Redis pub/sub
+# rollout. Source of truth — the validator asserts the running
+# revision matches every knob declared here, and infra_apply.py refuses
+# to plan writes against a project not on manifest.allowed_projects.
+#
+# NOTE — this file describes the STEADY-STATE target for the
+# rollout. The pinned `REDIS_ENABLED=0` remains in effect on
+# `main` until task #137's enablement PR flips it to `1` inside
+# the §4d window. Do NOT set `REDIS_ENABLED=1` here as a "flip
+# me later" placeholder — the validator enforces the current
+# pinned value, and a wrong default here would silently unpin
+# the constraint the reviewer required to be held in `main`.
+#
+# Manifest anchor: cloudrun
+apiVersion: cloudrun/v1
+kind: Service
+metadata:
+  name: worshiptranslate-backend
+  region: us-central1
+  # Cloud Run adds run.googleapis.com/... annotations for every
+  # revision. The validator asserts each of these on the SERVING
+  # revision — an update to the service template that has not
+  # yet promoted to serving does not satisfy the requirement.
+  required_service_annotations: {}
+spec:
+  # PR #31 §3 A8b requires "CPU is always allocated" so the 30 s
+  # in-process probe task fires reliably on idle instances. The
+  # default "CPU only during request processing" mode throttles
+  # asyncio.sleep(30) below the 90 s first-probe deadline.
+  cpu_allocation: always
+  # Track 1 Gate 2 pinned max-instances=1 until the §4d
+  # enablement PR unpins it. Change requires reviewer approval
+  # AND a coordinated shift on `manifest.pinned_constraints`.
+  max_instances: 1
+  min_instances: 0
+  # Ingress: only through the load balancer. The BOOT-1
+  # transactional session-start gate (PR #33) is the ONLY
+  # session-blocking hook the deploy-window helper trusts;
+  # allowing internal or all traffic would let a request bypass
+  # that gate.
+  ingress: internal-and-cloud-load-balancing
+  template:
+    metadata:
+      # The vpc-access-egress + connector annotations must MATCH
+      # `vpc.yaml`'s selected mode exactly. The validator
+      # cross-checks by refusing when the two files disagree.
+      required_template_annotations:
+        # Direct VPC egress mode (preferred — see vpc.yaml).
+        # For the Serverless VPC Access Connector fallback the
+        # infra_apply.py planner rewrites these to `all-traffic` and
+        # the connector resource name.
+        - key: run.googleapis.com/vpc-access-egress
+          value: all-traffic
+        - key: run.googleapis.com/network-interfaces
+          # Serialized JSON — the validator parses it. Kept as
+          # a template rather than a fixed value so the config
+          # can point at whichever subnet vpc.yaml declares.
+          value_from: vpc.direct_egress.network_interfaces_json
+    spec:
+      containers:
+        - image_placeholder: gcr.io/<project>/worshiptranslate-backend
+          resources:
+            # Sized to the current production template. Change
+            # only via the reviewer.
+            cpu: "1"
+            memory: 512Mi
+          env:
+            # PINNED for main until task #137's enablement PR
+            # flips it. The v6 helper (backend/scripts/gate2_helpers/)
+            # asserts REDIS_ENABLED is the LITERAL string "0",
+            # not a secretKeyRef, so a Secret Manager binding here
+            # is refused fail-closed.
+            - name: REDIS_ENABLED
+              value: "0"
+              kind: literal
+            # Steady-state values. `REDIS_HOST` becomes the
+            # Memorystore internal IP after §4c step 3 — see
+            # memorystore.yaml. The validator refuses a value
+            # that does not match memorystore.yaml.host_binding.
+            - name: REDIS_HOST
+              value_from: memorystore.host_binding
+              kind: literal
+            - name: REDIS_PORT
+              value: "6379"
+              kind: literal
+            - name: REDIS_CHANNEL_PREFIX
+              value: worshiptranslate
+              kind: literal
+            # Track 1 reconciler is enabled on main (PR #28
+            # merged 2026-09-19).
+            - name: ROOM_RECONCILER_ENABLED
+              value: "1"
+              kind: literal
+            # Password comes ONLY from Secret Manager (see
+            # secrets.yaml). Empty binding means AUTH is
+            # disabled on Memorystore — the operator picks one
+            # mode in §4c and updates both files together.
+            - name: REDIS_PASSWORD
+              value_from: secrets.redis_password
+              kind: secret_or_absent
+            # Runtime tuning — all optional, defaults land the
+            # right numbers; declared here so a value drift is
+            # visible.
+            - name: REDIS_PROBE_INTERVAL_SEC
+              value: "30"
+              kind: literal
+            - name: REDIS_PROBE_DEADLINE_SEC
+              value: "2"
+              kind: literal
+            - name: REDIS_RECOVERY_DEADLINE_SEC
+              value: "300"
+              kind: literal
+          # Health check port matches the container's uvicorn
+          # binding.
+          ports:
+            - name: http1
+              containerPort: 8000
