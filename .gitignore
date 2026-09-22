@@ -20,3 +20,4 @@ backend/*firebase-adminsdk*.json
 
 # Sermon manuscript exports — sensitive content, keep local only.
 /*.xlsx
+tmp/
