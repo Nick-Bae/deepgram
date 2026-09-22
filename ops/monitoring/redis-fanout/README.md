@@ -96,19 +96,21 @@ python ops/monitoring/redis-fanout/validate.py
 
 Runs in CI as a pytest suite (`backend/tests/test_redis_monitoring_config.py`).
 
-## Operator use — plan only (default)
+## Operator use — offline preview (default)
 
 ```
 python ops/monitoring/redis-fanout/apply.py \
     --project sturdy-dogfish-472313-k6
 ```
 
-Prints the planned actions (create / update / no-op / orphan
-/ refuse) without contacting Google Cloud. `--project` must
-be on `manifest.allowed_projects`; anything else is refused
-with `rc=4` before any planning runs.
+Prints an OFFLINE desired-state preview (create / update /
+no-op / orphan / refuse) without contacting Google Cloud. Every
+resource shows as `create-*` because the script never reads
+live cloud state — this is not a diff. `--project` must be on
+`manifest.allowed_projects`; anything else refuses with rc=4
+before any preview runs.
 
-## Operator use — apply (gated)
+## Operator use — apply (gated; not in this PR)
 
 ```
 python ops/monitoring/redis-fanout/apply.py \
@@ -117,19 +119,34 @@ python ops/monitoring/redis-fanout/apply.py \
     --apply --confirm 'I understand this affects production monitoring'
 ```
 
-**Note:** `--apply` in this PR (task #135) exits with rc=6 and
-a "planning only" message. The actual SDK snapshot + write paths
-land in task #137's enablement PR, after review. Splitting them
-keeps this PR reviewable as pure config + planner, and keeps a
-Google Cloud SDK dependency out of CI.
+**Note:** `--apply` in this PR (task #135) always returns `rc=6`
+with a "planning + validation only" message — the SDK snapshot
++ write paths land in task #137's enablement PR, after review.
+Splitting them keeps this PR reviewable as pure config + planner,
+and keeps a Google Cloud SDK dependency out of CI.
+
+The channel map format:
+
+```yaml
+# channels.yaml — mapping alert_id -> [channel resource name]
+a5-startup-without-recovery:
+  - projects/sturdy-dogfish-472313-k6/notificationChannels/…
+a5-legacy-startup-failed:
+  - projects/sturdy-dogfish-472313-k6/notificationChannels/…
+# … one entry per managed alert
+```
+
+`apply.py` refuses (rc=4) any value that does not match
+`projects/<--project>/notificationChannels/<id>`, and any key
+not in the manifest's alert set (typo protection).
 
 ## Return codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Plan printed, nothing to refuse; or (future) apply succeeded |
-| 2 | Missing Google Cloud SDK when `--apply` was requested |
-| 3 | Notification-channel map missing / malformed |
-| 4 | Refuse — allowlist miss, static-check failure, missing channel, or identity conflict |
+| 0 | Offline preview printed, nothing to refuse |
+| 2 | (Reserved) missing Google Cloud SDK — introduced with task #137's cloud-snapshot path |
+| 3 | Notification-channel map missing / malformed / bad YAML shape |
+| 4 | Refuse — allowlist miss, static-check failure, missing channel, unknown alert_id in channel map, bad channel-resource-name format, or identity conflict |
 | 5 | `--apply` supplied without correct `--confirm` |
-| 6 | `--apply` requested but this PR ships planning only |
+| 6 | `--apply` requested — this PR ships planning + validation only; SDK writes land with task #137 |

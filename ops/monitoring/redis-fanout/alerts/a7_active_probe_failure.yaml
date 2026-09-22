@@ -13,7 +13,7 @@ enabled: true
 userLabels:
   managed_by: ops-monitoring-redis-fanout
   alert_id: a7-active-probe-failure
-  runbook: docs/03-analysis/redis-fanout-rollout-proposal.md#alerts
+  runbook: redis-fanout-alerts
 documentation:
   mimeType: text/markdown
   content: |
@@ -21,9 +21,14 @@ documentation:
 
     An instance's `_probe_loop` emitted `redis_probe_failed`
     within the last 5 minutes. `reason` is one of "timeout",
-    "publish_failed", "exception". A stuck reader loop cannot
-    hide from this signal because the probe uses the adapter's
-    real `_pub` / `_sub` / `_pubsub` clients.
+    "publish_failed", "exception", or "loop_exception" — the
+    adapter emits all four (see `redis_pubsub.py` — the loop
+    body's outer `except Exception` produces the fourth). A
+    stuck reader loop cannot hide from this signal because the
+    probe uses the adapter's real `_pub` / `_sub` / `_pubsub`
+    clients.
+
+    Runbook: see `docs/03-analysis/redis-fanout-rollout-proposal.md#alerts`.
 conditions:
   - displayName: active_probe_failure > 0 per instance (5 min)
     conditionThreshold:

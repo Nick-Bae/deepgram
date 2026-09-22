@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +63,14 @@ import validate as _validate  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 CONFIRMATION_TOKEN = "I understand this affects production monitoring"
+
+# Notification-channel resource-name format Cloud Monitoring
+# accepts. The project segment MUST match the operator's
+# --project so a stale channel from another project cannot slip
+# through.
+_CHANNEL_NAME_RE_TEMPLATE = (
+    r"^projects/{project}/notificationChannels/[A-Za-z0-9_-]+$"
+)
 
 
 # --- Config models --------------------------------------------------------
@@ -102,10 +111,10 @@ class Plan:
 def _load_channel_map(path: Optional[Path]) -> dict[str, list[str]]:
     """The channel mapping YAML/JSON is a plain
     `{ <alert_id>: [<channel_resource_name>, ...] }` object.
-    Absent OR empty for any managed alert = refuse. Values are
-    treated as opaque resource names (typically
-    `projects/<id>/notificationChannels/<id>`); apply.py never
-    logs them."""
+    Values must be non-empty strings; further shape validation
+    (project match + notificationChannels/... format + unknown
+    alert IDs) runs in `_validate_channel_map` against the
+    manifest + --project."""
     if path is None:
         return {}
     if not path.exists():
@@ -116,10 +125,55 @@ def _load_channel_map(path: Optional[Path]) -> dict[str, list[str]]:
         raise ValueError(f"{path}: top-level must be a mapping alert_id -> [channel]")
     out: dict[str, list[str]] = {}
     for k, v in data.items():
-        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
-            raise ValueError(f"{path}: {k!r} must map to a list of channel resource names")
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise ValueError(
+                f"{path}: {k!r} must map to a non-empty list of non-empty "
+                f"channel resource-name strings"
+            )
         out[str(k)] = list(v)
     return out
+
+
+def _validate_channel_map(
+    channel_map: dict[str, list[str]],
+    *,
+    project: str,
+    manifest_alert_ids: set[str],
+) -> list[PlannedAction]:
+    """Return a list of refusal actions for channel-map problems:
+      - any value that does not match
+        `projects/<project>/notificationChannels/<id>`;
+      - any key not present in the manifest's alert set (typos
+        would otherwise silently skip a real alert).
+
+    Runs BEFORE `build_plan` so a bad map surfaces one refusal
+    per problem rather than being masked by 'missing channel'
+    refusals downstream."""
+    refusals: list[PlannedAction] = []
+    channel_re = re.compile(
+        _CHANNEL_NAME_RE_TEMPLATE.format(project=re.escape(project))
+    )
+    for alert_id, channels in channel_map.items():
+        if alert_id not in manifest_alert_ids:
+            refusals.append(PlannedAction(
+                kind="refuse", name=alert_id,
+                reason=(
+                    f"channel map lists unknown alert_id {alert_id!r}; "
+                    f"expected one of {sorted(manifest_alert_ids)!r}"
+                ),
+            ))
+            continue
+        for chan in channels:
+            if not channel_re.match(chan):
+                refusals.append(PlannedAction(
+                    kind="refuse", name=alert_id,
+                    reason=(
+                        f"notification channel resource name violates "
+                        f"projects/{project}/notificationChannels/<id> "
+                        f"format (redacted from output)"
+                    ),
+                ))
+    return refusals
 
 
 # --- Plan builder ---------------------------------------------------------
@@ -254,9 +308,15 @@ def build_plan(
 
 
 def render_plan(plan: Plan) -> str:
-    """Human-readable plan output. Never prints notification-channel
-    IDs, cloud project details, or resource contents beyond names."""
-    lines: list[str] = ["Plan:"]
+    """Human-readable output. Renamed from 'Plan:' — this PR ships
+    an OFFLINE preview only. It never reads live cloud state (no
+    SDK call is made), so `create-*` actions really mean 'desired
+    in manifest, not observed as absent in cloud'. Do not treat
+    the output as a real diff.
+
+    Never prints notification-channel IDs, cloud project details,
+    or resource contents beyond names."""
+    lines: list[str] = ["Offline desired-state preview:"]
     for a in plan.actions:
         prefix = {
             "create-metric": "  + metric ",
@@ -359,16 +419,35 @@ def _run(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 5
-        # Snapshot cloud state so the plan knows what already exists.
-        try:
-            existing_metrics, existing_alerts_by_identity = _snapshot_cloud(args.project)
-        except SystemExit as exc:
-            print(f"STOP: {exc}", file=sys.stderr)
-            return 2
-    else:
-        # Dry run: no cloud snapshot; treat everything as absent.
-        existing_metrics = set()
-        existing_alerts_by_identity = {}
+        # This PR ships planning + validation only. `--apply`
+        # against real Google Cloud lands with task #137's
+        # enablement PR (SDK snapshot + write paths + creds).
+        # Return rc=6 BEFORE _snapshot_cloud so the intent is
+        # explicit and the return path is unambiguous — the
+        # earlier code caught _snapshot_cloud's SystemExit and
+        # returned rc=2 instead, making rc=6 unreachable.
+        print(
+            "STOP: this PR ships planning + validation only. "
+            "--apply against real Google Cloud is gated on the next "
+            "PR (SDK snapshot + write paths); see README.md.",
+            file=sys.stderr,
+        )
+        return 6
+
+    # Dry run: no cloud snapshot; the preview treats everything
+    # as absent-in-cloud (see render_plan's docstring — it's a
+    # desired-state preview, not a live diff).
+    existing_metrics: set[str] = set()
+    existing_alerts_by_identity: dict[str, list[str]] = {}
+
+    # Format-validate the channel map against the manifest and
+    # --project BEFORE build_plan, so a bad-shape entry surfaces
+    # its own refusal rather than being masked by the downstream
+    # 'missing channel' refusal.
+    manifest_alert_ids = set(manifest.get("alerts", {}).keys())
+    format_refusals = _validate_channel_map(
+        channel_map, project=args.project, manifest_alert_ids=manifest_alert_ids,
+    )
 
     plan = build_plan(
         project=args.project,
@@ -377,23 +456,14 @@ def _run(argv: list[str]) -> int:
         existing_alerts_by_identity=existing_alerts_by_identity,
         manifest=manifest,
     )
+    # Prepend the channel-map refusals so they render first.
+    plan.actions = format_refusals + plan.actions
+
     print(render_plan(plan))
     if plan.has_refusals():
         return 4
-    if not args.apply:
-        print("\n(plan only; pass --apply --confirm '...' to write)")
-        return 0
-    # A real apply is out of scope for this PR — the plan builder
-    # is what's under review here. Return a distinct rc so an
-    # operator scripting apply doesn't misread the "planning only"
-    # message as success.
-    print(
-        "\nSTOP: this PR ships planning + validation only. "
-        "--apply against real Google Cloud is gated on the next "
-        "PR (SDK snapshot + write paths); see README.md.",
-        file=sys.stderr,
-    )
-    return 6
+    print("\n(offline preview only; pass --apply --confirm '...' — will exit rc=6)")
+    return 0
 
 
 def main() -> None:  # pragma: no cover

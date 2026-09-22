@@ -55,6 +55,48 @@ _INSTANCE_ID_EXTRACTOR_RE = re.compile(
     r"^\s*EXTRACT\(\s*jsonPayload\.instance_id\s*\)\s*$"
 )
 
+# Cloud Monitoring userLabels: keys and values must match
+# ^[a-z][a-z0-9_-]{0,62}$ (keys) / ^[a-z0-9_-]{0,63}$ (values).
+# A value with '/', '.', '#', or uppercase would cause the API
+# to reject the whole policy — the reviewer flagged this as a
+# blocker after PR #39 round 1 shipped a URL-shaped runbook
+# value that the API would refuse.
+_USER_LABEL_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
+_USER_LABEL_VALUE_RE = re.compile(r"^[a-z0-9_-]{0,63}$")
+
+# PromQL metric identifier in Cloud Monitoring — the log-based
+# translation of `logging.googleapis.com/user/<name>` and
+# `run.googleapis.com/container/<name>` uses colons + underscores.
+_PROMQL_METRIC_TOKEN_RE = re.compile(
+    r"(logging_googleapis_com:user_[A-Za-z0-9_]+|"
+    r"run_googleapis_com:[A-Za-z0-9_]+)"
+)
+# Extract the `by (label, label, ...)` list from a PromQL query.
+_PROMQL_BY_CLAUSE_RE = re.compile(
+    r"\bby\s*\(([^)]*)\)", flags=re.IGNORECASE,
+)
+
+
+def _promql_to_gcp_metric_type(token: str) -> str:
+    """Translate a PromQL metric identifier back to its Cloud
+    Monitoring `metric.type` form so alerts-vs-manifest checks
+    speak a single language.
+
+    Handles the two prefixes this repo actually uses. Unknown
+    prefixes fall through as-is."""
+    if token.startswith("logging_googleapis_com:user_"):
+        suffix = token[len("logging_googleapis_com:user_"):]
+        return f"logging.googleapis.com/user/{suffix}"
+    if token.startswith("run_googleapis_com:"):
+        suffix = token[len("run_googleapis_com:"):]
+        # Cloud Run metric types use '/' between the domain and
+        # each path segment. Only the last '_' becomes '/'
+        # (container/instance_count etc.), which matches what
+        # this repo actually references.
+        head, _, tail = suffix.partition("_")
+        return f"run.googleapis.com/{head}/{tail}" if tail else f"run.googleapis.com/{suffix}"
+    return token
+
 
 @dataclass
 class Check:
@@ -262,6 +304,28 @@ def _validate_alerts(
             f"expected kebab-case of manifest key {name!r}",
         )
 
+        # userLabels character restrictions — every key/value must
+        # match Cloud Monitoring's constraint. A URL-shaped
+        # `runbook: docs/...#alerts` would cause the API to reject
+        # the whole policy, which is what caused the PR #39 round-1
+        # blocker.
+        for k, v in user_labels.items():
+            key_ok = bool(_USER_LABEL_KEY_RE.match(str(k)))
+            val_ok = bool(_USER_LABEL_VALUE_RE.match(str(v)))
+            report.add(
+                f"alert.userLabel_key_charset:{name}:{k}",
+                key_ok,
+                f"userLabels key {k!r} violates Cloud Monitoring charset "
+                f"(^[a-z][a-z0-9_-]{{0,62}}$)",
+            )
+            report.add(
+                f"alert.userLabel_value_charset:{name}:{k}",
+                val_ok,
+                f"userLabels[{k!r}] value {v!r} violates Cloud Monitoring "
+                f"charset (^[a-z0-9_-]{{0,63}}$) — runbook URLs must live "
+                f"in the documentation markdown, not a label",
+            )
+
         # No hard-coded notificationChannels (apply.py injects at apply time).
         report.add(
             f"alert.notificationChannels_empty:{name}",
@@ -271,11 +335,13 @@ def _validate_alerts(
         )
 
         # Every metric.type referenced by any condition must be a
-        # declared managed metric.
+        # declared managed metric (or a listed correlating GCP
+        # metric such as run.googleapis.com/container/instance_count).
         referenced_metrics = _extract_metric_types(data)
         declared_metric_types = {
             f"logging.googleapis.com/user/{m}" for m in metrics_manifest.keys()
         }
+        declared_metric_types |= set(entry.get("correlating_gcp_metrics", []))
         undeclared = referenced_metrics - declared_metric_types
         report.add(
             f"alert.only_managed_metrics:{name}",
@@ -283,15 +349,39 @@ def _validate_alerts(
             f"references undeclared metric types: {sorted(undeclared)!r}",
         )
 
-        # Group_by from the manifest is present in the alert.
+        # Group_by from the manifest is present in the alert. The
+        # per-condition shape depends on query_kind: threshold /
+        # absent conditions use aggregations.groupByFields;
+        # PromQL conditions use `by (…)` inside the query text.
+        query_kind = entry.get("query_kind", "threshold")
         expected_group_by = set(entry.get("group_by", []))
-        got_group_by = _collect_group_by(data)
+        got_group_by = _collect_group_by(data, kind=query_kind)
         missing_groups = expected_group_by - got_group_by
         report.add(
             f"alert.group_by_present:{name}",
             not missing_groups,
-            f"missing group_by fields {sorted(missing_groups)!r}",
+            f"missing group_by fields {sorted(missing_groups)!r} "
+            f"(query_kind={query_kind!r})",
         )
+
+        # PromQL-specific structural checks: the `unless` join
+        # pattern is what allows A5/A6/A8a to fire on
+        # never-emitted series or to correlate across metrics.
+        # A promql alert whose query drops `unless` would silently
+        # regress to the same class of bug we're trying to fix.
+        if query_kind == "promql":
+            query_text = _collect_promql_queries(data)
+            report.add(
+                f"alert.promql_query_present:{name}",
+                bool(query_text),
+                "conditionPrometheusQueryLanguage.query is empty or missing",
+            )
+            report.add(
+                f"alert.promql_uses_unless_join:{name}",
+                "unless" in query_text,
+                "PromQL query does not use `unless` — required for "
+                "paired-condition alerts to survive never-emitted series",
+            )
 
 
 def _extract_metric_types(alert_data: dict) -> set[str]:
@@ -302,13 +392,24 @@ def _extract_metric_types(alert_data: dict) -> set[str]:
             if not isinstance(block, dict):
                 continue
             filter_text = str(block.get("filter", ""))
-            # Extract every metric.type="..." value.
             for m in re.finditer(r'metric\.type="([^"]+)"', filter_text):
                 out.add(m.group(1))
+        promql_block = cond.get("conditionPrometheusQueryLanguage")
+        if isinstance(promql_block, dict):
+            query_text = str(promql_block.get("query", ""))
+            for m in _PROMQL_METRIC_TOKEN_RE.finditer(query_text):
+                out.add(_promql_to_gcp_metric_type(m.group(1)))
     return out
 
 
-def _collect_group_by(alert_data: dict) -> set[str]:
+def _collect_group_by(alert_data: dict, *, kind: str = "threshold") -> set[str]:
+    """Aggregate the group-by labels across every condition.
+
+    For `threshold` / `absent` alerts, the fields live in each
+    condition's `aggregations[].groupByFields`. For `promql` alerts,
+    the grouping is expressed inside the query as
+    `sum by (label, label) (...)` — we scan every `by (...)` clause
+    across every query in the alert."""
     out: set[str] = set()
     for cond in alert_data.get("conditions") or []:
         for key in ("conditionThreshold", "conditionAbsent"):
@@ -318,7 +419,27 @@ def _collect_group_by(alert_data: dict) -> set[str]:
             for agg in block.get("aggregations") or []:
                 for field in agg.get("groupByFields") or []:
                     out.add(field)
+        promql_block = cond.get("conditionPrometheusQueryLanguage")
+        if isinstance(promql_block, dict):
+            query_text = str(promql_block.get("query", ""))
+            for m in _PROMQL_BY_CLAUSE_RE.finditer(query_text):
+                for label in m.group(1).split(","):
+                    label = label.strip()
+                    if label:
+                        out.add(label)
     return out
+
+
+def _collect_promql_queries(alert_data: dict) -> str:
+    """Concatenate every PromQL query text in the alert (a single
+    alert can carry multiple conditions, though the redis-fanout
+    alerts each have exactly one)."""
+    parts: list[str] = []
+    for cond in alert_data.get("conditions") or []:
+        promql_block = cond.get("conditionPrometheusQueryLanguage")
+        if isinstance(promql_block, dict):
+            parts.append(str(promql_block.get("query", "")))
+    return "\n".join(parts)
 
 
 def _validate_no_orphan_files(

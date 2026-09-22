@@ -18,7 +18,7 @@ enabled: true
 userLabels:
   managed_by: ops-monitoring-redis-fanout
   alert_id: a5-legacy-startup-failed
-  runbook: docs/03-analysis/redis-fanout-rollout-proposal.md#alerts
+  runbook: redis-fanout-alerts
 documentation:
   mimeType: text/markdown
   content: |
@@ -30,6 +30,8 @@ documentation:
     unpatched revision is live. Investigate immediately —
     Track 1 Gate 2's isolation failure mode is possible on
     that revision.
+
+    Runbook: see `docs/03-analysis/redis-fanout-rollout-proposal.md#alerts`.
 conditions:
   - displayName: legacy_startup_failed > 0 (per revision, 5 min)
     conditionThreshold:

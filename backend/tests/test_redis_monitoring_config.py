@@ -315,6 +315,204 @@ class RedisMonitoringApplyPlannerTests(unittest.TestCase):
 # --- structural: manifest ↔ files agree ----------------------------------
 
 
+class RedisMonitoringCLIRegressionTests(unittest.TestCase):
+    """CLI-level regression tests for `apply.py`. Every test drives
+    the argparse entry point (`apply._run(argv)`) so a future
+    refactor that reorders the refuse-vs-return-code branches gets
+    caught."""
+
+    def setUp(self):
+        import yaml  # type: ignore
+        import tempfile
+        with _validate.MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            self.manifest = yaml.safe_load(f)
+        self.project = self.manifest["allowed_projects"][0]
+        # A per-test scratch dir for the channel map file.
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="redisfanout-cli-"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_channel_map(self, mapping: dict) -> Path:
+        import yaml  # type: ignore
+        path = self._tmpdir / "channels.yaml"
+        with path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(mapping, f)
+        return path
+
+    def _full_valid_channels(self) -> dict:
+        return {
+            alert_id: [
+                f"projects/{self.project}/notificationChannels/channel-{alert_id}"
+            ]
+            for alert_id in self.manifest["alerts"].keys()
+        }
+
+    def _run(self, *argv: str) -> tuple[int, str, str]:
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = _apply._run(list(argv))
+            except SystemExit as exc:
+                rc = int(exc.code) if exc.code is not None else 0
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_apply_with_confirm_returns_rc6_not_rc2(self):
+        """The reviewer flagged that the earlier `_snapshot_cloud`
+        try/except swallowed the intended rc=6 into rc=2. Regression
+        barrier: --apply with a valid --confirm must return 6."""
+        channels = self._write_channel_map(self._full_valid_channels())
+        rc, _out, err = self._run(
+            "--project", self.project,
+            "--channels", str(channels),
+            "--apply", "--confirm", _apply.CONFIRMATION_TOKEN,
+        )
+        self.assertEqual(rc, 6, f"expected rc=6, got rc={rc}; stderr={err!r}")
+        self.assertIn("planning + validation only", err)
+
+    def test_apply_missing_confirm_returns_rc5(self):
+        channels = self._write_channel_map(self._full_valid_channels())
+        rc, _out, err = self._run(
+            "--project", self.project,
+            "--channels", str(channels),
+            "--apply",  # no --confirm
+        )
+        self.assertEqual(rc, 5)
+        self.assertIn("--confirm", err)
+
+    def test_dry_run_default_returns_rc0_with_full_channel_map(self):
+        channels = self._write_channel_map(self._full_valid_channels())
+        rc, out, err = self._run(
+            "--project", self.project,
+            "--channels", str(channels),
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Offline desired-state preview", out)
+
+    def test_dry_run_renames_output_to_offline_preview(self):
+        rc, out, _err = self._run("--project", self.project)
+        # Refuses because no channel map, but the header should
+        # be present either way.
+        self.assertIn("Offline desired-state preview", out)
+        self.assertNotIn("Plan:", out.splitlines()[0])
+
+    def test_channel_map_bad_format_refuses_rc4(self):
+        """A channel resource name that doesn't match the required
+        format for the operator's --project MUST refuse. Prevents a
+        stale channel from another project or a hand-typed typo
+        from silently succeeding."""
+        bad_channels = {
+            alert_id: [f"not-a-valid-channel-name-{alert_id}"]
+            for alert_id in self.manifest["alerts"].keys()
+        }
+        path = self._write_channel_map(bad_channels)
+        rc, out, _err = self._run(
+            "--project", self.project,
+            "--channels", str(path),
+        )
+        self.assertEqual(rc, 4)
+        self.assertIn("format", out)
+        # Refusal must sanitize the channel name (no leak).
+        self.assertNotIn("not-a-valid-channel-name", out)
+
+    def test_channel_map_unknown_alert_id_refused(self):
+        """A channel map key that isn't in the manifest's alert set
+        MUST refuse — typos would otherwise silently skip a real
+        alert."""
+        mapping = self._full_valid_channels()
+        mapping["a999_bogus_alert"] = [
+            f"projects/{self.project}/notificationChannels/xxx"
+        ]
+        path = self._write_channel_map(mapping)
+        rc, out, _err = self._run(
+            "--project", self.project,
+            "--channels", str(path),
+        )
+        self.assertEqual(rc, 4)
+        self.assertIn("a999_bogus_alert", out)
+        self.assertIn("unknown alert_id", out)
+
+
+class RedisMonitoringUserLabelCharsetTests(unittest.TestCase):
+    """Cloud Monitoring rejects userLabels values that contain
+    characters outside [a-z0-9_-]. A URL-shaped runbook value
+    would break every affected policy at apply time — the
+    reviewer flagged this as a blocker after PR #39 round 1."""
+
+    def test_every_alert_userLabel_conforms(self):
+        import yaml  # type: ignore
+        alerts_dir = Path(_validate.MANIFEST_PATH.parent) / "alerts"
+        checked = 0
+        for path in alerts_dir.glob("*.yaml"):
+            with path.open("r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            for k, v in (data.get("userLabels") or {}).items():
+                self.assertRegex(
+                    str(k), r"^[a-z][a-z0-9_-]{0,62}$",
+                    f"{path.name}: userLabels key {k!r} violates charset",
+                )
+                self.assertRegex(
+                    str(v), r"^[a-z0-9_-]{0,63}$",
+                    f"{path.name}: userLabels[{k!r}] value {v!r} violates "
+                    f"charset — URLs must live in documentation markdown",
+                )
+                checked += 1
+        self.assertGreater(checked, 0)
+
+
+class RedisMonitoringPromQLAlertTests(unittest.TestCase):
+    """Structural checks for the three PromQL-based alerts. Fires
+    on any regression that drops the `unless` join semantics the
+    reviewer required for A5/A6/A8a."""
+
+    PROMQL_ALERTS = (
+        "a5_startup_without_recovery",
+        "a6_reconnect_without_success",
+        "a8a_probe_absence_per_revision",
+    )
+
+    def _alert_file(self, name: str) -> dict:
+        import yaml  # type: ignore
+        with _validate.MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            manifest = yaml.safe_load(f)
+        path = Path(_validate.MANIFEST_PATH.parent) / manifest["alerts"][name]["file"]
+        with path.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    def test_promql_alerts_use_unless_join(self):
+        for name in self.PROMQL_ALERTS:
+            data = self._alert_file(name)
+            queries = "\n".join(
+                (c.get("conditionPrometheusQueryLanguage") or {}).get("query", "")
+                for c in data.get("conditions", [])
+            )
+            self.assertIn(
+                "unless", queries,
+                f"{name}: PromQL query does not use `unless` — required "
+                f"for paired-condition alerts to survive never-emitted "
+                f"series",
+            )
+
+    def test_a8a_correlates_container_instance_count(self):
+        """Regression barrier for the A8a blocker: the Cloud Run
+        liveness correlation MUST live inside the PromQL query, not
+        in a manual runbook step."""
+        data = self._alert_file("a8a_probe_absence_per_revision")
+        queries = "\n".join(
+            (c.get("conditionPrometheusQueryLanguage") or {}).get("query", "")
+            for c in data.get("conditions", [])
+        )
+        self.assertIn(
+            "run_googleapis_com:container_instance_count", queries,
+            "A8a must correlate probe absence with "
+            "run.googleapis.com/container/instance_count per rollout "
+            "doc §3 A8a",
+        )
+
+
 class RedisMonitoringManifestConsistencyTests(unittest.TestCase):
     """Regression barrier for manifest / file drift."""
 
