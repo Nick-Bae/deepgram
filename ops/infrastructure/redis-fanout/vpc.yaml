@@ -1,6 +1,6 @@
 # VPC egress path for Cloud Run → Memorystore reachability, per
 # rollout doc §4c step 2. Two modes are documented; only ONE
-# lands in production. The `active_mode` field picks — validate.py
+# lands in production. The `active_mode` field picks — infra_validate.py
 # refuses when both mode blocks are populated with real values,
 # and cloudrun.yaml cross-checks that its
 # `vpc-access-egress` / `network-interfaces` annotations match
@@ -40,7 +40,7 @@ spec:
 
   serverless_connector:
     # Populated only if the operator falls back to the connector
-    # mode. Leave the placeholders otherwise — validate.py
+    # mode. Leave the placeholders otherwise — infra_validate.py
     # refuses both blocks having non-placeholder values.
     name: "<connector-name-placeholder>"
     # `all-traffic` matches the Direct mode's ingress behaviour

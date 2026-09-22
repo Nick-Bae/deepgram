@@ -38,6 +38,7 @@ Usable as a CLI (`python validate.py`) or a library
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -48,9 +49,21 @@ try:
     import yaml  # type: ignore
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
-        f"PyYAML required for validate.py — install via requirements-dev.txt "
-        f"({exc!r})"
+        f"PyYAML required for infra_validate.py — install via "
+        f"requirements-dev.txt ({exc!r})"
     )
+
+
+# Memorystore knobs that MUST be present and MUST equal these
+# values. `tier` in particular is a fail-closed target: Basic
+# tier lacks the HA replication PR #31 §2's 15 s failover budget
+# assumed.
+_MEMORYSTORE_TIER_ALLOWED = {"STANDARD_HA"}
+_MEMORYSTORE_REDIS_VERSION_ALLOWED = {"REDIS_7_2"}
+_MEMORYSTORE_REGION_ALLOWED = {"us-central1"}
+_MEMORYSTORE_MEMORY_MIN_GB = 1
+_MEMORYSTORE_MEMORY_MAX_GB = 32
+_MEMORYSTORE_TRANSIT_ENCRYPTION_ALLOWED = {"DISABLED"}
 
 
 HERE = Path(__file__).resolve().parent
@@ -268,6 +281,8 @@ def _validate_cross_resource_invariants(
             _check_host_matches_memorystore,
         "transit_encryption_matches_client_ssl_kwarg":
             _check_transit_encryption,
+        "memorystore_declaration_is_fail_closed":
+            _check_memorystore_declaration,
     }
     for inv in manifest.get("cross_resource_invariants", []) or []:
         name = inv.get("name", "")
@@ -289,20 +304,34 @@ def _validate_cross_resource_invariants(
 
 
 def _check_vpc_matches_cloudrun(loaded: dict[str, dict]) -> tuple[bool, str]:
+    """Deep validation of the VPC ↔ Cloud Run agreement.
+
+    Per PR #40 round-2 reviewer feedback: the earlier version only
+    checked that Direct-mode JSON was nonempty. Task #136's whole
+    point is preventing partial-mode-switch failures — every
+    corner must fail closed."""
     vpc = loaded.get("vpc") or {}
     cloudrun = loaded.get("cloudrun") or {}
     active_mode = (vpc.get("metadata") or {}).get("active_mode") or ""
     if active_mode not in ("direct_egress", "serverless_connector"):
-        return False, f"vpc.active_mode={active_mode!r} — expected direct_egress or serverless_connector"
+        return False, (
+            f"vpc.active_mode={active_mode!r} — expected "
+            f"'direct_egress' or 'serverless_connector'"
+        )
 
-    # Cloud Run's required_template_annotations must reference the
-    # matching mode. Direct expects `all-traffic` +
-    # `network-interfaces`; connector expects `all-traffic` + a
-    # named connector.
+    spec = vpc.get("spec") or {}
+    declared_network = spec.get("network")
+    declared_subnet = spec.get("subnet")
+    if not (isinstance(declared_network, str) and declared_network):
+        return False, "vpc.spec.network is missing or not a string"
+    if not (isinstance(declared_subnet, str) and declared_subnet):
+        return False, "vpc.spec.subnet is missing or not a string"
+
+    # Cloud Run's required_template_annotations. Both modes need
+    # `vpc-access-egress`; the OTHER annotation depends on mode.
     tpl = (
         (cloudrun.get("spec") or {})
-        .get("template", {})
-        .get("metadata", {})
+        .get("template", {}).get("metadata", {})
         .get("required_template_annotations", [])
     )
     annot = {a.get("key"): a for a in tpl if isinstance(a, dict)}
@@ -313,36 +342,258 @@ def _check_vpc_matches_cloudrun(loaded: dict[str, dict]) -> tuple[bool, str]:
             f"cloudrun vpc-access-egress annotation={egress_value!r} — "
             f"expected 'all-traffic' for either mode"
         )
+
+    has_network_interfaces_annotation = (
+        "run.googleapis.com/network-interfaces" in annot
+    )
+    has_connector_annotation = (
+        "run.googleapis.com/vpc-access-connector" in annot
+    )
+
+    direct = spec.get("direct_egress") or {}
+    connector = spec.get("serverless_connector") or {}
+    direct_populated = _direct_egress_is_populated(direct)
+    connector_populated = _serverless_connector_is_populated(connector)
+
+    if direct_populated and connector_populated:
+        return False, (
+            "vpc.spec both direct_egress and serverless_connector are "
+            "populated with real values — pick one mode per rollout"
+        )
+
     if active_mode == "direct_egress":
+        # Cloud Run must reference the direct-egress annotation and
+        # MUST NOT carry a serverless connector annotation.
+        if not has_network_interfaces_annotation:
+            return False, (
+                "cloudrun template is missing "
+                "`run.googleapis.com/network-interfaces` annotation "
+                "required by direct-egress mode"
+            )
+        if has_connector_annotation:
+            return False, (
+                "cloudrun template carries a "
+                "`run.googleapis.com/vpc-access-connector` annotation "
+                "while active_mode=direct_egress — a partial switch "
+                "would leave BOTH paths configured. Remove the "
+                "connector annotation."
+            )
         nif = annot.get("run.googleapis.com/network-interfaces", {})
         if nif.get("value_from") != "vpc.direct_egress.network_interfaces_json":
             return False, (
-                f"cloudrun network-interfaces annotation must be "
-                f"`value_from: vpc.direct_egress.network_interfaces_json` "
-                f"in direct-egress mode"
+                "cloudrun network-interfaces annotation must be "
+                "`value_from: vpc.direct_egress.network_interfaces_json`"
             )
-        # And the vpc side must actually populate the JSON.
-        direct = (vpc.get("spec") or {}).get("direct_egress") or {}
-        if not direct.get("network_interfaces_json", "").strip():
-            return False, "vpc.direct_egress.network_interfaces_json is empty"
+        if not direct_populated:
+            return False, (
+                "vpc.direct_egress is empty in direct-egress mode"
+            )
+        # Parse the JSON and cross-check network/subnetwork against
+        # vpc.spec.network / vpc.spec.subnet. A mismatch here would
+        # mean the operator wrote two different subnets across the
+        # file — exactly the partial-mode-switch failure task #136
+        # exists to prevent.
+        try:
+            parsed = json.loads(direct["network_interfaces_json"])
+        except Exception as exc:
+            return False, (
+                f"vpc.direct_egress.network_interfaces_json is not "
+                f"valid JSON: {exc}"
+            )
+        if not isinstance(parsed, list) or not parsed:
+            return False, (
+                "vpc.direct_egress.network_interfaces_json must be a "
+                "non-empty JSON array"
+            )
+        first = parsed[0]
+        if not isinstance(first, dict):
+            return False, (
+                "vpc.direct_egress.network_interfaces_json[0] must be "
+                "an object"
+            )
+        if first.get("network") != declared_network:
+            return False, (
+                f"vpc.direct_egress.network_interfaces_json[0].network"
+                f"={first.get('network')!r} does not match "
+                f"vpc.spec.network={declared_network!r}"
+            )
+        if first.get("subnetwork") != declared_subnet:
+            return False, (
+                f"vpc.direct_egress.network_interfaces_json[0]."
+                f"subnetwork={first.get('subnetwork')!r} does not match "
+                f"vpc.spec.subnet={declared_subnet!r}"
+            )
+        if direct.get("egress") != "all-traffic":
+            return False, (
+                f"vpc.direct_egress.egress={direct.get('egress')!r} — "
+                f"expected 'all-traffic'"
+            )
+        if direct.get("private_google_access") is not True:
+            return False, (
+                "vpc.direct_egress.private_google_access must be true "
+                "so Cloud Run can still reach Firestore / Cloud Logging "
+                "after the VPC attach"
+            )
         return True, ""
+
     # Serverless connector mode.
-    conn = (vpc.get("spec") or {}).get("serverless_connector") or {}
-    if conn.get("name", "").startswith("<") or not conn.get("name"):
-        return False, "vpc.serverless_connector.name is still a placeholder"
+    if not has_connector_annotation:
+        return False, (
+            "cloudrun template is missing "
+            "`run.googleapis.com/vpc-access-connector` annotation "
+            "required by serverless-connector mode"
+        )
+    if has_network_interfaces_annotation:
+        return False, (
+            "cloudrun template carries a "
+            "`run.googleapis.com/network-interfaces` annotation while "
+            "active_mode=serverless_connector — remove it"
+        )
+    if not connector_populated:
+        return False, (
+            "vpc.serverless_connector is empty in serverless-connector mode"
+        )
+    if connector.get("egress") != "all-traffic":
+        return False, (
+            f"vpc.serverless_connector.egress={connector.get('egress')!r} "
+            f"— expected 'all-traffic'"
+        )
     return True, ""
 
 
+def _direct_egress_is_populated(block: dict) -> bool:
+    """The direct-egress block is populated with real values if
+    `network_interfaces_json` is a non-empty string that doesn't
+    look like a placeholder."""
+    j = block.get("network_interfaces_json") or ""
+    if not isinstance(j, str) or not j.strip():
+        return False
+    return "<" not in j  # no `<placeholder>` tokens
+
+
+def _serverless_connector_is_populated(block: dict) -> bool:
+    name = block.get("name") or ""
+    if not isinstance(name, str) or not name.strip():
+        return False
+    return not name.startswith("<")
+
+
 def _check_auth_matches_secret(loaded: dict[str, dict]) -> tuple[bool, str]:
+    """Strict-typed AUTH ↔ secret binding pairing.
+
+    The earlier `bool(...)` coercion accepted `"false"` (string)
+    or `0` (int) as valid Booleans and would let a typo pass —
+    the reviewer's PR #40 round-2 blocker. Require literal
+    Python `True` / `False` on BOTH sides."""
     mem = (loaded.get("memorystore") or {}).get("spec") or {}
     sec = (loaded.get("secrets") or {}).get("spec") or {}
-    auth_on = bool(mem.get("auth_enabled"))
-    password_bound = bool(((sec.get("redis_password") or {}).get("present")))
-    if auth_on != password_bound:
+
+    auth = mem.get("auth_enabled")
+    if not isinstance(auth, bool):
         return False, (
-            f"memorystore.auth_enabled={auth_on!r} but "
-            f"secrets.redis_password.present={password_bound!r} — pick one mode"
+            f"memorystore.spec.auth_enabled={auth!r} — must be a "
+            f"YAML boolean literal (`true` / `false`), not a string "
+            f"or integer"
         )
+
+    pw = (sec.get("redis_password") or {})
+    present = pw.get("present")
+    if not isinstance(present, bool):
+        return False, (
+            f"secrets.spec.redis_password.present={present!r} — must "
+            f"be a YAML boolean literal"
+        )
+    if auth != present:
+        return False, (
+            f"memorystore.auth_enabled={auth!r} but "
+            f"secrets.redis_password.present={present!r} — pick one mode"
+        )
+
+    # When AUTH is on, the full secret binding must be declared.
+    if auth:
+        skref = pw.get("secret_key_ref")
+        if not isinstance(skref, dict):
+            return False, (
+                "secrets.spec.redis_password.secret_key_ref is missing "
+                "or not a mapping — Cloud Run's secretKeyRef binding "
+                "needs `name` and `key`"
+            )
+        for key in ("name", "key"):
+            v = skref.get(key)
+            if not (isinstance(v, str) and v.strip()):
+                return False, (
+                    f"secrets.spec.redis_password.secret_key_ref.{key}"
+                    f"={v!r} is missing or not a non-empty string"
+                )
+        for key in ("secret_name", "version"):
+            v = pw.get(key)
+            if not (isinstance(v, str) and v.strip()):
+                return False, (
+                    f"secrets.spec.redis_password.{key}={v!r} is "
+                    f"missing or not a non-empty string"
+                )
+
+    return True, ""
+
+
+def _check_memorystore_declaration(loaded: dict[str, dict]) -> tuple[bool, str]:
+    """Fail-closed validation of every Memorystore knob PR #31
+    §4c step 3 requires. Not a cross-resource invariant per se,
+    but sits alongside them so a single failure shows up in the
+    same `invariant:...` name space in the report."""
+    mem = (loaded.get("memorystore") or {}).get("spec") or {}
+    if not mem:
+        return False, "memorystore.spec block is missing"
+
+    tier = mem.get("tier")
+    if tier not in _MEMORYSTORE_TIER_ALLOWED:
+        return False, (
+            f"memorystore.spec.tier={tier!r} — must be one of "
+            f"{sorted(_MEMORYSTORE_TIER_ALLOWED)!r} (Basic-tier lacks "
+            f"the HA replication PR #31 §2's 15 s failover budget "
+            f"assumed)"
+        )
+
+    version = mem.get("redis_version")
+    if version not in _MEMORYSTORE_REDIS_VERSION_ALLOWED:
+        return False, (
+            f"memorystore.spec.redis_version={version!r} — must be one "
+            f"of {sorted(_MEMORYSTORE_REDIS_VERSION_ALLOWED)!r}"
+        )
+
+    region = (loaded.get("memorystore") or {}).get("metadata", {}).get("region")
+    if region not in _MEMORYSTORE_REGION_ALLOWED:
+        return False, (
+            f"memorystore.metadata.region={region!r} — must be one of "
+            f"{sorted(_MEMORYSTORE_REGION_ALLOWED)!r}"
+        )
+
+    memsize = mem.get("memory_size_gb")
+    if not isinstance(memsize, int) or memsize < _MEMORYSTORE_MEMORY_MIN_GB \
+            or memsize > _MEMORYSTORE_MEMORY_MAX_GB:
+        return False, (
+            f"memorystore.spec.memory_size_gb={memsize!r} — must be an "
+            f"int in [{_MEMORYSTORE_MEMORY_MIN_GB}, "
+            f"{_MEMORYSTORE_MEMORY_MAX_GB}]"
+        )
+
+    mode = mem.get("transit_encryption_mode")
+    if mode not in _MEMORYSTORE_TRANSIT_ENCRYPTION_ALLOWED:
+        # Duplicate-of `_check_transit_encryption` but pinned at
+        # the declaration layer too. The other check enforces the
+        # client-ssl pairing constraint on a change.
+        return False, (
+            f"memorystore.spec.transit_encryption_mode={mode!r} — "
+            f"must be one of {sorted(_MEMORYSTORE_TRANSIT_ENCRYPTION_ALLOWED)!r} "
+            f"until the client ssl kwarg changes"
+        )
+
+    if not mem.get("host_binding"):
+        return False, (
+            "memorystore.spec.host_binding is empty — needed so "
+            "cloudrun's REDIS_HOST env can reference it via value_from"
+        )
+
     return True, ""
 
 

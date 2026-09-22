@@ -175,16 +175,31 @@ def _run(argv: list[str]) -> int:
     args = _build_arg_parser().parse_args(argv)
     manifest = _load_manifest()
 
+    # ALWAYS run allowlist + static validation via build_plan
+    # before any --apply decision. The earlier version returned
+    # rc=6 before build_plan, which meant `--apply --project
+    # unauthorized-project` bypassed the allowlist entirely.
+    # Task #137 would inherit that unsafe control flow. The
+    # ordering here is:
+    #   rc=5 — --apply without correct --confirm (input error)
+    #   rc=4 — allowlist / static-check refusal (config error)
+    #   rc=6 — real writes intentionally deferred to task #137
+    #   rc=0 — clean plan, no --apply
+    if args.apply and args.confirm != CONFIRMATION_TOKEN:
+        print(
+            f"STOP: --apply requires --confirm exactly "
+            f"{CONFIRMATION_TOKEN!r}. Refuse.",
+            file=sys.stderr,
+        )
+        return 5
+
+    plan = build_plan(project=args.project, manifest=manifest)
+
+    if plan.has_refusals():
+        print(render_plan(plan))
+        return 4
+
     if args.apply:
-        if args.confirm != CONFIRMATION_TOKEN:
-            print(
-                f"STOP: --apply requires --confirm exactly "
-                f"{CONFIRMATION_TOKEN!r}. Refuse.",
-                file=sys.stderr,
-            )
-            return 5
-        # rc=6 hoisted above any cloud snapshot — task #136 is
-        # explicitly review-only per the reviewer's briefing.
         print(
             "STOP: this PR ships planning + validation only. "
             "--apply against real Google Cloud is gated on the next "
@@ -193,10 +208,7 @@ def _run(argv: list[str]) -> int:
         )
         return 6
 
-    plan = build_plan(project=args.project, manifest=manifest)
     print(render_plan(plan))
-    if plan.has_refusals():
-        return 4
     print("\n(offline preview only; pass --apply --confirm '...' — will exit rc=6)")
     return 0
 

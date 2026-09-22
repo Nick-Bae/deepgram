@@ -1,6 +1,6 @@
 # Cloud Run service configuration required for the Redis pub/sub
 # rollout. Source of truth — the validator asserts the running
-# revision matches every knob declared here, and apply.py refuses
+# revision matches every knob declared here, and infra_apply.py refuses
 # to plan writes against a project not on manifest.allowed_projects.
 #
 # NOTE — this file describes the STEADY-STATE target for the
@@ -47,7 +47,7 @@ spec:
       required_template_annotations:
         # Direct VPC egress mode (preferred — see vpc.yaml).
         # For the Serverless VPC Access Connector fallback the
-        # apply.py planner rewrites these to `all-traffic` and
+        # infra_apply.py planner rewrites these to `all-traffic` and
         # the connector resource name.
         - key: run.googleapis.com/vpc-access-egress
           value: all-traffic

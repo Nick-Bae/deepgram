@@ -22,7 +22,7 @@ metadata:
   # the operator confirms non-overlap during §4c planning.
   reserved_ip_range_placeholder: "10.<vpc-supplied>.0.0/29"
 spec:
-  # Standard HA required. Basic is refused by validate.py.
+  # Standard HA required. Basic is refused by infra_validate.py.
   tier: STANDARD_HA
   # Version pinned so the readiness/failover behaviour in
   # PR #31 §2 remains the tested one. Bump only via reviewer +

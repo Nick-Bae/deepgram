@@ -1,5 +1,5 @@
 # Manifest — cross-reference of what the four resource YAMLs
-# declare, plus the invariants validate.py + apply.py enforce
+# declare, plus the invariants infra_validate.py + infra_apply.py enforce
 # across them. Do NOT hand-edit resources without updating this
 # manifest; the test suite enforces the mapping.
 
@@ -29,7 +29,7 @@ resources:
 # Constraints that must remain pinned on `main` until task
 # #137's enablement PR lifts them explicitly. Each entry
 # names a resource, a key path, and the expected value. The
-# validator refuses any drift; apply.py's plan refuses to
+# validator refuses any drift; infra_apply.py's plan refuses to
 # advance when a pinned constraint is violated.
 #
 # These are the ones the reviewer named in the task #136
@@ -73,7 +73,7 @@ pinned_constraints:
       would let a request bypass the gate.
 
 # Cross-resource invariants — pairs / triples of fields across
-# resources that MUST agree. validate.py refuses on any
+# resources that MUST agree. infra_validate.py refuses on any
 # disagreement.
 cross_resource_invariants:
   - name: vpc_mode_matches_cloudrun_annotations
@@ -108,8 +108,23 @@ cross_resource_invariants:
       the client-side ssl=True.
     references:
       - memorystore.spec.transit_encryption_mode
+  - name: memorystore_declaration_is_fail_closed
+    description: |
+      Fail-closed validation of every Memorystore knob PR #31
+      §4c step 3 requires: tier=STANDARD_HA (not Basic),
+      redis_version=REDIS_7_2, region=us-central1,
+      memory_size_gb in [1, 32], transit_encryption_mode=DISABLED
+      (paired with the client-ssl invariant above), non-empty
+      host_binding.
+    references:
+      - memorystore.spec.tier
+      - memorystore.spec.redis_version
+      - memorystore.metadata.region
+      - memorystore.spec.memory_size_gb
+      - memorystore.spec.transit_encryption_mode
+      - memorystore.spec.host_binding
 
-# Allowlist — production projects apply.py will plan against.
+# Allowlist — production projects infra_apply.py will plan against.
 # Same shape as ops/monitoring/redis-fanout/manifest.yaml.
 allowed_projects:
   - sturdy-dogfish-472313-k6
