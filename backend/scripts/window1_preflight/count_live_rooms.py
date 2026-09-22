@@ -45,7 +45,7 @@ these field names:
       "filter": "status == 'live'",
       "count": <int|null>,
       "complete": <true|false>,
-      "pages_read": <int>,
+      "documents_scanned": <int>,
       "elapsed_seconds": <float>,
       "rc": <int>,
       "reason": "<short human string>"    # nonzero rc only
@@ -73,6 +73,7 @@ from common import (  # noqa: E402
     die,
     emit,
     iso_utc_now,
+    positive_float,
 )
 
 
@@ -98,17 +99,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Firestore database ID. Must be on the allowlist.",
     )
     p.add_argument(
-        "--rpc-timeout-sec", type=float, default=DEFAULT_RPC_TIMEOUT_SEC,
+        "--rpc-timeout-sec", type=positive_float, default=DEFAULT_RPC_TIMEOUT_SEC,
         help=(
             "Per-page RPC timeout (default 10 s). Bounded by the "
-            "overall deadline — whichever is shorter applies."
+            "overall deadline — whichever is shorter applies. "
+            "Must be a positive finite float."
         ),
     )
     p.add_argument(
-        "--deadline-sec", type=float, default=DEFAULT_DEADLINE_SEC,
+        "--deadline-sec", type=positive_float, default=DEFAULT_DEADLINE_SEC,
         help=(
             "Overall wall-clock budget across all paginated RPCs "
-            "(default 30 s). Firing produces rc=7."
+            "(default 30 s). Firing produces rc=7. Must be a "
+            "positive finite float."
         ),
     )
     return p
@@ -135,7 +138,7 @@ def _run(argv: list[str]) -> int:
         check_target(args.project, args.database)
     except (TargetRefused, EnvMismatch) as exc:
         payload.update({
-            "count": None, "complete": False, "pages_read": 0,
+            "count": None, "complete": False, "documents_scanned": 0,
             "elapsed_seconds": 0.0, "rc": int(ExitCode.ALLOWLIST_REFUSAL),
             "reason": str(exc),
         })
@@ -150,7 +153,7 @@ def _run(argv: list[str]) -> int:
         from google.api_core import exceptions as gax  # type: ignore
     except Exception as exc:  # pragma: no cover
         payload.update({
-            "count": None, "complete": False, "pages_read": 0,
+            "count": None, "complete": False, "documents_scanned": 0,
             "elapsed_seconds": 0.0, "rc": int(ExitCode.UPSTREAM_API),
             "reason": f"google-cloud-firestore import failed: {exc!r}",
         })
@@ -168,35 +171,34 @@ def _run(argv: list[str]) -> int:
     )
 
     count = 0
-    pages_read = 0
     complete = False
     try:
         # `.stream()` yields DocumentSnapshots page-by-page under the
         # hood. We loop with an explicit iterator so we can bound
         # each page's RPC AND consult the overall deadline between
-        # pages.
+        # documents. `documents_scanned` in the output is the honest
+        # per-document count — earlier drafts named the field
+        # `pages_read` while incrementing it every 100 documents,
+        # which was neither pages nor read from the SDK's page
+        # boundaries; renamed and fixed to just equal `count` on
+        # success.
         iterator = query.stream(
             timeout=deadline.rpc_timeout(float(args.rpc_timeout_sec)),
             retry=None,
         )
         for _snap in iterator:
             count += 1
-            # Cheap page counter — not authoritative, just for
-            # observability. The Firestore SDK batches internally.
-            if count % 100 == 0:
-                pages_read += 1
-                if deadline.expired():
-                    raise TimeoutError(
-                        f"overall deadline {args.deadline_sec:.1f}s exceeded "
-                        f"after reading {count} docs / {pages_read} pages"
-                    )
+            if count % 100 == 0 and deadline.expired():
+                raise TimeoutError(
+                    f"overall deadline {args.deadline_sec:.1f}s exceeded "
+                    f"after reading {count} documents"
+                )
         # If the loop completed without raising, the iterator is
         # exhausted — `complete=true` is now safe.
         complete = True
-        pages_read = max(pages_read, 1) if count > 0 else pages_read
-    except gax.PermissionDenied as exc:
+    except (gax.PermissionDenied, gax.Unauthenticated) as exc:
         payload.update({
-            "count": None, "complete": False, "pages_read": pages_read,
+            "count": None, "complete": False, "documents_scanned": count,
             "elapsed_seconds": round(deadline.elapsed(), 3),
             "rc": int(ExitCode.PERMISSION),
             "reason": f"Firestore permission denied: {exc.message}",
@@ -205,7 +207,7 @@ def _run(argv: list[str]) -> int:
         die(ExitCode.PERMISSION, payload)
     except gax.DeadlineExceeded as exc:
         payload.update({
-            "count": None, "complete": False, "pages_read": pages_read,
+            "count": None, "complete": False, "documents_scanned": count,
             "elapsed_seconds": round(deadline.elapsed(), 3),
             "rc": int(ExitCode.TIMEOUT),
             "reason": f"per-RPC deadline exceeded: {exc.message}",
@@ -214,7 +216,7 @@ def _run(argv: list[str]) -> int:
         die(ExitCode.TIMEOUT, payload)
     except TimeoutError as exc:
         payload.update({
-            "count": None, "complete": False, "pages_read": pages_read,
+            "count": None, "complete": False, "documents_scanned": count,
             "elapsed_seconds": round(deadline.elapsed(), 3),
             "rc": int(ExitCode.TIMEOUT),
             "reason": str(exc),
@@ -226,7 +228,7 @@ def _run(argv: list[str]) -> int:
         # response shape, SDK-internal errors. Do NOT return
         # `complete=true` and do NOT return a count.
         payload.update({
-            "count": None, "complete": False, "pages_read": pages_read,
+            "count": None, "complete": False, "documents_scanned": count,
             "elapsed_seconds": round(deadline.elapsed(), 3),
             "rc": int(ExitCode.UPSTREAM_API),
             "reason": f"Firestore query failed: {type(exc).__name__}: {exc}",
@@ -239,7 +241,7 @@ def _run(argv: list[str]) -> int:
     payload.update({
         "count": int(count),
         "complete": True,
-        "pages_read": int(pages_read),
+        "documents_scanned": int(count),
         "elapsed_seconds": round(deadline.elapsed(), 3),
         "rc": int(ExitCode.OK),
     })

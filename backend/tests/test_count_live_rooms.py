@@ -136,11 +136,55 @@ class CountLiveRoomsAllowlistUnitTests(unittest.TestCase):
         for key in (
             "kind", "command", "verified_at", "project", "database",
             "collection_group", "filter", "count", "complete",
-            "pages_read", "elapsed_seconds", "rc", "reason",
+            "documents_scanned", "elapsed_seconds", "rc", "reason",
         ):
             self.assertIn(key, payload, f"missing schema field {key!r}")
         self.assertEqual(payload["command"], "count_live_rooms.py")
         self.assertEqual(payload["collection_group"], "rooms")
+
+    def test_zero_deadline_rejected_by_argparse(self):
+        """Reviewer's PR #41 blocker: --deadline-sec 0 must be
+        rejected by the positive-finite validator, not silently
+        accepted then blow up inside Deadline(). Argparse exits 2
+        via its own error path (usage on stderr, no JSON on
+        stdout) — distinct from ALLOWLIST_REFUSAL rc=2 which
+        does emit JSON."""
+        proc = subprocess.run(
+            [sys.executable, "-u",
+             str(_SCRIPTS_DIR / "count_live_rooms.py"),
+             "--project", PRODUCTION_PROJECT,
+             "--database", PRODUCTION_DATABASE,
+             "--deadline-sec", "0"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "", "argparse must not emit JSON")
+        self.assertIn("positive", proc.stderr.lower())
+
+    def test_negative_rpc_timeout_rejected_by_argparse(self):
+        proc = subprocess.run(
+            [sys.executable, "-u",
+             str(_SCRIPTS_DIR / "count_live_rooms.py"),
+             "--project", PRODUCTION_PROJECT,
+             "--database", PRODUCTION_DATABASE,
+             "--rpc-timeout-sec", "-2"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+
+    def test_nan_deadline_rejected_by_argparse(self):
+        proc = subprocess.run(
+            [sys.executable, "-u",
+             str(_SCRIPTS_DIR / "count_live_rooms.py"),
+             "--project", PRODUCTION_PROJECT,
+             "--database", PRODUCTION_DATABASE,
+             "--deadline-sec", "nan"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("finite", proc.stderr.lower())
 
 
 class CountLiveRoomsDeadlineUnitTests(unittest.TestCase):
@@ -253,7 +297,7 @@ class CountLiveRoomsEmulatorSubprocessTests(unittest.TestCase):
         for key in (
             "kind", "command", "verified_at", "project", "database",
             "collection_group", "filter", "count", "complete",
-            "pages_read", "elapsed_seconds", "rc",
+            "documents_scanned", "elapsed_seconds", "rc",
         ):
             self.assertIn(key, payload, f"missing schema field {key!r}")
 

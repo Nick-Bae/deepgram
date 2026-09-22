@@ -75,15 +75,20 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
+    ALLOWED_REGIONS,
     Deadline,
     EnvMismatch,
     ExitCode,
+    RegionRefused,
     TargetRefused,
+    check_region,
     check_target,
     diag,
     die,
     emit,
     iso_utc_now,
+    positive_float,
+    positive_int,
 )
 
 
@@ -96,7 +101,7 @@ DEFAULT_MAX_YOUNGEST_TICK_AGE_SEC = 60
 DEFAULT_RPC_TIMEOUT_SEC = 15.0
 DEFAULT_DEADLINE_SEC = 90.0
 DEFAULT_SERVICE_NAME = "worshiptranslate-backend"
-DEFAULT_CONTAINER_NAME = "worshiptranslate-backend"
+DEFAULT_REGION = "us-central1"
 
 
 # --- Argparse --------------------------------------------------------------
@@ -116,22 +121,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--database", required=True)
     p.add_argument("--service-name", default=DEFAULT_SERVICE_NAME)
     p.add_argument(
-        "--container-name", default=DEFAULT_CONTAINER_NAME,
+        "--region", default=DEFAULT_REGION,
         help=(
-            "Cloud Run container name label. instance_count is "
-            "reported per container_name — summing across multiple "
-            "containers would double-count a single Cloud Run "
-            "instance. Default is the primary container."
+            "Cloud Run region to pin the query to. Cloud Run "
+            "services are regional; a same-named service in a "
+            "different region would otherwise contaminate the "
+            "roster. Must be on the allowlist "
+            f"({sorted(ALLOWED_REGIONS)!r})."
         ),
     )
-    p.add_argument("--tick-window-sec", type=int, default=DEFAULT_TICK_WINDOW_SEC)
     p.add_argument(
-        "--metric-freshness-max-sec", type=float,
+        "--tick-window-sec", type=positive_int,
+        default=DEFAULT_TICK_WINDOW_SEC,
+    )
+    p.add_argument(
+        "--metric-freshness-max-sec", type=positive_float,
         default=DEFAULT_METRIC_FRESHNESS_MAX_SEC,
     )
-    p.add_argument("--metric-lookback-sec", type=int, default=DEFAULT_METRIC_LOOKBACK_SEC)
-    p.add_argument("--rpc-timeout-sec", type=float, default=DEFAULT_RPC_TIMEOUT_SEC)
-    p.add_argument("--deadline-sec", type=float, default=DEFAULT_DEADLINE_SEC)
+    p.add_argument(
+        "--metric-lookback-sec", type=positive_int,
+        default=DEFAULT_METRIC_LOOKBACK_SEC,
+    )
+    p.add_argument(
+        "--rpc-timeout-sec", type=positive_float,
+        default=DEFAULT_RPC_TIMEOUT_SEC,
+    )
+    p.add_argument(
+        "--deadline-sec", type=positive_float,
+        default=DEFAULT_DEADLINE_SEC,
+    )
     return p
 
 
@@ -145,7 +163,7 @@ def _base_payload(args: argparse.Namespace) -> dict[str, Any]:
         "verified_at": iso_utc_now(),
         "project": args.project,
         "service_name": args.service_name,
-        "container_name_filter": args.container_name,
+        "region": args.region,
         "tick_window_seconds": int(args.tick_window_sec),
         "metric_freshness_max_age_seconds": float(args.metric_freshness_max_sec),
         "min_ticks_per_instance": DEFAULT_MIN_TICKS_PER_INSTANCE,
@@ -158,13 +176,17 @@ def _base_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def fetch_tick_events(
-    project: str, service_name: str, tick_window_sec: int, deadline: Deadline,
-    rpc_timeout: float,
+    project: str, service_name: str, region: str, tick_window_sec: int,
+    deadline: Deadline, rpc_timeout: float,
 ) -> list[dict[str, Any]]:
     """Return every `reconciler_tick` JSON event in the window,
     each as a dict:
       {revision_name, instance_id, timestamp_iso, owned_rooms}
-    Raises on permission / RPC failure / malformed schema."""
+    Raises on permission / RPC failure / malformed schema.
+
+    `region` pins `resource.labels.location` on the filter —
+    Cloud Run services are regional, so a same-named service in
+    another region would otherwise appear in the results."""
     from google.cloud import logging_v2  # type: ignore
     from google.api_core import exceptions as gax  # type: ignore
 
@@ -173,6 +195,7 @@ def fetch_tick_events(
     log_filter = (
         f'resource.type="cloud_run_revision"\n'
         f'resource.labels.service_name="{service_name}"\n'
+        f'resource.labels.location="{region}"\n'
         f'jsonPayload.event="reconciler_tick"\n'
         f'timestamp >= "{start.strftime("%Y-%m-%dT%H:%M:%SZ")}"'
     )
@@ -286,13 +309,33 @@ def build_tick_roster(
 
 
 def fetch_metric_samples(
-    project: str, service_name: str, container_name: str,
+    project: str, service_name: str, region: str,
     lookback_sec: int, deadline: Deadline, rpc_timeout: float,
 ) -> list[dict[str, Any]]:
     """Return per-revision Cloud Run instance count samples in
     the window. Each entry:
-      {revision_name, container_name, active_plus_idle,
-       sample_timestamp_iso, sample_age_seconds}
+      {revision_name, active_plus_idle,
+       aligned_sample_timestamp_iso, sample_age_seconds}
+
+    The metric `run.googleapis.com/container/instance_count` is
+    reported PER-INSTANCE, not per-container-within-instance —
+    the earlier `container_name` filter was based on a
+    misremembering of the metric's label set and returned zero
+    series in production (Google documents `instance_count`
+    with only the `state` label). Filter removed.
+
+    `region` pins `resource.labels.location` so a same-named
+    Cloud Run service in a different region cannot contaminate
+    the roster.
+
+    Active + idle values MUST come from the SAME timestamp per
+    revision. Earlier code took the newest point independently
+    per state series then summed, which combined an old-active
+    with a newer-idle while reporting the newer stamp — masking
+    staleness. This implementation collects every (state,
+    timestamp, value) tuple per revision, then picks the newest
+    timestamp at which BOTH states have a point.
+
     Raises on permission / malformed schema / RPC failure."""
     from google.cloud import monitoring_v3  # type: ignore
     from google.api_core import exceptions as gax  # type: ignore
@@ -308,8 +351,8 @@ def fetch_metric_samples(
         f'metric.type="run.googleapis.com/container/instance_count" '
         f'AND resource.type="cloud_run_revision" '
         f'AND resource.labels.service_name="{service_name}" '
-        f'AND (metric.labels.state="active" OR metric.labels.state="idle") '
-        f'AND metric.labels.container_name="{container_name}"'
+        f'AND resource.labels.location="{region}" '
+        f'AND (metric.labels.state="active" OR metric.labels.state="idle")'
     )
 
     request = monitoring_v3.ListTimeSeriesRequest({
@@ -324,12 +367,9 @@ def fetch_metric_samples(
         retry=None,
     )
 
-    # Per-revision aggregation: sum the latest sample across
-    # `state=active` and `state=idle` (both count as "live
-    # processes emitting probes"). Per the reviewer, filter on
-    # container_name so we do not double-count a multi-container
-    # instance.
-    by_revision: dict[str, dict[str, Any]] = {}
+    # Per-revision per-state per-timestamp map:
+    # by_rev[rev][state] = { epoch_seconds_bucket: int_value }
+    by_rev: dict[str, dict[str, dict[int, int]]] = {}
     for series in pages:
         if deadline.expired():
             raise TimeoutError(
@@ -343,36 +383,51 @@ def fetch_metric_samples(
                 f"resource.labels.revision_name: {rev!r}"
             )
         metric_labels = getattr(getattr(series, "metric", None), "labels", None) or {}
-        this_container = metric_labels.get("container_name") if isinstance(metric_labels, dict) else None
-        if this_container != container_name:
-            # Defence in depth — the filter should have caught this.
-            continue
-        points = list(getattr(series, "points", []) or [])
-        if not points:
-            continue
-        # Points are returned newest-first per Google's docs; take [0].
-        latest = points[0]
-        ts_iso, ts_epoch = _extract_point_timestamp(latest)
-        value = _extract_point_value(latest)
-        entry = by_revision.setdefault(rev, {
-            "revision_name": rev,
-            "container_name": container_name,
-            "active_plus_idle": 0,
-            "sample_timestamp_iso": ts_iso,
-            "sample_timestamp_epoch": ts_epoch,
-        })
-        entry["active_plus_idle"] += int(value)
-        # Keep the newest sample timestamp across state series.
-        if ts_epoch > entry["sample_timestamp_epoch"]:
-            entry["sample_timestamp_iso"] = ts_iso
-            entry["sample_timestamp_epoch"] = ts_epoch
+        state = metric_labels.get("state") if isinstance(metric_labels, dict) else None
+        if state not in ("active", "idle"):
+            raise ValueError(
+                f"time-series has unexpected metric.labels.state={state!r}"
+            )
+        by_state = by_rev.setdefault(rev, {"active": {}, "idle": {}})
+        for point in list(getattr(series, "points", []) or []):
+            _ts_iso, ts_epoch = _extract_point_timestamp(point)
+            # Bucket by 1 s so tiny clock skew between the two
+            # state series still aligns.
+            bucket = int(round(ts_epoch))
+            by_state[state][bucket] = int(_extract_point_value(point))
 
     now_epoch = now.timestamp()
     out: list[dict[str, Any]] = []
-    for rev, entry in by_revision.items():
-        age = now_epoch - entry["sample_timestamp_epoch"]
-        entry["sample_age_seconds"] = round(age, 3)
-        out.append(entry)
+    for rev, states in by_rev.items():
+        active = states["active"]
+        idle = states["idle"]
+        # Newest bucket at which BOTH state series report a value.
+        common_buckets = sorted(
+            set(active.keys()) & set(idle.keys()), reverse=True,
+        )
+        if not common_buckets:
+            # A revision that reports only one of the two states
+            # is malformed — every Cloud Run instance is either
+            # active OR idle, so a healthy revision reports both
+            # (potentially with 0 in one of them). Absent one
+            # side, we cannot compute a trustworthy total.
+            raise ValueError(
+                f"revision {rev!r} has instance_count in only one "
+                f"state (active_buckets={len(active)}, "
+                f"idle_buckets={len(idle)}) — cannot align"
+            )
+        aligned_bucket = common_buckets[0]
+        aligned_ts = datetime.fromtimestamp(aligned_bucket, timezone.utc)
+        total = active[aligned_bucket] + idle[aligned_bucket]
+        out.append({
+            "revision_name": rev,
+            "active_value": active[aligned_bucket],
+            "idle_value": idle[aligned_bucket],
+            "active_plus_idle": total,
+            "aligned_sample_timestamp_iso": aligned_ts.isoformat(),
+            "aligned_sample_timestamp_epoch": float(aligned_bucket),
+            "sample_age_seconds": round(now_epoch - aligned_bucket, 3),
+        })
     return out
 
 
@@ -463,11 +518,28 @@ def cross_check(
             "status": status,
         })
 
-    all_clean = all(entry["status"] == "clean" for entry in tick_roster) \
-        and bool(tick_roster) is True  # empty roster is not "clean" by itself
+    # Empty telemetry is UNRESOLVED, not clean. Both a truly
+    # scaled-to-zero service AND a broken query that returns no
+    # series look the same from here. The runbook's "silence is
+    # unresolved" rule requires the operator to distinguish
+    # those cases out-of-band (e.g., by asking Cloud Run
+    # directly whether the service is currently scaled to zero)
+    # before declaring the window ready — the helper cannot
+    # decide it on its own.
     if not tick_roster and not metric_samples:
-        # No instances at all — treat as clean (0 rooms possible).
-        all_clean = True
+        # Report the union as a single synthetic entry so the
+        # rc classifier surfaces it as UNRESOLVED_MISMATCH.
+        union.append({
+            "revision_name": "<empty>",
+            "tick_count": 0,
+            "metric_count": None,
+            "metric_sample_age_seconds": None,
+            "status": "no_evidence",
+        })
+        return union, False, False, freshness_ok
+
+    all_clean = all(entry["status"] == "clean" for entry in tick_roster) \
+        and bool(tick_roster) is True
     return union, all_clean, all_match, freshness_ok
 
 
@@ -480,7 +552,8 @@ def _run(argv: list[str]) -> int:
 
     try:
         check_target(args.project, args.database)
-    except (TargetRefused, EnvMismatch) as exc:
+        check_region(args.region)
+    except (TargetRefused, EnvMismatch, RegionRefused) as exc:
         payload.update({
             "tick_roster": [], "cloud_run_metric": [], "roster_union": [],
             "all_instances_clean": False, "all_revisions_match": False,
@@ -512,10 +585,10 @@ def _run(argv: list[str]) -> int:
     # --- Cloud Logging pass -------------------------------------------
     try:
         events = fetch_tick_events(
-            args.project, args.service_name,
+            args.project, args.service_name, args.region,
             args.tick_window_sec, deadline, args.rpc_timeout_sec,
         )
-    except gax.PermissionDenied as exc:
+    except (gax.PermissionDenied, gax.Unauthenticated) as exc:
         _die_upstream(payload, deadline, ExitCode.PERMISSION,
                       f"Cloud Logging permission denied: {exc.message}")
     except gax.DeadlineExceeded as exc:
@@ -541,10 +614,10 @@ def _run(argv: list[str]) -> int:
     # --- Cloud Monitoring pass ----------------------------------------
     try:
         metric_samples = fetch_metric_samples(
-            args.project, args.service_name, args.container_name,
+            args.project, args.service_name, args.region,
             args.metric_lookback_sec, deadline, args.rpc_timeout_sec,
         )
-    except gax.PermissionDenied as exc:
+    except (gax.PermissionDenied, gax.Unauthenticated) as exc:
         _die_upstream(payload, deadline, ExitCode.PERMISSION,
                       f"Cloud Monitoring permission denied: {exc.message}")
     except gax.DeadlineExceeded as exc:

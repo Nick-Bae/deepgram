@@ -56,9 +56,27 @@ _EMULATOR_TARGETS: set[tuple[str, str]] = {
 }
 ALLOWED_TARGETS: set[tuple[str, str]] = _PRODUCTION_TARGETS | _EMULATOR_TARGETS
 
+# Cloud Run regions the roster helper is permitted to query. A same-
+# named service in another region can contaminate the roster if
+# location is not pinned.
+ALLOWED_REGIONS: set[str] = {"us-central1"}
+
 
 class TargetRefused(Exception):
     """Raised when (project, database) is not on the allowlist."""
+
+
+class RegionRefused(Exception):
+    """Raised when the requested Cloud Run region is not on the
+    allowlist."""
+
+
+def check_region(region: str) -> None:
+    if region not in ALLOWED_REGIONS:
+        raise RegionRefused(
+            f"region {region!r} is not on the allowlist "
+            f"({sorted(ALLOWED_REGIONS)!r})"
+        )
 
 
 class EnvMismatch(Exception):
@@ -172,9 +190,47 @@ class Deadline:
 def iso_utc_now() -> str:
     """`YYYY-MM-DDTHH:MM:SS.fffZ` — same format the adapter's
     `_emit` uses for `ts`. Suitable for `verified_at`
-    audit-trail fields."""
+    audit-trail fields.
+
+    Reads the clock ONCE and formats from that single sample —
+    an earlier implementation called `datetime.now(...)` twice
+    (once for `strftime`, once for `.microsecond`), which let
+    the seconds and milliseconds come from different instants
+    across a millisecond boundary."""
     from datetime import datetime, timezone
-    return (
-        datetime.now(timezone.utc)
-        .strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+# --- Argparse validators for finite, positive numeric inputs --------------
+
+
+def _positive_finite(kind: str, converter):
+    """Return an argparse type callable that rejects negative,
+    zero, and non-finite (`nan`, `inf`) values via
+    `argparse.ArgumentTypeError`. `kind` is the human name for
+    error messages ('int' or 'float')."""
+    import argparse
+    import math
+
+    def _check(raw: str):
+        try:
+            value = converter(raw)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"expected a positive {kind}, got {raw!r}"
+            )
+        if isinstance(value, float) and not math.isfinite(value):
+            raise argparse.ArgumentTypeError(
+                f"expected a finite {kind}, got {raw!r}"
+            )
+        if value <= 0:
+            raise argparse.ArgumentTypeError(
+                f"expected a positive {kind} > 0, got {raw!r}"
+            )
+        return value
+    return _check
+
+
+positive_float = _positive_finite("float", float)
+positive_int = _positive_finite("int", int)

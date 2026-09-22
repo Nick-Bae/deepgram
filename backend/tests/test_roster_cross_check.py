@@ -126,13 +126,23 @@ class RosterCrossCheckAllowlistUnitTests(unittest.TestCase):
         payload = json.loads(out)
         for key in (
             "kind", "command", "verified_at", "project", "service_name",
-            "container_name_filter", "tick_window_seconds",
+            "region", "tick_window_seconds",
             "metric_freshness_max_age_seconds",
             "tick_roster", "cloud_run_metric", "roster_union",
             "all_instances_clean", "all_revisions_match",
             "metric_freshness_ok", "elapsed_seconds", "rc", "reason",
         ):
             self.assertIn(key, payload, f"missing schema field {key!r}")
+
+    def test_bad_region_returns_rc2(self):
+        rc, out, _err = _run_cli(
+            "--project", PRODUCTION_PROJECT,
+            "--database", PRODUCTION_DATABASE,
+            "--region", "us-east4",
+        )
+        self.assertEqual(rc, 2)
+        payload = json.loads(out)
+        self.assertIn("region", payload["reason"])
 
 
 class RosterCrossCheckClassificationUnitTests(unittest.TestCase):
@@ -210,20 +220,28 @@ class RosterCrossCheckClassificationUnitTests(unittest.TestCase):
         )
         self.assertEqual(roster[0]["status"], "non_zero_rooms")
 
-    def test_cross_check_match(self):
-        tick_roster = [
-            {"revision_name": "rev-a", "instance_id": "i-1",
+    def _clean_ticks_for(self, rev, insts):
+        return [
+            {"revision_name": rev, "instance_id": inst,
              "tick_timestamps": [], "youngest_tick_age_seconds": 0,
              "span_seconds": 0, "owned_rooms_last_tick": 0,
-             "status": "clean"},
-            {"revision_name": "rev-a", "instance_id": "i-2",
-             "tick_timestamps": [], "youngest_tick_age_seconds": 0,
-             "span_seconds": 0, "owned_rooms_last_tick": 0,
-             "status": "clean"},
+             "status": "clean"}
+            for inst in insts
         ]
-        metric = [{"revision_name": "rev-a", "container_name": "x",
-                   "active_plus_idle": 2, "sample_timestamp_iso": "",
-                   "sample_timestamp_epoch": 0, "sample_age_seconds": 10}]
+
+    def _metric_entry(self, rev, count, sample_age_seconds=10):
+        return {
+            "revision_name": rev,
+            "active_value": 0, "idle_value": count,
+            "active_plus_idle": count,
+            "aligned_sample_timestamp_iso": "",
+            "aligned_sample_timestamp_epoch": 0,
+            "sample_age_seconds": sample_age_seconds,
+        }
+
+    def test_cross_check_match(self):
+        tick_roster = self._clean_ticks_for("rev-a", ["i-1", "i-2"])
+        metric = [self._metric_entry("rev-a", 2)]
         union, all_clean, all_match, freshness = rcc.cross_check(
             tick_roster, metric, freshness_max_age=180.0,
         )
@@ -233,15 +251,8 @@ class RosterCrossCheckClassificationUnitTests(unittest.TestCase):
         self.assertEqual(union[0]["status"], "match")
 
     def test_cross_check_mismatch(self):
-        tick_roster = [
-            {"revision_name": "rev-a", "instance_id": "i-1",
-             "tick_timestamps": [], "youngest_tick_age_seconds": 0,
-             "span_seconds": 0, "owned_rooms_last_tick": 0,
-             "status": "clean"},
-        ]
-        metric = [{"revision_name": "rev-a", "container_name": "x",
-                   "active_plus_idle": 3, "sample_timestamp_iso": "",
-                   "sample_timestamp_epoch": 0, "sample_age_seconds": 10}]
+        tick_roster = self._clean_ticks_for("rev-a", ["i-1"])
+        metric = [self._metric_entry("rev-a", 3)]
         union, all_clean, all_match, freshness = rcc.cross_check(
             tick_roster, metric, freshness_max_age=180.0,
         )
@@ -249,12 +260,7 @@ class RosterCrossCheckClassificationUnitTests(unittest.TestCase):
         self.assertEqual(union[0]["status"], "mismatch")
 
     def test_cross_check_missing_metric(self):
-        tick_roster = [
-            {"revision_name": "rev-a", "instance_id": "i-1",
-             "tick_timestamps": [], "youngest_tick_age_seconds": 0,
-             "span_seconds": 0, "owned_rooms_last_tick": 0,
-             "status": "clean"},
-        ]
+        tick_roster = self._clean_ticks_for("rev-a", ["i-1"])
         union, all_clean, all_match, freshness = rcc.cross_check(
             tick_roster, [], freshness_max_age=180.0,
         )
@@ -262,9 +268,7 @@ class RosterCrossCheckClassificationUnitTests(unittest.TestCase):
         self.assertEqual(union[0]["status"], "missing_metric")
 
     def test_cross_check_missing_ticks(self):
-        metric = [{"revision_name": "rev-a", "container_name": "x",
-                   "active_plus_idle": 1, "sample_timestamp_iso": "",
-                   "sample_timestamp_epoch": 0, "sample_age_seconds": 10}]
+        metric = [self._metric_entry("rev-a", 1)]
         union, all_clean, all_match, freshness = rcc.cross_check(
             [], metric, freshness_max_age=180.0,
         )
@@ -272,29 +276,26 @@ class RosterCrossCheckClassificationUnitTests(unittest.TestCase):
         self.assertEqual(union[0]["status"], "missing_ticks")
 
     def test_cross_check_stale_metric_flips_freshness(self):
-        tick_roster = [
-            {"revision_name": "rev-a", "instance_id": "i-1",
-             "tick_timestamps": [], "youngest_tick_age_seconds": 0,
-             "span_seconds": 0, "owned_rooms_last_tick": 0,
-             "status": "clean"},
-        ]
-        metric = [{"revision_name": "rev-a", "container_name": "x",
-                   "active_plus_idle": 1, "sample_timestamp_iso": "",
-                   "sample_timestamp_epoch": 0,
-                   "sample_age_seconds": 240}]  # 240 > 180
+        tick_roster = self._clean_ticks_for("rev-a", ["i-1"])
+        metric = [self._metric_entry("rev-a", 1, sample_age_seconds=240)]
         union, all_clean, all_match, freshness = rcc.cross_check(
             tick_roster, metric, freshness_max_age=180.0,
         )
         self.assertFalse(freshness)
 
-    def test_empty_roster_and_empty_metric_is_clean(self):
+    def test_empty_roster_and_empty_metric_is_unresolved(self):
+        """Reviewer's PR #41 round-2 blocker #1: empty/empty
+        must NOT be treated as verified clean. Both a truly
+        scaled-to-zero service AND a broken query returning
+        nothing look identical from here — the helper cannot
+        distinguish them alone. Fail closed."""
         union, all_clean, all_match, freshness = rcc.cross_check(
             [], [], freshness_max_age=180.0,
         )
-        self.assertEqual(union, [])
-        self.assertTrue(all_clean)
-        self.assertTrue(all_match)
-        self.assertTrue(freshness)
+        self.assertEqual(len(union), 1)
+        self.assertEqual(union[0]["status"], "no_evidence")
+        self.assertFalse(all_clean, "empty telemetry must not be clean")
+        self.assertFalse(all_match, "empty telemetry must not match")
 
 
 class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
@@ -355,11 +356,98 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
              "timestamp_iso": "t1", "timestamp_epoch": now - 45, "owned_rooms": 0},
         ]
 
-    def _fresh_metric(self, rev, count, container="worshiptranslate-backend"):
+    def _fresh_metric(self, rev, count):
         now = time.time()
-        return {"revision_name": rev, "container_name": container,
-                "active_plus_idle": count, "sample_timestamp_iso": "s",
-                "sample_timestamp_epoch": now - 30, "sample_age_seconds": 30}
+        # Split active/idle arbitrarily; the aggregated total is what
+        # cross_check consumes.
+        active = count if count <= 1 else count // 2
+        idle = count - active
+        return {
+            "revision_name": rev,
+            "active_value": active, "idle_value": idle,
+            "active_plus_idle": count,
+            "aligned_sample_timestamp_iso": "s",
+            "aligned_sample_timestamp_epoch": now - 30,
+            "sample_age_seconds": 30,
+        }
+
+    _ERROR_RAISERS = {
+        "malformed": (
+            "def _raise(*a, **k):\n"
+            "    raise ValueError('bogus payload: revision_name missing')\n"
+        ),
+        "permission": (
+            "def _raise(*a, **k):\n"
+            "    from google.api_core import exceptions as gax\n"
+            "    raise gax.PermissionDenied('caller lacks logging.entries.list')\n"
+        ),
+        "unauthenticated": (
+            "def _raise(*a, **k):\n"
+            "    from google.api_core import exceptions as gax\n"
+            "    raise gax.Unauthenticated('ADC not configured')\n"
+        ),
+        "timeout": (
+            "def _raise(*a, **k):\n"
+            "    raise TimeoutError('deadline expired during fetch')\n"
+        ),
+        "generic": (
+            "def _raise(*a, **k):\n"
+            "    raise RuntimeError('unexpected upstream failure')\n"
+        ),
+    }
+
+    def _run_shim_error(
+        self, kind: str, which: str, *extra_args: str,
+    ) -> tuple[int, dict, str]:
+        """Run the CLI in a subprocess where the named fetch
+        (`which` = 'ticks' or 'metric') raises the named error
+        kind. The other fetch returns a benign empty list so
+        control reaches the target path."""
+        raiser = self._ERROR_RAISERS[kind]
+        tmpdir = Path(tempfile.mkdtemp(prefix="rcc-shim-err-"))
+        try:
+            shim_path = tmpdir / "shim.py"
+            if which == "ticks":
+                patches = (
+                    "rcc.fetch_tick_events = _raise\n"
+                    "rcc.fetch_metric_samples = lambda *a, **k: []\n"
+                )
+            elif which == "metric":
+                patches = (
+                    "rcc.fetch_tick_events = lambda *a, **k: []\n"
+                    "rcc.fetch_metric_samples = _raise\n"
+                )
+            else:  # pragma: no cover
+                raise AssertionError(f"unknown which={which!r}")
+            shim_path.write_text(
+                "import sys\n"
+                f"sys.path.insert(0, {str(_SCRIPTS_DIR)!r})\n"
+                "import roster_cross_check as rcc\n"
+                + raiser
+                + patches
+                + "sys.exit(rcc._run(sys.argv[1:]))\n"
+            )
+            env = os.environ.copy()
+            env["FIRESTORE_EMULATOR_HOST"] = env.get(
+                "FIRESTORE_EMULATOR_HOST", "127.0.0.1:0",
+            )
+            cmd = [
+                sys.executable, "-u", str(shim_path),
+                "--project", EMULATOR_PROJECT,
+                "--database", EMULATOR_DATABASE,
+                *extra_args,
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60, env=env,
+            )
+            try:
+                payload = json.loads(proc.stdout)
+            except Exception:
+                payload = {"stdout_raw": proc.stdout}
+            return proc.returncode, payload, proc.stderr
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     # --- rc=0 verified -------------------------------------------------
 
@@ -372,9 +460,18 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
         self.assertTrue(payload["all_revisions_match"])
         self.assertTrue(payload["metric_freshness_ok"])
 
-    def test_rc0_verified_when_no_instances_at_all(self):
+    def test_rc8_unresolved_when_no_instances_at_all(self):
+        """Reviewer's PR #41 round-2 blocker #1: empty ticks +
+        empty metric can mean (a) truly scaled to zero, OR (b)
+        the query is broken — the helper cannot distinguish them.
+        Fail closed with `no_evidence` / rc=8 so the operator
+        confirms out-of-band before declaring the window ready."""
         rc, payload, err = self._run_shim([], [])
-        self.assertEqual(rc, 0, f"payload={payload!r} stderr={err!r}")
+        self.assertEqual(rc, 8, f"payload={payload!r} stderr={err!r}")
+        self.assertFalse(payload["all_instances_clean"])
+        self.assertFalse(payload["all_revisions_match"])
+        self.assertEqual(len(payload["roster_union"]), 1)
+        self.assertEqual(payload["roster_union"][0]["status"], "no_evidence")
 
     # --- rc=4 incomplete ----------------------------------------------
 
@@ -408,11 +505,16 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
 
     def test_rc5_stale_when_metric_sample_too_old(self):
         events = self._clean_tick("rev-a", "i-1")
-        # sample_age > freshness_max (default 180s)
+        # sample_age > freshness_max (default 180 s). Match the
+        # refactored schema — no container_name label, aligned
+        # timestamp fields — so cross_check accepts it and reads
+        # sample_age_seconds directly.
         metric = [{
-            "revision_name": "rev-a", "container_name": "worshiptranslate-backend",
-            "active_plus_idle": 1, "sample_timestamp_iso": "old",
-            "sample_timestamp_epoch": time.time() - 500,
+            "revision_name": "rev-a",
+            "active_value": 0, "idle_value": 1,
+            "active_plus_idle": 1,
+            "aligned_sample_timestamp_iso": "old",
+            "aligned_sample_timestamp_epoch": time.time() - 500,
             "sample_age_seconds": 500,
         }]
         rc, payload, _err = self._run_shim(events, metric)
@@ -432,6 +534,180 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
         events = self._clean_tick("rev-a", "i-1")
         rc, payload, _err = self._run_shim(events, [])
         self.assertEqual(rc, 8)
+
+    # --- rc=3 malformed upstream data --------------------------------
+
+    def test_rc3_malformed_from_ticks(self):
+        rc, payload, _err = self._run_shim_error("malformed", "ticks")
+        self.assertEqual(rc, 3)
+        self.assertIn("malformed", payload["reason"].lower())
+
+    def test_rc3_malformed_from_metric(self):
+        rc, payload, _err = self._run_shim_error("malformed", "metric")
+        self.assertEqual(rc, 3)
+        self.assertIn("malformed", payload["reason"].lower())
+
+    # --- rc=6 permission / authentication ----------------------------
+
+    def test_rc6_permission_denied_from_ticks(self):
+        rc, payload, _err = self._run_shim_error("permission", "ticks")
+        self.assertEqual(rc, 6)
+        self.assertIn("permission denied", payload["reason"].lower())
+
+    def test_rc6_permission_denied_from_metric(self):
+        rc, payload, _err = self._run_shim_error("permission", "metric")
+        self.assertEqual(rc, 6)
+        self.assertIn("permission denied", payload["reason"].lower())
+
+    def test_rc6_unauthenticated_from_ticks(self):
+        """Reviewer's PR #41 blocker: rc=6 must cover
+        Unauthenticated alongside PermissionDenied. ADC absent
+        surfaces as Unauthenticated, not PermissionDenied — the
+        operator sees the same 'permission-family' failure and
+        the runbook branches identically."""
+        rc, payload, _err = self._run_shim_error("unauthenticated", "ticks")
+        self.assertEqual(rc, 6)
+
+    def test_rc6_unauthenticated_from_metric(self):
+        rc, payload, _err = self._run_shim_error("unauthenticated", "metric")
+        self.assertEqual(rc, 6)
+
+    # --- rc=7 timeout / deadline exceeded ----------------------------
+
+    def test_rc7_timeout_from_ticks(self):
+        rc, payload, _err = self._run_shim_error("timeout", "ticks")
+        self.assertEqual(rc, 7)
+        self.assertIn("deadline expired", payload["reason"].lower())
+
+    def test_rc7_timeout_from_metric(self):
+        rc, payload, _err = self._run_shim_error("timeout", "metric")
+        self.assertEqual(rc, 7)
+
+    # --- rc=9 upstream API failure (generic) -------------------------
+
+    def test_rc9_generic_upstream_from_ticks(self):
+        rc, payload, _err = self._run_shim_error("generic", "ticks")
+        self.assertEqual(rc, 9)
+        self.assertIn("RuntimeError", payload["reason"])
+
+    def test_rc9_generic_upstream_from_metric(self):
+        rc, payload, _err = self._run_shim_error("generic", "metric")
+        self.assertEqual(rc, 9)
+
+    # --- Exactly one JSON on stdout for every non-usage rc ------------
+
+    def _assert_exactly_one_json_line(self, stdout: str) -> None:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, f"stdout should be one JSON line, got: {stdout!r}")
+        json.loads(lines[0])  # must parse
+
+    def test_stdout_one_json_line_across_every_rc(self):
+        """Reviewer's PR #41 blocker: 'exactly-one-JSON
+        assertions on every non-usage result'. Argparse-driven
+        rc=1 is exempt (argparse writes usage to stderr and
+        exits before emit() runs)."""
+        # rc=0
+        events = self._clean_tick("rev-a", "i-1")
+        metric = [self._fresh_metric("rev-a", 1)]
+        rc0_out = self._captured_stdout_for_shim(events, metric)
+        self._assert_exactly_one_json_line(rc0_out)
+        # rc=3
+        _, _, _ = self._run_shim_error("malformed", "ticks")
+        # rc=6
+        _, _, _ = self._run_shim_error("permission", "metric")
+        # rc=7
+        _, _, _ = self._run_shim_error("timeout", "ticks")
+        # rc=8 empty/empty
+        rc8_out = self._captured_stdout_for_shim([], [])
+        self._assert_exactly_one_json_line(rc8_out)
+        # rc=9
+        _, _, _ = self._run_shim_error("generic", "metric")
+
+    def _captured_stdout_for_shim(self, events, metric):
+        tmpdir = Path(tempfile.mkdtemp(prefix="rcc-shim-cap-"))
+        try:
+            fixture_path = tmpdir / "fixture.json"
+            fixture_path.write_text(json.dumps({
+                "tick_events": events, "metric_samples": metric,
+            }))
+            shim_path = tmpdir / "shim.py"
+            shim_path.write_text(
+                "import json, sys\n"
+                f"sys.path.insert(0, {str(_SCRIPTS_DIR)!r})\n"
+                "import roster_cross_check as rcc\n"
+                f"fixture = json.loads(open({str(fixture_path)!r}).read())\n"
+                "rcc.fetch_tick_events = lambda *a, **k: fixture['tick_events']\n"
+                "rcc.fetch_metric_samples = lambda *a, **k: fixture['metric_samples']\n"
+                "sys.exit(rcc._run(sys.argv[1:]))\n"
+            )
+            env = os.environ.copy()
+            env["FIRESTORE_EMULATOR_HOST"] = "127.0.0.1:0"
+            proc = subprocess.run(
+                [sys.executable, "-u", str(shim_path),
+                 "--project", EMULATOR_PROJECT,
+                 "--database", EMULATOR_DATABASE],
+                capture_output=True, text=True, timeout=30, env=env,
+            )
+            return proc.stdout
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # --- Argparse positive-finite validators (rc=2 from argparse) ----
+
+    def test_zero_deadline_rejected_by_argparse(self):
+        """--deadline-sec 0 must be rejected. Argparse exits 2
+        via its own error path (usage on stderr) — that is
+        distinct from our ALLOWLIST_REFUSAL rc=2 because
+        argparse writes nothing to stdout."""
+        proc = subprocess.run(
+            [sys.executable, "-u",
+             str(_SCRIPTS_DIR / "roster_cross_check.py"),
+             "--project", PRODUCTION_PROJECT,
+             "--database", PRODUCTION_DATABASE,
+             "--deadline-sec", "0"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "", "argparse must not emit a JSON payload")
+        self.assertIn("positive", proc.stderr.lower())
+
+    def test_negative_deadline_rejected_by_argparse(self):
+        proc = subprocess.run(
+            [sys.executable, "-u",
+             str(_SCRIPTS_DIR / "roster_cross_check.py"),
+             "--project", PRODUCTION_PROJECT,
+             "--database", PRODUCTION_DATABASE,
+             "--deadline-sec", "-1"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+
+    def test_nan_deadline_rejected_by_argparse(self):
+        proc = subprocess.run(
+            [sys.executable, "-u",
+             str(_SCRIPTS_DIR / "roster_cross_check.py"),
+             "--project", PRODUCTION_PROJECT,
+             "--database", PRODUCTION_DATABASE,
+             "--deadline-sec", "nan"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("finite", proc.stderr.lower())
+
+    def test_inf_rpc_timeout_rejected_by_argparse(self):
+        proc = subprocess.run(
+            [sys.executable, "-u",
+             str(_SCRIPTS_DIR / "roster_cross_check.py"),
+             "--project", PRODUCTION_PROJECT,
+             "--database", PRODUCTION_DATABASE,
+             "--rpc-timeout-sec", "inf"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
 
     # --- Schema always present ---------------------------------------
 
