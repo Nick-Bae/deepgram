@@ -1,0 +1,25 @@
+# Log-based metric — the reader loop body itself crashed
+# (not a reconnect attempt, an unexpected exception inside
+# _reader_loop). Any occurrence is unusual and worth
+# investigating.
+#
+# Manifest anchor: metrics.redis_pubsub_reader_errors
+name: redis_pubsub_reader_errors
+description: |
+  redis pubsub reader loop raised an unexpected error.
+  Managed by ops/monitoring/redis-fanout — do NOT edit in the
+  Cloud Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  jsonPayload.event="redis_pubsub_reader_error"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: instance_id
+      valueType: STRING
+      description: Adapter INSTANCE_ID.
+labelExtractors:
+  instance_id: EXTRACT(jsonPayload.instance_id)

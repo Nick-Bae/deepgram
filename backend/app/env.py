@@ -83,6 +83,13 @@ class ENV:
     REDIS_PROBE_DEADLINE_SEC: float = max(
         0.5, min(10.0, float(os.getenv("REDIS_PROBE_DEADLINE_SEC", "2")))
     )
+    # PR #31 §3 alert A5 — how long an initial-connect failure may
+    # go unrecovered before the adapter emits
+    # `redis_pubsub_recovery_deadline_missed`. Default 300 s (5 min)
+    # matches the approved contract. Overridable for tests.
+    REDIS_RECOVERY_DEADLINE_SEC: float = max(
+        5.0, min(3600.0, float(os.getenv("REDIS_RECOVERY_DEADLINE_SEC", "300")))
+    )
     INSTANCE_ID: str = _env_str("INSTANCE_ID", default=f"inst-{uuid.uuid4().hex[:12]}")
 
     @classmethod

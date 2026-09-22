@@ -1,0 +1,29 @@
+# Log-based metric — an in-process probe tick round-tripped
+# through the adapter's real _pub/_sub clients. This is the
+# ONLY per-instance liveness signal that exercises the adapter's
+# actual reader path (a fresh Redis client would succeed and
+# mask a stuck subscriber). Absence for a revision that was
+# emitting is A8a's signal.
+#
+# Manifest anchor: metrics.redis_pubsub_active_probe_success
+name: redis_pubsub_active_probe_success
+description: |
+  redis pubsub in-process probe round-tripped. This metric is
+  the substrate for A8a's absence policy. Emitted by
+  `_probe_loop` after `redis_probe_ok`. Managed by
+  ops/monitoring/redis-fanout — do NOT edit in the Cloud
+  Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  jsonPayload.event="redis_probe_ok"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: instance_id
+      valueType: STRING
+      description: Adapter INSTANCE_ID (per-process identity).
+labelExtractors:
+  instance_id: EXTRACT(jsonPayload.instance_id)

@@ -1,0 +1,34 @@
+# Log-based metric — counts every structured emission of
+# `redis_pubsub_initial_connect_failed`, the adapter's
+# initial-PING failure event (both timeout AND refused). Paired
+# with `redis_pubsub_reconnect_successes` by alert A5 to
+# distinguish stuck-startups from recovered-startups.
+#
+# Manifest anchor: metrics.redis_pubsub_startup_failed
+name: redis_pubsub_startup_failed
+description: |
+  redis pubsub adapter's initial ping failed. Emitted once per
+  startup attempt. Alert A5 pairs this with reconnect_successes
+  on the same instance to fire only on stuck startups. Managed
+  by ops/monitoring/redis-fanout — do NOT edit in the Cloud
+  Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  jsonPayload.event="redis_pubsub_initial_connect_failed"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: instance_id
+      valueType: STRING
+      description: Adapter INSTANCE_ID (per-process identity).
+    - key: reason
+      valueType: STRING
+      description: |
+        Failure reason — "timeout" or "refused". Set by the
+        adapter's _emit(reason=...) field.
+labelExtractors:
+  instance_id: EXTRACT(jsonPayload.instance_id)
+  reason: EXTRACT(jsonPayload.reason)

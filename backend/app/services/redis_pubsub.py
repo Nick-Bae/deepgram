@@ -53,6 +53,13 @@ EVENT_RECONNECTING = "redis_pubsub_reconnecting"
 EVENT_RECONNECTED = "redis_pubsub_reconnected"
 EVENT_RECONNECT_FAILED = "redis_pubsub_reconnect_failed"
 EVENT_READER_ERROR = "redis_pubsub_reader_error"
+# PR #31 §3 alert A5 — deadline-aware recovery signal. Emitted
+# once per (unrecovered startup failure) after
+# RECOVERY_DEADLINE_SEC elapse without a successful reconnect.
+# A5 alerts directly on this event so the monitoring rule does
+# NOT depend on rolling-window PromQL semantics that cannot
+# express "5 min after event X with no event Y since" reliably.
+EVENT_RECOVERY_DEADLINE_MISSED = "redis_pubsub_recovery_deadline_missed"
 # Probe events (task #127) are declared here so the catalogue is
 # complete but are NOT emitted by this PR — the probe task itself
 # lands in the probe-integration branch.
@@ -232,6 +239,22 @@ class RedisPubSub:
         # envelope arrives.
         self._probe_pending: Dict[str, asyncio.Future] = {}
 
+        # PR #31 §3 alert A5 — deadline-aware recovery tracking.
+        # `_startup_failed_at` is the monotonic timestamp of the
+        # most recent unrecovered `redis_pubsub_initial_connect_failed`
+        # emission (None once a subsequent `redis_pubsub_reconnected`
+        # clears it). `_recovery_deadline_emitted` prevents duplicate
+        # emissions of `redis_pubsub_recovery_deadline_missed` while
+        # the same failure remains unrecovered — A5 needs to fire on
+        # any occurrence, not on every check.
+        # `_watchdog_task` runs on its own cadence (~30 s) because
+        # the reader loop blocks on Redis messages and the probe
+        # loop skips ticks while disconnected; neither can be
+        # trusted to check the deadline reliably.
+        self._startup_failed_at: Optional[float] = None
+        self._recovery_deadline_emitted: bool = False
+        self._watchdog_task: Optional[asyncio.Task] = None
+
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -253,6 +276,81 @@ class RedisPubSub:
     def set_delivery_callback(self, cb: DeliveryCallback) -> None:
         """Called by ConnectionManager to receive incoming subscribed messages."""
         self._callback = cb
+
+    # --- Recovery-deadline tracking (PR #31 §3 alert A5) ---------------
+
+    def _mark_startup_failure(self) -> None:
+        """Called at the top of every `EVENT_INITIAL_CONNECT_FAILED`
+        emission. Records the failure timestamp so the watchdog can
+        measure elapsed unrecovered time. Idempotent: if a prior
+        unrecovered failure is still pending, we KEEP the older
+        timestamp — the deadline should measure the age of the
+        FIRST failure in this outage window, not the latest ping
+        retry. (`_recovery_deadline_emitted` prevents the watchdog
+        from re-firing while the older window is still open.)"""
+        if self._startup_failed_at is None:
+            self._startup_failed_at = time.monotonic()
+
+    def _clear_recovery_state(self) -> None:
+        """Called at the top of every `EVENT_RECONNECTED` emission.
+        The reader loop successfully repaired the connection; a
+        subsequent failure starts a fresh deadline window."""
+        self._startup_failed_at = None
+        self._recovery_deadline_emitted = False
+
+    def _check_recovery_deadline(self, *, now: Optional[float] = None) -> bool:
+        """Emit `EVENT_RECOVERY_DEADLINE_MISSED` once if the current
+        unrecovered failure has been open longer than
+        `REDIS_RECOVERY_DEADLINE_SEC`. Returns True if the event
+        was emitted on this call.
+
+        Exposed as a method (rather than inlined in the watchdog
+        loop) so tests can drive it with a monotonic `now`
+        override without needing to sleep for the real deadline."""
+        if self._startup_failed_at is None:
+            return False
+        if self._recovery_deadline_emitted:
+            return False
+        deadline = float(ENV.REDIS_RECOVERY_DEADLINE_SEC)
+        elapsed = (now if now is not None else time.monotonic()) - self._startup_failed_at
+        if elapsed < deadline:
+            return False
+        self._recovery_deadline_emitted = True
+        _emit(
+            EVENT_RECOVERY_DEADLINE_MISSED,
+            "ERROR",
+            deadline_seconds=deadline,
+            elapsed_seconds=round(elapsed, 3),
+            message=(
+                f"redis pubsub startup failed and did not recover "
+                f"within {deadline:.0f}s (elapsed {elapsed:.1f}s); "
+                f"alert A5 should page"
+            ),
+        )
+        return True
+
+    async def _recovery_watchdog_loop(self) -> None:
+        """Independent timer that ticks every ~30 s to check the
+        recovery deadline. Distinct from the reader loop (which
+        blocks on Redis messages) and the probe loop (which skips
+        ticks while disconnected) — those cannot be trusted to
+        catch a stuck-startup scenario in a bounded time.
+
+        Cancelled cleanly by `stop()`. Cadence bounded by
+        min(30 s, deadline/5) so the check fires at least a few
+        times before the deadline elapses even with a short
+        `REDIS_RECOVERY_DEADLINE_SEC` override (used in tests)."""
+        interval = max(0.05, min(30.0, ENV.REDIS_RECOVERY_DEADLINE_SEC / 5.0))
+        while self._started:
+            try:
+                await asyncio.sleep(interval)
+                if not self._started:
+                    return
+                self._check_recovery_deadline()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover
+                log.warning("recovery watchdog raised: %s", exc)
 
     def set_probe_callback(self, cb: Callable[[dict], Awaitable[None]]) -> None:
         """Register the probe-delivery callback (PR #31 §3 W7).
@@ -553,6 +651,11 @@ class RedisPubSub:
                 timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
             )
             self._connected = True
+            # A successful initial ping is itself a "recovery" for
+            # A5 purposes: clear any pending unrecovered failure
+            # tracker so a subsequent failure starts a fresh
+            # deadline window.
+            self._clear_recovery_state()
             _emit(
                 EVENT_STARTED,
                 "INFO",
@@ -566,6 +669,7 @@ class RedisPubSub:
             )
         except asyncio.TimeoutError:
             self._connected = False
+            self._mark_startup_failure()
             # Distinct `reason` field so the operator (and A5) can
             # tell TCP-accepted-but-hung apart from connection-refused.
             # Same `event` name so the metric/filter picks up both.
@@ -582,6 +686,7 @@ class RedisPubSub:
             )
         except Exception as exc:
             self._connected = False
+            self._mark_startup_failure()
             # `reason=refused` covers ConnectionError shape; anything
             # else surfaces via the message field for forensic
             # inspection (still under the same `event` name).
@@ -601,6 +706,18 @@ class RedisPubSub:
         self._started = True
         self._reader_task = asyncio.create_task(
             self._reader_loop(), name="redis-pubsub-reader",
+        )
+
+        # PR #31 §3 alert A5 — recovery deadline watchdog. Always
+        # scheduled (not gated on _connected) because the very case
+        # we care about is a startup that never recovers — the
+        # reader loop is blocked on Redis messages that never
+        # arrive, and the probe loop skips ticks while
+        # disconnected. Neither can be trusted to emit
+        # EVENT_RECOVERY_DEADLINE_MISSED on time.
+        self._watchdog_task = asyncio.create_task(
+            self._recovery_watchdog_loop(),
+            name="redis-pubsub-recovery-watchdog",
         )
 
         # PR #31 §3 W7 — probe task. Scheduled whenever a probe
@@ -678,39 +795,64 @@ class RedisPubSub:
             those partial clients.
         """
         # Nothing to do only when we have neither the started flag nor
-        # any lingering client objects.
+        # any lingering client objects. The early-return path STILL
+        # clears the A5 recovery state — the reviewer's blocking
+        # PR#39 round-4 defect was that a stale `_startup_failed_at`
+        # or `_recovery_deadline_emitted` could survive a stop()
+        # and mislead a subsequent start() on the same object into
+        # firing A5 too early (or never).
         if (
             not self._started
             and self._pub is None
             and self._sub is None
             and self._pubsub is None
             and self._probe_task is None
+            and self._watchdog_task is None
         ):
+            self._clear_recovery_state()
             return
         self._started = False
         self._connected = False
-        # PR #31 §3 W7 — probe task MUST be cancelled BEFORE
-        # `_teardown_clients()` so no probe attempt runs against a
-        # torn-down `_pub` / `_pubsub` client. Cancel before the
-        # reader task so the reader can drain any final probe
-        # dispatch it already saw without the probe task racing to
-        # publish again.
+        # Issue every cancel FIRST, then await each in the required
+        # ordering. Awaiting between cancels yields the event loop,
+        # which lets other running loops complete their in-flight
+        # `await asyncio.sleep(...)` and check `_started` — they
+        # then return naturally, bypassing our explicit cancel. The
+        # probe-cancel-before-teardown test asserts the CANCEL
+        # runs, not that the task exited by any path.
+        #
+        # PR #31 §3 W7 — probe cancel MUST be issued before
+        # `_teardown_clients()` (below) so no probe attempt runs
+        # against a torn-down `_pub`. PR #31 §3 alert A5 — watchdog
+        # cancel has no client-ordering requirement (watchdog does
+        # not touch Redis); issued for hygiene alongside the rest.
+        cancels: list[asyncio.Task] = []
         if self._probe_task and not self._probe_task.done():
             self._probe_task.cancel()
-            try:
-                await self._probe_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            cancels.append(self._probe_task)
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            cancels.append(self._watchdog_task)
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
+            cancels.append(self._reader_task)
+        for task in cancels:
             try:
-                await self._reader_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
         await self._teardown_clients()
         self._reader_task = None
         self._probe_task = None
+        self._watchdog_task = None
         self._probe_subscribed = False
+        # PR #31 §3 alert A5 — clear recovery state so a
+        # subsequent start() on the same adapter object begins a
+        # fresh deadline window. A stale `_startup_failed_at`
+        # would let the second lifecycle emit A5 too early using
+        # the old timestamp; a stale `_recovery_deadline_emitted`
+        # would suppress A5 during the second outage entirely.
+        self._clear_recovery_state()
         # Leave `_probe_subscription_desired` unchanged so a
         # subsequent `start()` on the same instance re-arms the
         # probe channel without a second `set_probe_callback()`
@@ -977,6 +1119,7 @@ class RedisPubSub:
                 )
                 if not desired and not probe_channel:
                     self._connected = True
+                    self._clear_recovery_state()
                     _emit(
                         EVENT_RECONNECTED,
                         "INFO",
@@ -1031,6 +1174,7 @@ class RedisPubSub:
                 if probe_channel:
                     self._probe_subscribed = True
                 self._connected = True
+                self._clear_recovery_state()
                 _emit(
                     EVENT_RECONNECTED,
                     "INFO",

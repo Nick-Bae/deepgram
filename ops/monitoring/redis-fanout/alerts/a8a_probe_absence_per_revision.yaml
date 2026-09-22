@@ -1,0 +1,84 @@
+# Alert A8a — steady-state probe absence per REVISION,
+# correlated with `run.googleapis.com/container/instance_count`
+# to prevent false-alerting on a revision that retired normally.
+#
+# PromQL `unless` join on (revision_name) fires when the
+# revision has active instances (instance_count > 0) but no
+# probe success in the last 2 min. Handles the reviewer's
+# earlier gap: a naked absence policy would page every time a
+# revision retired.
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a8a-probe-absence-per-revision. Runbook
+# URL lives in the documentation markdown.
+#
+# Manifest anchor: alerts.a8a_probe_absence_per_revision
+displayName: "[Redis fanout] A8a probe absence per revision (correlated w/ instance count)"
+combiner: OR
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a8a-probe-absence-per-revision
+  runbook: redis-fanout-alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A8a — Revision has instances but is not emitting probes
+
+    A revision's `run.googleapis.com/container/instance_count`
+    is > 0 (measured over the last 2 min) AND its
+    `redis_probe_ok` rate over the same window is zero. The
+    join on `revision_name` prevents false-alerting on a
+    revision that retired normally (instance_count would be 0
+    for such a revision, so the left side has no vector
+    element to fire on).
+
+    Complements A8b (operator-window per-instance completeness)
+    from the enablement §4d step 5.
+
+    Runbook: see `docs/03-analysis/redis-fanout-rollout-proposal.md#alerts`.
+conditions:
+  - displayName: probe absent while revision has active instances (per revision, 2 min)
+    conditionPrometheusQueryLanguage:
+      # Every selector is fail-closed:
+      #
+      # - `monitored_resource="cloud_run_revision"` on BOTH sides
+      #   pins the vector to the intended resource type
+      #   (log-based / built-in metrics can map to multiple).
+      # - `service_name="worshiptranslate-backend"` on
+      #   `container_instance_count` prevents any OTHER Cloud Run
+      #   service's instances from entering the left-hand vector
+      #   and falsely tripping "probe absent" on this service's
+      #   revisions.
+      # - `state=~"active|idle"` narrows
+      #   `run.googleapis.com/container/instance_count` to the
+      #   states that represent a live process able to emit
+      #   probes; the metric is otherwise separated per Cloud Run
+      #   state and an unfiltered sum would include stale states.
+      query: |
+        (
+          sum by (revision_name) (
+            avg_over_time(
+              run_googleapis_com:container_instance_count{
+                monitored_resource="cloud_run_revision",
+                service_name="worshiptranslate-backend",
+                state=~"active|idle"
+              }[2m]
+            )
+          ) > 0
+        )
+        unless on (revision_name)
+        (
+          sum by (revision_name) (
+            rate(
+              logging_googleapis_com:user_redis_pubsub_active_probe_success{
+                monitored_resource="cloud_run_revision"
+              }[2m]
+            ) > 0
+          )
+        )
+      duration: 120s
+      evaluationInterval: 60s
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s

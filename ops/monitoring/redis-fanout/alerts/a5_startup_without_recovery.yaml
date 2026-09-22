@@ -1,0 +1,70 @@
+# Alert A5 — a startup failure that did not recover within the
+# adapter's `REDIS_RECOVERY_DEADLINE_SEC` (default 300 s).
+#
+# The earlier round-2 PromQL design tried to express this with
+# a rolling-window `unless` join. The reviewer flagged three
+# problems with that shape:
+#
+#   1. `duration:60s` allowed paging ~1 min after startup_failed,
+#      not 5 min unrecovered.
+#   2. A reconnect success 4 min BEFORE the failure suppressed
+#      the alert (rolling window has no event-ordering
+#      guarantee).
+#   3. If the failure event drifted out of the [5m] window before
+#      the alert evaluated, the whole condition disappeared and
+#      nothing fired.
+#
+# Fix: emit `redis_pubsub_recovery_deadline_missed` from the
+# adapter after the deadline (see
+# `RedisPubSub._check_recovery_deadline`), and page on any
+# occurrence of that event. All three problems disappear because
+# the emission itself is the deadline-aware, ordered signal.
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a5-startup-without-recovery. Runbook URL
+# lives in the documentation markdown.
+#
+# Manifest anchor: alerts.a5_startup_without_recovery
+displayName: "[Redis fanout] A5 startup-failed without recovery (per instance)"
+combiner: OR
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a5-startup-without-recovery
+  runbook: redis-fanout-alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A5 — Redis pubsub startup failed and adapter did not recover
+
+    The adapter on some instance emitted
+    `redis_pubsub_recovery_deadline_missed`, meaning
+    `REDIS_RECOVERY_DEADLINE_SEC` (default 300 s) elapsed after
+    `redis_pubsub_initial_connect_failed` without a
+    `redis_pubsub_reconnected` on the SAME instance.
+
+    Runbook: see `docs/03-analysis/redis-fanout-rollout-proposal.md#alerts`
+    in the deepgram repo for the diagnostic sequence. Do NOT
+    silently roll back — a rollback reintroduces the
+    local-only-broadcast fallback that A5-legacy alerts on.
+conditions:
+  - displayName: recovery_deadline_missed > 0 per instance (5 min)
+    conditionThreshold:
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_recovery_deadline_missed"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - resource.label.revision_name
+            - metric.label.instance_id
+      comparison: COMPARISON_GT
+      thresholdValue: 0
+      duration: 0s
+      trigger:
+        count: 1
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s

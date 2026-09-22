@@ -1,0 +1,66 @@
+# Alert A6 — reader loop stuck in reconnect. > 3 attempts in
+# 5 min on some instance without any reconnect success on the
+# same instance.
+#
+# PromQL `unless` join on (revision_name, instance_id)
+# enforces the "same instance" requirement that a two-condition
+# `combiner: AND` cannot (AND at the alert level can be
+# satisfied by two different resources).
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a6-reconnect-without-success. Runbook URL
+# lives in the documentation markdown.
+#
+# Manifest anchor: alerts.a6_reconnect_without_success
+displayName: "[Redis fanout] A6 reconnect stuck without success (per instance)"
+combiner: OR
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a6-reconnect-without-success
+  runbook: redis-fanout-alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A6 — Reader loop is retrying without ever succeeding
+
+    An instance emitted `redis_pubsub_reconnecting` more than
+    3 times AND has NOT emitted `redis_pubsub_reconnected` in
+    the same 5-minute window. Investigate VPC path,
+    Memorystore health, and AUTH first.
+
+    Runbook: see `docs/03-analysis/redis-fanout-rollout-proposal.md#alerts`.
+conditions:
+  - displayName: reconnect_attempts > 3 AND no reconnect_successes (per instance, 5 min)
+    conditionPrometheusQueryLanguage:
+      # `monitored_resource="cloud_run_revision"` is a fail-closed
+      # selector — Google explicitly warns that log-based /
+      # user-defined metrics can map to multiple monitored-resource
+      # types, and an unqualified selector would let series from
+      # a stray resource enter the vector and drop or trigger the
+      # join unexpectedly. See PR #39 round-3 blocker #2.
+      query: |
+        (
+          sum by (revision_name, instance_id) (
+            increase(
+              logging_googleapis_com:user_redis_pubsub_reconnect_attempts{
+                monitored_resource="cloud_run_revision"
+              }[5m]
+            )
+          ) > 3
+        )
+        unless on (revision_name, instance_id)
+        (
+          sum by (revision_name, instance_id) (
+            increase(
+              logging_googleapis_com:user_redis_pubsub_reconnect_successes{
+                monitored_resource="cloud_run_revision"
+              }[5m]
+            )
+          ) > 0
+        )
+      duration: 60s
+      evaluationInterval: 60s
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s
