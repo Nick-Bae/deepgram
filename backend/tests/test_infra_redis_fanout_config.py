@@ -104,12 +104,12 @@ class InfraConfigValidatorTests(unittest.TestCase):
         self.assertTrue(c.ok, c.detail)
 
     def test_all_cross_resource_invariants_hold(self):
-        # 5 invariants after PR #40 round-2: the four original
+        # 6 invariants after PR #40 round-3: the four original
         # cross-resource pairings plus
-        # `memorystore_declaration_is_fail_closed` which pins
-        # Memorystore tier/version/region/capacity.
+        # `memorystore_declaration_is_fail_closed` (round-2) plus
+        # `cloudrun_redis_password_binding_is_valid` (round-3).
         checks = [c for c in self.report.checks if c.name.startswith("invariant:")]
-        self.assertEqual(len(checks), 5)
+        self.assertEqual(len(checks), 6)
         for c in checks:
             self.assertTrue(c.ok, f"{c.name}: {c.detail}")
 
@@ -511,6 +511,272 @@ class InfraMemorystoreDeclarationTests(unittest.TestCase):
             lambda L: L["memorystore"]["metadata"].__setitem__(
                 "region", "us-east1"),
         )
+
+
+class InfraServerlessConnectorBindingTests(unittest.TestCase):
+    """Reviewer's PR #40 round-3 blocker #1: the serverless-mode
+    branch only checked that the annotation KEY existed — an
+    empty or wrong-shaped `value` / `value_from` slipped through.
+    Regression barrier now pins the annotation to
+    `value_from: vpc.serverless_connector.name`."""
+
+    def _load_all(self):
+        import yaml  # type: ignore
+        with _validate.MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            manifest = yaml.safe_load(f)
+        loaded: dict[str, dict] = {}
+        for name, meta in manifest["resources"].items():
+            path = _OPS_DIR / meta["file"]
+            with path.open("r", encoding="utf-8") as f:
+                loaded[name] = yaml.safe_load(f)
+        return manifest, loaded
+
+    def _configure_serverless_mode(self, loaded: dict[str, dict], *, annotation: dict):
+        """Put the config in serverless_connector mode with a
+        supplied Cloud Run annotation for the connector key."""
+        loaded["vpc"]["metadata"]["active_mode"] = "serverless_connector"
+        loaded["vpc"]["spec"]["serverless_connector"]["name"] = "worshiptranslate-conn"
+        # Empty direct so the mixed-mode check doesn't fire first.
+        loaded["vpc"]["spec"]["direct_egress"]["network_interfaces_json"] = ""
+        # Replace the network-interfaces annotation with the
+        # connector annotation the test wants.
+        annots = (
+            loaded["cloudrun"]["spec"]["template"]["metadata"]
+            ["required_template_annotations"]
+        )
+        loaded["cloudrun"]["spec"]["template"]["metadata"][
+            "required_template_annotations"] = [
+            a for a in annots
+            if a.get("key") != "run.googleapis.com/network-interfaces"
+        ]
+        loaded["cloudrun"]["spec"]["template"]["metadata"][
+            "required_template_annotations"].append(annotation)
+
+    def _run_against(self, manifest: dict, loaded: dict[str, dict]):
+        import yaml  # type: ignore
+        from unittest.mock import patch as _patch
+        tmp = Path(tempfile.mkdtemp(prefix="infra-serverless-"))
+        for name, meta in manifest["resources"].items():
+            fname = Path(meta["file"]).name
+            (tmp / fname).write_text(
+                yaml.safe_dump(loaded[name]), encoding="utf-8",
+            )
+            meta["file"] = fname
+        (tmp / "manifest.yaml").write_text(
+            yaml.safe_dump(manifest), encoding="utf-8",
+        )
+        with _patch.object(_validate, "MANIFEST_PATH", tmp / "manifest.yaml"), \
+             _patch.object(_validate, "HERE", tmp):
+            return _validate.load_and_validate()
+
+    def _vpc_check(self, report):
+        return next(
+            (c for c in report.checks
+             if c.name == "invariant:vpc_mode_matches_cloudrun_annotations"),
+            None,
+        )
+
+    def test_connector_annotation_bound_via_value_from_passes(self):
+        manifest, loaded = self._load_all()
+        self._configure_serverless_mode(loaded, annotation={
+            "key": "run.googleapis.com/vpc-access-connector",
+            "value_from": "vpc.serverless_connector.name",
+        })
+        report = self._run_against(manifest, loaded)
+        c = self._vpc_check(report)
+        self.assertIsNotNone(c)
+        self.assertTrue(c.ok, f"correct binding rejected: {c.detail}")
+
+    def test_connector_annotation_empty_value_from_fails(self):
+        manifest, loaded = self._load_all()
+        self._configure_serverless_mode(loaded, annotation={
+            "key": "run.googleapis.com/vpc-access-connector",
+            "value_from": "",  # empty
+        })
+        report = self._run_against(manifest, loaded)
+        c = self._vpc_check(report)
+        self.assertFalse(c.ok)
+        self.assertIn("value_from", c.detail)
+
+    def test_connector_annotation_wrong_value_from_fails(self):
+        manifest, loaded = self._load_all()
+        self._configure_serverless_mode(loaded, annotation={
+            "key": "run.googleapis.com/vpc-access-connector",
+            "value_from": "vpc.direct_egress.network_interfaces_json",
+        })
+        report = self._run_against(manifest, loaded)
+        c = self._vpc_check(report)
+        self.assertFalse(c.ok)
+        self.assertIn("value_from", c.detail)
+
+    def test_connector_annotation_literal_value_fails(self):
+        """A literal `value` alongside value_from creates two
+        sources of truth — refuse. Direct literal only, no
+        value_from, also refused."""
+        manifest, loaded = self._load_all()
+        self._configure_serverless_mode(loaded, annotation={
+            "key": "run.googleapis.com/vpc-access-connector",
+            "value": "projects/x/locations/us-central1/connectors/foo",
+        })
+        report = self._run_against(manifest, loaded)
+        c = self._vpc_check(report)
+        self.assertFalse(c.ok)
+        # Either the value_from-missing check or the literal-value
+        # check surfaces — both reject this shape.
+        self.assertTrue(
+            "value_from" in c.detail or "literal" in c.detail,
+            c.detail,
+        )
+
+
+class InfraCloudRunRedisPasswordBindingTests(unittest.TestCase):
+    """Reviewer's PR #40 round-3 blocker #2: without an
+    end-to-end binding check, a plaintext REDIS_PASSWORD, a
+    mis-typed `value_from`, or a `kind=literal` could pass
+    validation. Task #137 would deploy the wrong secret.
+
+    Also covers the tightened secret_name↔secret_key_ref.name
+    and version↔secret_key_ref.key agreement in
+    _check_auth_matches_secret."""
+
+    def _load_all(self):
+        import yaml  # type: ignore
+        with _validate.MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            manifest = yaml.safe_load(f)
+        loaded: dict[str, dict] = {}
+        for name, meta in manifest["resources"].items():
+            path = _OPS_DIR / meta["file"]
+            with path.open("r", encoding="utf-8") as f:
+                loaded[name] = yaml.safe_load(f)
+        return manifest, loaded
+
+    def _run_against(self, manifest: dict, loaded: dict[str, dict]):
+        import yaml  # type: ignore
+        from unittest.mock import patch as _patch
+        tmp = Path(tempfile.mkdtemp(prefix="infra-secret-"))
+        for name, meta in manifest["resources"].items():
+            fname = Path(meta["file"]).name
+            (tmp / fname).write_text(
+                yaml.safe_dump(loaded[name]), encoding="utf-8",
+            )
+            meta["file"] = fname
+        (tmp / "manifest.yaml").write_text(
+            yaml.safe_dump(manifest), encoding="utf-8",
+        )
+        with _patch.object(_validate, "MANIFEST_PATH", tmp / "manifest.yaml"), \
+             _patch.object(_validate, "HERE", tmp):
+            return _validate.load_and_validate()
+
+    def _env(self, loaded: dict, name: str):
+        for e in loaded["cloudrun"]["spec"]["template"]["spec"]["containers"][0]["env"]:
+            if e.get("name") == name:
+                return e
+        return None
+
+    def _fails_with(self, expected_check: str, substr: str, mutator):
+        manifest, loaded = self._load_all()
+        mutator(loaded)
+        report = self._run_against(manifest, loaded)
+        c = next((x for x in report.checks if x.name == expected_check), None)
+        self.assertIsNotNone(c, f"{expected_check!r} did not run")
+        self.assertFalse(c.ok, f"{expected_check!r} unexpectedly passed")
+        self.assertIn(substr, c.detail)
+
+    def test_redis_password_kind_literal_is_rejected(self):
+        def _mutate(L):
+            e = self._env(L, "REDIS_PASSWORD")
+            e["kind"] = "literal"
+        self._fails_with(
+            "invariant:cloudrun_redis_password_binding_is_valid",
+            "secret_or_absent",
+            _mutate,
+        )
+
+    def test_redis_password_plaintext_value_is_rejected(self):
+        def _mutate(L):
+            e = self._env(L, "REDIS_PASSWORD")
+            e["value"] = "hunter2"
+        self._fails_with(
+            "invariant:cloudrun_redis_password_binding_is_valid",
+            "literal `value`",
+            _mutate,
+        )
+
+    def test_redis_password_wrong_value_from_is_rejected(self):
+        def _mutate(L):
+            e = self._env(L, "REDIS_PASSWORD")
+            e["value_from"] = "secrets.some_other_secret"
+        self._fails_with(
+            "invariant:cloudrun_redis_password_binding_is_valid",
+            "value_from",
+            _mutate,
+        )
+
+    def test_secret_name_disagrees_with_secret_key_ref_name(self):
+        def _mutate(L):
+            L["secrets"]["spec"]["redis_password"]["secret_name"] = "wrong-name"
+        self._fails_with(
+            "invariant:memorystore_auth_matches_secret_binding",
+            "secret_name",
+            _mutate,
+        )
+
+    def test_version_disagrees_with_secret_key_ref_key(self):
+        def _mutate(L):
+            L["secrets"]["spec"]["redis_password"]["version"] = "5"
+        self._fails_with(
+            "invariant:memorystore_auth_matches_secret_binding",
+            "version",
+            _mutate,
+        )
+
+
+class InfraMemorySizeBoolIsIntTests(unittest.TestCase):
+    """Reviewer's PR #40 round-3 small-hardening item:
+    `isinstance(True, int)` returns True in Python. Explicit
+    bool rejection prevents a stray `memory_size_gb: true`
+    from passing."""
+
+    def _load_all(self):
+        import yaml  # type: ignore
+        with _validate.MANIFEST_PATH.open("r", encoding="utf-8") as f:
+            manifest = yaml.safe_load(f)
+        loaded: dict[str, dict] = {}
+        for name, meta in manifest["resources"].items():
+            path = _OPS_DIR / meta["file"]
+            with path.open("r", encoding="utf-8") as f:
+                loaded[name] = yaml.safe_load(f)
+        return manifest, loaded
+
+    def _run_against(self, manifest: dict, loaded: dict[str, dict]):
+        import yaml  # type: ignore
+        from unittest.mock import patch as _patch
+        tmp = Path(tempfile.mkdtemp(prefix="infra-int-"))
+        for name, meta in manifest["resources"].items():
+            fname = Path(meta["file"]).name
+            (tmp / fname).write_text(
+                yaml.safe_dump(loaded[name]), encoding="utf-8",
+            )
+            meta["file"] = fname
+        (tmp / "manifest.yaml").write_text(
+            yaml.safe_dump(manifest), encoding="utf-8",
+        )
+        with _patch.object(_validate, "MANIFEST_PATH", tmp / "manifest.yaml"), \
+             _patch.object(_validate, "HERE", tmp):
+            return _validate.load_and_validate()
+
+    def test_memory_size_gb_true_is_rejected(self):
+        manifest, loaded = self._load_all()
+        loaded["memorystore"]["spec"]["memory_size_gb"] = True
+        report = self._run_against(manifest, loaded)
+        c = next(
+            (x for x in report.checks
+             if x.name == "invariant:memorystore_declaration_is_fail_closed"),
+            None,
+        )
+        self.assertIsNotNone(c)
+        self.assertFalse(c.ok, "bool `True` passed the int check")
+        self.assertIn("bool excluded", c.detail)
 
 
 class InfraApplyControlFlowTests(unittest.TestCase):

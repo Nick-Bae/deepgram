@@ -113,7 +113,7 @@ cross_resource_invariants:
       Fail-closed validation of every Memorystore knob PR #31
       §4c step 3 requires: tier=STANDARD_HA (not Basic),
       redis_version=REDIS_7_2, region=us-central1,
-      memory_size_gb in [1, 32], transit_encryption_mode=DISABLED
+      memory_size_gb in [1, 32] (bool excluded), transit_encryption_mode=DISABLED
       (paired with the client-ssl invariant above), non-empty
       host_binding.
     references:
@@ -123,6 +123,25 @@ cross_resource_invariants:
       - memorystore.spec.memory_size_gb
       - memorystore.spec.transit_encryption_mode
       - memorystore.spec.host_binding
+  - name: cloudrun_redis_password_binding_is_valid
+    description: |
+      End-to-end binding check on the REDIS_PASSWORD env:
+        - `kind` MUST be 'secret_or_absent';
+        - no plaintext `value` field is allowed;
+        - `value_from` MUST equal 'secrets.redis_password' so
+          the env resolves to the managed secret block, not
+          some other place.
+      Complements memorystore_auth_matches_secret_binding, which
+      now also checks secret_name==secret_key_ref.name AND
+      version==secret_key_ref.key so a mismatched Secret Manager
+      version cannot slip through.
+    references:
+      - cloudrun.spec.template.spec.containers[0].env[?(@.name=='REDIS_PASSWORD')].value_from
+      - cloudrun.spec.template.spec.containers[0].env[?(@.name=='REDIS_PASSWORD')].kind
+      - secrets.spec.redis_password.secret_name
+      - secrets.spec.redis_password.version
+      - secrets.spec.redis_password.secret_key_ref.name
+      - secrets.spec.redis_password.secret_key_ref.key
 
 # Allowlist — production projects infra_apply.py will plan against.
 # Same shape as ops/monitoring/redis-fanout/manifest.yaml.

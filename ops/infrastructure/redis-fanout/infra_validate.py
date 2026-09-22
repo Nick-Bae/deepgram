@@ -283,6 +283,8 @@ def _validate_cross_resource_invariants(
             _check_transit_encryption,
         "memorystore_declaration_is_fail_closed":
             _check_memorystore_declaration,
+        "cloudrun_redis_password_binding_is_valid":
+            _check_cloudrun_redis_password_binding,
     }
     for inv in manifest.get("cross_resource_invariants", []) or []:
         name = inv.get("name", "")
@@ -458,6 +460,28 @@ def _check_vpc_matches_cloudrun(loaded: dict[str, dict]) -> tuple[bool, str]:
             f"vpc.serverless_connector.egress={connector.get('egress')!r} "
             f"— expected 'all-traffic'"
         )
+    # The connector annotation MUST bind to
+    # `vpc.serverless_connector.name` via value_from. An empty or
+    # wrong literal `value` here previously slipped through
+    # unchecked — a partial-mode-switch failure the reviewer
+    # flagged in PR #40 round-3.
+    conn_annot = annot["run.googleapis.com/vpc-access-connector"]
+    conn_value_from = conn_annot.get("value_from")
+    conn_literal = conn_annot.get("value")
+    if conn_value_from != "vpc.serverless_connector.name":
+        return False, (
+            f"cloudrun `run.googleapis.com/vpc-access-connector` "
+            f"annotation must be `value_from: "
+            f"vpc.serverless_connector.name` — got value_from="
+            f"{conn_value_from!r}, value={conn_literal!r}"
+        )
+    if conn_literal is not None:
+        return False, (
+            f"cloudrun `run.googleapis.com/vpc-access-connector` "
+            f"annotation carries a literal `value={conn_literal!r}` in "
+            f"addition to value_from — remove the literal so the source "
+            f"of truth stays in vpc.serverless_connector.name"
+        )
     return True, ""
 
 
@@ -509,7 +533,11 @@ def _check_auth_matches_secret(loaded: dict[str, dict]) -> tuple[bool, str]:
             f"secrets.redis_password.present={present!r} — pick one mode"
         )
 
-    # When AUTH is on, the full secret binding must be declared.
+    # When AUTH is on, the full secret binding must be declared
+    # AND the top-level `secret_name`/`version` must match the
+    # secretKeyRef `name`/`key` — a mismatch means the operator
+    # copy-pasted from a different secret and the Cloud Run env
+    # would reference a version that does not exist.
     if auth:
         skref = pw.get("secret_key_ref")
         if not isinstance(skref, dict):
@@ -532,7 +560,64 @@ def _check_auth_matches_secret(loaded: dict[str, dict]) -> tuple[bool, str]:
                     f"secrets.spec.redis_password.{key}={v!r} is "
                     f"missing or not a non-empty string"
                 )
+        # Cross-field agreement (reviewer's PR #40 round-3 blocker):
+        # secret_name → secret_key_ref.name; version → secret_key_ref.key.
+        if pw["secret_name"] != skref["name"]:
+            return False, (
+                f"secrets.spec.redis_password.secret_name="
+                f"{pw['secret_name']!r} does not match "
+                f"secret_key_ref.name={skref['name']!r} — they must "
+                f"reference the same Secret Manager secret"
+            )
+        if pw["version"] != skref["key"]:
+            return False, (
+                f"secrets.spec.redis_password.version={pw['version']!r} "
+                f"does not match secret_key_ref.key={skref['key']!r} — "
+                f"the Cloud Run env would resolve a different version "
+                f"than the operator documented"
+            )
 
+    return True, ""
+
+
+def _check_cloudrun_redis_password_binding(loaded: dict[str, dict]) -> tuple[bool, str]:
+    """End-to-end binding check for the REDIS_PASSWORD env on
+    Cloud Run against secrets.yaml. Reviewer's PR #40 round-3
+    blocker: a plaintext value here, or a `value_from` that
+    references something OTHER than the managed secret block,
+    would have passed the earlier validator."""
+    envs = (
+        (loaded.get("cloudrun") or {}).get("spec", {})
+        .get("template", {}).get("spec", {})
+        .get("containers", [{}])[0].get("env", [])
+    )
+    redis_password = next(
+        (e for e in envs if isinstance(e, dict) and e.get("name") == "REDIS_PASSWORD"),
+        None,
+    )
+    if redis_password is None:
+        return False, "cloudrun env missing REDIS_PASSWORD"
+
+    kind = redis_password.get("kind")
+    if kind != "secret_or_absent":
+        return False, (
+            f"cloudrun REDIS_PASSWORD.kind={kind!r} — must be "
+            f"'secret_or_absent' so the value is sourced from Secret "
+            f"Manager (never a literal in the manifest)"
+        )
+    if "value" in redis_password:
+        return False, (
+            f"cloudrun REDIS_PASSWORD carries a literal `value` field "
+            f"({redis_password.get('value')!r}) — remove it. The Secret "
+            f"Manager binding is the source of truth."
+        )
+    value_from = redis_password.get("value_from")
+    if value_from != "secrets.redis_password":
+        return False, (
+            f"cloudrun REDIS_PASSWORD.value_from={value_from!r} — must "
+            f"be 'secrets.redis_password' so the env resolves to the "
+            f"declared secret binding, not some other block"
+        )
     return True, ""
 
 
@@ -569,11 +654,15 @@ def _check_memorystore_declaration(loaded: dict[str, dict]) -> tuple[bool, str]:
         )
 
     memsize = mem.get("memory_size_gb")
-    if not isinstance(memsize, int) or memsize < _MEMORYSTORE_MEMORY_MIN_GB \
+    # `isinstance(True, int)` is True in Python — explicitly
+    # reject bools so `memory_size_gb: true` cannot pass. The
+    # reviewer's PR #40 round-3 "small hardening item".
+    if isinstance(memsize, bool) or not isinstance(memsize, int) \
+            or memsize < _MEMORYSTORE_MEMORY_MIN_GB \
             or memsize > _MEMORYSTORE_MEMORY_MAX_GB:
         return False, (
             f"memorystore.spec.memory_size_gb={memsize!r} — must be an "
-            f"int in [{_MEMORYSTORE_MEMORY_MIN_GB}, "
+            f"int (bool excluded) in [{_MEMORYSTORE_MEMORY_MIN_GB}, "
             f"{_MEMORYSTORE_MEMORY_MAX_GB}]"
         )
 
