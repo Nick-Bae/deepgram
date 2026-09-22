@@ -64,10 +64,16 @@ class _FakeRef:
         self._holder = holder
         self._key = key
         self._get_calls = 0
+        self._get_kwargs: list[dict] = []
         self._set_calls: list[dict] = []
 
-    def get(self, transaction=None):
+    def get(self, transaction=None, *, timeout=None, retry="__default__"):
+        # Real firestore.DocumentReference.get() accepts `timeout`
+        # and `retry`. The fake records what was passed so tests
+        # can assert the writer forwarded bounded kwargs from
+        # `client.read_gate()`.
         self._get_calls += 1
+        self._get_kwargs.append({"timeout": timeout, "retry": retry})
         return _FakeSnapshot(self._holder.get(self._key))
 
     def set(self, payload):
@@ -120,6 +126,16 @@ class _FakeClient:
     def gate_ref(self):
         return self._ref
 
+    def read_gate(self, *, transaction=None):
+        # Mirror the production `GateDocClient.read_gate`
+        # contract: forwards bounded kwargs to the ref. Tests
+        # can then assert those bounds were applied.
+        return self._ref.get(
+            transaction=transaction,
+            timeout=writer._RPC_TIMEOUT_SEC,
+            retry=None,
+        )
+
     def server_timestamp(self):
         return "<test-server-ts>"
 
@@ -128,8 +144,16 @@ def _run_cli(
     argv: list[str],
     *,
     client: Optional[_FakeClient] = None,
+    env_overrides: Optional[dict[str, Optional[str]]] = None,
 ) -> tuple[int, str, str]:
-    """Return (exit_code, stdout, stderr)."""
+    """Return (exit_code, stdout, stderr).
+
+    `env_overrides` mutates os.environ inside a context — keys with
+    a `None` value are DELETED; string values are set. Restored on
+    exit. Default: the emulator target requires FIRESTORE_EMULATOR_HOST
+    to be present, so we set it to a benign fake value so the env
+    check passes for the fake_client tests. Tests that exercise the
+    env check itself override this."""
     if client is None:
         client = _FakeClient()
 
@@ -143,17 +167,18 @@ def _run_cli(
         )
         return client
 
-    # Patch the `transactional` decorator inside the writer so the
-    # fake transaction body runs directly (no google-cloud-firestore
-    # dependency for unit tests).
-    def _passthrough_transactional(fn):
-        def _run(transaction):
-            return fn(transaction)
-        return _run
+    # Default env for the fake path: emulator target expects
+    # FIRESTORE_EMULATOR_HOST set. Tests that need to exercise the
+    # env check itself pass their own overrides.
+    effective_env: dict[str, Optional[str]] = {
+        "FIRESTORE_EMULATOR_HOST": "127.0.0.1:0",  # fake — never contacted
+    }
+    if env_overrides:
+        effective_env.update(env_overrides)
 
     out = io.StringIO()
     err = io.StringIO()
-    with patch.object(
+    with _patched_env(effective_env), patch.object(
         writer, "_run_write", new=_fake_run_write,
     ), redirect_stdout(out), redirect_stderr(err):
         try:
@@ -166,6 +191,29 @@ def _run_cli(
     return rc, out.getvalue(), err.getvalue()
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def _patched_env(overrides: dict[str, Optional[str]]):
+    """Set/unset the given env vars for the duration of the block."""
+    original: dict[str, Optional[str]] = {}
+    try:
+        for key, value in overrides.items():
+            original[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, prev in original.items():
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
 def _fake_run_write(client, op, *, server_ts):
     """Runs the same logic as the real `_run_write` but against the
     _FakeClient's transaction (no `firestore.transactional` decorator
@@ -173,7 +221,7 @@ def _fake_run_write(client, op, *, server_ts):
     on the google-cloud-firestore install."""
     ref = client.gate_ref()
     tx = client.transaction()
-    snap = ref.get(transaction=tx)
+    snap = client.read_gate(transaction=tx)
     current_view = writer._parse_gate_doc(
         snap.to_dict() if snap.exists else None,
     )
@@ -537,6 +585,93 @@ class DeployGateWriterUnitTests(unittest.TestCase):
         rc, _, err = _run_cli(self.ARGS_PROJECT + ["status", "--force-repair"])
         self.assertNotEqual(rc, 0)
 
+    # --- env-target mismatch (fail-closed on FIRESTORE_EMULATOR_HOST) --
+
+    def test_production_target_refuses_when_emulator_env_set(self):
+        """If a production project/database is passed but
+        FIRESTORE_EMULATOR_HOST is set, the Google Firestore client
+        would silently redirect to the emulator. The writer must
+        refuse without opening a client."""
+        rc, _, err = _run_cli(
+            ["--project", "sturdy-dogfish-472313-k6",
+             "--database", "worship-translation",
+             "status"],
+            env_overrides={"FIRESTORE_EMULATOR_HOST": "127.0.0.1:8085"},
+        )
+        self.assertEqual(rc, 6, err)
+        self.assertIn("FIRESTORE_EMULATOR_HOST", err)
+        self.assertIn("production", err)
+
+    def test_emulator_target_refuses_when_emulator_env_unset(self):
+        """The emulator allowlist entry MUST have
+        FIRESTORE_EMULATOR_HOST set. Otherwise the client would
+        talk to real Firestore under the emulator project id."""
+        rc, _, err = _run_cli(
+            ["--project", "cleanup-track1-emulator",
+             "--database", "(default)",
+             "status"],
+            env_overrides={"FIRESTORE_EMULATOR_HOST": None},
+        )
+        self.assertEqual(rc, 6, err)
+        self.assertIn("FIRESTORE_EMULATOR_HOST", err)
+        self.assertIn("emulator", err)
+
+    # --- bounded per-RPC timeout + retry=None on reads ------------------
+
+    def test_status_read_forwards_bounded_kwargs(self):
+        """`client.read_gate()` must forward `timeout` and
+        `retry=None` down to the Firestore document read. Regressions
+        that drop either kwarg would remove the operator's per-RPC
+        upper bound."""
+        client = _FakeClient(initial={
+            "blocked": False, "revision": 1,
+            "reason": "", "blocked_by": "", "blocked_at": None,
+        })
+        rc, _, err = _run_cli(self.ARGS_PROJECT + ["status"], client=client)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(client._ref._get_kwargs), 1)
+        kwargs = client._ref._get_kwargs[0]
+        self.assertEqual(kwargs["timeout"], writer._RPC_TIMEOUT_SEC)
+        self.assertIsNone(kwargs["retry"])
+
+    def test_dry_run_read_forwards_bounded_kwargs(self):
+        client = _FakeClient(initial={
+            "blocked": False, "revision": 2,
+            "reason": "", "blocked_by": "", "blocked_at": None,
+        })
+        rc, _, err = _run_cli(
+            self.ARGS_PROJECT + [
+                "block", "--expected-revision", "2",
+                "--reason", "x", "--blocked-by", "y",
+            ],
+            client=client,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(client._ref._get_kwargs), 1)
+        kwargs = client._ref._get_kwargs[0]
+        self.assertEqual(kwargs["timeout"], writer._RPC_TIMEOUT_SEC)
+        self.assertIsNone(kwargs["retry"])
+
+    def test_transactional_read_forwards_bounded_kwargs(self):
+        """The transactional read inside `_run_write` must also
+        forward the bounded kwargs — via the same `client.read_gate`
+        path."""
+        client = _FakeClient()
+        rc, _, err = _run_cli(
+            self.ARGS_PROJECT + [
+                "block", "--expected-revision", "0",
+                "--reason", "x", "--blocked-by", "y",
+                "--apply", "--confirm", writer.CONFIRMATION_TOKEN,
+            ],
+            client=client,
+        )
+        self.assertEqual(rc, 0, err)
+        # One read inside the transaction; kwargs are bounded.
+        self.assertEqual(len(client._ref._get_kwargs), 1)
+        kwargs = client._ref._get_kwargs[0]
+        self.assertEqual(kwargs["timeout"], writer._RPC_TIMEOUT_SEC)
+        self.assertIsNone(kwargs["retry"])
+
     # --- output sanitization -------------------------------------------
 
     def test_output_never_prints_unlisted_fields(self):
@@ -726,6 +861,102 @@ class DeployGateWriterFirestoreTests(unittest.TestCase):
         snap = self._ref.get()
         self.assertTrue(snap.to_dict()["blocked"])
         self.assertEqual(snap.to_dict()["revision"], 1)
+
+    def test_concurrent_writers_exactly_one_commits(self):
+        """Two writers race against the same expected_revision=0 on
+        an absent document. Exactly one must commit; the other must
+        surface the stale-revision result; the final document
+        revision must have advanced by exactly one.
+
+        Distinct from the sequential stale test above: here BOTH
+        writers open transactions concurrently, without either
+        having seen the other's write. The Firestore transactional
+        wrapper's own conflict-retry then re-runs the losing body,
+        which now reads the just-committed revision=1 and refuses
+        the operator's original expected_revision=0.
+        """
+        import threading
+        from google.cloud import firestore  # type: ignore
+
+        client_a = writer.GateDocClient(
+            project="cleanup-track1-emulator", database="(default)",
+        )
+        client_b = writer.GateDocClient(
+            project="cleanup-track1-emulator", database="(default)",
+        )
+        server_ts_a = client_a.server_timestamp()
+        server_ts_b = client_b.server_timestamp()
+
+        op_a = writer.GateOperation(
+            action="block", expected_revision=0,
+            reason="racer-A", blocked_by="op-A",
+        )
+        op_b = writer.GateOperation(
+            action="block", expected_revision=0,
+            reason="racer-B", blocked_by="op-B",
+        )
+
+        results: dict[str, object] = {}
+        errors: dict[str, BaseException] = {}
+        # Barrier so both threads open their transaction and issue
+        # the first read at roughly the same instant. Without this,
+        # one thread may finish before the other starts, which
+        # would still meet the acceptance criteria but wouldn't
+        # actually exercise the concurrent-transaction path.
+        barrier = threading.Barrier(2)
+
+        def _drive(name: str, client, op, server_ts):
+            try:
+                try:
+                    barrier.wait(timeout=10.0)
+                except threading.BrokenBarrierError:
+                    pass
+                results[name] = writer._run_write(
+                    client, op, server_ts=server_ts,
+                )
+            except writer.StaleRevisionError as exc:
+                results[name] = {"kind": "stale", "reason": str(exc)}
+            except BaseException as exc:  # pragma: no cover
+                errors[name] = exc
+
+        t_a = threading.Thread(
+            target=_drive, args=("A", client_a, op_a, server_ts_a),
+        )
+        t_b = threading.Thread(
+            target=_drive, args=("B", client_b, op_b, server_ts_b),
+        )
+        t_a.start(); t_b.start()
+        t_a.join(timeout=30.0); t_b.join(timeout=30.0)
+
+        self.assertEqual(errors, {}, f"unexpected exceptions: {errors!r}")
+        self.assertEqual(set(results), {"A", "B"})
+
+        committed = [
+            name for name, r in results.items()
+            if isinstance(r, dict) and r.get("kind") == "committed"
+        ]
+        stale = [
+            name for name, r in results.items()
+            if isinstance(r, dict) and r.get("kind") == "stale"
+        ]
+        self.assertEqual(
+            len(committed), 1,
+            f"expected exactly one committer, got {results!r}",
+        )
+        self.assertEqual(
+            len(stale), 1,
+            f"expected exactly one stale-refusal, got {results!r}",
+        )
+
+        # Final state — exactly one revision bump, from 0 to 1.
+        snap = self._ref.get()
+        data = snap.to_dict()
+        self.assertIsNotNone(data)
+        self.assertTrue(data["blocked"])
+        self.assertEqual(data["revision"], 1)
+        # The reason field belongs to the WINNER, not the loser.
+        winner_op = op_a if committed[0] == "A" else op_b
+        self.assertEqual(data["reason"], winner_op.reason)
 
 
 if __name__ == "__main__":
