@@ -308,46 +308,13 @@ def build_tick_roster(
 # --- Cloud Monitoring pass ------------------------------------------------
 
 
-def fetch_metric_samples(
-    project: str, service_name: str, region: str,
-    lookback_sec: int, deadline: Deadline, rpc_timeout: float,
-) -> list[dict[str, Any]]:
-    """Return per-revision Cloud Run instance count samples in
-    the window. Each entry:
-      {revision_name, active_plus_idle,
-       aligned_sample_timestamp_iso, sample_age_seconds}
-
-    The metric `run.googleapis.com/container/instance_count` is
-    reported PER-INSTANCE, not per-container-within-instance —
-    the earlier `container_name` filter was based on a
-    misremembering of the metric's label set and returned zero
-    series in production (Google documents `instance_count`
-    with only the `state` label). Filter removed.
-
-    `region` pins `resource.labels.location` so a same-named
-    Cloud Run service in a different region cannot contaminate
-    the roster.
-
-    Active + idle values MUST come from the SAME timestamp per
-    revision. Earlier code took the newest point independently
-    per state series then summed, which combined an old-active
-    with a newer-idle while reporting the newer stamp — masking
-    staleness. This implementation collects every (state,
-    timestamp, value) tuple per revision, then picks the newest
-    timestamp at which BOTH states have a point.
-
-    Raises on permission / malformed schema / RPC failure."""
-    from google.cloud import monitoring_v3  # type: ignore
-    from google.api_core import exceptions as gax  # type: ignore
-
-    client = monitoring_v3.MetricServiceClient()
-    now = datetime.now(timezone.utc)
-    interval = monitoring_v3.TimeInterval({
-        "start_time": now - timedelta(seconds=lookback_sec),
-        "end_time": now,
-    })
-
-    metric_filter = (
+def _build_metric_filter(service_name: str, region: str) -> str:
+    """Cloud Monitoring filter string. Extracted so tests can
+    verify the required labels are present and the removed
+    `container_name` label is absent (round-2 blocker: the
+    metric documents only `state`, so a container_name filter
+    returned zero series in production)."""
+    return (
         f'metric.type="run.googleapis.com/container/instance_count" '
         f'AND resource.type="cloud_run_revision" '
         f'AND resource.labels.service_name="{service_name}" '
@@ -355,20 +322,22 @@ def fetch_metric_samples(
         f'AND (metric.labels.state="active" OR metric.labels.state="idle")'
     )
 
-    request = monitoring_v3.ListTimeSeriesRequest({
-        "name": f"projects/{project}",
-        "filter": metric_filter,
-        "interval": interval,
-        "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
-    })
-    pages = client.list_time_series(
-        request=request,
-        timeout=deadline.rpc_timeout(rpc_timeout),
-        retry=None,
-    )
 
-    # Per-revision per-state per-timestamp map:
-    # by_rev[rev][state] = { epoch_seconds_bucket: int_value }
+def _aggregate_metric_series(
+    pages, *, now_epoch: float, deadline: Deadline,
+) -> list[dict[str, Any]]:
+    """Bucket every (rev, state, timestamp) tuple, then pick the
+    newest bucket where BOTH states report a value per revision.
+
+    Extracted from `fetch_metric_samples` so tests can exercise
+    the alignment logic directly with fake TimeSeries fixtures —
+    round-2 tests monkey-patched the whole function, leaving
+    this production-critical path unexercised.
+
+    Raises TimeoutError if the deadline fires while iterating,
+    ValueError on malformed series (missing/wrong-typed
+    revision_name, unexpected metric.labels.state, or a
+    revision that reports only one of the two states)."""
     by_rev: dict[str, dict[str, dict[int, int]]] = {}
     for series in pages:
         if deadline.expired():
@@ -396,7 +365,6 @@ def fetch_metric_samples(
             bucket = int(round(ts_epoch))
             by_state[state][bucket] = int(_extract_point_value(point))
 
-    now_epoch = now.timestamp()
     out: list[dict[str, Any]] = []
     for rev, states in by_rev.items():
         active = states["active"]
@@ -429,6 +397,47 @@ def fetch_metric_samples(
             "sample_age_seconds": round(now_epoch - aligned_bucket, 3),
         })
     return out
+
+
+def fetch_metric_samples(
+    project: str, service_name: str, region: str,
+    lookback_sec: int, deadline: Deadline, rpc_timeout: float,
+) -> list[dict[str, Any]]:
+    """Return per-revision Cloud Run instance count samples in
+    the window. Each entry:
+      {revision_name, active_value, idle_value, active_plus_idle,
+       aligned_sample_timestamp_iso, aligned_sample_timestamp_epoch,
+       sample_age_seconds}
+
+    Thin composition of `_build_metric_filter` and
+    `_aggregate_metric_series` around the Cloud Monitoring
+    client. See those helpers for the reasoning behind the
+    filter shape and alignment rule.
+
+    Raises on permission / malformed schema / RPC failure."""
+    from google.cloud import monitoring_v3  # type: ignore
+    from google.api_core import exceptions as gax  # type: ignore
+
+    client = monitoring_v3.MetricServiceClient()
+    now = datetime.now(timezone.utc)
+    interval = monitoring_v3.TimeInterval({
+        "start_time": now - timedelta(seconds=lookback_sec),
+        "end_time": now,
+    })
+    request = monitoring_v3.ListTimeSeriesRequest({
+        "name": f"projects/{project}",
+        "filter": _build_metric_filter(service_name, region),
+        "interval": interval,
+        "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+    })
+    pages = client.list_time_series(
+        request=request,
+        timeout=deadline.rpc_timeout(rpc_timeout),
+        retry=None,
+    )
+    return _aggregate_metric_series(
+        pages, now_epoch=now.timestamp(), deadline=deadline,
+    )
 
 
 def _extract_point_timestamp(point: Any) -> tuple[str, float]:
@@ -567,6 +576,7 @@ def _run(argv: list[str]) -> int:
 
     try:
         from google.api_core import exceptions as gax  # type: ignore
+        from google.auth import exceptions as gauth  # type: ignore
     except Exception as exc:  # pragma: no cover
         payload.update({
             "tick_roster": [], "cloud_run_metric": [], "roster_union": [],
@@ -588,6 +598,13 @@ def _run(argv: list[str]) -> int:
             args.project, args.service_name, args.region,
             args.tick_window_sec, deadline, args.rpc_timeout_sec,
         )
+    except gauth.DefaultCredentialsError as exc:
+        # ADC not configured — authentication-family failure. The
+        # generic Exception handler below would misclassify this as
+        # rc=9 upstream API failure; the runbook branches on the
+        # distinction so we catch it explicitly.
+        _die_upstream(payload, deadline, ExitCode.PERMISSION,
+                      f"Application Default Credentials not found: {exc}")
     except (gax.PermissionDenied, gax.Unauthenticated) as exc:
         _die_upstream(payload, deadline, ExitCode.PERMISSION,
                       f"Cloud Logging permission denied: {exc.message}")
@@ -617,6 +634,9 @@ def _run(argv: list[str]) -> int:
             args.project, args.service_name, args.region,
             args.metric_lookback_sec, deadline, args.rpc_timeout_sec,
         )
+    except gauth.DefaultCredentialsError as exc:
+        _die_upstream(payload, deadline, ExitCode.PERMISSION,
+                      f"Application Default Credentials not found: {exc}")
     except (gax.PermissionDenied, gax.Unauthenticated) as exc:
         _die_upstream(payload, deadline, ExitCode.PERMISSION,
                       f"Cloud Monitoring permission denied: {exc.message}")

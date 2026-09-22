@@ -186,6 +186,57 @@ class CountLiveRoomsAllowlistUnitTests(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertIn("finite", proc.stderr.lower())
 
+    def test_default_credentials_error_at_construction_returns_rc6(self):
+        """Reviewer's PR #41 R3 blocker #1: ADC missing raises
+        DefaultCredentialsError at firestore.Client(...)
+        construction, BEFORE any RPC. Round-2 code built the
+        client outside the guarded try and emitted a bare
+        traceback — the JSON contract was silently broken. Now
+        the client build is inside try and DefaultCredentialsError
+        maps to rc=6 with a valid JSON payload."""
+        import tempfile as _tempfile
+        tmpdir = Path(_tempfile.mkdtemp(prefix="clr-cred-shim-"))
+        try:
+            shim_path = tmpdir / "shim.py"
+            shim_path.write_text(
+                "import sys\n"
+                f"sys.path.insert(0, {str(_SCRIPTS_DIR)!r})\n"
+                "# Poison firestore.Client so construction raises\n"
+                "# exactly what a missing ADC would raise.\n"
+                "from google.auth import exceptions as gauth\n"
+                "import google.cloud.firestore as gcf\n"
+                "class _RaisingClient:\n"
+                "    def __init__(self, *a, **k):\n"
+                "        raise gauth.DefaultCredentialsError('test: ADC not found')\n"
+                "gcf.Client = _RaisingClient\n"
+                "import count_live_rooms as clr\n"
+                "sys.exit(clr._run(sys.argv[1:]))\n"
+            )
+            env = os.environ.copy()
+            env["FIRESTORE_EMULATOR_HOST"] = "127.0.0.1:0"
+            proc = subprocess.run(
+                [sys.executable, "-u", str(shim_path),
+                 "--project", EMULATOR_PROJECT,
+                 "--database", EMULATOR_DATABASE],
+                capture_output=True, text=True, timeout=30, env=env,
+            )
+            self.assertEqual(
+                proc.returncode, 6,
+                f"expected rc=6, got {proc.returncode}\n"
+                f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}",
+            )
+            # The JSON contract must hold — exactly one line of JSON
+            # on stdout, no bare traceback.
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 1, f"stdout: {proc.stdout!r}")
+            payload = json.loads(lines[0])
+            self.assertEqual(payload["kind"], "live_room_count")
+            self.assertEqual(payload["rc"], 6)
+            self.assertIn("credentials", payload["reason"].lower())
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class CountLiveRoomsDeadlineUnitTests(unittest.TestCase):
 

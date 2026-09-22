@@ -386,6 +386,11 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
             "    from google.api_core import exceptions as gax\n"
             "    raise gax.Unauthenticated('ADC not configured')\n"
         ),
+        "default_credentials": (
+            "def _raise(*a, **k):\n"
+            "    from google.auth import exceptions as gauth\n"
+            "    raise gauth.DefaultCredentialsError('test: ADC not found')\n"
+        ),
         "timeout": (
             "def _raise(*a, **k):\n"
             "    raise TimeoutError('deadline expired during fetch')\n"
@@ -572,6 +577,20 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
         rc, payload, _err = self._run_shim_error("unauthenticated", "metric")
         self.assertEqual(rc, 6)
 
+    def test_rc6_default_credentials_from_ticks(self):
+        """Reviewer's PR #41 R3 blocker: DefaultCredentialsError
+        (ADC missing at client construction) must classify as
+        rc=6, not fall through to the generic Exception handler
+        that would emit rc=9. Runbook branches on the family."""
+        rc, payload, _err = self._run_shim_error("default_credentials", "ticks")
+        self.assertEqual(rc, 6, f"payload={payload!r}")
+        self.assertIn("credentials", payload["reason"].lower())
+
+    def test_rc6_default_credentials_from_metric(self):
+        rc, payload, _err = self._run_shim_error("default_credentials", "metric")
+        self.assertEqual(rc, 6, f"payload={payload!r}")
+        self.assertIn("credentials", payload["reason"].lower())
+
     # --- rc=7 timeout / deadline exceeded ----------------------------
 
     def test_rc7_timeout_from_ticks(self):
@@ -601,27 +620,51 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
         self.assertEqual(len(lines), 1, f"stdout should be one JSON line, got: {stdout!r}")
         json.loads(lines[0])  # must parse
 
-    def test_stdout_one_json_line_across_every_rc(self):
+    def test_stdout_exactly_one_json_line_on_every_non_usage_rc(self):
         """Reviewer's PR #41 blocker: 'exactly-one-JSON
         assertions on every non-usage result'. Argparse-driven
         rc=1 is exempt (argparse writes usage to stderr and
-        exits before emit() runs)."""
-        # rc=0
+        exits before emit() runs). Every other rc — including
+        the shim-injected error paths — must land exactly one
+        JSON object on stdout so the operator's `jq` pipeline
+        never trips."""
+        # rc=0 (verified)
         events = self._clean_tick("rev-a", "i-1")
         metric = [self._fresh_metric("rev-a", 1)]
-        rc0_out = self._captured_stdout_for_shim(events, metric)
-        self._assert_exactly_one_json_line(rc0_out)
-        # rc=3
-        _, _, _ = self._run_shim_error("malformed", "ticks")
-        # rc=6
-        _, _, _ = self._run_shim_error("permission", "metric")
-        # rc=7
-        _, _, _ = self._run_shim_error("timeout", "ticks")
-        # rc=8 empty/empty
-        rc8_out = self._captured_stdout_for_shim([], [])
-        self._assert_exactly_one_json_line(rc8_out)
-        # rc=9
-        _, _, _ = self._run_shim_error("generic", "metric")
+        self._assert_exactly_one_json_line(
+            self._captured_stdout_for_shim(events, metric),
+        )
+        # rc=8 (empty/empty unresolved)
+        self._assert_exactly_one_json_line(
+            self._captured_stdout_for_shim([], []),
+        )
+        # rc=3, 6, 7, 9 — capture stdout from each error shim
+        # and prove it is exactly one parseable JSON line, not
+        # just that the process exited with the right code.
+        # (The individual rc tests validate the exit code +
+        # payload contents; this test proves the stdout contract.)
+        for kind, expected_rc in (
+            ("malformed", 3),
+            ("permission", 6),
+            ("unauthenticated", 6),
+            ("default_credentials", 6),
+            ("timeout", 7),
+            ("generic", 9),
+        ):
+            for which in ("ticks", "metric"):
+                rc, payload, _err = self._run_shim_error(kind, which)
+                self.assertEqual(
+                    rc, expected_rc,
+                    f"kind={kind!r} which={which!r} payload={payload!r}",
+                )
+                # `_run_shim_error` sets payload to {"stdout_raw":
+                # ...} when stdout was not parseable JSON. That
+                # would violate the contract.
+                self.assertNotIn(
+                    "stdout_raw", payload,
+                    f"kind={kind!r} which={which!r} did not emit valid JSON: "
+                    f"{payload!r}",
+                )
 
     def _captured_stdout_for_shim(self, events, metric):
         tmpdir = Path(tempfile.mkdtemp(prefix="rcc-shim-cap-"))
@@ -743,6 +786,219 @@ class RosterCrossCheckExitCodeSubprocessTests(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class RosterCrossCheckMetricAlignmentTests(unittest.TestCase):
+    """Direct tests for the alignment + filter logic inside
+    `fetch_metric_samples`.
+
+    Reviewer's PR #41 R3 blocker #2: round-2 tests monkey-
+    patched the whole `fetch_metric_samples` function or fed
+    already-aggregated dicts to `cross_check`, so the
+    production-critical alignment code (1-s bucketing, newest
+    common bucket, single-state malformed detection, region-
+    pinned filter without container_name) had zero coverage.
+
+    These tests execute the real helpers extracted for
+    testability: `_aggregate_metric_series` (pure alignment
+    logic over an iterable of fake TimeSeries) and
+    `_build_metric_filter` (the query string).
+    """
+
+    def _pt(self, epoch: float, value: int):
+        from types import SimpleNamespace
+        from datetime import datetime, timezone
+        return SimpleNamespace(
+            interval=SimpleNamespace(
+                end_time=datetime.fromtimestamp(epoch, timezone.utc),
+            ),
+            # Provide both fields — the extractor prefers int64_value
+            # when truthy, else falls through to double_value.
+            value=SimpleNamespace(
+                int64_value=value, double_value=float(value),
+            ),
+        )
+
+    def _ts(self, rev: str, state: str, points: list[tuple[float, int]]):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            resource=SimpleNamespace(labels={"revision_name": rev}),
+            metric=SimpleNamespace(labels={"state": state}),
+            points=[self._pt(e, v) for e, v in points],
+        )
+
+    def _deadline(self):
+        # Generous budget — these tests iterate a handful of
+        # fake series in-memory; only clock skew would ever fire it.
+        return common.Deadline(300.0)
+
+    # --- Alignment logic --------------------------------------------
+
+    def test_active_and_idle_at_same_timestamp_aligned(self):
+        now = time.time()
+        pages = [
+            self._ts("rev-a", "active", [(now - 30, 2)]),
+            self._ts("rev-a", "idle", [(now - 30, 1)]),
+        ]
+        out = rcc._aggregate_metric_series(
+            pages, now_epoch=now, deadline=self._deadline(),
+        )
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertEqual(entry["revision_name"], "rev-a")
+        self.assertEqual(entry["active_value"], 2)
+        self.assertEqual(entry["idle_value"], 1)
+        self.assertEqual(entry["active_plus_idle"], 3)
+        self.assertAlmostEqual(entry["sample_age_seconds"], 30, delta=1.5)
+
+    def test_newer_unmatched_point_is_ignored_in_favor_of_common(self):
+        """A newer active point without a matching idle point at
+        the same bucket must NOT be selected — code falls back to
+        the newest bucket where BOTH states report. Otherwise
+        the returned total would count active-only and drop the
+        idle contribution entirely."""
+        now = time.time()
+        pages = [
+            self._ts("rev-a", "active", [(now - 10, 5), (now - 60, 2)]),
+            # Idle only reports at the older bucket.
+            self._ts("rev-a", "idle", [(now - 60, 1)]),
+        ]
+        out = rcc._aggregate_metric_series(
+            pages, now_epoch=now, deadline=self._deadline(),
+        )
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        # OLD active picked because it is the newest active bucket
+        # that also has an idle partner.
+        self.assertEqual(entry["active_value"], 2)
+        self.assertEqual(entry["idle_value"], 1)
+        self.assertEqual(entry["active_plus_idle"], 3)
+        self.assertAlmostEqual(entry["sample_age_seconds"], 60, delta=1.5)
+
+    def test_newest_of_multiple_common_buckets_is_selected(self):
+        now = time.time()
+        pages = [
+            self._ts("rev-a", "active", [(now - 30, 4), (now - 60, 2)]),
+            self._ts("rev-a", "idle", [(now - 30, 1), (now - 60, 3)]),
+        ]
+        out = rcc._aggregate_metric_series(
+            pages, now_epoch=now, deadline=self._deadline(),
+        )
+        entry = out[0]
+        self.assertEqual(entry["active_value"], 4)
+        self.assertEqual(entry["idle_value"], 1)
+        self.assertEqual(entry["active_plus_idle"], 5)
+        self.assertAlmostEqual(entry["sample_age_seconds"], 30, delta=1.5)
+
+    def test_single_state_present_raises_valueerror_for_rc3(self):
+        """A revision that reports only one of the two states
+        (`active` OR `idle`, not both) is malformed — the
+        cross-check cannot compute a trustworthy total from a
+        one-sided series. Raises ValueError, which the CLI
+        classifies as rc=3 MALFORMED via its `except ValueError`
+        handler on the fetch path."""
+        now = time.time()
+        pages = [
+            self._ts("rev-a", "active", [(now - 30, 2)]),
+            # No idle series at all.
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            rcc._aggregate_metric_series(
+                pages, now_epoch=now, deadline=self._deadline(),
+            )
+        self.assertIn("cannot align", str(ctx.exception))
+        self.assertIn("rev-a", str(ctx.exception))
+
+    def test_freshness_computed_from_aligned_timestamp_not_newest_point(self):
+        """When a revision has a very-recent active-only point
+        and an older common bucket, sample_age must reflect the
+        common bucket's age — otherwise a mixed count would ship
+        with a misleadingly fresh stamp and the freshness gate
+        would silently pass on stale data."""
+        now = time.time()
+        pages = [
+            self._ts("rev-a", "active", [(now - 5, 9), (now - 200, 2)]),
+            self._ts("rev-a", "idle", [(now - 200, 3)]),
+        ]
+        out = rcc._aggregate_metric_series(
+            pages, now_epoch=now, deadline=self._deadline(),
+        )
+        entry = out[0]
+        # Aligned bucket is the older common one.
+        self.assertEqual(entry["active_value"], 2)
+        self.assertEqual(entry["idle_value"], 3)
+        # Age from that bucket, NOT from the fresher unmatched
+        # 5-s-old active point.
+        self.assertAlmostEqual(entry["sample_age_seconds"], 200, delta=1.5)
+
+    def test_missing_revision_name_label_raises_valueerror(self):
+        from types import SimpleNamespace
+        from datetime import datetime, timezone
+        bad = SimpleNamespace(
+            resource=SimpleNamespace(labels={}),  # no revision_name
+            metric=SimpleNamespace(labels={"state": "active"}),
+            points=[SimpleNamespace(
+                interval=SimpleNamespace(
+                    end_time=datetime.now(timezone.utc),
+                ),
+                value=SimpleNamespace(int64_value=1, double_value=1.0),
+            )],
+        )
+        with self.assertRaises(ValueError) as ctx:
+            rcc._aggregate_metric_series(
+                [bad], now_epoch=time.time(), deadline=self._deadline(),
+            )
+        self.assertIn("revision_name", str(ctx.exception))
+
+    def test_unexpected_state_label_raises_valueerror(self):
+        now = time.time()
+        pages = [self._ts("rev-a", "unknown_state", [(now - 30, 1)])]
+        with self.assertRaises(ValueError) as ctx:
+            rcc._aggregate_metric_series(
+                pages, now_epoch=now, deadline=self._deadline(),
+            )
+        self.assertIn("state", str(ctx.exception))
+
+    def test_aggregation_covers_multiple_revisions_independently(self):
+        now = time.time()
+        pages = [
+            self._ts("rev-a", "active", [(now - 30, 2)]),
+            self._ts("rev-a", "idle", [(now - 30, 1)]),
+            self._ts("rev-b", "active", [(now - 45, 5)]),
+            self._ts("rev-b", "idle", [(now - 45, 0)]),
+        ]
+        out = rcc._aggregate_metric_series(
+            pages, now_epoch=now, deadline=self._deadline(),
+        )
+        by_rev = {e["revision_name"]: e for e in out}
+        self.assertEqual(by_rev["rev-a"]["active_plus_idle"], 3)
+        self.assertEqual(by_rev["rev-b"]["active_plus_idle"], 5)
+
+    # --- Filter string ----------------------------------------------
+
+    def test_filter_has_required_labels_and_no_container_name(self):
+        """The metric documents only `state`; a container_name
+        filter returned zero series in production. Verify the
+        query includes metric-type, resource-type, service,
+        region, both state values — and does NOT include the
+        removed container_name label anywhere."""
+        f = rcc._build_metric_filter("worshiptranslate-backend", "us-central1")
+        self.assertIn(
+            'metric.type="run.googleapis.com/container/instance_count"', f,
+        )
+        self.assertIn('resource.type="cloud_run_revision"', f)
+        self.assertIn(
+            'resource.labels.service_name="worshiptranslate-backend"', f,
+        )
+        self.assertIn('resource.labels.location="us-central1"', f)
+        self.assertIn('metric.labels.state="active"', f)
+        self.assertIn('metric.labels.state="idle"', f)
+        self.assertNotIn("container_name", f)
+
+    def test_filter_pins_arbitrary_region(self):
+        f = rcc._build_metric_filter("svc", "europe-west4")
+        self.assertIn('resource.labels.location="europe-west4"', f)
+        self.assertNotIn("us-central1", f)
 
 
 if __name__ == "__main__":

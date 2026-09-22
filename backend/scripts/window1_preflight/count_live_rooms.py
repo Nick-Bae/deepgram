@@ -151,6 +151,7 @@ def _run(argv: list[str]) -> int:
     try:
         from google.cloud import firestore  # type: ignore
         from google.api_core import exceptions as gax  # type: ignore
+        from google.auth import exceptions as gauth  # type: ignore
     except Exception as exc:  # pragma: no cover
         payload.update({
             "count": None, "complete": False, "documents_scanned": 0,
@@ -161,18 +162,24 @@ def _run(argv: list[str]) -> int:
         die(ExitCode.UPSTREAM_API, payload)
 
     deadline = Deadline(float(args.deadline_sec))
-    client = firestore.Client(project=args.project, database=args.database)
-
-    # Collection-group query — iterates every `rooms` subcollection
-    # across every `organizations/*` document. Same shape the
-    # reconciler uses.
-    query = client.collection_group("rooms").where(
-        filter=firestore.FieldFilter("status", "==", "live"),
-    )
 
     count = 0
     complete = False
     try:
+        # Client construction discovers Application Default
+        # Credentials, so it can raise
+        # google.auth.exceptions.DefaultCredentialsError HERE —
+        # BEFORE any RPC. Round-2 code built the client outside
+        # this try, which meant a missing ADC printed a bare
+        # traceback and violated the "exactly one JSON on stdout"
+        # contract. Construction lives inside the guarded block
+        # for that reason.
+        client = firestore.Client(
+            project=args.project, database=args.database,
+        )
+        query = client.collection_group("rooms").where(
+            filter=firestore.FieldFilter("status", "==", "live"),
+        )
         # `.stream()` yields DocumentSnapshots page-by-page under the
         # hood. We loop with an explicit iterator so we can bound
         # each page's RPC AND consult the overall deadline between
@@ -196,6 +203,17 @@ def _run(argv: list[str]) -> int:
         # If the loop completed without raising, the iterator is
         # exhausted — `complete=true` is now safe.
         complete = True
+    except gauth.DefaultCredentialsError as exc:
+        # ADC missing is an authentication-family failure, not an
+        # upstream API failure — the runbook branches on rc=6.
+        payload.update({
+            "count": None, "complete": False, "documents_scanned": count,
+            "elapsed_seconds": round(deadline.elapsed(), 3),
+            "rc": int(ExitCode.PERMISSION),
+            "reason": f"Application Default Credentials not found: {exc}",
+        })
+        diag(f"STOP: {payload['reason']}")
+        die(ExitCode.PERMISSION, payload)
     except (gax.PermissionDenied, gax.Unauthenticated) as exc:
         payload.update({
             "count": None, "complete": False, "documents_scanned": count,
