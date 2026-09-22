@@ -808,32 +808,32 @@ class RedisPubSub:
             return
         self._started = False
         self._connected = False
-        # PR #31 §3 alert A5 — watchdog task cancelled with the
-        # rest of the lifecycle. Doesn't touch Redis clients so
-        # ordering vs probe/reader is not load-bearing; cancelled
-        # here for hygiene.
-        if self._watchdog_task and not self._watchdog_task.done():
-            self._watchdog_task.cancel()
-            try:
-                await self._watchdog_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        # PR #31 §3 W7 — probe task MUST be cancelled BEFORE
-        # `_teardown_clients()` so no probe attempt runs against a
-        # torn-down `_pub` / `_pubsub` client. Cancel before the
-        # reader task so the reader can drain any final probe
-        # dispatch it already saw without the probe task racing to
-        # publish again.
+        # Issue every cancel FIRST, then await each in the required
+        # ordering. Awaiting between cancels yields the event loop,
+        # which lets other running loops complete their in-flight
+        # `await asyncio.sleep(...)` and check `_started` — they
+        # then return naturally, bypassing our explicit cancel. The
+        # probe-cancel-before-teardown test asserts the CANCEL
+        # runs, not that the task exited by any path.
+        #
+        # PR #31 §3 W7 — probe cancel MUST be issued before
+        # `_teardown_clients()` (below) so no probe attempt runs
+        # against a torn-down `_pub`. PR #31 §3 alert A5 — watchdog
+        # cancel has no client-ordering requirement (watchdog does
+        # not touch Redis); issued for hygiene alongside the rest.
+        cancels: list[asyncio.Task] = []
         if self._probe_task and not self._probe_task.done():
             self._probe_task.cancel()
-            try:
-                await self._probe_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            cancels.append(self._probe_task)
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            cancels.append(self._watchdog_task)
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
+            cancels.append(self._reader_task)
+        for task in cancels:
             try:
-                await self._reader_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
         await self._teardown_clients()
