@@ -655,8 +655,7 @@ class RedisPubSub:
             # A5 purposes: clear any pending unrecovered failure
             # tracker so a subsequent failure starts a fresh
             # deadline window.
-            self._startup_failed_at = None
-            self._recovery_deadline_emitted = False
+            self._clear_recovery_state()
             _emit(
                 EVENT_STARTED,
                 "INFO",
@@ -796,7 +795,12 @@ class RedisPubSub:
             those partial clients.
         """
         # Nothing to do only when we have neither the started flag nor
-        # any lingering client objects.
+        # any lingering client objects. The early-return path STILL
+        # clears the A5 recovery state — the reviewer's blocking
+        # PR#39 round-4 defect was that a stale `_startup_failed_at`
+        # or `_recovery_deadline_emitted` could survive a stop()
+        # and mislead a subsequent start() on the same object into
+        # firing A5 too early (or never).
         if (
             not self._started
             and self._pub is None
@@ -805,6 +809,7 @@ class RedisPubSub:
             and self._probe_task is None
             and self._watchdog_task is None
         ):
+            self._clear_recovery_state()
             return
         self._started = False
         self._connected = False
@@ -841,6 +846,13 @@ class RedisPubSub:
         self._probe_task = None
         self._watchdog_task = None
         self._probe_subscribed = False
+        # PR #31 §3 alert A5 — clear recovery state so a
+        # subsequent start() on the same adapter object begins a
+        # fresh deadline window. A stale `_startup_failed_at`
+        # would let the second lifecycle emit A5 too early using
+        # the old timestamp; a stale `_recovery_deadline_emitted`
+        # would suppress A5 during the second outage entirely.
+        self._clear_recovery_state()
         # Leave `_probe_subscription_desired` unchanged so a
         # subsequent `start()` on the same instance re-arms the
         # probe channel without a second `set_probe_callback()`

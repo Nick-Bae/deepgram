@@ -154,5 +154,171 @@ class RecoveryWatchdogEventNameTests(unittest.TestCase):
         )
 
 
+class RecoveryStateSurvivesStopTests(unittest.IsolatedAsyncioTestCase):
+    """Reviewer's PR #39 round-4 blocking defect: `_startup_failed_at`
+    and `_recovery_deadline_emitted` survived stop(), so a
+    subsequent start() on the SAME adapter object could:
+      - emit A5 too early using the old timestamp; or
+      - never emit A5 at all when the flag was already True.
+
+    Tests exercise stop() through both the normal and early-return
+    paths, and drive `_check_recovery_deadline` against the actual
+    watchdog machinery."""
+
+    def setUp(self):
+        self._patcher = patch.object(ENV, "REDIS_RECOVERY_DEADLINE_SEC", 5.0)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+
+    async def test_stop_early_return_clears_recovery_state(self):
+        """A never-started adapter with a leftover
+        `_startup_failed_at` (e.g., set by a test) must have that
+        state wiped by stop() so the caller cannot depend on the
+        default constructor state."""
+        ps = RedisPubSub()
+        ps._enabled = True
+        # Simulate stale state without ever calling start().
+        ps._startup_failed_at = 12345.0
+        ps._recovery_deadline_emitted = True
+        # No tasks / clients: exercise the early-return branch.
+        self.assertIsNone(ps._probe_task)
+        self.assertIsNone(ps._reader_task)
+        self.assertIsNone(ps._watchdog_task)
+        await ps.stop()
+        self.assertIsNone(
+            ps._startup_failed_at,
+            "stop()'s early-return branch left `_startup_failed_at` "
+            "stale — a subsequent start() would think an outage was "
+            "already in flight",
+        )
+        self.assertFalse(
+            ps._recovery_deadline_emitted,
+            "stop()'s early-return branch left `_recovery_deadline_emitted` "
+            "set — A5 would be suppressed on the next outage",
+        )
+
+    async def test_stop_before_deadline_lets_restart_receive_fresh_deadline(self):
+        """failure → stop before deadline → restart → failure
+        must receive a FRESH deadline window measured from the
+        SECOND failure timestamp, not the first."""
+        ps = RedisPubSub()
+        ps._enabled = True
+        # Simulate a start() that emitted a startup failure.
+        with patch.object(time, "monotonic", return_value=1000.0):
+            ps._mark_startup_failure()
+        self.assertEqual(ps._startup_failed_at, 1000.0)
+        # stop() BEFORE the deadline elapsed.
+        await ps.stop()
+        self.assertIsNone(ps._startup_failed_at)
+        self.assertFalse(ps._recovery_deadline_emitted)
+        # Restart — a new failure comes in much later.
+        with patch.object(time, "monotonic", return_value=1_000_000.0):
+            ps._mark_startup_failure()
+        self.assertEqual(
+            ps._startup_failed_at, 1_000_000.0,
+            "second failure inherited the pre-stop timestamp — A5 "
+            "would fire immediately using the ancient value",
+        )
+        # And the deadline check now measures from THE SECOND
+        # failure — 4s later is still under (deadline=5s).
+        with patch.object(rp, "_emit") as m:
+            self.assertFalse(
+                ps._check_recovery_deadline(now=1_000_004.0),
+                "second outage window fired A5 too early — old "
+                "timestamp survived stop()",
+            )
+            m.assert_not_called()
+
+    async def test_stop_after_deadline_lets_restart_emit_again(self):
+        """failure → deadline emitted → stop → restart → failure
+        can emit again. Prevents `_recovery_deadline_emitted=True`
+        from muting A5 for the entire lifetime of the
+        RedisPubSub object across a restart."""
+        ps = RedisPubSub()
+        ps._enabled = True
+        # First lifecycle: mark failure, elapse deadline, emit.
+        with patch.object(time, "monotonic", return_value=100.0):
+            ps._mark_startup_failure()
+        with patch.object(rp, "_emit"):
+            self.assertTrue(ps._check_recovery_deadline(now=105.0))
+            self.assertTrue(ps._recovery_deadline_emitted)
+        # Stop.
+        await ps.stop()
+        self.assertFalse(
+            ps._recovery_deadline_emitted,
+            "stop() left the once-fired guard set — the next "
+            "outage would be silent on this adapter",
+        )
+        # Second lifecycle: new failure + deadline elapse — the
+        # deadline event MUST fire again (A5 pages on ANY
+        # occurrence).
+        with patch.object(time, "monotonic", return_value=200.0):
+            ps._mark_startup_failure()
+        with patch.object(rp, "_emit") as m:
+            self.assertTrue(
+                ps._check_recovery_deadline(now=205.0),
+                "second-lifecycle outage did not re-emit A5 — the "
+                "guard survived stop()",
+            )
+            self.assertEqual(m.call_count, 1)
+
+
+class RealWatchdogLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """The `_recovery_watchdog_loop` task itself — not just
+    `_check_recovery_deadline`. Uses a very-short deadline so the
+    test doesn't have to sleep for 5 minutes; asserts the task
+    schedules, fires the emission naturally, and is cleaned up by
+    stop()."""
+
+    async def test_watchdog_emits_after_short_deadline_and_stop_clears_task(self):
+        # Very short deadline so the loop fires within test wall
+        # clock. `_recovery_watchdog_loop` clamps its sleep to
+        # min(30s, deadline/5), floored at 0.05s.
+        with patch.object(ENV, "REDIS_RECOVERY_DEADLINE_SEC", 0.25):
+            ps = RedisPubSub()
+            ps._enabled = True
+            ps._started = True  # `_recovery_watchdog_loop` checks this
+            ps._watchdog_task = _asyncio_task(ps)
+            ps._mark_startup_failure()
+            emissions: list[str] = []
+            real_emit = rp._emit
+
+            def _capture(event, severity="INFO", **fields):
+                emissions.append(event)
+                return real_emit(event, severity, **fields)
+
+            with patch.object(rp, "_emit", side_effect=_capture):
+                # Wait up to ~1.5s for the loop to observe the
+                # deadline and emit.
+                import asyncio as _asyncio
+                deadline = _asyncio.get_running_loop().time() + 1.5
+                while _asyncio.get_running_loop().time() < deadline:
+                    if rp.EVENT_RECOVERY_DEADLINE_MISSED in emissions:
+                        break
+                    await _asyncio.sleep(0.05)
+                self.assertIn(
+                    rp.EVENT_RECOVERY_DEADLINE_MISSED, emissions,
+                    f"watchdog loop did not emit within 1.5s; "
+                    f"emissions={emissions!r}",
+                )
+                # Stop clears the task ref AND the recovery state.
+                await ps.stop()
+                self.assertIsNone(ps._watchdog_task)
+                self.assertIsNone(ps._startup_failed_at)
+                self.assertFalse(ps._recovery_deadline_emitted)
+
+
+def _asyncio_task(ps):
+    """Helper — schedule `_recovery_watchdog_loop` on the current
+    running loop. Kept out of the test method so the with-patch
+    block reads clean."""
+    import asyncio as _asyncio
+    return _asyncio.create_task(
+        ps._recovery_watchdog_loop(), name="redis-pubsub-recovery-watchdog",
+    )
+
+
 if __name__ == "__main__":
     unittest.main()
