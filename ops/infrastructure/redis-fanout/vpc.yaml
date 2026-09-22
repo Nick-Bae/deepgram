@@ -1,0 +1,52 @@
+# VPC egress path for Cloud Run → Memorystore reachability, per
+# rollout doc §4c step 2. Two modes are documented; only ONE
+# lands in production. The `active_mode` field picks — validate.py
+# refuses when both mode blocks are populated with real values,
+# and cloudrun.yaml cross-checks that its
+# `vpc-access-egress` / `network-interfaces` annotations match
+# the active mode.
+#
+# Manifest anchor: vpc
+apiVersion: infra/v1
+kind: VpcConfig
+metadata:
+  # ONE of "direct_egress" or "serverless_connector". Direct is
+  # preferred per PR #31 §4c step 2 (no connector to provision,
+  # no fixed capacity ceiling). Serverless connector is the
+  # fallback for the cases where Direct VPC egress is not
+  # available for the region/organization.
+  active_mode: direct_egress
+spec:
+  network: default
+  subnet: worshiptranslate-egress
+  region: us-central1
+
+  direct_egress:
+    # Direct VPC egress attaches the network interface to the
+    # Cloud Run revision itself. `all-traffic` sends every
+    # outbound flow through the VPC — required so the
+    # Memorystore private IP is reachable.
+    egress: all-traffic
+    # Serialized JSON — cloudrun.yaml's
+    # `run.googleapis.com/network-interfaces` template pulls
+    # this via `vpc.direct_egress.network_interfaces_json`.
+    network_interfaces_json: |
+      [{"network":"default","subnetwork":"worshiptranslate-egress","tags":[]}]
+    # Private Google Access on the egress subnet — REQUIRED so
+    # Cloud Run instances can still reach Google APIs
+    # (Firestore, Cloud Logging) after the VPC attach flips
+    # them off the default egress path.
+    private_google_access: true
+
+  serverless_connector:
+    # Populated only if the operator falls back to the connector
+    # mode. Leave the placeholders otherwise — validate.py
+    # refuses both blocks having non-placeholder values.
+    name: "<connector-name-placeholder>"
+    # `all-traffic` matches the Direct mode's ingress behaviour
+    # so `redis_pubsub.py` reaches Memorystore both ways.
+    egress: all-traffic
+    # Connector-specific capacity settings, documented so the
+    # operator knows the knobs when picking this fallback.
+    min_throughput: 200
+    max_throughput: 1000

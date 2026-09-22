@@ -1,0 +1,61 @@
+# Cloud Memorystore Redis instance required for the Redis
+# pub/sub rollout, per rollout doc §4c step 3.
+#
+# **Standard tier is required.** Basic-tier is refused
+# fail-closed because it lacks the HA replication that PR #31
+# §2 assumed for its 15 s planned-failover budget. Standard
+# does NOT eliminate interruptions — Google documents planned
+# failover at ~15 s during maintenance
+# (https://cloud.google.com/memorystore/docs/redis/failover-and-patching).
+# The startup-recovery fix in `redis_pubsub.py::start()` +
+# `_reader_loop._reconnect()` is what makes that survivable.
+#
+# Manifest anchor: memorystore
+apiVersion: redis/v1
+kind: Instance
+metadata:
+  name: worshiptranslate-fanout
+  region: us-central1
+  # Reserved subnet CIDR — must lie inside the VPC network
+  # `vpc.yaml` declares and MUST NOT overlap the operator VPN
+  # or any peer network. The validator only asserts shape here;
+  # the operator confirms non-overlap during §4c planning.
+  reserved_ip_range_placeholder: "10.<vpc-supplied>.0.0/29"
+spec:
+  # Standard HA required. Basic is refused by validate.py.
+  tier: STANDARD_HA
+  # Version pinned so the readiness/failover behaviour in
+  # PR #31 §2 remains the tested one. Bump only via reviewer +
+  # a fresh 15 s failover budget verification.
+  redis_version: REDIS_7_2
+  # Sized to the current fanout traffic; 1 GiB is the smallest
+  # Standard-HA capacity and is comfortably above the working
+  # set of a fanout that never persists messages.
+  memory_size_gb: 1
+  # AUTH is REQUIRED by default. If the operator chooses to run
+  # AUTH-disabled, they set `auth_enabled: false` here AND
+  # remove `redis_password` from `secrets.yaml` in the same
+  # commit — the validator refuses a mismatched pair (AUTH on
+  # here but no secret in secrets.yaml, or AUTH off but secret
+  # still bound).
+  auth_enabled: true
+  # Transit encryption. Cloud Memorystore Standard-HA supports
+  # SERVER_AUTHENTICATION on Redis 7; the pubsub client uses
+  # `ssl=False` today so we start with DISABLED and note the
+  # follow-up. Any change here MUST also update the client's
+  # ssl kwarg — the validator refuses TLS-mismatched pairs.
+  transit_encryption_mode: DISABLED
+  # Maintenance window matches the operator's ops-hours
+  # preference. Failover during this window is the expected
+  # 15 s interruption the fix in §2 was designed to survive;
+  # picking a different window would silently move the risk.
+  maintenance_policy_placeholder:
+    weekly_maintenance_window:
+      day: SUNDAY
+      start_time: "10:00"  # UTC — 03:00 America/Los_Angeles
+  # Cloud Run consumes this via `REDIS_HOST`. cloudrun.yaml
+  # references `memorystore.host_binding` — that indirection
+  # exists so a rebuild of the instance can update the IP in
+  # ONE place. Left as a placeholder in this PR because the
+  # instance does not yet exist.
+  host_binding: "10.<memorystore-supplied>.0.3"

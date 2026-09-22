@@ -1,0 +1,115 @@
+# Manifest — cross-reference of what the four resource YAMLs
+# declare, plus the invariants validate.py + apply.py enforce
+# across them. Do NOT hand-edit resources without updating this
+# manifest; the test suite enforces the mapping.
+
+version: 1
+service_name: worshiptranslate-backend
+region: us-central1
+
+# The four resource YAMLs the validator loads.
+resources:
+  cloudrun:
+    file: cloudrun.yaml
+    kind: Service
+    apiVersion: cloudrun/v1
+  memorystore:
+    file: memorystore.yaml
+    kind: Instance
+    apiVersion: redis/v1
+  vpc:
+    file: vpc.yaml
+    kind: VpcConfig
+    apiVersion: infra/v1
+  secrets:
+    file: secrets.yaml
+    kind: SecretBindings
+    apiVersion: secrets/v1
+
+# Constraints that must remain pinned on `main` until task
+# #137's enablement PR lifts them explicitly. Each entry
+# names a resource, a key path, and the expected value. The
+# validator refuses any drift; apply.py's plan refuses to
+# advance when a pinned constraint is violated.
+#
+# These are the ones the reviewer named in the task #136
+# briefing: "Do not apply Cloud Run, Memorystore, VPC, CPU,
+# secret, or REDIS_ENABLED production changes yet."
+pinned_constraints:
+  - resource: cloudrun
+    path: spec.template.spec.containers[0].env[?(@.name=='REDIS_ENABLED')].value
+    expected: "0"
+    rationale: |
+      Track 1 Gate 2 constraint. Enablement PR (task #137) is
+      the ONLY vehicle authorised to flip this to "1", inside
+      a §4d window.
+  - resource: cloudrun
+    path: spec.template.spec.containers[0].env[?(@.name=='REDIS_ENABLED')].kind
+    expected: literal
+    rationale: |
+      REDIS_ENABLED MUST be a literal env value, never a
+      secretKeyRef. A secret binding here would let the value
+      change silently and defeat the pinned=0 gate.
+  - resource: cloudrun
+    path: spec.max_instances
+    expected: 1
+    rationale: |
+      PR #31 §4c holds --max-instances=1 until enablement.
+      Higher instance counts require the Track 1 Gate 2 rerun
+      documented in §5.
+  - resource: cloudrun
+    path: spec.cpu_allocation
+    expected: always
+    rationale: |
+      PR #31 §3 A8b's 90 s first-probe deadline cannot be met
+      under Cloud Run's default "CPU only during request
+      processing" throttling.
+  - resource: cloudrun
+    path: spec.ingress
+    expected: internal-and-cloud-load-balancing
+    rationale: |
+      BOOT-1 session-start gate (PR #33) trusts the load
+      balancer as the single ingress. Allowing internal or all
+      would let a request bypass the gate.
+
+# Cross-resource invariants — pairs / triples of fields across
+# resources that MUST agree. validate.py refuses on any
+# disagreement.
+cross_resource_invariants:
+  - name: vpc_mode_matches_cloudrun_annotations
+    description: |
+      cloudrun.yaml's `run.googleapis.com/vpc-access-egress`
+      + `run.googleapis.com/network-interfaces` annotations
+      match vpc.yaml's active_mode.
+    references:
+      - vpc.active_mode
+      - cloudrun.spec.template.metadata.required_template_annotations
+  - name: memorystore_auth_matches_secret_binding
+    description: |
+      memorystore.auth_enabled == true iff
+      secrets.redis_password.present == true. Either the
+      operator picks AUTH and binds the secret, or neither.
+    references:
+      - memorystore.spec.auth_enabled
+      - secrets.spec.redis_password.present
+  - name: cloudrun_redis_host_matches_memorystore_binding
+    description: |
+      cloudrun.env.REDIS_HOST binds to
+      `memorystore.host_binding` via value_from — a rebuilt
+      Memorystore instance updates the IP in ONE place.
+    references:
+      - cloudrun.spec.template.spec.containers[0].env[?(@.name=='REDIS_HOST')].value_from
+      - memorystore.spec.host_binding
+  - name: transit_encryption_matches_client_ssl_kwarg
+    description: |
+      memorystore.transit_encryption_mode == DISABLED is the
+      current shape (client uses ssl=False). Any switch to
+      SERVER_AUTHENTICATION MUST land in the same commit as
+      the client-side ssl=True.
+    references:
+      - memorystore.spec.transit_encryption_mode
+
+# Allowlist — production projects apply.py will plan against.
+# Same shape as ops/monitoring/redis-fanout/manifest.yaml.
+allowed_projects:
+  - sturdy-dogfish-472313-k6
