@@ -36,6 +36,17 @@ Behaviour contract (from the reviewer's task #133 spec):
   message. No silent-accept.
 - Stale expected revision → rejected inside the transaction; no
   write happens.
+- FIRESTORE_EMULATOR_HOST must match the target: the production
+  target requires the env var to be UNSET (otherwise the Google
+  client silently redirects to the emulator even when the caller
+  passes a production project); the emulator target requires the
+  env var to be SET (otherwise the client talks to real
+  Firestore). Fail-closed on either mismatch — no `--force-env`
+  escape hatch.
+- Firestore reads carry an explicit per-RPC timeout and
+  `retry=None` so a single hung RPC cannot stall the operator;
+  the transactional wrapper still retries on Firestore conflict
+  aborts.
 - Output NEVER prints credentials or unrelated document contents.
   Only fields the operator needs to see (blocked, revision,
   reason, blocked_by, blocked_at) and always as literal strings.
@@ -77,6 +88,52 @@ CONFIRMATION_TOKEN = "I understand this affects production"
 # Sentinel meaning "the doc must be absent" for `--expected-revision 0`.
 _EXPECTED_ABSENT = 0
 
+# Per-RPC timeout applied to every Firestore document read the writer
+# performs. Bounds a single hung RPC; the transactional wrapper's own
+# conflict retries are untouched.
+_RPC_TIMEOUT_SEC = 10.0
+
+# Targets that MUST NOT have FIRESTORE_EMULATOR_HOST set (real Firestore).
+_PRODUCTION_TARGETS: set[tuple[str, str]] = {
+    ("sturdy-dogfish-472313-k6", "worship-translation"),
+}
+# Targets that MUST have FIRESTORE_EMULATOR_HOST set (emulator).
+_EMULATOR_TARGETS: set[tuple[str, str]] = {
+    ("cleanup-track1-emulator", "(default)"),
+}
+# Sanity check: allowlist is the disjoint union of the two above. Prevents
+# a future edit from adding a target that skips the env-mismatch check.
+assert ALLOWED_TARGETS == _PRODUCTION_TARGETS | _EMULATOR_TARGETS
+assert _PRODUCTION_TARGETS.isdisjoint(_EMULATOR_TARGETS)
+
+
+class EnvironmentMismatchError(Exception):
+    """Raised when FIRESTORE_EMULATOR_HOST is set for a production
+    target (would silently redirect writes to the emulator) or unset
+    for an emulator target (would talk to real Firestore)."""
+
+
+def _check_environment_match(target: tuple[str, str], env: dict) -> None:
+    """Fail-closed on env/target mismatch. The Google Firestore client
+    library treats FIRESTORE_EMULATOR_HOST as absolute: if it is set,
+    every request is routed to that host regardless of the caller's
+    `project` argument. So we cannot trust `--project` alone — we must
+    also verify the env is in the correct shape for the intended
+    environment."""
+    emulator_host = env.get("FIRESTORE_EMULATOR_HOST") or ""
+    if target in _PRODUCTION_TARGETS and emulator_host:
+        raise EnvironmentMismatchError(
+            f"target {target[0]!r}/{target[1]!r} is production, but "
+            f"FIRESTORE_EMULATOR_HOST is set. The Google client would "
+            f"silently redirect writes to the emulator. Refuse."
+        )
+    if target in _EMULATOR_TARGETS and not emulator_host:
+        raise EnvironmentMismatchError(
+            f"target {target[0]!r}/{target[1]!r} is the emulator, but "
+            f"FIRESTORE_EMULATOR_HOST is not set. The Google client "
+            f"would talk to real Firestore. Refuse."
+        )
+
 
 # --- Firestore adapters ----------------------------------------------------
 
@@ -106,6 +163,18 @@ class GateDocClient:
             self._client
             .collection(DEPLOY_GATE_COLLECTION)
             .document(DEPLOY_GATE_DOCUMENT)
+        )
+
+    def read_gate(self, *, transaction=None):
+        """Bounded read of the gate document. Applies a per-RPC
+        timeout and disables the SDK's default retry so a single
+        hung read cannot stall the operator. The `@transactional`
+        wrapper's own conflict-abort retries are untouched — this
+        knob controls only the raw RPC layer."""
+        return self.gate_ref().get(
+            transaction=transaction,
+            timeout=_RPC_TIMEOUT_SEC,
+            retry=None,
         )
 
     def server_timestamp(self):
@@ -245,7 +314,7 @@ def _run_write(
 
     @transactional
     def _tx(transaction):
-        snap = ref.get(transaction=transaction)
+        snap = client.read_gate(transaction=transaction)
         current_view = _parse_gate_doc(snap.to_dict() if snap.exists else None)
         op.check_revision(current_view)
         if op.is_noop(current_view):
@@ -370,13 +439,19 @@ def _run(argv: list[str], *, client_factory=None) -> int:
         )
         return 2
 
+    try:
+        _check_environment_match(target, dict(os.environ))
+    except EnvironmentMismatchError as exc:
+        print(f"STOP: {exc}", file=sys.stderr)
+        return 6
+
     if client_factory is None:
         client = GateDocClient(project=args.project, database=args.database)
     else:
         client = client_factory(project=args.project, database=args.database)
 
     if args.action == "status":
-        snap = client.gate_ref().get()
+        snap = client.read_gate()
         try:
             view = _parse_gate_doc(snap.to_dict() if snap.exists else None)
         except MalformedGateError as exc:
@@ -407,7 +482,7 @@ def _run(argv: list[str], *, client_factory=None) -> int:
         # Read current state through the same client (no
         # transaction; dry run is intentionally not
         # transactional).
-        snap = client.gate_ref().get()
+        snap = client.read_gate()
         try:
             current = _parse_gate_doc(snap.to_dict() if snap.exists else None)
         except MalformedGateError as exc:
