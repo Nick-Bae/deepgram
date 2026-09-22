@@ -1280,6 +1280,40 @@ async def _room_sweeper_loop() -> None:
 # (idle_timeout / max_duration / cap enforcement).
 
 
+async def _start_pubsub_singleton(pubsub) -> None:
+    """Auto-enable the in-process probe and start the pub/sub singleton.
+    The one entry `_on_startup` uses for the production Redis client.
+
+    Deliberately lives in `main.py`, NOT inside `RedisPubSub.start()`:
+    baking `enable_probe_task()` into the adapter would arm the probe
+    for every RedisPubSub instance that anyone constructs — tests,
+    the integration harness, batch scripts — expanding the behaviour
+    beyond the production singleton. Keeping the enable at the sole
+    production caller preserves the F-25/F-26/F-27 test paths, which
+    build their own pubsub objects and do NOT want per-tick probe
+    traffic on their expected subscriber counts.
+
+    Order matters — `enable_probe_task()` MUST run BEFORE `start()`.
+    `start()` reads `_probe_subscription_desired` (set by
+    `enable_probe_task()`) to decide whether to subscribe to this
+    instance's own probe channel on the initial ping AND to schedule
+    the 30 s `_probe_loop` task. Calling them in the reverse order
+    would delay the first probe until the reader loop's next
+    `_reconnect` pass.
+
+    Idempotent:
+      - `enable_probe_task()` short-circuits when the callback is
+        already installed.
+      - `start()` short-circuits when `_started` is already True.
+    A warm re-entry of `_on_startup` therefore does not spawn a
+    second probe task.
+    """
+    if not pubsub.enabled:
+        return
+    pubsub.enable_probe_task()
+    await pubsub.start()
+
+
 @app.on_event("startup")
 async def _on_startup():
     global _room_sweeper_task, _room_reconciler_task, _room_reconciler
@@ -1297,8 +1331,8 @@ async def _on_startup():
         f"host_presence_end_rooms={ROOM_HOST_PRESENCE_END_ROOMS}"
     )
     from app.services.redis_pubsub import pubsub as _pubsub
+    await _start_pubsub_singleton(_pubsub)
     if _pubsub.enabled:
-        await _pubsub.start()
         print(f"[REDIS_PUBSUB] enabled connected={_pubsub.connected} instance={ENV.INSTANCE_ID}")
     else:
         print("[REDIS_PUBSUB] disabled (REDIS_ENABLED=0) — local-only broadcast")
