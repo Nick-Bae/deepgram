@@ -591,12 +591,25 @@ def _check_cloudrun_redis_password_binding(loaded: dict[str, dict]) -> tuple[boo
         .get("template", {}).get("spec", {})
         .get("containers", [{}])[0].get("env", [])
     )
-    redis_password = next(
-        (e for e in envs if isinstance(e, dict) and e.get("name") == "REDIS_PASSWORD"),
-        None,
-    )
-    if redis_password is None:
+    # Reviewer's PR #40 round-3 nonblocking hardening: exactly ONE
+    # REDIS_PASSWORD entry — a stale duplicate would let the first
+    # match govern the binding while the second silently overrode
+    # it on the running revision. Cloud Run's env array is
+    # order-sensitive; a duplicate is always a bug.
+    matches = [
+        e for e in envs
+        if isinstance(e, dict) and e.get("name") == "REDIS_PASSWORD"
+    ]
+    if len(matches) == 0:
         return False, "cloudrun env missing REDIS_PASSWORD"
+    if len(matches) > 1:
+        return False, (
+            f"cloudrun env contains {len(matches)} REDIS_PASSWORD "
+            f"entries — must be exactly 1. A duplicate would let the "
+            f"first entry pass validation while the second silently "
+            f"overrode it on the running revision"
+        )
+    redis_password = matches[0]
 
     kind = redis_password.get("kind")
     if kind != "secret_or_absent":

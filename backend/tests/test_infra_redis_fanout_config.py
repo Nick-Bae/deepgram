@@ -730,6 +730,26 @@ class InfraCloudRunRedisPasswordBindingTests(unittest.TestCase):
             _mutate,
         )
 
+    def test_duplicate_redis_password_env_is_rejected(self):
+        """Reviewer's PR #40 round-3 nonblocking hardening: a
+        duplicate REDIS_PASSWORD env entry would let the first
+        match govern the check while the second silently
+        overrode it on the running revision. Cloud Run's env
+        array is order-sensitive; duplicates are always a bug."""
+        def _mutate(L):
+            envs = L["cloudrun"]["spec"]["template"]["spec"]["containers"][0]["env"]
+            # Append a stale duplicate with a wrong binding.
+            envs.append({
+                "name": "REDIS_PASSWORD",
+                "value_from": "secrets.some_stale_other",
+                "kind": "secret_or_absent",
+            })
+        self._fails_with(
+            "invariant:cloudrun_redis_password_binding_is_valid",
+            "2 REDIS_PASSWORD entries",
+            _mutate,
+        )
+
 
 class InfraMemorySizeBoolIsIntTests(unittest.TestCase):
     """Reviewer's PR #40 round-3 small-hardening item:
