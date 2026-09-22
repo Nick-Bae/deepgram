@@ -32,6 +32,20 @@ jobs:
       - name: Run pytest
         run: pytest tests/ -v
 
+      # Gate 2 helpers v6 tests live outside backend/, under
+      # ops/gate2-helpers/v6/tests/. Add an explicit step so CI
+      # actually runs them — the reviewer flagged that PR #36's
+      # first CI pass reported "backend-tests pass" without ever
+      # running v6's suite.
+      - name: Run Gate 2 v6 helper tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ -d ops/gate2-helpers/v6/tests ]; then
+              python -m pytest ops/gate2-helpers/v6/tests/ -v
+          else
+              echo "ops/gate2-helpers/v6/tests/ absent — skipping (branch pre-v6)."
+          fi
+
   # Firestore-emulator-backed transactional-recheck test for PR-T1-B.
   # Scoped narrowly: proves that activity committed BEFORE the termination
   # transaction opens is respected by the recheck. Does NOT claim to validate

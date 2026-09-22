@@ -1,8 +1,18 @@
 # Gate 2 helpers v6 — specification
 
-**Status:** review-only draft on branch `docs/gate2-helpers-v6-spec`. Not for merge or deployment yet — v6 approval is intentionally gated on the dependencies listed below (per PR #31 §5).
+**Status:** review-only draft on branch `docs/gate2-helpers-v6-spec`. **v6 is PARTIAL** — the pieces this branch ships are listed in "What's here" (§0 below); the pieces that remain are listed alongside them and named in the dependencies table (§D). Not for merge or deployment yet — v6 approval is gated on the dependencies below (per PR #31 §5).
 
 **Reference:** PR #31 (`docs/03-analysis/redis-fanout-rollout-proposal.md`) §5 spells out the acceptance criteria. This spec is the concrete v5→v6 diff plan the enablement PR will implement.
+
+## §0. What this branch ships vs what remains
+
+| Piece | This branch | Enablement PR |
+|---|---|---|
+| `analyze_cloud_run` v6 diff (contract, literal REDIS_ENABLED, VPC egress on serving revision, AUTH secretKeyRef structural validation) | **shipped** (skeleton with 35 fixture tests) | — |
+| Preserved v5 guards (traffic split, latestReady/latestCreated identity, Ready + seconds-Ready, `ROOM_RECONCILER_ENABLED=1`, `--max-instances=1`) | **stubbed** via `_run_v5_guards()` | verbatim copy from `~/.gate2-helpers-v5/_gate2_lib.py` |
+| `log_checks.py` runtime helpers for §4a-2 (adapter-up, A5 paired condition, A8b first-probe deadline) and §4a-3 (log-absence verification) | **not present** | full implementation |
+| `gate2_preflight.sh` / `gate2_postdeploy.sh` drivers | **not present** | wrappers that call the new signature |
+| Copy of v5 test suite alongside v6 tests | **not present** | `_gate2_test.py` + `_gate2_wrapper_test.py` copied |
 
 ## Scope
 
@@ -21,11 +31,12 @@ Each of the following MUST have landed on `main` before v6 can be used for a rea
 | D3 | In-process probe task + `redis_probe_ok`/`redis_probe_failed` events | **PR #35** | `test_redis_pubsub.py::RedisPubSubProbeLoopTests` |
 | D4 | Log-based metrics + alert policies (A5, A5-legacy, A6, A7, A8a) | Task #135 — separate operator PR | `ops/monitoring/reconciler/` apply |
 | D5 | `REDIS_ENABLED=1` env on the serving revision (via §4d window) | Enablement PR (task #137) | `gcloud run revisions describe` returns `REDIS_ENABLED=1` |
-| D6 | Memorystore Standard-tier instance + VPC egress path attached to Cloud Run | Task #136 (Cloud Run config + Memorystore provisioning) | `gcloud run services describe` shows connector or Direct VPC subnet |
+| D6 | Memorystore Standard-tier instance + VPC egress path attached to Cloud Run + **"CPU always allocated"** | Task #136 (Cloud Run config + Memorystore provisioning) | `gcloud run services describe` shows connector or Direct VPC subnet AND `spec.template.metadata.annotations."run.googleapis.com/cpu-throttling"="false"` — PR #31 §3 W2 requires always-allocated CPU so the 30 s probe task fires reliably |
 | D7 | AUTH secret binding matches the Memorystore instance | Task #136 | Revision env: `REDIS_PASSWORD` present iff instance has AUTH, absent otherwise |
 | D8 | Production `deploy_gate` writer script exists so §4d step 1/6 can execute | Task #133 | Script lands with its own regression tests |
+| D9 | **Probe auto-enable in singleton startup path** — PR #35 makes the probe OPT-IN via `enable_probe_task()`. For a real Gate 2 rerun the singleton must call `enable_probe_task()` unconditionally when `REDIS_ENABLED=1`. Merging PR #35 alone does NOT supply this. | Task #134 — separate PR | Adapter's `start()` schedules `_probe_task` when Redis is enabled; F-27-adjacent test confirms in-CI |
 
-v6 can be run against a `GATE2_EXPECTED_REDIS=0` fixture ANY time (that's the current production shape). The `=1` path is only meaningful after D1-D7 are all true.
+v6 can be run against a `GATE2_EXPECTED_REDIS=0` fixture ANY time (that's the current production shape). The `=1` path is only meaningful after D1-D9 are ALL true — merging PR #34+#35 covers D2+D3 but NOT D6 (CPU), D9 (auto-enable), D4/D7/D8/D1/D5.
 
 ## Contract changes vs v5
 
@@ -112,7 +123,7 @@ if expected_redis == "1":
 Static analysis of `service_desc`/`revision_desc` is not enough. PR #31 §4a-2 and §5 also require the postdeploy helper to run Cloud Logging queries and assert:
 
 - **Adapter-up per instance** — for every rostered `jsonPayload.instance_id` on the serving revision, at least one entry matches `jsonPayload.event="redis_pubsub_started"` OR `jsonPayload.event="redis_pubsub_reconnected"`. Requiring only `_started` would spuriously fail an instance that started while Memorystore was briefly unreachable — see PR #31 §4a-2 W4.
-- **A5 paired condition** — `jsonPayload.event="redis_pubsub_startup_failed"` on an instance MUST be followed within 5 min by `jsonPayload.event="redis_pubsub_reconnect_successes"` on the SAME `jsonPayload.instance_id`. A lone `startup_failed` is a stop.
+- **A5 paired condition** — `jsonPayload.event="redis_pubsub_initial_connect_failed"` on an instance MUST be followed within 5 min by `jsonPayload.event="redis_pubsub_reconnected"` on the SAME `jsonPayload.instance_id`. A lone `redis_pubsub_initial_connect_failed` is a stop. **Event names come from the ACTUAL adapter emissions** (see `backend/app/services/redis_pubsub.py::_emit` catalogue on PR #34) — the older aggregate/metric names `redis_pubsub_startup_failed` / `redis_pubsub_reconnect_successes` were metric-filter labels, never event names emitted by the adapter, and using them in the log query would match nothing.
 - **A8b first-probe deadline** — for every rostered instance, at least one `jsonPayload.event="redis_probe_ok"` MUST land within `PROBE_FIRST_DEADLINE_SEC` (default 90 s) of the instance's first `jsonPayload.event="reconciler_tick"`. Missing = UNRESOLVED = window fails.
 
 These live in a new `ops/gate2-helpers/v6/log_checks.py` module (skeleton exists in this branch; full implementation lands with D3+D4).
