@@ -1,0 +1,138 @@
+# Manifest — the source-of-truth mapping from each monitoring
+# resource in this directory to the log event it consumes, the
+# labels it extracts, and its alert dependencies. Read by
+# validate.py (structural checks) and apply.py (topological
+# apply order — metrics before the alerts that reference them).
+#
+# Do NOT hand-edit resources without updating this manifest.
+# The test suite enforces the mapping (see
+# backend/tests/test_redis_monitoring_config.py).
+
+version: 1
+service: worshiptranslate-backend
+resource_type: cloud_run_revision
+
+# Every metric must extract instance_id via
+# EXTRACT(jsonPayload.instance_id) except the legacy metric,
+# which the pre-fix code cannot emit that field for.
+required_extracted_labels:
+  - instance_id
+required_resource_labels:
+  - resource.labels.revision_name
+required_json_fields:
+  - jsonPayload.event
+
+metrics:
+  redis_pubsub_startup_failed:
+    file: metrics/redis_pubsub_startup_failed.yaml
+    event: redis_pubsub_initial_connect_failed
+    extracts:
+      - instance_id
+      - reason
+    consumed_by:
+      - a5_startup_without_recovery
+  redis_pubsub_reconnect_attempts:
+    file: metrics/redis_pubsub_reconnect_attempts.yaml
+    event: redis_pubsub_reconnecting
+    extracts:
+      - instance_id
+    consumed_by:
+      - a6_reconnect_without_success
+  redis_pubsub_reconnect_successes:
+    file: metrics/redis_pubsub_reconnect_successes.yaml
+    event: redis_pubsub_reconnected
+    extracts:
+      - instance_id
+    consumed_by:
+      - a5_startup_without_recovery
+      - a6_reconnect_without_success
+  redis_pubsub_reconnect_failures:
+    file: metrics/redis_pubsub_reconnect_failures.yaml
+    event: redis_pubsub_reconnect_failed
+    extracts:
+      - instance_id
+    consumed_by: []
+  redis_pubsub_reader_errors:
+    file: metrics/redis_pubsub_reader_errors.yaml
+    event: redis_pubsub_reader_error
+    extracts:
+      - instance_id
+    consumed_by: []
+  redis_pubsub_active_probe_success:
+    file: metrics/redis_pubsub_active_probe_success.yaml
+    event: redis_probe_ok
+    extracts:
+      - instance_id
+    consumed_by:
+      - a8a_probe_absence_per_revision
+  redis_pubsub_active_probe_failure:
+    file: metrics/redis_pubsub_active_probe_failure.yaml
+    event: redis_probe_failed
+    extracts:
+      - instance_id
+      - reason
+    consumed_by:
+      - a7_active_probe_failure
+  # Legacy — pre-PR#32 emitter, textPayload not jsonPayload,
+  # cannot extract instance_id. See its YAML for detail.
+  redis_pubsub_legacy_startup_failed:
+    file: metrics/redis_pubsub_legacy_startup_failed.yaml
+    textPayload_match: "redis connect failed; falling back to local-only broadcast"
+    extracts: []
+    consumed_by:
+      - a5_legacy_startup_failed
+
+alerts:
+  a5_startup_without_recovery:
+    file: alerts/a5_startup_without_recovery.yaml
+    metrics_used:
+      - redis_pubsub_startup_failed
+      - redis_pubsub_reconnect_successes
+    group_by:
+      - resource.label.revision_name
+      - metric.label.instance_id
+  a5_legacy_startup_failed:
+    file: alerts/a5_legacy_startup_failed.yaml
+    metrics_used:
+      - redis_pubsub_legacy_startup_failed
+    group_by:
+      - resource.label.revision_name
+  a6_reconnect_without_success:
+    file: alerts/a6_reconnect_without_success.yaml
+    metrics_used:
+      - redis_pubsub_reconnect_attempts
+      - redis_pubsub_reconnect_successes
+    group_by:
+      - resource.label.revision_name
+      - metric.label.instance_id
+  a7_active_probe_failure:
+    file: alerts/a7_active_probe_failure.yaml
+    metrics_used:
+      - redis_pubsub_active_probe_failure
+    group_by:
+      - resource.label.revision_name
+      - metric.label.instance_id
+      - metric.label.reason
+  a8a_probe_absence_per_revision:
+    file: alerts/a8a_probe_absence_per_revision.yaml
+    metrics_used:
+      - redis_pubsub_active_probe_success
+    # revision_name ONLY (per rollout doc §3 A8a).
+    group_by:
+      - resource.label.revision_name
+
+# Every managed alert MUST carry these userLabels for the apply
+# script to identify it. Two policies with the same alert_id
+# are a fatal conflict.
+managed_labels:
+  managed_by: ops-monitoring-redis-fanout
+required_alert_userLabels:
+  - managed_by
+  - alert_id
+  - runbook
+
+# Allowlist enforced by apply.py — the only projects it will
+# write to. Emulator entry is present so tests exercise the
+# same code path.
+allowed_projects:
+  - sturdy-dogfish-472313-k6

@@ -1,0 +1,31 @@
+# Log-based metric — an in-process probe tick failed (publish
+# raised, callback threw, or the round-trip timed out). Any
+# occurrence in a 5-minute window pages via A7.
+#
+# Manifest anchor: metrics.redis_pubsub_active_probe_failure
+name: redis_pubsub_active_probe_failure
+description: |
+  redis pubsub in-process probe failed. Emitted by `_probe_loop`
+  after `redis_probe_failed`. Feeds A7. Managed by
+  ops/monitoring/redis-fanout — do NOT edit in the Cloud
+  Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  jsonPayload.event="redis_probe_failed"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: instance_id
+      valueType: STRING
+      description: Adapter INSTANCE_ID.
+    - key: reason
+      valueType: STRING
+      description: |
+        Failure reason from `_probe_loop` — "timeout",
+        "publish_failed", or "exception".
+labelExtractors:
+  instance_id: EXTRACT(jsonPayload.instance_id)
+  reason: EXTRACT(jsonPayload.reason)

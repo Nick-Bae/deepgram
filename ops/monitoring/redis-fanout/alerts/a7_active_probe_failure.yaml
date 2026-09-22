@@ -1,0 +1,48 @@
+# Alert A7 — the in-process probe failed. Any occurrence in a
+# 5-min window pages, per instance. Exercises the adapter's
+# REAL reader path so a stuck subscriber cannot be masked by a
+# fresh client.
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a7-active-probe-failure
+#
+# Manifest anchor: alerts.a7_active_probe_failure
+displayName: "[Redis fanout] A7 in-process probe failure (per instance)"
+combiner: OR
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a7-active-probe-failure
+  runbook: docs/03-analysis/redis-fanout-rollout-proposal.md#alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A7 — In-process probe failed on some instance
+
+    An instance's `_probe_loop` emitted `redis_probe_failed`
+    within the last 5 minutes. `reason` is one of "timeout",
+    "publish_failed", "exception". A stuck reader loop cannot
+    hide from this signal because the probe uses the adapter's
+    real `_pub` / `_sub` / `_pubsub` clients.
+conditions:
+  - displayName: active_probe_failure > 0 per instance (5 min)
+    conditionThreshold:
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_active_probe_failure"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - resource.label.revision_name
+            - metric.label.instance_id
+            - metric.label.reason
+      comparison: COMPARISON_GT
+      thresholdValue: 0
+      duration: 0s
+      trigger:
+        count: 1
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s

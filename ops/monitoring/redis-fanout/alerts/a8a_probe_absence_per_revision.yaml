@@ -1,0 +1,61 @@
+# Alert A8a — steady-state probe absence, per REVISION (NOT
+# per instance). Fires when a `redis_pubsub_active_probe_success`
+# series for a revision has previously reported and has been
+# silent for the last 2 min. Explicitly does NOT catch the
+# per-instance retirement case (Counter-example 1 in the spec)
+# or the never-emitted case (Counter-example 2) — those are
+# handled by A8b during operator windows, per the rollout doc.
+#
+# Grouping is by `resource.labels.revision_name` ONLY —
+# per-instance absence is invisible to Cloud Monitoring absence
+# policies when a sibling on the same revision keeps emitting.
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a8a-probe-absence-per-revision
+#
+# Manifest anchor: alerts.a8a_probe_absence_per_revision
+displayName: "[Redis fanout] A8a probe absence per revision"
+combiner: OR
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a8a-probe-absence-per-revision
+  runbook: docs/03-analysis/redis-fanout-rollout-proposal.md#alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A8a — Whole revision stopped emitting probes
+
+    A revision that WAS emitting `redis_probe_ok` has been
+    silent for 2 min. Cloud Monitoring's absence policy
+    requires at least one prior data point on the series
+    (Counter-example 3 in the rollout spec — a fresh revision
+    that never emits its first probe is caught by A8b during
+    operator windows, not here).
+
+    Manual step for the operator: cross-check
+    `run.googleapis.com/container/instance_count` on the same
+    revision. If the count is 0, the revision was retired
+    normally and A8a is a false alarm. If > 0, the revision is
+    stuck and needs investigation.
+conditions:
+  - displayName: active_probe_success absent per revision (2 min)
+    conditionAbsent:
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_active_probe_success"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          # NOTE: revision_name ONLY. Grouping by instance_id
+          # here would silently fire on every instance
+          # retirement (Counter-example 1 in the spec).
+          groupByFields:
+            - resource.label.revision_name
+      duration: 120s
+      trigger:
+        count: 1
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s

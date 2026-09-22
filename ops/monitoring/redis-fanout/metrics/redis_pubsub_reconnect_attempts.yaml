@@ -1,0 +1,27 @@
+# Log-based metric — the reader loop's reconnect attempts.
+# Rising counter without matching reconnect_successes = adapter
+# repeatedly retrying and failing (Redis unreachable, VPC path
+# broken, credentials wrong). Feeds alert A6 paired with the
+# success counter.
+#
+# Manifest anchor: metrics.redis_pubsub_reconnect_attempts
+name: redis_pubsub_reconnect_attempts
+description: |
+  redis pubsub reader loop attempted a reconnect. Not by itself
+  an alert — inspected paired with successes by alert A6.
+  Managed by ops/monitoring/redis-fanout — do NOT edit in the
+  Cloud Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  jsonPayload.event="redis_pubsub_reconnecting"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: instance_id
+      valueType: STRING
+      description: Adapter INSTANCE_ID.
+labelExtractors:
+  instance_id: EXTRACT(jsonPayload.instance_id)

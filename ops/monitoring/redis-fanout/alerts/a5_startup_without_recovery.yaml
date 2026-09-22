@@ -1,0 +1,83 @@
+# Alert A5 — a startup failure that never recovered.
+#
+# Paired condition: `redis_pubsub_startup_failed > 0` on some
+# instance AND `redis_pubsub_reconnect_successes` on the SAME
+# instance == 0 in the same 5-minute window. Distinguishes the
+# healthy-startup-glitch from the stuck-adapter case that Gate 2
+# was about.
+#
+# Grouped by `resource.labels.revision_name` AND the extracted
+# `instance_id` — a per-service aggregate would hide the exact
+# failure mode this alert exists to catch.
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a5-startup-without-recovery. The operator
+# apply script identifies existing policies by these labels — a
+# display-name-only lookup would double-create if the display
+# name were edited in the console.
+#
+# Manifest anchor: alerts.a5_startup_without_recovery
+displayName: "[Redis fanout] A5 startup-failed without recovery (per instance)"
+combiner: AND
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a5-startup-without-recovery
+  runbook: docs/03-analysis/redis-fanout-rollout-proposal.md#alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A5 — Redis pubsub startup failed and adapter did not recover
+
+    An instance emitted `redis_pubsub_initial_connect_failed`
+    and has NOT emitted `redis_pubsub_reconnected` on the same
+    instance within the following 5 minutes.
+
+    See PR #31 §3 "Alerts" in the rollout proposal for the
+    diagnostic steps. Do NOT silently roll back — a rollback
+    reintroduces the local-only-broadcast fallback that A5-legacy
+    alerts on.
+conditions:
+  - displayName: startup_failed > 0 AND reconnect_successes == 0 (same instance, 5 min)
+    conditionThreshold:
+      # Cloud Monitoring alerts support paired-condition
+      # evaluation via `denominatorFilter` or via two conditions
+      # combined with `combiner=AND`. We use the two-condition
+      # form so both series are grouped identically and the
+      # dashboard shows both raw counts.
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_startup_failed"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - resource.label.revision_name
+            - metric.label.instance_id
+      comparison: COMPARISON_GT
+      thresholdValue: 0
+      duration: 0s
+      trigger:
+        count: 1
+  - displayName: reconnect_successes on same instance == 0 (5 min)
+    conditionAbsent:
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_reconnect_successes"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - resource.label.revision_name
+            - metric.label.instance_id
+      duration: 300s
+      trigger:
+        count: 1
+# Notification channels are provided by the operator via CLI
+# override — the file references them by ID so the config is not
+# environment-specific. See manifest.yaml and apply.py.
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s  # 7 days

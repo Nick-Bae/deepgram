@@ -1,0 +1,24 @@
+# Log-based metric — one reconnect attempt failed. Not by
+# itself an alert; needed so A6's ratio (attempts vs successes)
+# is unambiguous.
+#
+# Manifest anchor: metrics.redis_pubsub_reconnect_failures
+name: redis_pubsub_reconnect_failures
+description: |
+  redis pubsub reader loop reconnect attempt failed. Feeds A6.
+  Managed by ops/monitoring/redis-fanout — do NOT edit in the
+  Cloud Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  jsonPayload.event="redis_pubsub_reconnect_failed"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: instance_id
+      valueType: STRING
+      description: Adapter INSTANCE_ID.
+labelExtractors:
+  instance_id: EXTRACT(jsonPayload.instance_id)

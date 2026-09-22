@@ -1,0 +1,27 @@
+# Log-based metric — ROLLBACK TELL. Matches the pre-fix
+# adapter's plain-text log line only. Never emitted by any
+# revision that includes PR #32 or later. Non-zero indicates a
+# rollback occurred or a pre-#32 revision is somehow live.
+# Pages via A5-legacy — independent of A5's paired condition
+# because pre-fix code has no structured emitter at all.
+#
+# Manifest anchor: metrics.redis_pubsub_legacy_startup_failed
+name: redis_pubsub_legacy_startup_failed
+description: |
+  ROLLBACK TELL. Pre-PR#32 fallback-to-local-only log line.
+  Non-zero => a rollback or unpatched revision is live.
+  Managed by ops/monitoring/redis-fanout — do NOT edit in the
+  Cloud Console.
+filter: |
+  resource.type="cloud_run_revision"
+  resource.labels.service_name="worshiptranslate-backend"
+  textPayload:"redis connect failed; falling back to local-only broadcast"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  # No instance_id extraction — pre-fix code has no structured
+  # emitter and no instance_id field. Group by revision_name
+  # (a resource label) at the alert layer.
+  labels: []
+labelExtractors: {}

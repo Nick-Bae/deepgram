@@ -1,0 +1,52 @@
+# Alert A5-legacy — ROLLBACK TELL. Any occurrence of the
+# pre-PR#32 fallback log line in a 5-min window pages.
+# Independent of A5's paired condition because pre-fix code has
+# NO reconnect emitter at all and A5's absence branch would
+# never resolve.
+#
+# Grouped by `resource.labels.revision_name` (per-revision) —
+# the legacy metric has no instance_id extractor because the
+# pre-fix code has no structured emitter.
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a5-legacy-startup-failed
+#
+# Manifest anchor: alerts.a5_legacy_startup_failed
+displayName: "[Redis fanout] A5-legacy rollback tell (pre-PR#32 code live)"
+combiner: OR
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a5-legacy-startup-failed
+  runbook: docs/03-analysis/redis-fanout-rollout-proposal.md#alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A5-legacy — Pre-PR#32 fallback log line observed
+
+    A revision is emitting the pre-fix
+    "redis connect failed; falling back to local-only broadcast"
+    text log line. This means a rollback happened or an
+    unpatched revision is live. Investigate immediately —
+    Track 1 Gate 2's isolation failure mode is possible on
+    that revision.
+conditions:
+  - displayName: legacy_startup_failed > 0 (per revision, 5 min)
+    conditionThreshold:
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_legacy_startup_failed"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - resource.label.revision_name
+      comparison: COMPARISON_GT
+      thresholdValue: 0
+      duration: 0s
+      trigger:
+        count: 1
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s

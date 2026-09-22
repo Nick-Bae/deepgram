@@ -1,0 +1,61 @@
+# Alert A6 — reader loop stuck in reconnect. > 3 attempts in
+# 5 min on some instance AND no successes on the same instance
+# in the same window. Signals a broken VPC path, wrong
+# credentials, or Memorystore in an unhealthy state.
+#
+# Managed identity: userLabels.managed_by=ops-monitoring-redis-fanout
+# + userLabels.alert_id=a6-reconnect-without-success
+#
+# Manifest anchor: alerts.a6_reconnect_without_success
+displayName: "[Redis fanout] A6 reconnect stuck without success (per instance)"
+combiner: AND
+enabled: true
+userLabels:
+  managed_by: ops-monitoring-redis-fanout
+  alert_id: a6-reconnect-without-success
+  runbook: docs/03-analysis/redis-fanout-rollout-proposal.md#alerts
+documentation:
+  mimeType: text/markdown
+  content: |
+    ## A6 — Reader loop is retrying without ever succeeding
+
+    An instance emitted `redis_pubsub_reconnecting` more than 3
+    times AND has NOT emitted `redis_pubsub_reconnected` in the
+    same 5-minute window. Investigate the VPC path,
+    Memorystore health, and AUTH first.
+conditions:
+  - displayName: reconnect_attempts > 3 per instance (5 min)
+    conditionThreshold:
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_reconnect_attempts"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 300s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - resource.label.revision_name
+            - metric.label.instance_id
+      comparison: COMPARISON_GT
+      thresholdValue: 3
+      duration: 0s
+      trigger:
+        count: 1
+  - displayName: reconnect_successes on same instance == 0 (5 min)
+    conditionAbsent:
+      filter: |
+        metric.type="logging.googleapis.com/user/redis_pubsub_reconnect_successes"
+        resource.type="cloud_run_revision"
+      aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_DELTA
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+            - resource.label.revision_name
+            - metric.label.instance_id
+      duration: 300s
+      trigger:
+        count: 1
+notificationChannels: []
+alertStrategy:
+  autoClose: 604800s
