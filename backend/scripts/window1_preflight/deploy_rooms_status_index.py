@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "3.4.1"  # R9: comment cleanup only (R7-era "scan_complete=True alone is quiescent" wording removed); no runtime semantic change since R8
+SCRIPT_VERSION = "3.5.0"  # R11: post-shape accepts absent-or-false usesAncestorConfig; post allows mixed CREATING/READY; poll waits for all four entries READY; production-derived fixtures
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -1225,74 +1225,97 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
 # --- Polling ------------------------------------------------------------
 
 
-def _current_rs_state(gcloud: str) -> str:
-    """Return the state of the rooms.status COLLECTION_GROUP
-    ASCENDING entry, or 'MISSING' if absent. Reads the nested
-    `Index.fields[]` shape gcloud actually returns (R3 correction
-    — R2 read a non-existent flat shape and never matched any
-    real production entry)."""
+def _current_rs_shape(gcloud: str) -> dict:
+    """R11: return the current rooms.status shape from gcloud as
+    the canonical dict `_validate_rooms_status_target_shape` and
+    `_load_rooms_status` share. Reads the nested `Index.fields[]`
+    proto shape gcloud actually returns."""
     raw = _run_gcloud(
         gcloud, "firestore", "indexes", "fields", "describe", "status",
         f"--project={PROJECT_ID}", f"--database={DATABASE_ID}",
         "--collection-group=rooms", "--format=json",
     )
     data = json.loads(raw)
-    for e in data.get("indexConfig", {}).get("indexes", []):
-        canonical = _canonicalize_index_entry(e)
-        if (canonical.get("order") == "ASCENDING"
-                and canonical.get("queryScope") == "COLLECTION_GROUP"):
-            return canonical.get("state") or "UNKNOWN"
+    canonical = [
+        _canonicalize_index_entry(e)
+        for e in data.get("indexConfig", {}).get("indexes", [])
+    ]
+    return {
+        "usesAncestorConfig": data.get("indexConfig", {}).get("usesAncestorConfig"),
+        "indexes": sorted(
+            canonical,
+            key=lambda c: (str(c.get("order") or ""),
+                           str(c.get("arrayConfig") or ""),
+                           str(c.get("queryScope") or "")),
+        ),
+    }
+
+
+def _current_rs_state(gcloud: str) -> str:
+    """Back-compat shim retained for the R3 test that asserts on
+    the CG_ASC state directly. Returns the CG_ASC entry state, or
+    'MISSING' if that specific entry is absent. R11's own poll
+    loop uses `_current_rs_shape` (all four entries) instead."""
+    shape = _current_rs_shape(gcloud)
+    for e in shape["indexes"]:
+        if (e.get("order") == "ASCENDING"
+                and e.get("queryScope") == "COLLECTION_GROUP"):
+            return e.get("state") or "UNKNOWN"
     return "MISSING"
 
 
 def _poll_until_ready(gcloud: str, audit_dir: Path, *,
                       timeout_sec: float, interval_sec: float,
                       assert_present: bool) -> str:
-    """Poll `rooms.status` until state=READY. Returns the terminal
-    state observed. Raises TimeoutError on timeout, RuntimeError
-    on NEEDS_REPAIR or unexpected state.
+    """R11: poll `rooms.status` until ALL FOUR required entries
+    are READY.
 
-    R3 finding 7: `MISSING` is the driver's absence sentinel, not
-    a documented Firestore index lifecycle state (which is one of
-    CREATING / READY / NEEDS_REPAIR per the docs). Once the
-    post-deploy snapshot has confirmed the CG_ASC entry exists,
-    a subsequent MISSING observation must hard-stop immediately —
-    it means the entry regressed. `assert_present=True` enables
-    that immediate stop; the driver passes True after post-diff
-    passes."""
+    On every iteration:
+      1. Fetch the full rooms.status shape from gcloud via
+         `_current_rs_shape`.
+      2. Apply the R11 unified target-shape validator with
+         `allow_creating=True`. Any problem — NEEDS_REPAIR, an
+         unknown state, a missing/duplicate/extra entry, wrong
+         fieldPath, wrong scope, wrong mode, usesAncestorConfig
+         reverting to True, more or fewer than four entries — is
+         raised as `RuntimeError` immediately. Caller maps that
+         to rc=8 poll_error.
+      3. If every entry state == 'READY', return 'READY'.
+      4. Otherwise sleep and retry until deadline; on timeout
+         raise `TimeoutError` (caller maps to rc=8 poll_timeout).
+
+    `assert_present` is preserved for back-compat with earlier
+    tests; the R11 shape check already asserts the four entries
+    are present, so the parameter is now advisory.
+    """
     poll_dir = audit_dir / "poll"
     poll_dir.mkdir(parents=True, exist_ok=True)
     poll_dir.chmod(0o700)
     log_path = poll_dir / "poll.log"
     deadline = time.monotonic() + timeout_sec
     while True:
-        state = _current_rs_state(gcloud)
+        shape = _current_rs_shape(gcloud)
+        states = [e.get("state") for e in shape["indexes"]]
+        uac = shape.get("usesAncestorConfig")
         with log_path.open("a") as f:
-            f.write(f"{_iso_now()} state={state}\n")
-        if state == "READY":
-            return state
-        if state == "NEEDS_REPAIR":
-            raise RuntimeError(f"rooms.status entered {state}")
-        if state == "MISSING":
-            if assert_present:
-                raise RuntimeError(
-                    "rooms.status COLLECTION_GROUP ASCENDING entry "
-                    "was present in the post-deploy snapshot but is "
-                    "MISSING from a subsequent describe response — "
-                    "index regressed"
-                )
-            # Only permitted when we do NOT yet know the override
-            # is present; the driver never passes assert_present
-            # False today, so this branch is defensive.
-        elif state != "CREATING":
-            raise RuntimeError(
-                f"unexpected state {state!r} (not one of "
-                f"{sorted(FIRESTORE_INDEX_STATES)!r} or MISSING)"
+            f.write(
+                f"{_iso_now()} states={states} "
+                f"usesAncestorConfig={uac!r}\n"
             )
+        problems = _validate_rooms_status_target_shape(
+            shape, phase="poll", allow_creating=True,
+        )
+        if problems:
+            raise RuntimeError(
+                "rooms.status shape violation during poll: "
+                + "; ".join(problems)
+            )
+        if states and all(s == "READY" for s in states):
+            return "READY"
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f"index did not reach READY within {timeout_sec:.0f}s "
-                f"(last state={state})"
+                f"rooms.status did not reach ALL-READY within "
+                f"{timeout_sec:.0f}s (last states={states})"
             )
         time.sleep(interval_sec)
 
@@ -1435,91 +1458,161 @@ def _validate_pre_rooms_status(snapshot_dir: Path) -> None:
              "; ".join(problems))
 
 
-def _validate_post_rooms_status(snapshot_dir: Path) -> None:
-    """Post-deploy: rooms.status must show `usesAncestorConfig ==
-    false` (explicit override took over), FOUR entries with
-    nested `fieldPath == "status"`, three COLLECTION-scope
-    entries READY, and one COLLECTION_GROUP ASCENDING entry in
-    {CREATING, READY}."""
-    rs = _load_rooms_status(snapshot_dir)
+# --- R11: unified rooms.status target-shape validator -----------------
+#
+# R11 supersedes R10's post + final validators after the 2026-09-26
+# production deployment exposed two independent false-negatives:
+#   (a) R10 required `usesAncestorConfig == False` (literal boolean).
+#       Production returns the field ABSENT once the override is
+#       explicit — proto3 default-omission for the `false` value.
+#   (b) R10 required the three inherited COLLECTION-scope entries to
+#       be READY immediately in the post-snapshot. Firestore
+#       transiently returns them to CREATING while it rebuilds them
+#       under the explicit override, so post-deploy sees the whole
+#       target set in CREATING and reaches READY minutes later.
+# R11 accepts both real production shapes: absent-or-false
+# usesAncestorConfig, and post-phase entries in CREATING OR READY.
+
+REQUIRED_ROOMS_STATUS_ENTRIES: frozenset = frozenset({
+    ("ASCENDING", None, "COLLECTION"),
+    ("DESCENDING", None, "COLLECTION"),
+    (None, "CONTAINS", "COLLECTION"),
+    ("ASCENDING", None, "COLLECTION_GROUP"),
+})
+
+
+def _validate_rooms_status_target_shape(
+    rs: dict, phase: str, allow_creating: bool,
+) -> list[str]:
+    """R11: single source of truth for whether a rooms.status shape
+    matches the intended post-deploy contract. Returns a list of
+    problem strings (empty means the shape is valid).
+
+    The `rs` argument is the canonical shape dict produced by
+    `_load_rooms_status()` (from a snapshot file) or
+    `_current_rs_shape()` (live from gcloud). Both flatten
+    Firestore's nested `Index.fields[]` proto into per-entry
+    fieldPath/order/arrayConfig/queryScope/state records.
+
+    Rules (all must hold for zero problems):
+      1. `usesAncestorConfig` must be absent (None) OR literal
+         `False`. `True` is rejected — the explicit override did
+         not take over. Any non-bool value is also rejected.
+      2. Exactly four entries.
+      3. Every `fieldPath` must equal `"status"`.
+      4. Every state must be a known Firestore lifecycle state
+         (CREATING, READY, NEEDS_REPAIR). Any unknown state is
+         rejected. NEEDS_REPAIR is always rejected — it indicates
+         the index cannot build automatically.
+      5. When `allow_creating=True`: state ∈ {CREATING, READY}.
+         Used during the post-deploy shape check and every poll
+         iteration.
+      6. When `allow_creating=False`: state must equal READY. Used
+         once polling has confirmed all four entries reached READY.
+      7. The set of (order, arrayConfig, queryScope) tuples must
+         equal `REQUIRED_ROOMS_STATUS_ENTRIES` EXACTLY — no
+         missing, no duplicate, no extra fifth entry."""
     problems: list[str] = []
-    if rs.get("usesAncestorConfig") is not False:
+    uac = rs.get("usesAncestorConfig")
+    if uac is True:
         problems.append(
-            f"post rooms.status usesAncestorConfig={rs.get('usesAncestorConfig')!r}, "
-            f"expected False"
+            f"{phase} rooms.status usesAncestorConfig=True — "
+            f"explicit override did not take over"
+        )
+    elif uac is not None and uac is not False:
+        problems.append(
+            f"{phase} rooms.status usesAncestorConfig={uac!r} — "
+            f"expected absent (None) or False"
         )
     entries = rs.get("indexes", [])
     if len(entries) != 4:
         problems.append(
-            f"post rooms.status has {len(entries)} entries, expected 4"
+            f"{phase} rooms.status has {len(entries)} entries, "
+            f"expected 4"
         )
     for i, e in enumerate(entries):
         if e.get("fieldPath") != "status":
-            problems.append(f"post entries[{i}] fieldPath={e.get('fieldPath')!r} != status")
-    col_asc = [e for e in entries
-               if e.get("order") == "ASCENDING"
-               and e.get("queryScope") == "COLLECTION"]
-    col_desc = [e for e in entries
-                if e.get("order") == "DESCENDING"
-                and e.get("queryScope") == "COLLECTION"]
-    col_arr = [e for e in entries
-               if e.get("arrayConfig") == "CONTAINS"
-               and e.get("queryScope") == "COLLECTION"]
-    cg_asc = [e for e in entries
-              if e.get("order") == "ASCENDING"
-              and e.get("queryScope") == "COLLECTION_GROUP"]
-    if len(col_asc) != 1 or col_asc[0].get("state") != "READY":
-        problems.append(f"post COLLECTION ASC entries={col_asc!r}")
-    if len(col_desc) != 1 or col_desc[0].get("state") != "READY":
-        problems.append(f"post COLLECTION DESC entries={col_desc!r}")
-    if len(col_arr) != 1 or col_arr[0].get("state") != "READY":
-        problems.append(f"post COLLECTION ARRAY_CONTAINS entries={col_arr!r}")
-    if len(cg_asc) != 1:
-        problems.append(f"post COLLECTION_GROUP ASC count={len(cg_asc)}, expected 1")
-    elif cg_asc[0].get("state") not in ("CREATING", "READY"):
-        problems.append(f"post CG_ASC state={cg_asc[0].get('state')!r} not in "
-                        f"{{CREATING, READY}}")
+            problems.append(
+                f"{phase} entries[{i}] fieldPath="
+                f"{e.get('fieldPath')!r} != 'status'"
+            )
+        state = e.get("state")
+        if state == "NEEDS_REPAIR":
+            problems.append(
+                f"{phase} entries[{i}] state=NEEDS_REPAIR — "
+                f"index cannot build automatically"
+            )
+        elif state not in FIRESTORE_INDEX_STATES:
+            problems.append(
+                f"{phase} entries[{i}] state={state!r} not in "
+                f"{sorted(FIRESTORE_INDEX_STATES)!r}"
+            )
+        elif allow_creating:
+            if state not in ("CREATING", "READY"):
+                problems.append(
+                    f"{phase} entries[{i}] state={state!r} not in "
+                    f"{{CREATING, READY}}"
+                )
+        else:
+            if state != "READY":
+                problems.append(
+                    f"{phase} entries[{i}] state={state!r} != READY"
+                )
+    keys = [
+        (e.get("order"), e.get("arrayConfig"), e.get("queryScope"))
+        for e in entries
+    ]
+    seen: set = set()
+    dupes: set = set()
+    for k in keys:
+        if k in seen:
+            dupes.add(k)
+        seen.add(k)
+    if dupes:
+        problems.append(
+            f"{phase} duplicate entry keys: {sorted(dupes, key=str)!r}"
+        )
+    observed = set(keys)
+    missing = REQUIRED_ROOMS_STATUS_ENTRIES - observed
+    extra = observed - REQUIRED_ROOMS_STATUS_ENTRIES
+    if missing:
+        problems.append(
+            f"{phase} missing entries: {sorted(missing, key=str)!r}"
+        )
+    if extra:
+        problems.append(
+            f"{phase} unexpected entries: {sorted(extra, key=str)!r}"
+        )
+    return problems
+
+
+def _validate_post_rooms_status(snapshot_dir: Path) -> None:
+    """R11: apply the unified target-shape validator with
+    `allow_creating=True`. Post-deploy accepts entries in
+    CREATING or READY — Firestore transitions the three inherited
+    COLLECTION-scope entries through CREATING once the override
+    becomes explicit, and the new COLLECTION_GROUP entry starts
+    life in CREATING. See `_validate_rooms_status_target_shape`
+    for the full contract."""
+    rs = _load_rooms_status(snapshot_dir)
+    problems = _validate_rooms_status_target_shape(
+        rs, phase="post", allow_creating=True,
+    )
     if problems:
         _die(RC.POST_DIFF, "post_rooms_status_shape",
              "; ".join(problems))
 
 
 def _validate_final_rooms_status(snapshot_dir: Path) -> None:
-    """Final: same shape as post except all four entries MUST
-    be READY."""
+    """R11: apply the unified target-shape validator with
+    `allow_creating=False`. Every entry must be in state READY —
+    polling has already confirmed the transition, so any drift
+    back to CREATING (or worse) at final-snapshot time is
+    treated as regression."""
     rs = _load_rooms_status(snapshot_dir)
-    problems: list[str] = []
-    if rs.get("usesAncestorConfig") is not False:
-        problems.append(
-            f"final rooms.status usesAncestorConfig={rs.get('usesAncestorConfig')!r}, "
-            f"expected False"
-        )
-    entries = rs.get("indexes", [])
-    if len(entries) != 4:
-        problems.append(
-            f"final rooms.status has {len(entries)} entries, expected 4"
-        )
-    for i, e in enumerate(entries):
-        if e.get("fieldPath") != "status":
-            problems.append(f"final entries[{i}] fieldPath={e.get('fieldPath')!r} != status")
-        if e.get("state") != "READY":
-            problems.append(f"final entries[{i}] state={e.get('state')!r} != READY")
-    required = {
-        ("ASCENDING", None, "COLLECTION"),
-        ("DESCENDING", None, "COLLECTION"),
-        (None, "CONTAINS", "COLLECTION"),
-        ("ASCENDING", None, "COLLECTION_GROUP"),
-    }
-    actual = {
-        (e.get("order"), e.get("arrayConfig"), e.get("queryScope"))
-        for e in entries
-    }
-    if actual != required:
-        problems.append(
-            f"final entry-shape mismatch: "
-            f"missing={sorted(required - actual, key=str)!r} "
-            f"extra={sorted(actual - required, key=str)!r}"
-        )
+    problems = _validate_rooms_status_target_shape(
+        rs, phase="final", allow_creating=False,
+    )
     if problems:
         _die(RC.FINAL_DIFF, "final_rooms_status_shape",
              "; ".join(problems))

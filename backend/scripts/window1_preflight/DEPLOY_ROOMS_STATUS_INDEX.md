@@ -11,7 +11,7 @@ invoke the driver.
 
 | | |
 |---|---|
-| Driver script version | `3.4.1` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
+| Driver script version | `3.5.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
 | Approved PR #42 SHA to pin | recorded independently by the reviewer; passed as `--reviewer-approved-sha` and MUST equal `--pr42-sha` |
 | Script sha256 pin | recorded independently by the reviewer; passed as `--script-sha256`; driver re-hashes itself and refuses on mismatch |
 | Firebase CLI version required | `13.19.0` (passed as `--firebase-tools-version-pin`; bump requires re-running the fixture suite) |
@@ -130,6 +130,46 @@ Fixture coverage:
   during a SIGINT-mid-deploy.
 - `test_sigint_mid_deploy_terminates_process_group_and_prevents_late_mutation`
   (R4) — default-SIGTERM-handling grandchild during a SIGINT.
+
+## Post/final rooms.status target shape (R11)
+
+R11 replaced R10's independent post + final validators with a
+single unified target-shape check. This was necessary after the
+**2026-09-26 production deploy** at R10 landed the intended
+change (all four rooms.status entries eventually reached READY
+in Firestore) but the R10 validator rejected the *observed*
+post-snapshot with rc=7 because of two independent false-
+negatives that only appear against real Firestore:
+
+1. **`usesAncestorConfig` omission.** R10 required literal
+   `false`. Firestore returns the field ABSENT (proto3 default
+   omission for the false value) once the override is explicit.
+   R11 accepts absent OR `false`; only `true` is rejected.
+2. **Transient CREATING on inherited entries.** R10 required
+   the three pre-existing COLLECTION-scope entries to be READY
+   immediately after `firebase deploy` returned. Firestore
+   transitions them through CREATING when the override becomes
+   explicit. R11's post/poll phase accepts CREATING or READY;
+   the poll loop waits until all four entries reach READY, then
+   the final phase enforces READY-only.
+
+R11's `_validate_rooms_status_target_shape` is the single
+source of truth. It rejects: NEEDS_REPAIR, unknown states,
+missing/duplicate/extra entries, wrong fieldPath, wrong scope,
+wrong index mode, `usesAncestorConfig=True`.
+
+Production-derived fixtures in
+`backend/tests/deploy_index_fixtures/real_gcloud_samples/`
+pin R11 against the exact shapes observed 2026-09-26:
+
+  - `fields_describe_rooms_status_post_creating.json`
+  - `fields_describe_rooms_status_final_ready.json`
+  - `fields_list_dbwide_post_creating.json`
+  - `fields_list_dbwide_final_ready.json`
+
+The `database.json` metadata (uid, etag, backup config) is
+deliberately NOT committed — only the minimal structural
+fixtures needed by the tests.
 
 ## Recovery is a compensating change, NOT a git revert
 

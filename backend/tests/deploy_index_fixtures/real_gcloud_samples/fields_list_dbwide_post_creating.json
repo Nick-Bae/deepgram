@@ -1,0 +1,87 @@
+[
+  {
+    "indexConfig": {
+      "indexes": [
+        {
+          "fields": [
+            {
+              "fieldPath": "*",
+              "order": "ASCENDING"
+            }
+          ],
+          "queryScope": "COLLECTION",
+          "state": "READY"
+        },
+        {
+          "fields": [
+            {
+              "fieldPath": "*",
+              "order": "DESCENDING"
+            }
+          ],
+          "queryScope": "COLLECTION",
+          "state": "READY"
+        },
+        {
+          "fields": [
+            {
+              "arrayConfig": "CONTAINS",
+              "fieldPath": "*"
+            }
+          ],
+          "queryScope": "COLLECTION",
+          "state": "READY"
+        }
+      ]
+    },
+    "name": "projects/sturdy-dogfish-472313-k6/databases/worship-translation/collectionGroups/__default__/fields/*"
+  },
+  {
+    "indexConfig": {
+      "ancestorField": "projects/sturdy-dogfish-472313-k6/databases/worship-translation/collectionGroups/__default__/fields/*",
+      "indexes": [
+        {
+          "fields": [
+            {
+              "fieldPath": "status",
+              "order": "ASCENDING"
+            }
+          ],
+          "queryScope": "COLLECTION",
+          "state": "CREATING"
+        },
+        {
+          "fields": [
+            {
+              "fieldPath": "status",
+              "order": "DESCENDING"
+            }
+          ],
+          "queryScope": "COLLECTION",
+          "state": "CREATING"
+        },
+        {
+          "fields": [
+            {
+              "arrayConfig": "CONTAINS",
+              "fieldPath": "status"
+            }
+          ],
+          "queryScope": "COLLECTION",
+          "state": "CREATING"
+        },
+        {
+          "fields": [
+            {
+              "fieldPath": "status",
+              "order": "ASCENDING"
+            }
+          ],
+          "queryScope": "COLLECTION_GROUP",
+          "state": "CREATING"
+        }
+      ]
+    },
+    "name": "projects/sturdy-dogfish-472313-k6/databases/worship-translation/collectionGroups/rooms/fields/status"
+  }
+]

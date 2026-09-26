@@ -545,8 +545,12 @@ class DeployDriverFixtureTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 7, proc.stderr[:400])
             payload = json.loads(proc.stdout.splitlines()[0])
             self.assertEqual(payload["outcome"], "post_rooms_status_shape")
-            self.assertIn("COLLECTION_GROUP ASC count=0",
-                          payload["reason"])
+            # R11 message wording: the unified validator reports
+            # entry count + missing-set instead of R10's per-branch
+            # "COLLECTION_GROUP ASC count=0" phrasing. Both fire on
+            # the same hard-stop condition (CG_ASC entry absent).
+            self.assertIn("missing entries", payload["reason"])
+            self.assertIn("COLLECTION_GROUP", payload["reason"])
         finally:
             sb.cleanup()
 
@@ -843,7 +847,13 @@ class R3ExtendedFixtureTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 8, proc.stderr[:400])
             payload = json.loads(proc.stdout.splitlines()[0])
             self.assertEqual(payload["outcome"], "poll_error")
-            self.assertIn("regressed", payload["reason"])
+            # R11 wording: the poll's unified shape validator
+            # reports "missing entries" when the CG_ASC entry
+            # disappears mid-poll (previously the poll said the
+            # index "regressed"). Same behavior — hard stop rc=8
+            # with poll_error outcome — different phrasing.
+            self.assertIn("shape violation during poll", payload["reason"])
+            self.assertIn("missing entries", payload["reason"])
         finally:
             sb.cleanup()
 
@@ -1936,6 +1946,331 @@ class R10TrapFailureMarkerExactnessTests(unittest.TestCase):
         tf = self._write_marker(body)
         with self.assertRaises(AssertionError):
             _assert_trap_failure_is_only_contradictory_state(self, tf)
+
+
+class R11ShapeValidatorTests(unittest.TestCase):
+    """R11: the unified rooms.status target-shape validator is the
+    single source of truth for post/poll/final acceptance. The
+    2026-09-26 production deploy exposed two R10 false-negatives
+    (usesAncestorConfig omitted; inherited entries transiently
+    CREATING); R11 accepts both real production shapes and rejects
+    every other class of drift.
+
+    These tests exercise `_validate_rooms_status_target_shape`
+    with hand-built canonical dicts — the same shape both
+    `_load_rooms_status()` and `_current_rs_shape()` produce."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "dep_drv_r11_shape", str(_DRIVER),
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def _entry(self, order, arr, scope, state, field="status"):
+        return {"fieldPath": field, "order": order,
+                "arrayConfig": arr, "queryScope": scope, "state": state}
+
+    def _all_ready(self):
+        return [
+            self._entry("ASCENDING", None, "COLLECTION", "READY"),
+            self._entry("DESCENDING", None, "COLLECTION", "READY"),
+            self._entry(None, "CONTAINS", "COLLECTION", "READY"),
+            self._entry("ASCENDING", None, "COLLECTION_GROUP", "READY"),
+        ]
+
+    def _all_creating(self):
+        return [{**e, "state": "CREATING"} for e in self._all_ready()]
+
+    def _mixed(self):
+        e = self._all_ready()
+        e[0]["state"] = "CREATING"
+        e[3]["state"] = "CREATING"
+        return e
+
+    # ---- usesAncestorConfig acceptance rules ----
+
+    def test_uac_absent_all_ready_accepted_post_and_final(self):
+        rs = {"indexes": self._all_ready()}  # no usesAncestorConfig
+        self.assertEqual(
+            self.mod._validate_rooms_status_target_shape(
+                rs, phase="post", allow_creating=True), [])
+        self.assertEqual(
+            self.mod._validate_rooms_status_target_shape(
+                rs, phase="final", allow_creating=False), [])
+
+    def test_uac_false_all_ready_accepted_post_and_final(self):
+        rs = {"usesAncestorConfig": False, "indexes": self._all_ready()}
+        self.assertEqual(
+            self.mod._validate_rooms_status_target_shape(
+                rs, phase="post", allow_creating=True), [])
+        self.assertEqual(
+            self.mod._validate_rooms_status_target_shape(
+                rs, phase="final", allow_creating=False), [])
+
+    def test_uac_true_rejected_post(self):
+        rs = {"usesAncestorConfig": True, "indexes": self._all_ready()}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("usesAncestorConfig=True" in p for p in problems))
+
+    def test_uac_true_rejected_final(self):
+        rs = {"usesAncestorConfig": True, "indexes": self._all_ready()}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="final", allow_creating=False)
+        self.assertTrue(any("usesAncestorConfig=True" in p for p in problems))
+
+    def test_uac_non_bool_rejected(self):
+        rs = {"usesAncestorConfig": "false", "indexes": self._all_ready()}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("usesAncestorConfig=" in p for p in problems))
+
+    # ---- state-transition acceptance rules ----
+
+    def test_all_creating_accepted_in_post(self):
+        rs = {"indexes": self._all_creating()}
+        self.assertEqual(
+            self.mod._validate_rooms_status_target_shape(
+                rs, phase="post", allow_creating=True), [])
+
+    def test_all_creating_rejected_in_final(self):
+        rs = {"indexes": self._all_creating()}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="final", allow_creating=False)
+        self.assertEqual(len(problems), 4)
+        for p in problems:
+            self.assertIn("!= READY", p)
+
+    def test_mixed_creating_and_ready_accepted_in_post(self):
+        rs = {"indexes": self._mixed()}
+        self.assertEqual(
+            self.mod._validate_rooms_status_target_shape(
+                rs, phase="post", allow_creating=True), [])
+
+    def test_mixed_creating_and_ready_rejected_in_final(self):
+        rs = {"indexes": self._mixed()}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="final", allow_creating=False)
+        # exactly 2 CREATING entries → 2 !=READY problems
+        creating_problems = [p for p in problems if "!= READY" in p]
+        self.assertEqual(len(creating_problems), 2)
+
+    # ---- error-class rejection rules ----
+
+    def test_needs_repair_rejected_in_post(self):
+        entries = self._all_ready()
+        entries[3]["state"] = "NEEDS_REPAIR"
+        rs = {"indexes": entries}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("NEEDS_REPAIR" in p for p in problems))
+
+    def test_needs_repair_rejected_in_final(self):
+        entries = self._all_ready()
+        entries[3]["state"] = "NEEDS_REPAIR"
+        rs = {"indexes": entries}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="final", allow_creating=False)
+        self.assertTrue(any("NEEDS_REPAIR" in p for p in problems))
+
+    def test_missing_entry_rejected(self):
+        rs = {"indexes": self._all_ready()[:3]}  # drop CG_ASC
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("missing entries" in p for p in problems))
+        self.assertTrue(any("3 entries, expected 4" in p for p in problems))
+
+    def test_duplicate_entry_rejected(self):
+        entries = self._all_ready()
+        entries.append(self._entry("ASCENDING", None, "COLLECTION", "READY"))
+        # 5 entries with one duplicate — also count!=4, but that's fine
+        rs = {"indexes": entries[:4] + entries[3:4]}
+        # crafted: 4th is CG_ASC and we append CG_ASC → duplicate
+        rs2 = {"indexes": self._all_ready() + [
+            self._entry("ASCENDING", None, "COLLECTION_GROUP", "READY")]}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs2, phase="post", allow_creating=True)
+        self.assertTrue(
+            any("duplicate entry keys" in p for p in problems),
+            f"expected duplicate-detection in problems={problems!r}"
+        )
+
+    def test_extra_fifth_entry_rejected(self):
+        entries = self._all_ready()
+        entries.append(self._entry("DESCENDING", None, "COLLECTION_GROUP",
+                                   "READY"))
+        rs = {"indexes": entries}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("unexpected entries" in p for p in problems))
+        self.assertTrue(any("5 entries, expected 4" in p for p in problems))
+
+    def test_unknown_state_rejected(self):
+        entries = self._all_ready()
+        entries[0]["state"] = "PENDING"
+        rs = {"indexes": entries}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("state='PENDING' not in" in p for p in problems))
+
+    def test_wrong_field_path_rejected(self):
+        entries = self._all_ready()
+        entries[0]["fieldPath"] = "not_status"
+        rs = {"indexes": entries}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("fieldPath='not_status'" in p for p in problems))
+
+    def test_wrong_scope_rejected(self):
+        entries = self._all_ready()
+        # Change COLLECTION_GROUP ASC to COLLECTION ASC → duplicate +
+        # missing one CG entry
+        entries[3]["queryScope"] = "COLLECTION"
+        rs = {"indexes": entries}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(any("missing entries" in p for p in problems))
+
+    def test_wrong_mode_rejected(self):
+        # Change ARRAY_CONTAINS entry to an ordered ASC entry
+        entries = self._all_ready()
+        entries[2] = self._entry("ASCENDING", None, "COLLECTION", "READY")
+        rs = {"indexes": entries}
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertTrue(
+            any("missing entries" in p for p in problems)
+            or any("duplicate" in p for p in problems)
+        )
+
+
+class R11ProductionFixtureTests(unittest.TestCase):
+    """R11: load the sanitized production-derived fixtures captured
+    2026-09-26 and assert the R11 validators accept them exactly
+    as the R10 rerun on production would have — proving that the
+    R10 false-negative is closed and that R11 will decide correctly
+    against real Firestore output shapes.
+
+    Fixtures at `deploy_index_fixtures/real_gcloud_samples/`:
+      - `fields_describe_rooms_status_post_creating.json` — the
+        rooms.status shape immediately after `firebase deploy`
+        returned rc=0: usesAncestorConfig ABSENT, four entries
+        all in CREATING state.
+      - `fields_describe_rooms_status_final_ready.json` — the same
+        shape ~7 minutes later after Firestore finished building:
+        usesAncestorConfig ABSENT, four entries all READY.
+      - `fields_list_dbwide_post_creating.json` — the db-wide
+        fields list at post time (default ancestor + rooms.status
+        explicit override, entries CREATING).
+      - `fields_list_dbwide_final_ready.json` — same, entries READY."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "dep_drv_r11_prod", str(_DRIVER),
+        )
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+        cls.SAMPLES = _FIXTURES / "real_gcloud_samples"
+
+    def _canonicalize(self, path: Path) -> dict:
+        raw = json.loads(path.read_text())
+        canonical = [
+            self.mod._canonicalize_index_entry(e)
+            for e in raw.get("indexConfig", {}).get("indexes", [])
+        ]
+        return {
+            "usesAncestorConfig": raw.get("indexConfig", {}).get(
+                "usesAncestorConfig"),
+            "indexes": sorted(
+                canonical,
+                key=lambda c: (str(c.get("order") or ""),
+                               str(c.get("arrayConfig") or ""),
+                               str(c.get("queryScope") or "")),
+            ),
+        }
+
+    def test_post_creating_fixture_accepted_by_post_validator(self):
+        p = self.SAMPLES / "fields_describe_rooms_status_post_creating.json"
+        rs = self._canonicalize(p)
+        # usesAncestorConfig should be absent
+        self.assertIsNone(rs["usesAncestorConfig"])
+        # 4 entries, all state=CREATING
+        self.assertEqual(len(rs["indexes"]), 4)
+        self.assertEqual([e["state"] for e in rs["indexes"]],
+                         ["CREATING"] * 4)
+        # post validator accepts (allow_creating=True)
+        problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="post", allow_creating=True)
+        self.assertEqual(problems, [])
+        # final validator REJECTS this shape (it needs all READY)
+        final_problems = self.mod._validate_rooms_status_target_shape(
+            rs, phase="final", allow_creating=False)
+        self.assertNotEqual(final_problems, [])
+
+    def test_final_ready_fixture_accepted_by_both_validators(self):
+        p = self.SAMPLES / "fields_describe_rooms_status_final_ready.json"
+        rs = self._canonicalize(p)
+        self.assertIsNone(rs["usesAncestorConfig"])
+        self.assertEqual(len(rs["indexes"]), 4)
+        self.assertEqual([e["state"] for e in rs["indexes"]],
+                         ["READY"] * 4)
+        # Both validators accept
+        for phase, allow in (("post", True), ("final", False)):
+            problems = self.mod._validate_rooms_status_target_shape(
+                rs, phase=phase, allow_creating=allow)
+            self.assertEqual(problems, [], f"phase={phase} problems={problems}")
+
+    def test_dbwide_post_creating_fixture_has_rooms_status_override(self):
+        """R11: the db-wide field-list fixture during post-CREATING
+        must contain exactly one explicit override (rooms.status)
+        plus the __default__ ancestor sentinel."""
+        p = self.SAMPLES / "fields_list_dbwide_post_creating.json"
+        data = json.loads(p.read_text())
+        self.assertEqual(len(data), 2)
+        explicit = [e for e in data
+                    if "/__default__/fields/" not in e.get("name", "")]
+        default = [e for e in data
+                   if "/__default__/fields/" in e.get("name", "")]
+        self.assertEqual(len(explicit), 1)
+        self.assertEqual(len(default), 1)
+        self.assertTrue(
+            explicit[0].get("name", "").endswith(
+                "/collectionGroups/rooms/fields/status"),
+            f"unexpected explicit override: {explicit[0].get('name')!r}",
+        )
+        # Entry states in the fixture (post-CREATING) = all CREATING
+        idxs = explicit[0].get("indexConfig", {}).get("indexes", [])
+        self.assertEqual(len(idxs), 4)
+        self.assertEqual([i.get("state") for i in idxs], ["CREATING"] * 4)
+
+    def test_dbwide_final_ready_fixture_has_rooms_status_override(self):
+        p = self.SAMPLES / "fields_list_dbwide_final_ready.json"
+        data = json.loads(p.read_text())
+        self.assertEqual(len(data), 2)
+        explicit = [e for e in data
+                    if "/__default__/fields/" not in e.get("name", "")]
+        self.assertEqual(len(explicit), 1)
+        idxs = explicit[0].get("indexConfig", {}).get("indexes", [])
+        self.assertEqual(len(idxs), 4)
+        self.assertEqual([i.get("state") for i in idxs], ["READY"] * 4)
+
+    def test_neither_dbwide_fixture_contains_uid_or_etag(self):
+        """R11: guard against accidentally committing the database
+        `uid` or `etag` fields (from `databases describe`) in the
+        db-wide field-list fixtures. The reviewer requires the
+        minimal sanitized structural fixtures only."""
+        for name in ("fields_list_dbwide_post_creating.json",
+                     "fields_list_dbwide_final_ready.json",
+                     "fields_describe_rooms_status_post_creating.json",
+                     "fields_describe_rooms_status_final_ready.json"):
+            text = (self.SAMPLES / name).read_text()
+            self.assertNotIn('"uid"', text, f"{name} contains uid")
+            self.assertNotIn('"etag"', text, f"{name} contains etag")
 
 
 if __name__ == "__main__":
