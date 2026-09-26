@@ -1930,6 +1930,115 @@ class PostRpcDeadlineEnforcementTests(unittest.TestCase):
 
     # --- Monitoring: final-page RPC overruns budget ------------
 
+    def test_fetch_metric_samples_raises_after_aggregation_overruns_deadline(self):
+        """R7 blocker: `_aggregate_metric_series` checks
+        `deadline.expired()` at the TOP of each series iteration,
+        so processing the FINAL series can push us past budget
+        without any inner check firing again — aggregation
+        completes and `fetch_metric_samples` would return the
+        aggregated result. R7 adds a post-aggregation gate that
+        must raise TimeoutError with a distinct message before
+        the successful return.
+
+        Test setup:
+          - Budget = 20s; RPC costs 5s (within budget).
+          - Two real proto series (active + idle for `rev-a` at
+            the same 1-s bucket, so aggregation produces exactly
+            one union entry).
+          - `_extract_point_value` is patched to advance the fake
+            clock by 10s per call. Series 1's point advances
+            5→15 (still within budget); series 2's point advances
+            15→25 (past budget) — but the aggregator's pre-iter
+            check has already passed for series 2, so aggregation
+            completes.
+          - fetch_metric_samples must raise TimeoutError instead
+            of returning the aggregated `rev-a` entry."""
+        from google.cloud import monitoring_v3
+        from google.cloud.monitoring_v3.services.metric_service import (
+            MetricServiceClient,
+        )
+        from google.cloud.monitoring_v3.services.metric_service.pagers import (
+            ListTimeSeriesPager,
+        )
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        state, fake_monotonic = self._fake_clock()
+
+        # Fix the point timestamp so `_extract_point_timestamp`
+        # is deterministic; only `_extract_point_value` advances
+        # the fake clock.
+        end = Timestamp()
+        end.FromDatetime(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        active_series = monitoring_v3.TimeSeries({
+            "resource": {"labels": {"revision_name": "rev-a"}},
+            "metric": {"labels": {"state": "active"}},
+            "points": [monitoring_v3.Point({
+                "interval": {"end_time": end},
+                "value": {"int64_value": 2},
+            })],
+        })
+        idle_series = monitoring_v3.TimeSeries({
+            "resource": {"labels": {"revision_name": "rev-a"}},
+            "metric": {"labels": {"state": "idle"}},
+            "points": [monitoring_v3.Point({
+                "interval": {"end_time": end},
+                "value": {"int64_value": 1},
+            })],
+        })
+        final_page = monitoring_v3.ListTimeSeriesResponse(
+            time_series=[active_series, idle_series],
+            next_page_token="",
+        )
+
+        rpc_calls: list[dict] = []
+
+        def _method(request, *, retry=None, timeout=None, metadata=()):
+            rpc_calls.append({"timeout": timeout, "retry": retry})
+            state["t"] += 5.0   # RPC costs 5s — within 20s budget
+            return final_page
+
+        class _FakeMetricClient:
+            def list_time_series(self, request, *, retry=None, timeout=None, metadata=()):
+                initial = _method(request, retry=retry, timeout=timeout, metadata=metadata)
+                return ListTimeSeriesPager(
+                    method=_method,
+                    request=request,
+                    response=initial,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+
+        original_extract = rcc._extract_point_value
+
+        def slow_extract(point):
+            v = original_extract(point)
+            state["t"] += 10.0   # each point extraction advances 10s
+            return v
+
+        with patch.object(common.time, "monotonic", fake_monotonic), \
+             patch.object(MetricServiceClient, "__new__",
+                          lambda cls, *a, **k: _FakeMetricClient()), \
+             patch.object(rcc, "_extract_point_value", slow_extract):
+            with self.assertRaises(TimeoutError) as ctx:
+                rcc.fetch_metric_samples(
+                    project=PRODUCTION_PROJECT,
+                    service_name="worshiptranslate-backend",
+                    region="us-central1",
+                    lookback_sec=240,
+                    deadline=common.Deadline(20.0),
+                    rpc_timeout=15.0,
+                )
+
+        # Exactly one page RPC — no next_page_token; the loop
+        # exits cleanly after page 1 and hands control to
+        # `_aggregate_metric_series`.
+        self.assertEqual(len(rpc_calls), 1)
+        # Distinct R7 message so callers can distinguish this from
+        # the R6 pre-aggregation and post-RPC gates.
+        self.assertIn("before returning Cloud Monitoring results",
+                      str(ctx.exception))
+
     def test_fetch_metric_samples_raises_after_final_page_rpc_overrun(self):
         """Same shape as the tick-side final-page test: single
         page with `next_page_token=""` whose RPC overruns the

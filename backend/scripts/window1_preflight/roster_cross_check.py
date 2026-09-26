@@ -287,9 +287,14 @@ def fetch_tick_events(
     (`google.cloud.logging_v2` v3.x); the older high-level
     `logging_v2.Client.list_entries(...)` on that same package
     version did not accept `timeout=` / `retry=` and raised a
-    `TypeError` — a round-3 rehearsal caught that. The gapic
-    pager honors the initial `timeout` and `retry=None` on
-    EVERY page fetch, so subsequent pages remain bounded.
+    `TypeError` — a round-3 rehearsal caught that. R5 replaced
+    the gapic pager's built-in page iteration (which freezes the
+    initial `timeout=` across every subsequent page RPC) with a
+    manual page-token loop: `deadline.rpc_timeout(rpc_timeout)`
+    is recomputed BEFORE each page RPC, `deadline.expired()` is
+    checked AFTER each page RPC (R6) and again between entries
+    and before returning, and each pager construction consumes
+    only its first (already-fetched) page.
 
     `region` pins `resource.labels.location` — Cloud Run services
     are regional; a same-named service in another region would
@@ -598,9 +603,21 @@ def fetch_metric_samples(
             f"deadline expired before aggregating Cloud Monitoring series "
             f"({len(series_pages)} series buffered)"
         )
-    return _aggregate_metric_series(
+    aggregated = _aggregate_metric_series(
         series_pages, now_epoch=now.timestamp(), deadline=deadline,
     )
+    # R7: post-aggregation deadline gate. The per-iteration check
+    # inside `_aggregate_metric_series` fires at the TOP of each
+    # series iteration, so processing the final series can push us
+    # past budget without any inner check firing again. Refuse
+    # here so a wall-clock breach during the last series's
+    # processing does not slip through as a "successful" return.
+    if deadline.expired():
+        raise TimeoutError(
+            f"deadline expired before returning Cloud Monitoring results "
+            f"({len(aggregated)} revision entries buffered)"
+        )
+    return aggregated
 
 
 def _extract_point_timestamp(point: Any) -> tuple[str, float]:
