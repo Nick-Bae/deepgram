@@ -1428,25 +1428,23 @@ class R6DeployGroupQuiescenceTests(unittest.TestCase):
         os.chmod(_FAKE_FIREBASE, 0o755)
 
     def test_leader_exits_early_grandchild_ignoring_sigterm_prevented(self):
-        """R6 finding 1a: fake_firebase forks a same-PG
-        grandchild that installs SIG_IGN for SIGTERM and would
-        mutate after ~12 s, then exits rc=0 immediately. Prior
-        to R6, `_terminate_deploy_child()` resolved the PGID via
-        `os.getpgid(popen.pid)` at trap time. Once the direct
-        firebase leader was reaped, that call raised
-        `ProcessLookupError` and the driver returned quietly,
-        leaving the grandchild alive to mutate production during
-        the post-snapshot.
+        """R6 finding 1a (tightened R7): fake_firebase forks a
+        same-PG grandchild that installs SIG_IGN for SIGTERM and
+        would mutate after ~12 s, then exits rc=0 immediately.
 
-        R6 captures the PGID at Popen (with
-        `start_new_session=True`, PGID==PID synchronously) AND
-        runs the drain on the rc=0 exit path. SIGKILL then
-        clears the grandchild before its mutation fires.
+        The R6 driver captures the PGID at Popen and drains on
+        the rc=0 exit path. SIGKILL clears the grandchild before
+        its mutation fires. Because fake_firebase does NOT
+        publish rooms.status in this scenario, the driver's
+        post-shape validator sees the pre-state after the
+        successful deploy and fails with rc=7 outcome=
+        `post_rooms_status_shape`.
 
-        Assertion: the mutation never lands. The exit code is
-        NOT checked strictly — post-diff will surface a
-        different failure (the fake never published
-        rooms.status), which is expected."""
+        Assertions (per reviewer R7 request):
+          - grandchild-ready marker exists (proves the fixture
+            actually spawned the SIG_IGN grandchild);
+          - exact rc=7 with outcome=`post_rooms_status_shape`;
+          - no late mutation in state."""
         sb = _Sandbox()
         try:
             state = _make_scenario(
@@ -1455,42 +1453,60 @@ class R6DeployGroupQuiescenceTests(unittest.TestCase):
                 extra={"sabotage_mutation_delay": 12.0},
             )
             proc = sb.run_driver(state, poll_timeout_sec=1)
-            # Wait past the grandchild's mutation window. If the
-            # R6 drain didn't run, the grandchild's timer would
-            # fire during this wait and land its mutation in
-            # state.
+            # Grandchild readiness handshake: the fixture writes
+            # this marker before beginning its sleep. Its
+            # presence proves the SIG_IGN grandchild was really
+            # spawned and running when the driver started
+            # draining.
+            ready = state.parent / "sabotage_gc_ready_leader_exit.txt"
+            self.assertTrue(
+                ready.exists(),
+                "grandchild ready marker missing — fixture did "
+                "not spawn the SIG_IGN grandchild, so this test "
+                "isn't exercising the leader-exits-early race.",
+            )
+            self.assertEqual(
+                proc.returncode, 7,
+                f"driver must exit rc=7 (post-shape validator "
+                f"catches unpublished rooms.status). "
+                f"stdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["rc"], 7)
+            self.assertEqual(payload["outcome"],
+                             "post_rooms_status_shape")
+            # Wait past the mutation window; assert the SIG_IGN
+            # grandchild never fired.
             time.sleep(15.0)
             final_state = json.loads(state.read_text())
             self.assertFalse(
                 final_state.get("late_child_mutation", False),
-                "R6 regression: grandchild survived after leader "
-                "exited rc=0 — the PGID must be captured at Popen "
-                "(not resolved via getpgid on a reaped leader) and "
-                "the drain must run on the rc=0 exit path. "
-                f"driver output: {proc.stdout}\nstderr: {proc.stderr}",
+                "R6/R7 regression: SIG_IGN grandchild survived "
+                "after leader exited early. The PGID must be "
+                "captured at Popen and the drain must SIGKILL "
+                "the group on the rc=0 path.",
             )
         finally:
             sb.cleanup()
 
     def test_normal_zero_exit_grandchild_delayed_mutation_prevented(self):
-        """R6 finding 1b: fake_firebase publishes rooms.status
-        AND spawns a same-PG grandchild that would mutate after
-        ~12 s, then exits rc=0. A fully-successful deploy path
-        that ALSO leaves a background descendant. Without R6's
-        rc=0-path drain, the grandchild's mutation lands during
-        the driver's post-snapshot / poll / final-snapshot phases
-        and corrupts the audit.
+        """R6 finding 1b (tightened R7): fake_firebase publishes
+        rooms.status normally AND spawns a same-PG grandchild
+        with SIG_IGN for SIGTERM that would mutate after ~12 s,
+        then exits rc=0.
 
-        R6 drains on the rc=0 path; SIGKILL clears the
-        grandchild before its timer fires; the deploy can then
-        complete cleanly (rc=0) because quiescence WAS
-        established.
+        The R6 rc=0-path drain SIGKILLs the grandchild before
+        its timer fires. Because rooms.status IS published, the
+        post-shape validator passes; because poll_state_sequence
+        is `[READY]`, polling and final-diff both pass. The
+        driver returns rc=0 outcome=`verified`.
 
-        Assertion: the mutation never lands. The exit code may
-        be 0 (drain succeeded, post/final all pass) or non-zero
-        (some other check fails); the operationally-critical
-        invariant is that no descendant write reached
-        production."""
+        Assertions (per reviewer R7 request):
+          - grandchild-ready marker exists (proves fixture ran);
+          - exact rc=0 with outcome=`verified`;
+          - `trap-failure.txt` MUST NOT exist (drain succeeded
+            cleanly);
+          - no late mutation in state."""
         sb = _Sandbox()
         try:
             state = _make_scenario(
@@ -1499,42 +1515,56 @@ class R6DeployGroupQuiescenceTests(unittest.TestCase):
                 extra={"sabotage_mutation_delay": 12.0},
             )
             proc = sb.run_driver(state, poll_timeout_sec=1)
+            ready = state.parent / "sabotage_gc_ready_success.txt"
+            self.assertTrue(
+                ready.exists(),
+                "grandchild ready marker missing — fixture did "
+                "not spawn the SIG_IGN grandchild.",
+            )
+            self.assertEqual(
+                proc.returncode, 0,
+                f"normal-success path with SIGKILL-cleared "
+                f"grandchild must exit rc=0. "
+                f"stdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["rc"], 0)
+            self.assertEqual(payload["outcome"], "verified")
+            tf = sb.audit / "trap-failure.txt"
+            self.assertFalse(
+                tf.exists(),
+                "trap-failure.txt must NOT exist on the clean "
+                "rc=0 path — the drain SIGKILLed the grandchild "
+                "and the /proc scan proved quiescence.",
+            )
             time.sleep(15.0)
             final_state = json.loads(state.read_text())
             self.assertFalse(
                 final_state.get("late_child_mutation", False),
-                "R6 regression: descendant survived a normal rc=0 "
-                "deploy — the drain must run on the rc=0 path, not "
-                "only on signal / timeout paths. "
-                f"driver output: {proc.stdout}\nstderr: {proc.stderr}",
+                "R6/R7 regression: SIG_IGN grandchild survived "
+                "a normal rc=0 deploy — the drain must SIGKILL "
+                "the group before returning success.",
             )
         finally:
             sb.cleanup()
 
     def test_quiescence_failure_dies_rc6_with_trap_failure_marker(self):
         """R6 finding 1: when the drain CANNOT establish
-        quiescence (survivors remain after SIGKILL), the driver
-        must (a) write `trap-failure.txt` naming the survivors
-        and (b) exit rc=6 (`deploy_group_quiescence_failed`) —
-        never rc=0.
+        quiescence (a real SIGKILL-immune process is impossible
+        under POSIX, so we simulate via env-var hook), the
+        driver must (a) write `trap-failure.txt` naming the
+        survivor and (b) exit rc=6.
 
-        A real SIGKILL cannot be ignored, so this test exercises
-        the pathological branch by running the driver under an
-        env var that forces `_wait_pgid_drained` to always
-        return a fake survivor. The driver is invoked as a
-        subprocess so its atexit / signal-handler installation
-        does not leak into the parent test process."""
+        The `PR42_TESTING_FORCE_DRAIN_SURVIVOR=1` env var forces
+        `_pgid_scan` to return a scan with a synthetic
+        non-zombie survivor + `scan_complete=True`, so the
+        quiescence check reports live members on every call."""
         sb = _Sandbox()
         try:
             state = _make_scenario(sb.root)
             proc = sb.run_driver(
                 state,
                 extra_env={
-                    # See `_wait_pgid_drained` in the driver:
-                    # a positive integer here forces the return
-                    # value to be a synthetic non-empty list so
-                    # the quiescence check reports a survivor
-                    # on every call.
                     "PR42_TESTING_FORCE_DRAIN_SURVIVOR": "1",
                 },
             )
@@ -1557,6 +1587,95 @@ class R6DeployGroupQuiescenceTests(unittest.TestCase):
             self.assertIn("quiescence_not_established", tf.read_text())
         finally:
             sb.cleanup()
+
+
+class R7ProcScanFailClosedTests(unittest.TestCase):
+    """R7 finding 1: an incomplete `/proc` scan while the process
+    group still exists must NEVER be accepted as quiescence.
+    Prior to R7, `_pgid_alive_members()` returned an empty list
+    on `os.listdir("/proc")` OSError or on per-PID stat read
+    failures — silently declaring the group drained. The reviewer
+    reproduced a live grandchild mutating state on a Linux
+    environment where /proc enumeration returned empty while
+    `killpg(pgid, 0)` confirmed the group still existed.
+
+    R7 replaces the fail-open helper with a structured `_PgScan`
+    that carries an explicit `scan_complete` flag AND uses
+    `killpg(pgid, 0)` as kernel-authoritative existence. An
+    incomplete scan against a still-existing group triggers the
+    fail-closed rc=6 branch.
+
+    Test hook: `PR42_TESTING_FORCE_PROC_INCOMPLETE=1` forces
+    `_pgid_scan` to return `group_exists=True, scan_complete=
+    False, non_zombie_members=[], zombie_members=[]`. This
+    exactly simulates the reviewer's reproduction environment."""
+
+    def setUp(self):
+        os.chmod(_FAKE_GCLOUD, 0o755)
+        os.chmod(_FAKE_FIREBASE, 0o755)
+
+    def test_incomplete_proc_scan_with_live_group_fails_closed(self):
+        """When /proc enumeration cannot prove exhaustiveness AND
+        the kernel confirms the group still exists, the driver
+        must NOT declare quiescence. It must exit rc=6, record
+        `trap-failure.txt` with the scan_complete=False detail,
+        and never return rc=0."""
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={
+                    "PR42_TESTING_FORCE_PROC_INCOMPLETE": "1",
+                },
+            )
+            self.assertEqual(
+                proc.returncode, 6,
+                f"an incomplete /proc scan against a still-"
+                f"existing group must fail closed rc=6. "
+                f"stdout={proc.stdout}\nstderr={proc.stderr}"
+            )
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["rc"], 6)
+            self.assertEqual(payload["outcome"],
+                             "deploy_group_quiescence_failed")
+            tf = sb.audit / "trap-failure.txt"
+            self.assertTrue(
+                tf.exists(),
+                "trap-failure.txt must be written when the /proc "
+                "scan is incomplete — silent fail-open was the R6 "
+                "defect this test regresses against.",
+            )
+            body = tf.read_text()
+            self.assertIn("quiescence_not_established", body)
+            # The scan detail must record scan_complete=False so
+            # the operator can distinguish this class of failure
+            # from a real SIGKILL-immune process.
+            self.assertIn("scan_complete=False", body)
+        finally:
+            sb.cleanup()
+
+    def test_pgscan_group_exists_flag_reflects_killpg_esrch(self):
+        """Unit-level: `_pgid_group_exists` must return False
+        (ESRCH) for a PGID with no members and True for the
+        current process's PG."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "dep_drv_r7", str(_DRIVER),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Our own PG exists.
+        self.assertTrue(
+            mod._pgid_group_exists(os.getpgid(os.getpid())),
+            "current process's PG must be reported as existing",
+        )
+        # An impossibly large PGID — no process could have that
+        # ID. killpg returns ESRCH.
+        self.assertFalse(
+            mod._pgid_group_exists(2**30),
+            "an unused PGID must be reported as non-existent (ESRCH)",
+        )
 
 
 if __name__ == "__main__":

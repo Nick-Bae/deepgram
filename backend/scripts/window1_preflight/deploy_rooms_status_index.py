@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "3.2.0"  # R6: capture _DEPLOY_PGID at Popen (no getpgid race), drain on every deploy exit path (incl. rc=0), non-quiescence fails rc=6
+SCRIPT_VERSION = "3.3.0"  # R7: kernel-authoritative quiescence via killpg(pgid,0); fail-closed on any incomplete /proc scan while group still exists
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -242,23 +242,121 @@ def _record_trap_failure_line(stage: str, detail: str) -> None:
         _diag(f"CRITICAL: could not write trap-failure marker for {stage}")
 
 
-def _pgid_alive_members(pgid: int) -> list[int]:
-    """R5 finding 1: return the PIDs currently in `pgid`, read from
-    `/proc/*/stat`. Direct-child `Popen.wait()` is insufficient — a
-    grandchild that ignores SIGTERM can survive it, leaving a live
-    process in the group that continues to mutate production while
-    the driver takes its post-snapshot.
+# --- R7: structured process-group scan --------------------------------
+#
+# R7 finding: the R5/R6 helper `_pgid_alive_members()` returned an
+# empty list under three distinct conditions:
+#   (a) the process group truly has no members;
+#   (b) `/proc` was unavailable (permission denied, mount error,
+#       non-Linux platform);
+#   (c) individual `/proc/{pid}/stat` reads failed or were
+#       malformed.
+# `_wait_pgid_drained()` then treated all three the same and
+# declared quiescence — a FAIL-OPEN behaviour that the reviewer
+# reproduced on a Linux environment where a real live grandchild
+# was invisible to the enumeration while `killpg(pgid, 0)`
+# confirmed the group still existed. R7 replaces that helper with
+# a structured scan whose result distinguishes:
+#   - group truly gone (ESRCH from `killpg(pgid, 0)`);
+#   - group exists but complete /proc scan finds no non-zombie
+#     members (operationally quiescent — zombies cannot mutate);
+#   - group exists and /proc scan found live non-zombie members
+#     (not drained);
+#   - group exists but the /proc scan hit ANY error or malformed
+#     entry (UNKNOWN — must fail closed).
+#
+# `_pgid_group_exists()` uses `killpg(pgid, 0)` as the
+# kernel-authoritative existence check — that syscall returns
+# ESRCH iff every member has been reaped. It is the only signal
+# call that can PROVE quiescence without relying on `/proc`.
 
-    Reads `stat` and takes field-3 (`pgrp`) after the parenthesized
-    comm. Never raises: signal-handler-safe. On non-Linux platforms
-    `/proc` is absent → returns []; the driver runs on Linux CI +
-    Cloud Run + the operator's WSL/Linux host, so this coverage is
-    the deployment surface."""
-    alive: list[int] = []
+
+import collections
+
+_PgScan = collections.namedtuple(
+    "_PgScan",
+    ["group_exists", "non_zombie_members", "zombie_members",
+     "scan_complete", "scan_error_notes"],
+)
+
+
+def _pgid_group_exists(pgid: int) -> bool:
+    """Kernel-authoritative check via `os.killpg(pgid, 0)`. Signal
+    zero performs no delivery; it only validates permissions and
+    existence. Returns False ONLY on `ProcessLookupError` (ESRCH,
+    meaning the kernel confirms no process is in the group).
+    Every other error (EPERM, EINVAL, OSError) returns True —
+    fail-closed."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        # EPERM means the group exists but we don't have signal
+        # permission; any other OSError is ambiguous — treat as
+        # "still exists" to be safe.
+        return True
+
+
+def _pgid_scan(pgid: int) -> _PgScan:
+    """Walk `/proc` and classify members of `pgid`. Returns a
+    `_PgScan` with:
+      - `group_exists`: kernel-authoritative bool from `killpg`.
+      - `non_zombie_members`: PIDs whose /proc state is NOT 'Z'.
+      - `zombie_members`: PIDs whose state is 'Z' (waiting to be
+        reaped; cannot run user code).
+      - `scan_complete`: True only if every observed PID's stat
+        read succeeded and parsed cleanly.
+      - `scan_error_notes`: short strings describing each error.
+
+    A caller MUST NOT treat `non_zombie_members == []` as drained
+    unless `group_exists == False` OR `scan_complete == True`.
+
+    Test hooks (env vars, ignored in production):
+      - `PR42_TESTING_FORCE_PROC_INCOMPLETE=1` — returns a scan
+        with `group_exists=True, scan_complete=False`, no members.
+        Used by the R7 regression that proves the fail-closed
+        path fires when /proc enumeration is unreliable.
+      - `PR42_TESTING_FORCE_DRAIN_SURVIVOR=1` — returns a scan
+        with a synthetic non-zombie survivor and `scan_complete=
+        True`. Used by the R6 regression that exercises the
+        SIGKILL-immune branch."""
+    if os.environ.get("PR42_TESTING_FORCE_PROC_INCOMPLETE") == "1":
+        return _PgScan(
+            group_exists=True,
+            non_zombie_members=[],
+            zombie_members=[],
+            scan_complete=False,
+            scan_error_notes=["PR42_TESTING_FORCE_PROC_INCOMPLETE"],
+        )
+    if os.environ.get("PR42_TESTING_FORCE_DRAIN_SURVIVOR") == "1":
+        return _PgScan(
+            group_exists=True,
+            non_zombie_members=[pgid + 1],
+            zombie_members=[],
+            scan_complete=True,
+            scan_error_notes=["PR42_TESTING_FORCE_DRAIN_SURVIVOR"],
+        )
+
+    exists = _pgid_group_exists(pgid)
+    non_zombie: list[int] = []
+    zombie: list[int] = []
+    notes: list[str] = []
+    complete = True
     try:
         entries = os.listdir("/proc")
-    except (FileNotFoundError, PermissionError, OSError):
-        return alive
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        # /proc unavailable at all — the scan cannot enumerate
+        # members. Combine with `exists` via the caller.
+        notes.append(f"listdir(/proc): {type(exc).__name__}")
+        return _PgScan(
+            group_exists=exists,
+            non_zombie_members=[],
+            zombie_members=[],
+            scan_complete=False,
+            scan_error_notes=notes,
+        )
     for entry in entries:
         if not entry.isdigit():
             continue
@@ -266,56 +364,91 @@ def _pgid_alive_members(pgid: int) -> list[int]:
         try:
             with open(f"/proc/{pid}/stat", "r") as f:
                 data = f.read()
-        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        except (FileNotFoundError, ProcessLookupError):
+            # Process exited between listdir and open. Not a
+            # scan error — the process is genuinely gone.
+            continue
+        except (PermissionError, OSError) as exc:
+            # We couldn't inspect this PID; scan can no longer
+            # prove exhaustiveness.
+            complete = False
+            notes.append(f"stat({pid}): {type(exc).__name__}")
             continue
         rparen = data.rfind(")")
         if rparen < 0:
+            complete = False
+            notes.append(f"stat({pid}): no rparen")
             continue
         # After `) `: state, ppid, pgrp, ...
         fields = data[rparen + 2:].split()
         if len(fields) < 3:
+            complete = False
+            notes.append(f"stat({pid}): truncated ({len(fields)} fields)")
             continue
-        # Skip zombies: state='Z' means the process has exited and
-        # is waiting for its parent to reap it. A zombie cannot run
-        # user code or issue syscalls — SIGKILL is a no-op on it —
-        # so counting it as "alive" would falsely trigger the
-        # quiescence-not-established marker whenever the direct
-        # deploy child dies before the driver's `popen.wait()`
-        # reaches it.
         state = fields[0]
-        if state == "Z":
-            continue
         try:
-            if int(fields[2]) == pgid:
-                alive.append(pid)
+            pgrp = int(fields[2])
         except ValueError:
+            complete = False
+            notes.append(f"stat({pid}): non-int pgrp {fields[2]!r}")
             continue
-    return alive
+        if pgrp != pgid:
+            continue
+        if state == "Z":
+            zombie.append(pid)
+        else:
+            non_zombie.append(pid)
+    return _PgScan(
+        group_exists=exists,
+        non_zombie_members=non_zombie,
+        zombie_members=zombie,
+        scan_complete=complete,
+        scan_error_notes=notes,
+    )
 
 
-def _wait_pgid_drained(pgid: int, timeout: float) -> list[int]:
-    """Poll `_pgid_alive_members` until either empty or `timeout`
-    seconds elapse. Returns the list of survivor PIDs at exit time
-    (empty means fully drained). Uses monotonic time so a wall-clock
-    jump cannot short-circuit or overrun the grace budget.
+def _pgid_alive_members(pgid: int) -> list[int]:
+    """Back-compat shim for the R5 unit test — returns the non-
+    zombie PID list from a `_pgid_scan()`. Callers requiring
+    quiescence proof MUST use `_pgid_scan()` directly and check
+    `group_exists` + `scan_complete`."""
+    return list(_pgid_scan(pgid).non_zombie_members)
 
-    Test hook: `PR42_TESTING_FORCE_DRAIN_SURVIVOR=1` in the
-    environment forces this helper to return a synthetic non-
-    empty list (`[pgid + 1]`) so tests can exercise the
-    quiescence-failure branch of `_terminate_deploy_child` /
-    `_deploy` without relying on a real SIGKILL-immune process
-    (which does not exist under POSIX). The env-var name is
-    long and unique so it cannot be flipped by accident in
-    production."""
-    if os.environ.get("PR42_TESTING_FORCE_DRAIN_SURVIVOR") == "1":
-        return [pgid + 1]
+
+def _wait_pgid_drained(pgid: int, timeout: float) -> _PgScan:
+    """Poll until quiescence is DEFINITELY established, or the
+    timeout elapses. Returns the final `_PgScan`.
+
+    Quiescence conditions (either is sufficient):
+      (a) `killpg(pgid, 0)` reports ESRCH — kernel confirms no
+          member remains;
+      (b) a COMPLETE /proc scan finds no non-zombie members.
+
+    An incomplete scan while the group still exists is NEVER
+    accepted as quiescence — the caller inspects the return value
+    and treats that state as fail-closed."""
     deadline = time.monotonic() + timeout
+    last: "_PgScan | None" = None
     while time.monotonic() < deadline:
-        alive = _pgid_alive_members(pgid)
-        if not alive:
-            return []
+        last = _pgid_scan(pgid)
+        if not last.group_exists:
+            return last
+        if last.scan_complete and not last.non_zombie_members:
+            return last
         time.sleep(_TRAP_DRAIN_POLL_SEC)
-    return _pgid_alive_members(pgid)
+    if last is None:
+        last = _pgid_scan(pgid)
+    return last
+
+
+def _pgscan_is_quiescent(scan: _PgScan) -> bool:
+    """A scan proves quiescence if the kernel confirms the group
+    is gone, or a complete /proc scan found no non-zombie
+    members. An incomplete scan against a still-existing group is
+    NEVER quiescence (fail-closed)."""
+    if not scan.group_exists:
+        return True
+    return scan.scan_complete and not scan.non_zombie_members
 
 
 def _terminate_deploy_child() -> bool:
@@ -368,18 +501,19 @@ def _terminate_deploy_child() -> bool:
     except (ProcessLookupError, OSError):
         pass
 
-    # Wait for every process in the group to drain.
-    survivors = _wait_pgid_drained(pgid, timeout=TRAP_SIGTERM_GRACE_SEC)
+    # Wait for the group to reach kernel-authoritative drained
+    # state OR a complete /proc scan proving only zombies remain.
+    scan = _wait_pgid_drained(pgid, timeout=TRAP_SIGTERM_GRACE_SEC)
 
-    if survivors:
-        # At least one process ignored (or was slow to handle)
-        # SIGTERM. Escalate to SIGKILL on the whole group and give
-        # them a short window to be reaped.
+    if not _pgscan_is_quiescent(scan):
+        # Either non-zombie live members remain, OR the /proc scan
+        # was incomplete against a still-existing group. Escalate
+        # to SIGKILL and re-check.
         try:
             os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
-        survivors = _wait_pgid_drained(pgid, timeout=TRAP_SIGKILL_GRACE_SEC)
+        scan = _wait_pgid_drained(pgid, timeout=TRAP_SIGKILL_GRACE_SEC)
 
     # Reap the direct child so its exit status is collected and no
     # zombie remains. Skip if popen was already reaped elsewhere
@@ -392,17 +526,23 @@ def _terminate_deploy_child() -> bool:
         except Exception:
             pass
 
-    quiescent = not survivors
+    quiescent = _pgscan_is_quiescent(scan)
     _LAST_DRAIN_QUIESCENT = quiescent
 
     if not quiescent:
-        # SIGKILL didn't clear the group — the post-snapshot cannot
-        # be trusted as a quiescent capture. Record the survivors
-        # so the operator can investigate; do NOT swallow.
-        _record_trap_failure_line(
-            "quiescence_not_established",
-            f"pgid={pgid} pids_alive_after_sigkill={sorted(survivors)!r}",
+        # Post-snapshot cannot be trusted as a quiescent capture.
+        # Record the full scan detail — including scan_complete
+        # and any /proc error notes — so the operator sees whether
+        # the failure was a live descendant or an unreliable scan.
+        detail = (
+            f"pgid={pgid} "
+            f"group_exists={scan.group_exists} "
+            f"scan_complete={scan.scan_complete} "
+            f"non_zombie_members={sorted(scan.non_zombie_members)!r} "
+            f"zombie_members={sorted(scan.zombie_members)!r} "
+            f"scan_error_notes={scan.scan_error_notes!r}"
         )
+        _record_trap_failure_line("quiescence_not_established", detail)
     return quiescent
 
 

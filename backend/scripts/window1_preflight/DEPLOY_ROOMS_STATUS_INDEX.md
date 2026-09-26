@@ -11,7 +11,7 @@ invoke the driver.
 
 | | |
 |---|---|
-| Driver script version | `3.2.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
+| Driver script version | `3.3.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
 | Approved PR #42 SHA to pin | recorded independently by the reviewer; passed as `--reviewer-approved-sha` and MUST equal `--pr42-sha` |
 | Script sha256 pin | recorded independently by the reviewer; passed as `--script-sha256`; driver re-hashes itself and refuses on mismatch |
 | Firebase CLI version required | `13.19.0` (passed as `--firebase-tools-version-pin`; bump requires re-running the fixture suite) |
@@ -79,25 +79,46 @@ the driver moves on:
 2. **A whole-PG drain runs on every `_deploy` exit path** —
    normal rc=0, non-zero exit, timeout, and signal-triggered
    teardown (R6 finding 1). The drain sends SIGTERM to the PG,
-   waits up to 5 s for every non-zombie member to disappear
-   from `/proc`, SIGKILLs any survivor, and waits up to 2 s
-   more. Zombie processes (`state == 'Z'`) are excluded — they
-   cannot run user code (R5 finding 1).
-3. **`trap-failure.txt` records the survivor list** if any
-   process outlives SIGKILL, and the driver exits **rc=6
-   (`deploy_group_quiescence_failed`)** — an rc=0 result is
-   not returned when quiescence cannot be established.
-4. The signal-handler trap additionally takes the post-snapshot
+   waits up to 5 s for kernel-authoritative quiescence, SIGKILLs
+   any survivor, and waits up to 2 s more.
+3. **Kernel-authoritative quiescence check (R7 finding 1)** —
+   `killpg(pgid, 0)` is the *only* signal call that PROVES the
+   group has been fully reaped (returns ESRCH). A `/proc` walk
+   alone is insufficient because it can return an empty list on
+   permission errors, mount-namespace differences, or transient
+   file-not-found conditions. The driver treats `killpg(pgid, 0)
+   == ESRCH` OR a `_pgid_scan` result with `scan_complete=True`
+   and no non-zombie members as quiescent. Any other combination
+   — including an incomplete `/proc` scan while the group still
+   exists — is FAIL-CLOSED: `trap-failure.txt` records the full
+   scan detail (including `scan_complete=False` and `scan_error_
+   notes`) and the driver exits **rc=6
+   (`deploy_group_quiescence_failed`)**. An rc=0 result is never
+   returned when quiescence cannot be established.
+4. **Zombies are excluded from the live set** (R5 finding 1) —
+   `state == 'Z'` in `/proc/{pid}/stat` means the process has
+   exited and is waiting for its parent to reap it. It cannot
+   run user code, so it is not treated as a live survivor.
+5. The signal-handler trap additionally takes the post-snapshot
    and re-raises the original signal so the process exits with
    the canonical signal exit code.
 
 Fixture coverage:
 
+- `R7ProcScanFailClosedTests` — `PR42_TESTING_FORCE_PROC_INCOMPLETE`
+  simulates the reviewer's environment where `/proc` enumeration
+  returns empty while `killpg(pgid, 0)` confirms the group
+  exists; driver must exit rc=6 and record trap-failure.txt.
+  Plus a unit test proving `_pgid_group_exists` correctly maps
+  ESRCH to False.
 - `R6DeployGroupQuiescenceTests` — leader-exits-early race
   (fake firebase forks a same-PG grandchild that installs
   `SIG_IGN` for SIGTERM, then exits rc=0 immediately) and
   normal-rc=0 race (successful deploy leaves a delayed-mutation
-  grandchild).
+  grandchild). Tightened R7 assertions: grandchild-ready marker
+  MUST exist; leader-exits-early expects rc=7 outcome=
+  `post_rooms_status_shape`; normal-success expects exact rc=0
+  outcome=`verified` and no trap-failure marker.
 - `R5ProcessGroupDrainTests` — grandchild ignoring SIGTERM
   during a SIGINT-mid-deploy.
 - `test_sigint_mid_deploy_terminates_process_group_and_prevents_late_mutation`
