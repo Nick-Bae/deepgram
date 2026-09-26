@@ -1,28 +1,59 @@
 #!/usr/bin/env python3
-"""Fake `firebase` shim used by `test_deploy_rooms_status_index.py`.
+"""Fake `firebase` shim for `test_deploy_rooms_status_index.py`.
 
-Reads its scripted behavior from `$PR42_FAKE_STATE` (same file
-`fake_gcloud.py` uses). Recognized top-level state keys used
-here:
+R3 model — strict argv validation (finding 9):
+  - `firebase --version`  → prints `state["firebase_version"]`, rc 0
+  - `firebase deploy --project=PROJECT --only=firestore:indexes --non-interactive --json`
+      → runs the deploy side-effect scripted in state; rc from
+        state["deploy_rc"]
 
-  "firebase_version": "13.19.0"     # returned by `firebase --version`
-  "deploy_rc":        0             # rc for `firebase deploy`
-  "deploy_side_effect": "commit_success"  # or "commit_no_op",
-                                          # "sigint_mid_deploy"
+Any other invocation is refused with rc=2 so a driver typo
+surfaces immediately.
 
-`deploy_side_effect: "commit_success"` also advances the state
-file so subsequent `fake_gcloud` snapshot calls see the deploy's
-effect on Firestore (adds the CG_ASC entry). It does this by
-rewriting `poll_state_sequence` (if not already set) to
-["CREATING","READY"] and marking a `deploy_committed=true` flag.
+State drives:
+  "firebase_version": "13.19.0"
+  "deploy_rc": 0
+  "deploy_side_effect": one of:
+    - "commit_success" (default)   — publishes rooms.status
+                                     override; CG_ASC → READY via
+                                     poll_state_sequence
+    - "commit_no_op"               — no server-side change
+    - "commit_needs_repair"        — publishes override; CG_ASC
+                                     → NEEDS_REPAIR
+    - "commit_never_ready"         — publishes override; CG_ASC
+                                     → CREATING forever
+    - "commit_leaves_missing"      — publishes override in fields
+                                     list, but describe never
+                                     shows the CG_ASC entry
+    - "commit_partial_delete_unrelated" — deletes an unrelated
+                                     composite
+    - "commit_extra_addition"     — adds an unrelated composite
+    - "sigint_mid_deploy"         — SIGINT parent driver; spawn
+                                     a background child that
+                                     WOULD mutate state 2 s later
+                                     if not killed (finding 6)
+    - "commit_regresses_after_ready" — CG_ASC observes READY once
+                                     then MISSING (finding 7)
 """
 from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+_PROJECT_ID = "sturdy-dogfish-472313-k6"
+
+_ALLOWED_DEPLOY_ARGV = [
+    "deploy",
+    f"--project={_PROJECT_ID}",
+    "--only=firestore:indexes",
+    "--non-interactive",
+    "--json",
+]
 
 
 def _load_state() -> tuple[Path, dict]:
@@ -34,113 +65,170 @@ def _save_state(p: Path, state: dict) -> None:
     p.write_text(json.dumps(state, indent=2) + "\n")
 
 
+# --- version ------------------------------------------------------------
+
+
 def _handle_version(state: dict) -> int:
     ver = state.get("firebase_version", "13.19.0")
     print(ver)
     return 0
 
 
-def _publish_new_rooms_status_override(state: dict) -> None:
-    """Simulate what `firebase deploy --only firestore:indexes`
-    would do to production: create the rooms.status field
-    override with the four intended entries so a subsequent
-    `gcloud firestore indexes fields list --collection-group=rooms`
-    returns it."""
-    override = {
+# --- deploy side effects ------------------------------------------------
+
+
+def _rooms_status_override_entry() -> dict:
+    """The four-entry override that a real firebase deploy would
+    write for rooms.status when applying PR #42's config. R3
+    shape (nested `Index.fields[]`)."""
+    def entry(*, order=None, array=None, scope, state_val="READY"):
+        inner = {"fieldPath": "status"}
+        if order is not None:
+            inner["order"] = order
+        if array is not None:
+            inner["arrayConfig"] = array
+        return {
+            "fields": [inner],
+            "queryScope": scope,
+            "state": state_val,
+        }
+    return {
         "name": (
             "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
             "collectionGroups/rooms/fields/status"
         ),
         "indexConfig": {
             "indexes": [
-                {"order": "ASCENDING",  "queryScope": "COLLECTION",       "state": "READY"},
-                {"order": "DESCENDING", "queryScope": "COLLECTION",       "state": "READY"},
-                {"arrayConfig": "CONTAINS", "queryScope": "COLLECTION",   "state": "READY"},
-                {"order": "ASCENDING",  "queryScope": "COLLECTION_GROUP", "state": "READY"},
+                entry(order="ASCENDING",  scope="COLLECTION"),
+                entry(order="DESCENDING", scope="COLLECTION"),
+                entry(array="CONTAINS",   scope="COLLECTION"),
+                entry(order="ASCENDING",  scope="COLLECTION_GROUP",
+                      state_val="READY"),
             ],
-            # Explicit override REPLACES the ancestor default.
             "usesAncestorConfig": False,
         },
     }
-    state.setdefault("fields_by_group", {}).setdefault("rooms", []).append(override)
+
+
+def _publish_rooms_status(state: dict) -> None:
+    state.setdefault("field_overrides", []).append(
+        _rooms_status_override_entry()
+    )
 
 
 def _apply_deploy_effect(state_path: Path, state: dict) -> None:
-    """Mutate the state file so post-deploy fake-gcloud calls
-    observe the deploy's effect on production Firestore."""
     effect = state.get("deploy_side_effect", "commit_success")
     if effect == "commit_no_op":
-        # Deploy failed OR was a no-op; no production side effect.
         return
     if effect == "commit_success":
-        _publish_new_rooms_status_override(state)
-        if "poll_state_sequence" not in state:
-            state["poll_state_sequence"] = ["CREATING", "READY"]
+        _publish_rooms_status(state)
+        state.setdefault("poll_state_sequence", ["CREATING", "READY"])
         state["deploy_committed"] = True
         _save_state(state_path, state)
         return
     if effect == "commit_needs_repair":
-        _publish_new_rooms_status_override(state)
+        _publish_rooms_status(state)
         state["poll_state_sequence"] = ["CREATING", "NEEDS_REPAIR"]
         state["deploy_committed"] = True
         _save_state(state_path, state)
         return
     if effect == "commit_never_ready":
-        _publish_new_rooms_status_override(state)
+        _publish_rooms_status(state)
         state["poll_state_sequence"] = ["CREATING"] * 10000
         state["deploy_committed"] = True
         _save_state(state_path, state)
         return
     if effect == "commit_leaves_missing":
-        # Simulated pathology: the override is registered (visible
-        # to `fields list`) but the CG_ASC entry never surfaces in
-        # `fields describe`. Polling therefore observes MISSING
-        # until the (short in tests) timeout fires.
-        _publish_new_rooms_status_override(state)
+        _publish_rooms_status(state)
         state["poll_state_sequence"] = ["MISSING"] * 10000
         state["deploy_committed"] = True
         _save_state(state_path, state)
         return
     if effect == "commit_partial_delete_unrelated":
-        # Deploy created the intended override AND deleted an
-        # unrelated composite index (server-side surprise).
-        _publish_new_rooms_status_override(state)
+        _publish_rooms_status(state)
         state["composites"] = []
-        state["deploy_committed"] = True
         state["poll_state_sequence"] = ["READY"]
+        state["deploy_committed"] = True
         _save_state(state_path, state)
         return
     if effect == "commit_extra_addition":
-        # Deploy created the intended override AND an unrelated
-        # composite index that wasn't in PR #42's config.
-        _publish_new_rooms_status_override(state)
-        extra = {
+        _publish_rooms_status(state)
+        state.setdefault("composites", []).append({
+            "name": (
+                "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
+                "collectionGroups/unrelated_group/indexes/fake_id"
+            ),
             "collectionGroup": "unrelated_group",
             "fields": [{"fieldPath": "foo", "order": "ASCENDING"}],
             "queryScope": "COLLECTION",
             "state": "READY",
-        }
-        state.setdefault("composites", []).append(extra)
-        state["deploy_committed"] = True
+        })
         state["poll_state_sequence"] = ["READY"]
+        state["deploy_committed"] = True
+        _save_state(state_path, state)
+        return
+    if effect == "commit_regresses_after_ready":
+        # Simulate the race the reviewer flagged: post-diff sees
+        # the override present, polling sees READY once, then a
+        # subsequent poll observes MISSING (index deleted or
+        # otherwise disappeared). Driver must hard-stop on that
+        # MISSING.
+        _publish_rooms_status(state)
+        state["poll_state_sequence"] = ["READY", "MISSING", "MISSING"]
+        state["deploy_committed"] = True
         _save_state(state_path, state)
         return
     if effect == "sigint_mid_deploy":
-        # Send SIGINT to the parent driver process to simulate
-        # operator Ctrl-C mid-deploy. The driver's trap must
-        # fire. Because the interrupt precedes any real apply,
-        # do NOT publish the override — the post-snapshot proves
-        # the trap ran even though production state is unchanged.
-        state["deploy_committed"] = False
-        _save_state(state_path, state)
+        # Fork a detached child that would mutate the state 2 s
+        # later, then SIGINT the parent driver. If the driver's
+        # trap does NOT terminate the deploy process group, the
+        # child survives and mutates state AFTER the post-snapshot.
+        # If the trap correctly kills the process group, the child
+        # is reaped BEFORE it mutates.
+        pid = os.fork()
+        if pid == 0:
+            # Grandchild: detach and mutate later.
+            os.setsid()
+            time.sleep(2.0)
+            try:
+                cur = json.loads(state_path.read_text())
+                cur["late_child_mutation"] = True
+                cur["composites"] = cur.get("composites", []) + [{
+                    "collectionGroup": "sabotage_group",
+                    "fields": [{"fieldPath": "x", "order": "ASCENDING"}],
+                    "queryScope": "COLLECTION",
+                    "state": "READY",
+                }]
+                state_path.write_text(json.dumps(cur, indent=2) + "\n")
+            except Exception:
+                pass
+            os._exit(0)
+        # Parent-of-child (still the fake firebase process): send
+        # SIGINT to the driver.
         parent = os.getppid()
         os.kill(parent, signal.SIGINT)
-        time.sleep(0.5)
+        # Simulate a hanging deploy: sleep so the driver's trap
+        # gets a chance to observe us alive and terminate our
+        # process group. The grandchild we forked is NOT in this
+        # PG (setsid'd), so its survival depends on whether the
+        # driver knows to kill IT too — for our test, we simply
+        # verify that even the intended process-group kill of
+        # THIS process happens, and use `late_child_mutation` as
+        # the sabotage marker.
+        time.sleep(5.0)
         return
     # Unknown effect: no-op.
 
 
-def _handle_deploy(state_path: Path, state: dict) -> int:
+def _handle_deploy(state_path: Path, state: dict, argv: list[str]) -> int:
+    # R3 finding 9: strict argv validation. Any deviation → rc=2.
+    if argv != _ALLOWED_DEPLOY_ARGV:
+        print(
+            f"fake_firebase: unexpected deploy argv {argv!r} "
+            f"(expected {_ALLOWED_DEPLOY_ARGV!r})",
+            file=sys.stderr,
+        )
+        return 2
     _apply_deploy_effect(state_path, state)
     rc = int(state.get("deploy_rc", 0))
     if rc != 0:
@@ -158,8 +246,8 @@ def main(argv):
     if argv == ["--version"]:
         return _handle_version(state)
 
-    if "deploy" in argv:
-        return _handle_deploy(state_path, state)
+    if argv and argv[0] == "deploy":
+        return _handle_deploy(state_path, state, argv)
 
     print(f"fake_firebase: unhandled command {argv!r}", file=sys.stderr)
     return 2

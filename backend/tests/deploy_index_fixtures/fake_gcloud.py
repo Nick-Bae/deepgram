@@ -1,31 +1,53 @@
 #!/usr/bin/env python3
-"""Fake `gcloud` shim used by `test_deploy_rooms_status_index.py`.
+"""Fake `gcloud` shim for `test_deploy_rooms_status_index.py`.
 
-Behavior is driven by a JSON state file at `$PR42_FAKE_STATE`.
-The file has the shape:
+R3 model — reflects the REAL gcloud response shape:
+  - `firestore indexes composite list --format=json`
+      → JSON list of composite index objects
+  - `firestore indexes fields list --format=json`  (NO
+      --collection-group filter) → JSON list of every field
+      entry across every collection group (includes the
+      `__default__` ancestor sentinel and every explicit
+      override)
+  - `firestore indexes fields list --collection-group=<cg> --format=json`
+      → same but filtered to one collection group
+  - `firestore indexes fields describe <field> --collection-group=<cg>
+      --format=json` → single field's indexConfig with
+      `indexConfig.indexes[]`, each entry shaped as
+      {fields: [{fieldPath, order|arrayConfig}], queryScope, state}
+  - `firestore databases describe --database=<db> --format=json`
+      → database metadata: name, type, locationId
 
+State file at `$PR42_FAKE_STATE` drives it:
     {
-      "composites": [ ... gcloud composite list response ... ],
-      "fields_by_group": {
-          "rooms":  [ ... gcloud fields list response for rooms ... ],
-          "services": [ ... ],
+      "composites": [...],
+      "field_overrides": [                # authoritative list, real shape
+          {"name": "projects/.../collectionGroups/rooms/fields/status",
+           "indexConfig": {
+              "indexes": [
+                {"fields": [{"fieldPath":"status","order":"ASCENDING"}],
+                 "queryScope": "COLLECTION",
+                 "state": "READY"},
+                ...
+              ]
+           }
+          },
           ...
-      },
-      "rooms_status_describe": { ... gcloud fields describe response ... },
-      "poll_state_sequence": ["CREATING", "CREATING", "READY"],
+      ],
+      "ancestor_default_entry": { ... },  # the __default__ sentinel
+      "database": { "name":..., "type":"FIRESTORE_NATIVE",
+                    "locationId": "us-central1", ... },
+      "poll_state_sequence": ["CREATING","READY"],  # for rooms.status describe
       "poll_state_cursor": 0,
-      "die": null    // or an rc integer to simulate gcloud failure
+      "die": null                         # or int rc to force failure
     }
 
-Each `describe` call advances `poll_state_cursor` if the caller
-is asking for `rooms.status` — this lets tests script the
-`CREATING → READY` transition and the `NEEDS_REPAIR` /
-`MISSING` failure modes without waiting real time.
-
-The state file is updated in place so a fresh cursor is
-observed on each invocation.
+Cursor semantics: each `fields describe rooms.status` call
+advances the cursor. If the caller asks about a different
+collection group / field, cursor is untouched.
 """
 from __future__ import annotations
+import copy
 import json
 import os
 import sys
@@ -48,19 +70,47 @@ def _die_maybe(state: dict) -> None:
         sys.exit(rc)
 
 
+def _get_flag(args, name: str) -> str | None:
+    for a in args:
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+# --- composite list -----------------------------------------------------
+
+
 def _handle_composite_list(state: dict) -> None:
     print(json.dumps(state.get("composites", [])))
 
 
+# --- fields list (db-wide OR per-collection-group) ---------------------
+
+
 def _handle_fields_list(state: dict, args) -> None:
     cg = _get_flag(args, "--collection-group")
-    groups = state.get("fields_by_group", {})
-    print(json.dumps(groups.get(cg, [])))
+    ancestor = state.get("ancestor_default_entry")
+    all_entries = []
+    if ancestor is not None:
+        all_entries.append(ancestor)
+    all_entries.extend(state.get("field_overrides", []))
+    if cg is None:
+        # Database-wide list.
+        print(json.dumps(all_entries))
+        return
+    # Filter by collection group.
+    filtered = [
+        e for e in all_entries
+        if f"/collectionGroups/{cg}/fields/" in (e.get("name") or "")
+    ]
+    print(json.dumps(filtered))
+
+
+# --- fields describe (nested-fields shape) -----------------------------
 
 
 def _handle_fields_describe(state_path: Path, state: dict, args) -> None:
     cg = _get_flag(args, "--collection-group")
-    # `describe <field>` — field name is a positional arg.
     field = None
     for i, a in enumerate(args):
         if a == "describe":
@@ -68,68 +118,67 @@ def _handle_fields_describe(state_path: Path, state: dict, args) -> None:
                 field = args[i + 1]
             break
     if cg == "rooms" and field == "status":
-        seq = state.get("poll_state_sequence") or ["READY"]
+        seq = state.get("poll_state_sequence") or ["MISSING"]
         cursor = int(state.get("poll_state_cursor", 0))
         idx = min(cursor, len(seq) - 1)
-        current_state = seq[idx]
+        current_cg_state = seq[idx]
         state["poll_state_cursor"] = cursor + 1
         _save_state(state_path, state)
-        payload = _rooms_status_payload(current_state)
-        print(json.dumps(payload))
+        print(json.dumps(_rooms_status_payload(state, current_cg_state)))
         return
-    # Non-rooms.status describe: hand back whatever the state file
-    # has (or an empty describe response).
-    payload = state.get("rooms_status_describe") or {
-        "indexConfig": {"indexes": []},
+    # Non-rooms.status describe: find matching override entry.
+    for entry in state.get("field_overrides", []):
+        name = entry.get("name") or ""
+        if (f"/collectionGroups/{cg}/fields/{field}" in name):
+            print(json.dumps(entry))
+            return
+    # Not found — return a synthesized empty describe (mirrors real
+    # gcloud when a field has no explicit override).
+    print(json.dumps({
+        "indexConfig": {"indexes": [],
+                        "ancestorField": (
+                            f"projects/sturdy-dogfish-472313-k6/"
+                            f"databases/worship-translation/"
+                            f"collectionGroups/__default__/fields/*"
+                        ),
+                        "usesAncestorConfig": True},
         "name": (
             f"projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
             f"collectionGroups/{cg}/fields/{field}"
         ),
-    }
-    print(json.dumps(payload))
+    }))
 
 
-def _rooms_status_payload(cg_asc_state: str) -> dict:
-    """Build a `fields describe rooms.status` response for the
-    given COLLECTION_GROUP ASCENDING state. Preserves the three
-    ancestor-default COLLECTION-scope entries. `MISSING` means
-    the CG ASC entry is entirely absent from the response."""
-    base = [
-        {"fields": [{"fieldPath": "status", "order": "ASCENDING"}],
-         "queryScope": "COLLECTION", "state": "READY"},
-        {"fields": [{"fieldPath": "status", "order": "DESCENDING"}],
-         "queryScope": "COLLECTION", "state": "READY"},
-        {"fields": [{"fieldPath": "status", "arrayConfig": "CONTAINS"}],
-         "queryScope": "COLLECTION", "state": "READY"},
+def _rooms_status_payload(state: dict, cg_asc_state: str) -> dict:
+    """Build a `fields describe rooms.status` response with the
+    R3 nested shape. The three ancestor-default COLLECTION-scope
+    entries are always present; the CG_ASC entry appears only
+    when `cg_asc_state != "MISSING"`."""
+    def entry(fpath, *, order=None, array=None, scope="COLLECTION", state_val="READY"):
+        inner = {"fieldPath": fpath}
+        if order is not None:
+            inner["order"] = order
+        if array is not None:
+            inner["arrayConfig"] = array
+        return {
+            "fields": [inner],
+            "queryScope": scope,
+            "state": state_val,
+        }
+
+    indexes = [
+        entry("status", order="ASCENDING", scope="COLLECTION"),
+        entry("status", order="DESCENDING", scope="COLLECTION"),
+        entry("status", array="CONTAINS", scope="COLLECTION"),
     ]
-    if cg_asc_state == "MISSING":
-        indexes = base
-    else:
-        indexes = base + [
-            {"fields": [{"fieldPath": "status", "order": "ASCENDING"}],
-             "queryScope": "COLLECTION_GROUP", "state": cg_asc_state},
-        ]
-    # The driver's canonicalizer looks for `indexConfig.indexes[].order`
-    # and `queryScope` and `arrayConfig` at the top of each entry, not
-    # nested inside `fields`. Match the shape `gcloud firestore
-    # indexes fields describe` actually returns for single-field
-    # indexes: entries with `order`/`arrayConfig` + `queryScope` +
-    # `state` directly on each index.
-    flat = []
-    for e in indexes:
-        # Each entry in `base` above has a single field; the real
-        # `gcloud fields describe` response puts `order` /
-        # `arrayConfig` and `queryScope` at the entry level.
-        f0 = e["fields"][0]
-        flat.append({
-            "order": f0.get("order"),
-            "arrayConfig": f0.get("arrayConfig"),
-            "queryScope": e["queryScope"],
-            "state": e["state"],
-        })
+    if cg_asc_state != "MISSING":
+        indexes.append(
+            entry("status", order="ASCENDING",
+                  scope="COLLECTION_GROUP", state_val=cg_asc_state)
+        )
     return {
         "indexConfig": {
-            "indexes": flat,
+            "indexes": indexes,
             "ancestorField": (
                 "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
                 "collectionGroups/__default__/fields/*"
@@ -143,21 +192,29 @@ def _rooms_status_payload(cg_asc_state: str) -> dict:
     }
 
 
-def _get_flag(args, name: str) -> str | None:
-    for a in args:
-        if a.startswith(name + "="):
-            return a.split("=", 1)[1]
-    return None
+# --- databases describe -------------------------------------------------
+
+
+def _handle_databases_describe(state: dict, args) -> None:
+    default = {
+        "name": "projects/sturdy-dogfish-472313-k6/databases/worship-translation",
+        "type": "FIRESTORE_NATIVE",
+        "locationId": "us-central1",
+        "uid": "test-uid",
+    }
+    print(json.dumps(state.get("database") or default))
+
+
+# --- entry --------------------------------------------------------------
 
 
 def main(argv):
     if not argv:
         print("usage: fake_gcloud.py <args...>", file=sys.stderr)
-        sys.exit(2)
+        return 2
     state_path, state = _load_state()
     _die_maybe(state)
 
-    # Detect firestore indexes {composite,fields} subcommand.
     if "firestore" in argv and "indexes" in argv:
         if "composite" in argv and "list" in argv:
             _handle_composite_list(state); return 0
@@ -165,6 +222,8 @@ def main(argv):
             _handle_fields_list(state, argv); return 0
         if "fields" in argv and "describe" in argv:
             _handle_fields_describe(state_path, state, argv); return 0
+    if "firestore" in argv and "databases" in argv and "describe" in argv:
+        _handle_databases_describe(state, argv); return 0
     print(f"fake_gcloud: unhandled command {argv!r}", file=sys.stderr)
     return 2
 

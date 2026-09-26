@@ -142,36 +142,68 @@ def _default_composites() -> list[dict]:
     return []
 
 
-def _default_fields_by_group() -> dict[str, list]:
-    """Baseline field overrides — R4 inventory showed production
-    has none (all rooms.status entries come from usesAncestorConfig).
-    Tests may override this."""
+def _default_ancestor_entry() -> dict:
+    """The `__default__` ancestor sentinel entry that appears in
+    every `firestore indexes fields list` response (with or without
+    `--collection-group`)."""
     return {
-        "organizations": [],
-        "services": [],
-        "rooms": [],
-        "members": [],
-        "invites": [],
-        "usage": [],
-        "sermons": [],
+        "name": (
+            "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
+            "collectionGroups/__default__/fields/*"
+        ),
+        "indexConfig": {
+            "indexes": [
+                {"fields": [{"fieldPath": "*", "order": "ASCENDING"}],
+                 "queryScope": "COLLECTION", "state": "READY"},
+                {"fields": [{"fieldPath": "*", "order": "DESCENDING"}],
+                 "queryScope": "COLLECTION", "state": "READY"},
+                {"fields": [{"fieldPath": "*", "arrayConfig": "CONTAINS"}],
+                 "queryScope": "COLLECTION", "state": "READY"},
+            ],
+        },
+    }
+
+
+def _default_field_overrides() -> list:
+    """R4 inventory showed production has zero explicit field
+    overrides (only the __default__ ancestor). Tests may override
+    this to inject unrelated overrides that would trigger a
+    pre-deploy delta refusal, or the intended rooms.status entry
+    if the scenario needs it pre-existing."""
+    return []
+
+
+def _default_database() -> dict:
+    return {
+        "name": "projects/sturdy-dogfish-472313-k6/databases/worship-translation",
+        "type": "FIRESTORE_NATIVE",
+        "locationId": "us-central1",
+        "uid": "test-uid",
     }
 
 
 def _make_scenario(env_dir: Path, *,
                    composites=None,
-                   fields_by_group=None,
+                   field_overrides=None,
+                   ancestor_default_entry=None,
+                   database=None,
                    deploy_rc=0,
                    deploy_side_effect="commit_success",
                    firebase_version=DEFAULT_FIREBASE_VERSION,
                    poll_state_sequence=None,
                    die=None) -> Path:
-    """Write a state file for the fake CLIs and return its path."""
+    """Write a state file for the fake CLIs (R3 shape)."""
     state = {
         "composites": composites if composites is not None else _default_composites(),
-        "fields_by_group": (
-            fields_by_group if fields_by_group is not None
-            else _default_fields_by_group()
+        "field_overrides": (
+            field_overrides if field_overrides is not None
+            else _default_field_overrides()
         ),
+        "ancestor_default_entry": (
+            ancestor_default_entry if ancestor_default_entry is not None
+            else _default_ancestor_entry()
+        ),
+        "database": database if database is not None else _default_database(),
         "deploy_rc": deploy_rc,
         "deploy_side_effect": deploy_side_effect,
         "firebase_version": firebase_version,
@@ -186,7 +218,14 @@ def _make_scenario(env_dir: Path, *,
 
 
 class _Sandbox:
-    """One test's isolated environment: worktree + audit dir + state file."""
+    """One test's isolated environment: worktree + audit dir + state file.
+
+    The reviewed driver is copied INTO the sandbox worktree at its
+    real repo-relative path BEFORE the initial commit, so the
+    driver's R3 finding-5 precondition (invoked-from-pinned-worktree
+    + sha256 hash-check) is naturally satisfied. The
+    `dirty` / `extra_commit` flags then operate on top of a
+    committed state that already contains the driver."""
 
     def __init__(self, *, valid_worktree=True,
                  dirty=False, extra_commit=False,
@@ -200,8 +239,6 @@ class _Sandbox:
         self.worktree.mkdir()
         if valid_worktree:
             if broken_pr42_config:
-                # Wrong shape: only COLLECTION_GROUP DESCENDING, missing
-                # all COLLECTION-scope entries.
                 (self.worktree / "firestore.indexes.json").write_text(
                     json.dumps({
                         "indexes": [],
@@ -219,13 +256,23 @@ class _Sandbox:
             _write_firebase_json(self.worktree / "firebase.json")
             _write_firebaserc(self.worktree / ".firebaserc",
                               project=firebaserc_project)
+            # R3 finding 5: driver must live inside the pinned
+            # worktree. Copy it in BEFORE the initial commit so
+            # HEAD contains it and the worktree is clean afterward.
+            self.driver_in_worktree = (
+                self.worktree / "backend" / "scripts" / "window1_preflight"
+                / "deploy_rooms_status_index.py"
+            )
+            self.driver_in_worktree.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_DRIVER, self.driver_in_worktree)
         self.sha = _init_git(
             self.worktree, dirty=dirty, extra_commit_after=extra_commit,
         )
         self.pinned_sha = self.sha
         if extra_commit:
-            # Pin the sha the driver expects to the FIRST commit, so the
-            # current HEAD (which is now the second commit) mismatches.
+            # Pin the driver's expected SHA to the FIRST commit so
+            # the current HEAD (which is now the second commit)
+            # mismatches — proves R2/R3 precondition fires.
             first = subprocess.run(
                 ["git", "rev-parse", "HEAD^"],
                 cwd=self.worktree, capture_output=True, text=True, check=True,
@@ -240,18 +287,37 @@ class _Sandbox:
                    poll_interval_sec=0.05,
                    firebase_version_pin=DEFAULT_FIREBASE_VERSION,
                    dry_run=False,
-                   extra_env=None):
+                   extra_env=None,
+                   override_pr42_sha=None,
+                   override_reviewer_approved_sha=None,
+                   override_script_sha256=None):
+        """Invoke the driver from inside the sandbox worktree.
+        The driver was already copied in by `_Sandbox.__init__`."""
         env = os.environ.copy()
         env["PR42_FAKE_STATE"] = str(state_path)
         env["PR42_GCLOUD"] = str(_FAKE_GCLOUD)
         env["PR42_FIREBASE"] = str(_FAKE_FIREBASE)
         if extra_env:
             env.update(extra_env)
+
+        driver_path = getattr(self, "driver_in_worktree", None) or _DRIVER
+
+        # sha256 of the driver file the test will invoke.
+        import hashlib
+        h = hashlib.sha256()
+        with open(driver_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        real_script_sha = h.hexdigest()
+
         cmd = [
-            sys.executable, str(_DRIVER),
+            sys.executable, str(driver_path),
             "--audit-dir", str(self.audit),
             "--worktree", str(self.worktree),
-            "--pr42-sha", self.pinned_sha,
+            "--pr42-sha", (override_pr42_sha or self.pinned_sha),
+            "--reviewer-approved-sha",
+            (override_reviewer_approved_sha or self.pinned_sha),
+            "--script-sha256", (override_script_sha256 or real_script_sha),
             "--gcloud", str(_FAKE_GCLOUD),
             "--firebase", str(_FAKE_FIREBASE),
             "--firebase-tools-version-pin", firebase_version_pin,
@@ -345,6 +411,11 @@ class DeployDriverFixtureTests(unittest.TestCase):
     # ---------- unexpected server-side change ----------
 
     def test_unexpected_deletion_of_unrelated_composite(self):
+        """R3 upgrade: the pre-deploy delta refuses at rc=5 BEFORE
+        firebase runs, because a pre-existing composite would be
+        deleted by the deploy (PR #42's local file has
+        `indexes: []`). This surfaces the risk earlier than R2's
+        post-diff catch."""
         pre_composites = [{
             "collectionGroup": "services",
             "fields": [{"fieldPath": "activeRoomId", "order": "ASCENDING"},
@@ -360,9 +431,10 @@ class DeployDriverFixtureTests(unittest.TestCase):
                 deploy_side_effect="commit_partial_delete_unrelated",
             )
             proc = sb.run_driver(state)
-            self.assertEqual(proc.returncode, 7, proc.stderr[:400])
+            self.assertEqual(proc.returncode, 5, proc.stderr[:400])
             payload = json.loads(proc.stdout.splitlines()[0])
-            self.assertEqual(payload["outcome"], "post_composites_diff")
+            self.assertEqual(payload["outcome"], "pre_deploy_delta")
+            self.assertIn("composites", payload["reason"])
         finally:
             sb.cleanup()
 
@@ -395,17 +467,23 @@ class DeployDriverFixtureTests(unittest.TestCase):
         finally:
             sb.cleanup()
 
-    def test_missing_never_appears_hits_timeout(self):
+    def test_missing_never_appears_hard_stops_on_first_poll(self):
+        """R3 finding 7 upgrade: because the post-deploy snapshot
+        confirmed the CG_ASC entry exists (fake_firebase publishes
+        the override before setting the poll sequence), a MISSING
+        observation from polling is now an immediate hard-stop —
+        NOT a wait-until-timeout. Rc=8 with outcome=poll_error."""
         sb = _Sandbox()
         try:
             state = _make_scenario(
                 sb.root, deploy_side_effect="commit_leaves_missing",
             )
-            proc = sb.run_driver(state, poll_timeout_sec=1)
+            proc = sb.run_driver(state, poll_timeout_sec=5,
+                                 poll_interval_sec=0.01)
             self.assertEqual(proc.returncode, 8, proc.stderr[:400])
             payload = json.loads(proc.stdout.splitlines()[0])
-            self.assertEqual(payload["outcome"], "poll_timeout")
-            self.assertIn("MISSING", payload["reason"])
+            self.assertEqual(payload["outcome"], "poll_error")
+            self.assertIn("regressed", payload["reason"])
         finally:
             sb.cleanup()
 
@@ -518,6 +596,271 @@ class DeployDriverFixtureTests(unittest.TestCase):
             self.assertTrue((sb.audit / "post").is_dir(),
                             "SIGINT trap must still write post/ snapshot")
             self.assertTrue((sb.audit / "post" / "manifest.json").exists())
+        finally:
+            sb.cleanup()
+
+
+class R3ExtendedFixtureTests(unittest.TestCase):
+    """R3-specific coverage — findings 1, 3, 5, 6, 7, 8, 9."""
+
+    def setUp(self):
+        os.chmod(_FAKE_GCLOUD, 0o755)
+        os.chmod(_FAKE_FIREBASE, 0o755)
+
+    # Finding 1 + 9: unknown collection-group override caught by
+    # the DB-wide fields list.
+    def test_pre_deploy_refuses_when_unknown_cg_has_explicit_override(self):
+        """An override in an unknown/unmodeled collection group in
+        pre-state MUST cause the pre-deploy delta to refuse: PR
+        #42's local `fieldOverrides` doesn't declare it, so
+        firebase deploy would DELETE it. The R2 hardcoded 7-group
+        allowlist would have silently missed this."""
+        unknown_override = {
+            "name": (
+                "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
+                "collectionGroups/unknown_group/fields/some_field"
+            ),
+            "indexConfig": {"indexes": [
+                {"fields": [{"fieldPath": "some_field", "order": "ASCENDING"}],
+                 "queryScope": "COLLECTION_GROUP", "state": "READY"},
+            ]},
+        }
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root, field_overrides=[unknown_override])
+            proc = sb.run_driver(state)
+            self.assertEqual(proc.returncode, 5, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "pre_deploy_delta")
+            self.assertIn("would_delete", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 3: pre-deploy delta refuses when an unrelated override exists.
+    def test_pre_deploy_refuses_when_unrelated_override_would_be_deleted(self):
+        unrelated = {
+            "name": (
+                "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
+                "collectionGroups/services/fields/activeRoomId"
+            ),
+            "indexConfig": {"indexes": [
+                {"fields": [{"fieldPath": "activeRoomId", "order": "ASCENDING"}],
+                 "queryScope": "COLLECTION_GROUP", "state": "READY"},
+            ]},
+        }
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root, field_overrides=[unrelated])
+            proc = sb.run_driver(state)
+            self.assertEqual(proc.returncode, 5, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "pre_deploy_delta")
+        finally:
+            sb.cleanup()
+
+    # Finding 3: pre-deploy delta refuses when there's a pre-existing composite.
+    def test_pre_deploy_refuses_when_remote_composite_would_be_deleted(self):
+        composite = {
+            "name": "projects/foo/databases/bar/collectionGroups/x/indexes/y",
+            "collectionGroup": "x",
+            "fields": [{"fieldPath": "a", "order": "ASCENDING"}],
+            "queryScope": "COLLECTION",
+            "state": "READY",
+        }
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root, composites=[composite])
+            proc = sb.run_driver(state)
+            self.assertEqual(proc.returncode, 5, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "pre_deploy_delta")
+            self.assertIn("composites", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 3: dry-run runs the pre-deploy delta too.
+    def test_dry_run_runs_pre_deploy_delta_and_refuses_bad_pre_state(self):
+        unrelated = {
+            "name": (
+                "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
+                "collectionGroups/x/fields/y"
+            ),
+            "indexConfig": {"indexes": []},
+        }
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root, field_overrides=[unrelated])
+            proc = sb.run_driver(state, dry_run=True)
+            self.assertEqual(proc.returncode, 5, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "pre_deploy_delta")
+        finally:
+            sb.cleanup()
+
+    # Finding 5: reviewer-approved-sha must equal --pr42-sha.
+    def test_reviewer_approved_sha_mismatch_rejected(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(state,
+                                 override_reviewer_approved_sha="0" * 40)
+            self.assertEqual(proc.returncode, 2, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "preconditions")
+            self.assertIn("reviewer-approved SHA", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 5: script-sha256 mismatch rejected.
+    def test_script_sha256_mismatch_rejected(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(state,
+                                 override_script_sha256="deadbeef" * 8)
+            self.assertEqual(proc.returncode, 2, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "preconditions")
+            self.assertIn("script sha256 mismatch", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 7: MISSING observed AFTER post-deploy = hard stop.
+    def test_missing_after_ready_immediately_hard_stops(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(
+                sb.root, deploy_side_effect="commit_regresses_after_ready",
+            )
+            proc = sb.run_driver(state, poll_timeout_sec=5,
+                                 poll_interval_sec=0.01)
+            self.assertEqual(proc.returncode, 8, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "poll_error")
+            self.assertIn("regressed", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 8: remote database mismatch (locationId wrong).
+    def test_remote_database_wrong_location_rejected(self):
+        wrong_db = _default_database()
+        wrong_db["locationId"] = "europe-west4"
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root, database=wrong_db)
+            proc = sb.run_driver(state)
+            self.assertEqual(proc.returncode, 4, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "target_confirm")
+            self.assertIn("locationId", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 8: remote database mismatch (name wrong — wrong project).
+    def test_remote_database_wrong_name_rejected(self):
+        wrong_db = _default_database()
+        wrong_db["name"] = "projects/other-project/databases/worship-translation"
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root, database=wrong_db)
+            proc = sb.run_driver(state)
+            self.assertEqual(proc.returncode, 4, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "target_confirm")
+            self.assertIn("name", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 8: positive-finite argparse validators.
+    def test_zero_poll_timeout_rejected_by_argparse(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(state, poll_timeout_sec=0)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "",
+                             "argparse must not emit a JSON payload")
+        finally:
+            sb.cleanup()
+
+    def test_nan_deploy_timeout_rejected_by_argparse(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(state, deploy_timeout_sec="nan")
+            self.assertNotEqual(proc.returncode, 0)
+        finally:
+            sb.cleanup()
+
+    # Finding 8: strict schema — unknown top-level key.
+    def test_static_invariants_reject_unknown_top_level_key(self):
+        sb = _Sandbox()
+        try:
+            (sb.worktree / "firestore.indexes.json").write_text(
+                json.dumps({
+                    "indexes": [],
+                    "fieldOverrides": [{
+                        "collectionGroup": "rooms",
+                        "fieldPath": "status",
+                        "indexes": [
+                            {"order": "ASCENDING",  "queryScope": "COLLECTION"},
+                            {"order": "DESCENDING", "queryScope": "COLLECTION"},
+                            {"arrayConfig": "CONTAINS", "queryScope": "COLLECTION"},
+                            {"order": "ASCENDING",  "queryScope": "COLLECTION_GROUP"},
+                        ],
+                    }],
+                    "surprise": {"unexpected": "key"},
+                }) + "\n"
+            )
+            subprocess.run(["git", "add", "-A"], cwd=sb.worktree, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "add stray key"],
+                           cwd=sb.worktree, check=True)
+            sb.pinned_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=sb.worktree,
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(state)
+            self.assertEqual(proc.returncode, 5, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "static_invariants")
+            self.assertIn("unknown top-level", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    # Finding 8: strict schema — duplicate entries.
+    def test_static_invariants_reject_duplicate_entries(self):
+        sb = _Sandbox()
+        try:
+            (sb.worktree / "firestore.indexes.json").write_text(
+                json.dumps({
+                    "indexes": [],
+                    "fieldOverrides": [{
+                        "collectionGroup": "rooms",
+                        "fieldPath": "status",
+                        "indexes": [
+                            {"order": "ASCENDING",  "queryScope": "COLLECTION"},
+                            {"order": "ASCENDING",  "queryScope": "COLLECTION"},  # dupe
+                            {"order": "DESCENDING", "queryScope": "COLLECTION"},
+                            {"arrayConfig": "CONTAINS", "queryScope": "COLLECTION"},
+                            {"order": "ASCENDING",  "queryScope": "COLLECTION_GROUP"},
+                        ],
+                    }],
+                }) + "\n"
+            )
+            subprocess.run(["git", "add", "-A"], cwd=sb.worktree, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "add dupe"],
+                           cwd=sb.worktree, check=True)
+            sb.pinned_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=sb.worktree,
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(state)
+            self.assertEqual(proc.returncode, 5, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "static_invariants")
+            self.assertIn("duplicate", payload["reason"])
         finally:
             sb.cleanup()
 

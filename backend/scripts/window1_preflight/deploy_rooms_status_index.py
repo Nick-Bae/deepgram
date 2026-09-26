@@ -87,7 +87,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "2.0.0"  # R3: db-wide snapshots, real proto shape, pre-deploy delta, hardened signal handling
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -111,24 +111,32 @@ PROJECT_ID = "sturdy-dogfish-472313-k6"
 DATABASE_ID = "worship-translation"
 LOCATION_ID = "us-central1"
 
-# Field-override discovery uses this allowlist because the
-# Firestore Admin API doesn't expose a database-wide fieldOverride
-# list. Any collection group that carries app data goes here so
-# the semantic diff can prove no unrelated field override was
-# added or removed by this deploy.
-KNOWN_COLLECTION_GROUPS: tuple[str, ...] = (
-    "organizations",
-    "services",
-    "rooms",
-    "members",
-    "invites",
-    "usage",
-    "sermons",
-)
-
+# R3 correction: `gcloud firestore indexes fields list` accepts
+# `--collection-group` as OPTIONAL — omitting it lists explicit
+# field overrides across EVERY collection group. R2 wrongly claimed
+# a database-wide listing did not exist and used a hardcoded seven-
+# group allowlist, which silently missed overrides in unknown or
+# newly-introduced collection groups. The driver now runs the
+# single db-wide list.
 DEFAULT_DEPLOY_TIMEOUT_SEC = 300
 DEFAULT_POLL_TIMEOUT_SEC = 1800
 DEFAULT_POLL_INTERVAL_SEC = 30
+
+# Firestore's documented single-field index lifecycle states.
+# `MISSING` is the driver's absence sentinel returned by
+# `_current_rs_state` when the CG_ASC entry is not in the describe
+# response — it is NOT a real API state, so once the post-deploy
+# snapshot confirms the override exists, a subsequent MISSING
+# observation from polling means the entry regressed and must
+# hard-stop immediately.
+FIRESTORE_INDEX_STATES: frozenset[str] = frozenset({
+    "CREATING", "READY", "NEEDS_REPAIR",
+})
+
+# Sentinel `ancestorField` name segment for the implicit-default
+# fields config that appears in `fields list` without being an
+# explicit override. Filter it out of the field-override set.
+_ANCESTOR_DEFAULT_FIELDPATH_MARKER = "/collectionGroups/__default__/fields/"
 
 
 # --- IO helpers ---------------------------------------------------------
@@ -161,13 +169,51 @@ def _sha256(path: Path) -> str:
 # --- Global state for the post-snapshot trap ----------------------------
 
 _POST_SNAPSHOT_TAKEN = False
+# R3 finding 6: the driver tracks the deploy child so the trap can
+# terminate its process group before snapshotting. Without this the
+# child (firebase, and the tools it spawns) can continue mutating
+# production Firestore AFTER a signal-triggered snapshot appears to
+# capture the "final" state.
+_DEPLOY_CHILD_PGID: int | None = None
+
+
+def _terminate_deploy_child() -> None:
+    """If a firebase-deploy child is still running, terminate its
+    entire process group and wait for it to reap. Best-effort;
+    swallows individual OSError so the caller can still snapshot."""
+    global _DEPLOY_CHILD_PGID
+    pgid = _DEPLOY_CHILD_PGID
+    if pgid is None:
+        return
+    _DEPLOY_CHILD_PGID = None
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    # Give the group up to 5 s to exit.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)  # probe: is anyone left?
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    # Still alive → SIGKILL the group.
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def _install_trap(audit_dir: Path, gcloud: str) -> None:
-    """Install a signal handler + atexit hook that fires exactly
-    once and writes the post-snapshot to `audit_dir/post/`. Uses
-    the same pattern the shell EXIT trap uses: idempotent, runs
-    on success, non-zero, SIGTERM, and SIGINT."""
+    """Install a signal handler + atexit hook that:
+      1. terminates any running deploy child's process group so
+         firebase cannot keep mutating production after we start
+         snapshotting;
+      2. writes the post-snapshot to `audit_dir/post/`;
+      3. re-raises the original signal so the process exits with
+         the canonical signal exit code.
+    Fires exactly once across atexit + SIGINT + SIGTERM."""
     import atexit
 
     def _run_once():
@@ -175,6 +221,13 @@ def _install_trap(audit_dir: Path, gcloud: str) -> None:
         if _POST_SNAPSHOT_TAKEN:
             return
         _POST_SNAPSHOT_TAKEN = True
+        # (1) Terminate child FIRST so any mutations happening
+        # during our snapshot cannot land.
+        try:
+            _terminate_deploy_child()
+        except Exception as exc:  # pragma: no cover
+            _diag(f"trap terminate child: {type(exc).__name__}: {exc}")
+        # (2) Snapshot.
         post_dir = audit_dir / "post"
         try:
             _take_snapshot(gcloud, post_dir, label="post")
@@ -183,8 +236,6 @@ def _install_trap(audit_dir: Path, gcloud: str) -> None:
 
     def _handler(signum, _frame):
         _run_once()
-        # Re-raise the signal so the process exits with the
-        # canonical signal exit code.
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
@@ -214,10 +265,13 @@ def _run_gcloud(gcloud: str, *args: str, timeout: float = 60.0) -> str:
 
 
 def _take_snapshot(gcloud: str, snapshot_dir: Path, *, label: str) -> None:
-    """Take a database-wide snapshot of composite indexes plus
-    field overrides on every known collection group. Writes JSON
-    per collection group + a `manifest.json` summarizing what
-    was captured + a `snapshot.sha256`."""
+    """Take a database-wide snapshot: composite indexes list,
+    field overrides list (across ALL collection groups — no
+    `--collection-group` filter, per the R3 correction), and the
+    rooms.status describe response. Writes one JSON per gcloud
+    call + a `manifest.json` + a `snapshot.sha256`. Also records
+    the `firestore databases describe` metadata so target
+    confirmation has a canonical anchor."""
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir.chmod(0o700)
 
@@ -227,10 +281,9 @@ def _take_snapshot(gcloud: str, snapshot_dir: Path, *, label: str) -> None:
         "project": PROJECT_ID,
         "database": DATABASE_ID,
         "location": LOCATION_ID,
-        "known_collection_groups": list(KNOWN_COLLECTION_GROUPS),
     }
 
-    # Database-wide composite indexes (no collection-group filter).
+    # Database-wide composite indexes.
     composite_path = snapshot_dir / "composite-indexes.json"
     composite_json = _run_gcloud(
         gcloud, "firestore", "indexes", "composite", "list",
@@ -240,20 +293,24 @@ def _take_snapshot(gcloud: str, snapshot_dir: Path, *, label: str) -> None:
     composite_path.write_text(composite_json)
     manifest["composite_count"] = len(json.loads(composite_json))
 
-    # Per-known-collection-group field overrides.
-    fields_dir = snapshot_dir / "fields"
-    fields_dir.mkdir(exist_ok=True)
-    fields_dir.chmod(0o700)
-    per_group: dict[str, int] = {}
-    for cg in KNOWN_COLLECTION_GROUPS:
-        raw = _run_gcloud(
-            gcloud, "firestore", "indexes", "fields", "list",
-            f"--project={PROJECT_ID}", f"--database={DATABASE_ID}",
-            f"--collection-group={cg}", "--format=json",
-        )
-        (fields_dir / f"{cg}.json").write_text(raw)
-        per_group[cg] = len(json.loads(raw))
-    manifest["field_overrides_per_collection_group"] = per_group
+    # Database-wide field overrides (NO --collection-group filter).
+    # Includes the `__default__` ancestor sentinel plus every
+    # explicit override across every collection group in the db —
+    # the R2 hardcoded seven-group allowlist could not observe an
+    # override in an unknown or newly-introduced collection group.
+    fields_all_path = snapshot_dir / "fields-list.json"
+    fields_all_json = _run_gcloud(
+        gcloud, "firestore", "indexes", "fields", "list",
+        f"--project={PROJECT_ID}", f"--database={DATABASE_ID}",
+        "--format=json",
+    )
+    fields_all_path.write_text(fields_all_json)
+    parsed = json.loads(fields_all_json)
+    manifest["fields_list_total"] = len(parsed)
+    manifest["fields_list_explicit_overrides"] = sum(
+        1 for e in parsed
+        if _ANCESTOR_DEFAULT_FIELDPATH_MARKER not in (e.get("name") or "")
+    )
 
     # rooms.status field-level state (the one we care most about).
     rs_path = snapshot_dir / "rooms-status.json"
@@ -263,6 +320,21 @@ def _take_snapshot(gcloud: str, snapshot_dir: Path, *, label: str) -> None:
         "--collection-group=rooms", "--format=json",
     )
     rs_path.write_text(rs_json)
+
+    # Database metadata — canonical target confirmation anchor.
+    db_path = snapshot_dir / "database.json"
+    db_json = _run_gcloud(
+        gcloud, "firestore", "databases", "describe",
+        f"--project={PROJECT_ID}", f"--database={DATABASE_ID}",
+        "--format=json",
+    )
+    db_path.write_text(db_json)
+    db_meta = json.loads(db_json)
+    manifest["database_metadata"] = {
+        "name": db_meta.get("name"),
+        "type": db_meta.get("type"),
+        "locationId": db_meta.get("locationId"),
+    }
 
     (snapshot_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -304,47 +376,80 @@ def _parse_cg_from_name(name: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _load_field_overrides(snapshot_dir: Path) -> list[dict[str, Any]]:
-    """Return every explicit field override across the known
-    collection groups as a canonicalized list."""
-    out = []
-    fields_dir = snapshot_dir / "fields"
-    for cg in KNOWN_COLLECTION_GROUPS:
-        raw = json.loads((fields_dir / f"{cg}.json").read_text())
-        for entry in raw:
-            # `fields list` returns only explicit overrides — the
-            # implicit ancestor-default fields are NOT here.
-            out.append({
-                "collectionGroup": cg,
-                "fieldPath": _parse_field_path_from_name(entry.get("name", "")),
-                "indexes": [
-                    {"order": i.get("order"),
-                     "arrayConfig": i.get("arrayConfig"),
-                     "queryScope": i.get("queryScope"),
-                     "state": i.get("state")}
-                    for i in entry.get("indexConfig", {}).get("indexes", [])
-                ],
-                "usesAncestorConfig": entry.get("indexConfig", {}).get("usesAncestorConfig"),
-            })
-    return out
-
-
 def _parse_field_path_from_name(name: str) -> str | None:
     # projects/.../collectionGroups/<cg>/fields/<field>
     m = re.search(r"/fields/([^/]+)$", name)
     return m.group(1) if m else None
 
 
+def _parse_cg_from_field_name(name: str) -> str | None:
+    m = re.search(r"/collectionGroups/([^/]+)/fields/", name)
+    return m.group(1) if m else None
+
+
+def _canonicalize_index_entry(entry: dict) -> dict:
+    """Convert one `Index` proto entry into a flat comparison
+    record. The REAL gcloud shape nests `order` / `arrayConfig`
+    inside `fields[]`. Single-field overrides always have exactly
+    one `fields` element (the override's own field path); the
+    driver captures that inner order/arrayConfig alongside
+    queryScope + state as a canonical shape."""
+    fields = entry.get("fields") or []
+    inner = fields[0] if fields else {}
+    return {
+        "fieldPath": inner.get("fieldPath"),
+        "order": inner.get("order"),
+        "arrayConfig": inner.get("arrayConfig"),
+        "queryScope": entry.get("queryScope"),
+        "state": entry.get("state"),
+    }
+
+
+def _load_field_overrides(snapshot_dir: Path) -> list[dict[str, Any]]:
+    """Return every explicit field override across the database.
+    R3 reads `fields-list.json` (the db-wide list) and filters
+    out the `__default__` ancestor sentinel — that entry describes
+    the default per-field policy, not an explicit override.
+
+    Each returned dict has:
+      collectionGroup, fieldPath, indexes[canonical_entry], name
+    """
+    out = []
+    fields_all = json.loads((snapshot_dir / "fields-list.json").read_text())
+    for entry in fields_all:
+        name = entry.get("name") or ""
+        if _ANCESTOR_DEFAULT_FIELDPATH_MARKER in name:
+            # Ancestor default — NOT an explicit override.
+            continue
+        cg = _parse_cg_from_field_name(name)
+        fp = _parse_field_path_from_name(name)
+        out.append({
+            "name": name,
+            "collectionGroup": cg,
+            "fieldPath": fp,
+            "indexes": [
+                _canonicalize_index_entry(e)
+                for e in entry.get("indexConfig", {}).get("indexes", [])
+            ],
+            "usesAncestorConfig": entry.get("indexConfig", {}).get("usesAncestorConfig"),
+        })
+    return out
+
+
 def _load_rooms_status(snapshot_dir: Path) -> dict[str, Any]:
-    """rooms.status describe → canonical."""
+    """rooms.status describe → canonical (nested-fields shape)."""
     raw = json.loads((snapshot_dir / "rooms-status.json").read_text())
+    canonical = [
+        _canonicalize_index_entry(e)
+        for e in raw.get("indexConfig", {}).get("indexes", [])
+    ]
     return {
         "usesAncestorConfig": raw.get("indexConfig", {}).get("usesAncestorConfig"),
         "indexes": sorted(
-            [(e.get("order"), e.get("arrayConfig"), e.get("queryScope"),
-              e.get("state"))
-             for e in raw.get("indexConfig", {}).get("indexes", [])],
-            key=lambda t: (str(t[0]), str(t[1]), str(t[2]))
+            canonical,
+            key=lambda c: (str(c.get("order") or ""),
+                           str(c.get("arrayConfig") or ""),
+                           str(c.get("queryScope") or "")),
         ),
     }
 
@@ -406,61 +511,219 @@ def _load_pr42_indexes_json(worktree: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+_ALLOWED_TOP_KEYS: frozenset[str] = frozenset({"indexes", "fieldOverrides"})
+_ALLOWED_OVERRIDE_KEYS: frozenset[str] = frozenset({
+    "collectionGroup", "fieldPath", "indexes",
+})
+_ALLOWED_ENTRY_KEYS: frozenset[str] = frozenset({
+    "order", "arrayConfig", "queryScope",
+})
+
+
 def _static_invariants(pr42_cfg: dict[str, Any]) -> list[str]:
-    """Return list of failure reasons (empty means pass)."""
+    """R3 finding 8: strict schema. Reject unknown top-level keys,
+    unknown override keys, unknown entry keys, wrong types, and
+    duplicate entries.
+
+    Required shape:
+      {"indexes": [],
+       "fieldOverrides": [
+         {"collectionGroup": "rooms",
+          "fieldPath": "status",
+          "indexes": [ EXACTLY four entries; see body ]}
+       ]}
+
+    Returns a list of failure reasons; empty means pass."""
     problems: list[str] = []
+
+    # Top-level must be a dict with only allowed keys.
+    if not isinstance(pr42_cfg, dict):
+        return [f"top level must be a JSON object, got {type(pr42_cfg).__name__}"]
+    unknown_top = sorted(set(pr42_cfg.keys()) - _ALLOWED_TOP_KEYS)
+    if unknown_top:
+        problems.append(f"unknown top-level keys: {unknown_top!r}")
+
+    # `indexes` must be present and equal to [].
     if pr42_cfg.get("indexes") != []:
         problems.append(
             f"expected `indexes` to be [], got {pr42_cfg.get('indexes')!r}"
         )
-    overrides = pr42_cfg.get("fieldOverrides", [])
+
+    overrides = pr42_cfg.get("fieldOverrides")
+    if not isinstance(overrides, list):
+        problems.append(
+            f"expected `fieldOverrides` to be a list, got "
+            f"{type(overrides).__name__}"
+        )
+        return problems
     if len(overrides) != 1:
         problems.append(
             f"expected exactly one fieldOverride, got {len(overrides)}"
         )
         return problems
+
     o = overrides[0]
-    if o.get("collectionGroup") != "rooms" or o.get("fieldPath") != "status":
+    if not isinstance(o, dict):
+        problems.append(f"fieldOverride must be an object, got {type(o).__name__}")
+        return problems
+
+    unknown_ov = sorted(set(o.keys()) - _ALLOWED_OVERRIDE_KEYS)
+    if unknown_ov:
+        problems.append(f"unknown fieldOverride keys: {unknown_ov!r}")
+
+    if o.get("collectionGroup") != "rooms":
         problems.append(
-            f"fieldOverride not for rooms.status: "
-            f"{o.get('collectionGroup')}.{o.get('fieldPath')}"
+            f"collectionGroup must be 'rooms', got {o.get('collectionGroup')!r}"
         )
-    entries = o.get("indexes", [])
-    have_col_asc = any(
-        e.get("order") == "ASCENDING" and e.get("queryScope") == "COLLECTION"
-        for e in entries
-    )
-    have_col_desc = any(
-        e.get("order") == "DESCENDING" and e.get("queryScope") == "COLLECTION"
-        for e in entries
-    )
-    have_col_arr = any(
-        e.get("arrayConfig") == "CONTAINS" and e.get("queryScope") == "COLLECTION"
-        for e in entries
-    )
-    have_cg_asc = [
-        e for e in entries
-        if e.get("order") == "ASCENDING"
-        and e.get("queryScope") == "COLLECTION_GROUP"
-    ]
-    if not have_col_asc:
-        problems.append("missing COLLECTION ASCENDING")
-    if not have_col_desc:
-        problems.append("missing COLLECTION DESCENDING")
-    if not have_col_arr:
-        problems.append("missing COLLECTION ARRAY_CONTAINS")
-    if len(have_cg_asc) != 1:
+    if o.get("fieldPath") != "status":
         problems.append(
-            f"expected exactly one COLLECTION_GROUP ASCENDING, got {len(have_cg_asc)}"
+            f"fieldPath must be 'status', got {o.get('fieldPath')!r}"
         )
-    forbidden_cg = [
-        e for e in entries
-        if e.get("queryScope") == "COLLECTION_GROUP"
-        and (e.get("order") == "DESCENDING" or e.get("arrayConfig") == "CONTAINS")
-    ]
-    if forbidden_cg:
-        problems.append(f"forbidden COLLECTION_GROUP entries: {forbidden_cg!r}")
+
+    entries = o.get("indexes")
+    if not isinstance(entries, list):
+        problems.append(
+            f"override `indexes` must be a list, got {type(entries).__name__}"
+        )
+        return problems
+
+    # Each entry must have only allowed keys, correct types.
+    normalized_entries: list[tuple] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            problems.append(f"entries[{i}] must be an object, got {type(entry).__name__}")
+            continue
+        unknown_e = sorted(set(entry.keys()) - _ALLOWED_ENTRY_KEYS)
+        if unknown_e:
+            problems.append(f"entries[{i}] unknown keys: {unknown_e!r}")
+        order = entry.get("order")
+        array_cfg = entry.get("arrayConfig")
+        scope = entry.get("queryScope")
+        # Enum discipline: exactly one of `order` / `arrayConfig` set.
+        if (order is None) == (array_cfg is None):
+            problems.append(
+                f"entries[{i}] must set exactly one of `order`/`arrayConfig`, "
+                f"got order={order!r} arrayConfig={array_cfg!r}"
+            )
+        if order is not None and order not in ("ASCENDING", "DESCENDING"):
+            problems.append(f"entries[{i}] invalid order={order!r}")
+        if array_cfg is not None and array_cfg != "CONTAINS":
+            problems.append(f"entries[{i}] invalid arrayConfig={array_cfg!r}")
+        if scope not in ("COLLECTION", "COLLECTION_GROUP"):
+            problems.append(f"entries[{i}] invalid queryScope={scope!r}")
+        normalized_entries.append((order, array_cfg, scope))
+
+    # No duplicates.
+    if len(normalized_entries) != len(set(normalized_entries)):
+        seen = set()
+        dupes = []
+        for e in normalized_entries:
+            if e in seen:
+                dupes.append(e)
+            seen.add(e)
+        problems.append(f"duplicate entries: {dupes!r}")
+
+    # REQUIRED exact four-entry set.
+    required = {
+        ("ASCENDING", None, "COLLECTION"),
+        ("DESCENDING", None, "COLLECTION"),
+        (None, "CONTAINS", "COLLECTION"),
+        ("ASCENDING", None, "COLLECTION_GROUP"),
+    }
+    actual = set(normalized_entries)
+    missing = required - actual
+    extra = actual - required
+    if missing:
+        problems.append(
+            f"missing required entries: {sorted(missing, key=str)!r}"
+        )
+    if extra:
+        problems.append(
+            f"unexpected entries: {sorted(extra, key=str)!r}"
+        )
     return problems
+
+
+# --- Pre-deploy semantic delta (R3 finding 3) -------------------------
+
+
+def _compute_pre_deploy_delta(pre_snapshot_dir: Path,
+                              worktree: Path) -> dict[str, Any]:
+    """Compute the proposed post-deploy field-override state
+    from the pre-snapshot + PR #42's local `firestore.indexes.json`,
+    then diff proposed vs pre. Refuse if the proposed change
+    would remove any pre-existing override, add anything other
+    than the intended `rooms.status`, or leave the composites
+    list disturbed. Returns a report dict.
+
+    Called BEFORE `firebase deploy` — so the operator has a
+    fail-closed proof that the LOCAL config, if applied, would
+    take production from the current pre-snapshot to
+    (pre + intended rooms.status) with nothing else changed."""
+    pre_over = _load_field_overrides(pre_snapshot_dir)
+    pr42_cfg = _load_pr42_indexes_json(worktree)
+    # The PR #42 file's local `fieldOverrides` list IS the
+    # complete post-state that `firebase deploy` would apply
+    # (deleting anything not present remotely). Build the
+    # "proposed post-state" as {existing pre-overrides for OTHER
+    # (collectionGroup, fieldPath) pairs} + {PR42's local entries
+    # for the pairs it declares}. Then compare against pre.
+    #
+    # Under `firebase deploy` semantics, ANY override remotely
+    # present but not in the local file WOULD BE DELETED. R3 must
+    # refuse deploy if such a deletion would happen.
+    local_overrides = pr42_cfg.get("fieldOverrides", [])
+    local_pairs = {
+        (o.get("collectionGroup"), o.get("fieldPath"))
+        for o in local_overrides
+    }
+    pre_pairs = {
+        (o.get("collectionGroup"), o.get("fieldPath"))
+        for o in pre_over
+    }
+    would_delete = pre_pairs - local_pairs
+    if would_delete:
+        return {
+            "ok": False,
+            "kind": "would_delete_remote_overrides",
+            "detail": {"would_delete": sorted(str(p) for p in would_delete)},
+        }
+    unrelated_local = local_pairs - {("rooms", "status")}
+    if unrelated_local:
+        return {
+            "ok": False,
+            "kind": "local_declares_unrelated_overrides",
+            "detail": {"unrelated": sorted(str(p) for p in unrelated_local)},
+        }
+    # The one intended add: rooms.status not yet in pre.
+    if ("rooms", "status") in pre_pairs:
+        return {
+            "ok": False,
+            "kind": "rooms_status_already_present",
+            "detail": {"note": "pre-snapshot already contains an explicit "
+                              "rooms.status override — R4 inventory said no"},
+        }
+    # Composites: PR #42 declares `indexes: []`. If pre has any
+    # composite index, firebase deploy would delete it. Refuse.
+    pre_composites = _load_composite(pre_snapshot_dir)
+    local_composites = pr42_cfg.get("indexes", [])
+    if pre_composites and local_composites == []:
+        return {
+            "ok": False,
+            "kind": "would_delete_remote_composites",
+            "detail": {"pre_composite_count": len(pre_composites)},
+        }
+    return {
+        "ok": True,
+        "kind": "delta_ready",
+        "detail": {
+            "would_add_field_overrides": [{"collectionGroup": "rooms",
+                                           "fieldPath": "status"}],
+            "would_add_composites": [],
+            "would_remove_field_overrides": [],
+            "would_remove_composites": [],
+        },
+    }
 
 
 # --- Deploy invocation --------------------------------------------------
@@ -470,7 +733,14 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
             audit_dir: Path) -> int:
     """Run `firebase deploy --only firestore:indexes` from the
     detached worktree with a bounded timeout. Returns rc; captures
-    stdout/stderr into audit_dir/deploy/."""
+    stdout/stderr into audit_dir/deploy/.
+
+    R3 finding 6: the child runs in its own session (new process
+    group) so a signal delivered to the driver alone doesn't leave
+    firebase (and its `firebase-tools` spawns) mutating production.
+    The `_DEPLOY_CHILD_PGID` module global tracks the group; the
+    signal trap terminates it before snapshotting."""
+    global _DEPLOY_CHILD_PGID
     deploy_dir = audit_dir / "deploy"
     deploy_dir.mkdir(parents=True, exist_ok=True)
     deploy_dir.chmod(0o700)
@@ -482,20 +752,33 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
         "--json",
     ]
     (deploy_dir / "cmd.txt").write_text(json.dumps(cmd) + "\n")
-    with (deploy_dir / "deploy.stdout").open("wb") as so, \
-         (deploy_dir / "deploy.stderr").open("wb") as se:
+    so = (deploy_dir / "deploy.stdout").open("wb")
+    se = (deploy_dir / "deploy.stderr").open("wb")
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(worktree),
+            stdout=so, stderr=se,
+            # Put the child in its own process group so signals
+            # can target the whole subtree.
+            start_new_session=True,
+        )
+        _DEPLOY_CHILD_PGID = os.getpgid(proc.pid)
         try:
-            proc = subprocess.run(
-                cmd, cwd=str(worktree),
-                stdout=so, stderr=se, timeout=timeout_sec,
-            )
-            rc = proc.returncode
+            rc = proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
-            rc = 124  # matches GNU `timeout`
             se.write(
                 f"\n\n[driver] firebase deploy timed out after "
-                f"{timeout_sec:.0f}s\n".encode()
+                f"{timeout_sec:.0f}s — terminating process group\n".encode()
             )
+            _terminate_deploy_child()
+            rc = 124  # matches GNU `timeout` exit code convention
+    finally:
+        so.close()
+        se.close()
+        # Whether by normal exit or by termination, the child (and
+        # its group) is no longer active; clear the marker so the
+        # signal trap doesn't try to terminate a reaped PGID.
+        _DEPLOY_CHILD_PGID = None
     (deploy_dir / "deploy.rc").write_text(f"{rc}\n")
     return rc
 
@@ -505,7 +788,10 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
 
 def _current_rs_state(gcloud: str) -> str:
     """Return the state of the rooms.status COLLECTION_GROUP
-    ASCENDING entry, or 'MISSING' if absent."""
+    ASCENDING entry, or 'MISSING' if absent. Reads the nested
+    `Index.fields[]` shape gcloud actually returns (R3 correction
+    — R2 read a non-existent flat shape and never matched any
+    real production entry)."""
     raw = _run_gcloud(
         gcloud, "firestore", "indexes", "fields", "describe", "status",
         f"--project={PROJECT_ID}", f"--database={DATABASE_ID}",
@@ -513,16 +799,28 @@ def _current_rs_state(gcloud: str) -> str:
     )
     data = json.loads(raw)
     for e in data.get("indexConfig", {}).get("indexes", []):
-        if (e.get("order") == "ASCENDING"
-                and e.get("queryScope") == "COLLECTION_GROUP"):
-            return e.get("state", "UNKNOWN")
+        canonical = _canonicalize_index_entry(e)
+        if (canonical.get("order") == "ASCENDING"
+                and canonical.get("queryScope") == "COLLECTION_GROUP"):
+            return canonical.get("state") or "UNKNOWN"
     return "MISSING"
 
 
 def _poll_until_ready(gcloud: str, audit_dir: Path, *,
-                      timeout_sec: float, interval_sec: float) -> str:
+                      timeout_sec: float, interval_sec: float,
+                      assert_present: bool) -> str:
     """Poll `rooms.status` until state=READY. Returns the terminal
-    state observed. Raises TimeoutError on timeout."""
+    state observed. Raises TimeoutError on timeout, RuntimeError
+    on NEEDS_REPAIR or unexpected state.
+
+    R3 finding 7: `MISSING` is the driver's absence sentinel, not
+    a documented Firestore index lifecycle state (which is one of
+    CREATING / READY / NEEDS_REPAIR per the docs). Once the
+    post-deploy snapshot has confirmed the CG_ASC entry exists,
+    a subsequent MISSING observation must hard-stop immediately —
+    it means the entry regressed. `assert_present=True` enables
+    that immediate stop; the driver passes True after post-diff
+    passes."""
     poll_dir = audit_dir / "poll"
     poll_dir.mkdir(parents=True, exist_ok=True)
     poll_dir.chmod(0o700)
@@ -536,8 +834,22 @@ def _poll_until_ready(gcloud: str, audit_dir: Path, *,
             return state
         if state == "NEEDS_REPAIR":
             raise RuntimeError(f"rooms.status entered {state}")
-        if state not in ("CREATING", "MISSING"):
-            raise RuntimeError(f"unexpected state {state!r}")
+        if state == "MISSING":
+            if assert_present:
+                raise RuntimeError(
+                    "rooms.status COLLECTION_GROUP ASCENDING entry "
+                    "was present in the post-deploy snapshot but is "
+                    "MISSING from a subsequent describe response — "
+                    "index regressed"
+                )
+            # Only permitted when we do NOT yet know the override
+            # is present; the driver never passes assert_present
+            # False today, so this branch is defensive.
+        elif state != "CREATING":
+            raise RuntimeError(
+                f"unexpected state {state!r} (not one of "
+                f"{sorted(FIRESTORE_INDEX_STATES)!r} or MISSING)"
+            )
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"index did not reach READY within {timeout_sec:.0f}s "
@@ -564,6 +876,31 @@ def _die(rc: int, kind: str, reason: str) -> "None":
     sys.exit(rc)
 
 
+def _positive_finite_float(kind: str, name: str):
+    """Argparse type callable that rejects zero, negative, NaN,
+    and +/-inf via `argparse.ArgumentTypeError` — same pattern as
+    PR #41's `common.positive_float`."""
+    import math
+
+    def _check(raw):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"{name}: expected a positive finite {kind}, got {raw!r}"
+            )
+        if not math.isfinite(value):
+            raise argparse.ArgumentTypeError(
+                f"{name}: expected a finite {kind}, got {raw!r}"
+            )
+        if value <= 0:
+            raise argparse.ArgumentTypeError(
+                f"{name}: expected a positive {kind} > 0, got {raw!r}"
+            )
+        return value
+    return _check
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deploy_rooms_status_index.py",
@@ -578,43 +915,97 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Detached worktree pinned to PR #42 SHA")
     p.add_argument("--pr42-sha", required=True,
                    help="Exact PR #42 head commit the worktree must be at")
+    p.add_argument("--reviewer-approved-sha", required=True,
+                   help=(
+                       "Independent copy of the reviewer-approved PR #42 SHA "
+                       "the operator has verified against out-of-band review "
+                       "artifacts. MUST equal --pr42-sha; refusing to accept "
+                       "a newer HEAD that hasn't been reviewed."
+                   ))
+    p.add_argument("--script-sha256", required=True,
+                   help=(
+                       "sha256 hex digest of this driver file as it was "
+                       "reviewed. Rechecked at runtime against the actual "
+                       "file — a swap would refuse to run."
+                   ))
     p.add_argument("--gcloud", default=os.environ.get("PR42_GCLOUD", "gcloud"))
     p.add_argument("--firebase", default=os.environ.get("PR42_FIREBASE", "firebase"))
     p.add_argument("--firebase-tools-version-pin", required=True,
                    help="Required output of `firebase --version` (exact match)")
-    p.add_argument("--deploy-timeout-sec", type=float,
-                   default=float(os.environ.get(
-                       "PR42_DEPLOY_TIMEOUT_SEC", DEFAULT_DEPLOY_TIMEOUT_SEC)))
-    p.add_argument("--poll-timeout-sec", type=float,
-                   default=float(os.environ.get(
-                       "PR42_POLL_TIMEOUT_SEC", DEFAULT_POLL_TIMEOUT_SEC)))
-    p.add_argument("--poll-interval-sec", type=float,
-                   default=float(os.environ.get(
-                       "PR42_POLL_INTERVAL_SEC", DEFAULT_POLL_INTERVAL_SEC)))
+    p.add_argument(
+        "--deploy-timeout-sec",
+        type=_positive_finite_float("float", "--deploy-timeout-sec"),
+        default=float(os.environ.get(
+            "PR42_DEPLOY_TIMEOUT_SEC", DEFAULT_DEPLOY_TIMEOUT_SEC)),
+    )
+    p.add_argument(
+        "--poll-timeout-sec",
+        type=_positive_finite_float("float", "--poll-timeout-sec"),
+        default=float(os.environ.get(
+            "PR42_POLL_TIMEOUT_SEC", DEFAULT_POLL_TIMEOUT_SEC)),
+    )
+    p.add_argument(
+        "--poll-interval-sec",
+        type=_positive_finite_float("float", "--poll-interval-sec"),
+        default=float(os.environ.get(
+            "PR42_POLL_INTERVAL_SEC", DEFAULT_POLL_INTERVAL_SEC)),
+    )
     p.add_argument("--dry-run", action="store_true",
-                   help="Skip only the firebase deploy invocation; still snapshot + diff")
+                   help=(
+                       "Preparation-only mode: run preconditions, "
+                       "pre-snapshot, target confirmation (incl. gcloud "
+                       "firestore databases describe), static invariants "
+                       "on PR #42 config, AND the pre-deploy semantic delta "
+                       "against the pre-snapshot. Do NOT invoke firebase, "
+                       "post-diff, poll, or final-diff."
+                   ))
     return p
 
 
 def _check_preconditions(args: argparse.Namespace) -> None:
+    # R3 finding 5: driver script hash equality. The operator MUST
+    # pass the reviewed sha256 of this file; a swap of the running
+    # script would refuse to run.
+    script_path = Path(__file__).resolve()
+    actual_sha = _sha256(script_path)
+    if actual_sha != args.script_sha256:
+        _die(RC.PRECONDITIONS, "preconditions",
+             f"driver script sha256 mismatch: file={actual_sha!r}, "
+             f"pin={args.script_sha256!r} — script has been modified "
+             f"since review")
+
+    # R3 finding 5: reviewer-approved SHA must equal the runtime-
+    # pinned PR #42 SHA. `gh pr view --json headRefOid` alone would
+    # silently accept a newer, unreviewed head — the operator's
+    # duty is to bring the reviewed SHA as an independent input.
+    if args.reviewer_approved_sha != args.pr42_sha:
+        _die(RC.PRECONDITIONS, "preconditions",
+             f"reviewer-approved SHA {args.reviewer_approved_sha!r} != "
+             f"runtime --pr42-sha {args.pr42_sha!r}")
+
     # gcloud exists
     if shutil.which(args.gcloud) is None and not Path(args.gcloud).is_file():
         _die(RC.PRECONDITIONS, "preconditions",
              f"gcloud not found: {args.gcloud!r}")
-    # firebase exists (unless dry-run allows skipping — but we still
-    # verify the version pin so an operator error surfaces).
+    # firebase exists
     if shutil.which(args.firebase) is None and not Path(args.firebase).is_file():
         _die(RC.PRECONDITIONS, "preconditions",
              f"firebase not found: {args.firebase!r}")
-    # firebase version pin (exact match)
+    # R3 finding 8: firebase --version must succeed (rc == 0) AND
+    # its stdout must match the pin exactly.
     try:
-        ver = subprocess.run(
+        ver_proc = subprocess.run(
             [args.firebase, "--version"],
             capture_output=True, text=True, timeout=15,
-        ).stdout.strip()
+        )
     except Exception as exc:
         _die(RC.PRECONDITIONS, "preconditions",
              f"firebase --version failed: {exc}")
+    if ver_proc.returncode != 0:
+        _die(RC.PRECONDITIONS, "preconditions",
+             f"firebase --version rc={ver_proc.returncode}, "
+             f"stderr={ver_proc.stderr.strip()[:200]!r}")
+    ver = ver_proc.stdout.strip()
     if ver != args.firebase_tools_version_pin:
         _die(RC.PRECONDITIONS, "preconditions",
              f"firebase-tools version mismatch: have {ver!r}, "
@@ -643,6 +1034,16 @@ def _check_preconditions(args: argparse.Namespace) -> None:
     if dirty:
         _die(RC.PRECONDITIONS, "preconditions",
              f"worktree {wt} is dirty: {dirty!r}")
+    # R3 finding 5 (continued): the driver we invoke must live
+    # inside the pinned worktree — not the operator's random
+    # checkout. Compare absolute paths.
+    expected_script = (wt / "backend" / "scripts" / "window1_preflight"
+                       / "deploy_rooms_status_index.py").resolve()
+    if script_path != expected_script:
+        _die(RC.PRECONDITIONS, "preconditions",
+             f"driver script path {str(script_path)!r} is not the "
+             f"one inside the pinned worktree "
+             f"{str(expected_script)!r}")
     # Audit dir owner-only + empty
     ad = Path(args.audit_dir)
     if not ad.is_dir():
@@ -657,7 +1058,7 @@ def _check_preconditions(args: argparse.Namespace) -> None:
              f"audit dir must be empty at driver start")
 
 
-def _confirm_target(args: argparse.Namespace) -> None:
+def _confirm_target(args: argparse.Namespace, audit_dir: Path) -> None:
     wt = Path(args.worktree)
     fb = json.loads((wt / "firebase.json").read_text())
     fs = fb.get("firestore", {})
@@ -679,6 +1080,24 @@ def _confirm_target(args: argparse.Namespace) -> None:
     if default != PROJECT_ID:
         _die(RC.TARGET_CONFIRM, "target_confirm",
              f".firebaserc default project={default!r} != {PROJECT_ID!r}")
+    # R3 finding 8: cross-check the REAL remote database via
+    # `gcloud firestore databases describe`. The pre-snapshot has
+    # already captured this into audit_dir/pre/database.json; read
+    # from there so we don't re-hit the API and so a fresh snapshot
+    # is on file for the audit trail.
+    db_meta = json.loads((audit_dir / "pre" / "database.json").read_text())
+    expected_name = f"projects/{PROJECT_ID}/databases/{DATABASE_ID}"
+    if db_meta.get("name") != expected_name:
+        _die(RC.TARGET_CONFIRM, "target_confirm",
+             f"remote database.name={db_meta.get('name')!r} != {expected_name!r}")
+    if db_meta.get("locationId") != LOCATION_ID:
+        _die(RC.TARGET_CONFIRM, "target_confirm",
+             f"remote database.locationId={db_meta.get('locationId')!r} "
+             f"!= {LOCATION_ID!r}")
+    if db_meta.get("type") not in ("FIRESTORE_NATIVE",):
+        _die(RC.TARGET_CONFIRM, "target_confirm",
+             f"remote database.type={db_meta.get('type')!r} — expected "
+             f"FIRESTORE_NATIVE")
 
 
 def _desired_field_overrides(pre_overrides: list[dict]) -> list[dict]:
@@ -738,16 +1157,17 @@ def main(argv: list[str]) -> int:
         _die(RC.PRE_SNAPSHOT, "pre_snapshot",
              f"{type(exc).__name__}: {exc}")
 
-    # 2. Target confirm
+    # 2. Target confirm (also cross-checks the REAL remote via
+    #    gcloud firestore databases describe from the pre-snapshot).
     try:
-        _confirm_target(args)
+        _confirm_target(args, audit_dir)
     except SystemExit:
         raise
     except Exception as exc:
         _die(RC.TARGET_CONFIRM, "target_confirm",
              f"{type(exc).__name__}: {exc}")
 
-    # 3. Static invariants on PR #42's file + delta computation
+    # 3. Static invariants on PR #42's file (strict schema).
     try:
         pr42_cfg = _load_pr42_indexes_json(Path(args.worktree))
         problems = _static_invariants(pr42_cfg)
@@ -759,6 +1179,25 @@ def main(argv: list[str]) -> int:
     except Exception as exc:
         _die(RC.STATIC_INVARIANTS, "static_invariants",
              f"{type(exc).__name__}: {exc}")
+
+    # 3b. R3 finding 3: pre-deploy semantic delta. Prove the LOCAL
+    #     config, if applied, would take production from the
+    #     pre-snapshot to (pre + intended rooms.status) with
+    #     nothing else changed. Any unrelated remote composite
+    #     or override that firebase deploy would delete → refuse.
+    try:
+        delta = _compute_pre_deploy_delta(audit_dir / "pre",
+                                          Path(args.worktree))
+    except Exception as exc:
+        _die(RC.STATIC_INVARIANTS, "pre_deploy_delta",
+             f"{type(exc).__name__}: {exc}")
+    (audit_dir / "pre-deploy-delta.json").write_text(
+        json.dumps(delta, indent=2, sort_keys=True) + "\n"
+    )
+    if not delta.get("ok"):
+        _die(RC.STATIC_INVARIANTS, "pre_deploy_delta",
+             f"delta refused: kind={delta.get('kind')} "
+             f"detail={delta.get('detail')!r}")
 
     # 4. --dry-run: preparation checkpoint. Skips deploy, post-diff,
     #    polling, final-diff. Trap is NOT installed because there is
@@ -878,12 +1317,14 @@ def main(argv: list[str]) -> int:
         _die(RC.POST_DIFF, "post_diff",
              f"{type(exc).__name__}: {exc}")
 
-    # 9. Poll until READY
+    # 9. Poll until READY. Post-diff confirmed the CG_ASC entry
+    #    is present, so any MISSING observation must hard-stop.
     try:
         _poll_until_ready(
             args.gcloud, audit_dir,
             timeout_sec=args.poll_timeout_sec,
             interval_sec=args.poll_interval_sec,
+            assert_present=True,
         )
     except TimeoutError as exc:
         _die(RC.POLL, "poll_timeout", str(exc))
@@ -892,20 +1333,45 @@ def main(argv: list[str]) -> int:
     except Exception as exc:
         _die(RC.POLL, "poll_error", f"{type(exc).__name__}: {exc}")
 
-    # 10. Final snapshot + final diff
+    # 10. Final snapshot + FULL semantic diff (R3 finding 4). Not
+    #     only rooms.status: prove every composite index and every
+    #     unrelated field override is unchanged relative to pre,
+    #     AND the intended CG_ASC entry is present and READY.
     try:
         _take_snapshot(args.gcloud, audit_dir / "final", label="final")
+        pre_comp = _load_composite(audit_dir / "pre")
+        final_comp = _load_composite(audit_dir / "final")
+        pre_over = _load_field_overrides(audit_dir / "pre")
         final_over = _load_field_overrides(audit_dir / "final")
-        final_added_rs = [
+
+        # Composites: nothing added, nothing removed vs pre.
+        final_comp_diff = _diff_composites(pre_comp, final_comp)
+        if final_comp_diff["added"] or final_comp_diff["removed"]:
+            _die(RC.FINAL_DIFF, "final_composites_drift",
+                 f"composites changed relative to pre: {final_comp_diff!r}")
+
+        # Field overrides: exactly one new — rooms.status; nothing removed.
+        final_over_diff = _diff_field_overrides(pre_over, final_over)
+        if final_over_diff["removed"]:
+            _die(RC.FINAL_DIFF, "final_field_overrides_removed",
+                 f"field overrides removed relative to pre: "
+                 f"{final_over_diff['removed']!r}")
+        if len(final_over_diff["added"]) != 1:
+            _die(RC.FINAL_DIFF, "final_field_overrides_added",
+                 f"expected exactly one new field override in final vs pre, "
+                 f"got {len(final_over_diff['added'])}: "
+                 f"{final_over_diff['added']!r}")
+
+        final_rs = [
             o for o in final_over
-            if o.get("collectionGroup") == "rooms" and o.get("fieldPath") == "status"
+            if o.get("collectionGroup") == "rooms"
+            and o.get("fieldPath") == "status"
         ]
-        if len(final_added_rs) != 1:
+        if len(final_rs) != 1:
             _die(RC.FINAL_DIFF, "final_missing_rooms_status",
-                 f"final snapshot has {len(final_added_rs)} rooms.status overrides")
-        # State of the CG ASC entry must be READY.
+                 f"final snapshot has {len(final_rs)} rooms.status overrides")
         cg_asc = [
-            e for e in final_added_rs[0]["indexes"]
+            e for e in final_rs[0]["indexes"]
             if e.get("order") == "ASCENDING"
             and e.get("queryScope") == "COLLECTION_GROUP"
         ]
