@@ -1,0 +1,16 @@
+{
+  "appEngineIntegrationMode": "DISABLED",
+  "backupConfig": {
+    "backupSchedulesEnabled": true
+  },
+  "concurrencyMode": "PESSIMISTIC",
+  "databaseEdition": "STANDARD",
+  "deleteProtectionState": "DELETE_PROTECTION_DISABLED",
+  "freeTier": true,
+  "locationId": "us-central1",
+  "name": "projects/sturdy-dogfish-472313-k6/databases/worship-translation",
+  "pointInTimeRecoveryEnablement": "POINT_IN_TIME_RECOVERY_DISABLED",
+  "realtimeUpdatesMode": "REALTIME_UPDATES_MODE_ENABLED",
+  "type": "FIRESTORE_NATIVE",
+  "versionRetentionPeriod": "3600s"
+}
