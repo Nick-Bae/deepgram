@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "3.4.0"  # R8: quiescence rule tightened — a still-existing group with zero visible members is contradictory (fail-closed) unless a zombie is also visible
+SCRIPT_VERSION = "3.4.1"  # R9: comment cleanup only (R7-era "scan_complete=True alone is quiescent" wording removed); no runtime semantic change since R8
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -255,20 +255,28 @@ def _record_trap_failure_line(stage: str, detail: str) -> None:
 # declared quiescence — a FAIL-OPEN behaviour that the reviewer
 # reproduced on a Linux environment where a real live grandchild
 # was invisible to the enumeration while `killpg(pgid, 0)`
-# confirmed the group still existed. R7 replaces that helper with
-# a structured scan whose result distinguishes:
+# confirmed the group still existed. R7/R8 replace that helper
+# with a structured scan whose result distinguishes:
 #   - group truly gone (ESRCH from `killpg(pgid, 0)`);
-#   - group exists but complete /proc scan finds no non-zombie
-#     members (operationally quiescent — zombies cannot mutate);
+#   - group exists AND complete /proc scan finds no live non-
+#     zombie members AND at least one VISIBLE zombie member
+#     (operationally quiescent — the group is kept alive only by
+#     unreapable exited processes; R8 rule);
 #   - group exists and /proc scan found live non-zombie members
 #     (not drained);
 #   - group exists but the /proc scan hit ANY error or malformed
-#     entry (UNKNOWN — must fail closed).
+#     entry (UNKNOWN — must fail closed);
+#   - group exists AND complete /proc scan found NO members at
+#     all (contradictory: killpg says exists, scan sees nothing —
+#     must fail closed; R8 blocker).
 #
 # `_pgid_group_exists()` uses `killpg(pgid, 0)` as the
 # kernel-authoritative existence check — that syscall returns
 # ESRCH iff every member has been reaped. It is the only signal
 # call that can PROVE quiescence without relying on `/proc`.
+# `_pgscan_is_quiescent()` is the sole authoritative predicate;
+# `scan_complete=True` alone is NOT sufficient — see its
+# docstring for the exact contract.
 
 
 import collections
@@ -310,8 +318,12 @@ def _pgid_scan(pgid: int) -> _PgScan:
         read succeeded and parsed cleanly.
       - `scan_error_notes`: short strings describing each error.
 
-    A caller MUST NOT treat `non_zombie_members == []` as drained
-    unless `group_exists == False` OR `scan_complete == True`.
+    A caller MUST NOT interpret this result directly to decide
+    drainage. `_pgscan_is_quiescent()` is the sole authoritative
+    predicate. Under R8, `scan_complete == True` alone is NOT
+    sufficient — a completely-scanned empty result against a
+    live-per-kernel group is the contradictory-state fail-closed
+    trigger, not quiescence.
 
     Test hooks (env vars, ignored in production):
       - `PR42_TESTING_FORCE_PROC_INCOMPLETE=1` — returns a scan

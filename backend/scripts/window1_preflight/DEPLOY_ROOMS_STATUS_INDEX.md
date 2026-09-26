@@ -11,7 +11,7 @@ invoke the driver.
 
 | | |
 |---|---|
-| Driver script version | `3.4.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
+| Driver script version | `3.4.1` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
 | Approved PR #42 SHA to pin | recorded independently by the reviewer; passed as `--reviewer-approved-sha` and MUST equal `--pr42-sha` |
 | Script sha256 pin | recorded independently by the reviewer; passed as `--script-sha256`; driver re-hashes itself and refuses on mismatch |
 | Firebase CLI version required | `13.19.0` (passed as `--firebase-tools-version-pin`; bump requires re-running the fixture suite) |
