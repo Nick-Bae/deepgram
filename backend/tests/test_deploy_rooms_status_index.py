@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -343,6 +344,54 @@ class _Sandbox:
         return proc
 
 
+# R10: anchored regex that matches EXACTLY the driver's
+# contradictory-state fail-closed marker line. The driver writes:
+#   "<ISO> quiescence_not_established: pgid=<N> group_exists=<b>
+#    scan_complete=<b> non_zombie_members=<repr>
+#    zombie_members=<repr> scan_error_notes=<repr>\n"
+# For the contradictory-state race (killpg says exists, /proc walk
+# saw nothing at all), every list is empty and both booleans are
+# True. The pattern below is fullmatch-anchored so ANY extra text
+# on the line — or ANY extra line in the file — fails the
+# assertion.
+_CONTRADICTORY_STATE_MARKER_RE = re.compile(
+    r"\A"
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z"
+    r" quiescence_not_established:"
+    r" pgid=\d+"
+    r" group_exists=True"
+    r" scan_complete=True"
+    r" non_zombie_members=\[\]"
+    r" zombie_members=\[\]"
+    r" scan_error_notes=\[\]"
+    r"\Z"
+)
+
+
+def _assert_trap_failure_is_only_contradictory_state(tc, tf_path):
+    """R10: assert `trap-failure.txt` contains EXACTLY one non-
+    empty line AND that line matches the anchored contradictory-
+    state regex. Any additional line — e.g., a
+    `take_snapshot(post)` failure appended after the drain —
+    fails the assertion, as does any extra text on the same
+    line. Callers use this on paths that must ONLY show the
+    intended fail-closed record from the killpg/proc race."""
+    body = tf_path.read_text()
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    tc.assertEqual(
+        len(lines), 1,
+        f"trap-failure.txt must contain exactly one non-empty "
+        f"line; found {len(lines)}. content={body!r}",
+    )
+    line = lines[0]
+    tc.assertRegex(
+        line, _CONTRADICTORY_STATE_MARKER_RE,
+        f"trap-failure.txt line must fullmatch the contradictory-"
+        f"state marker EXACTLY (no extra text, no extra "
+        f"failures). got line={line!r}",
+    )
+
+
 class DeployDriverFixtureTests(unittest.TestCase):
     """Fixture-backed scenarios listed in the module docstring."""
 
@@ -633,30 +682,26 @@ class DeployDriverFixtureTests(unittest.TestCase):
                 "trap must SIGTERM firebase's process group AND "
                 "wait() before snapshotting",
             )
-            # R9: under R8's tightened quiescence rule, the
-            # transient race between `killpg(pgid, 0)` (says
-            # "exists" while a zombie is briefly unreaped) and
-            # the `/proc` walk (finds nothing because init
-            # reaped in the microsecond in between) can leave a
-            # `trap-failure.txt` marker whose ONLY content is
-            # the intended fail-closed contradictory-state
-            # response. That marker is not a defect — it is the
-            # correct fail-closed record. Accept it here as
-            # long as (a) the mutation didn't fire (already
-            # asserted above) and (b) the marker's shape is
-            # ONLY the contradictory state. Any OTHER
-            # trap-failure content indicates a real safety
-            # concern and must fail the test.
+            # R9 accepted the contradictory-state marker as the
+            # intended fail-closed record from the killpg-vs-/proc
+            # race. R10 tightens the assertion so a marker that
+            # contains the expected substrings PLUS any extra
+            # failure line (e.g., a take_snapshot(post) exception
+            # recorded after the drain) is rejected. The exactness
+            # check requires:
+            #   - trap-failure.txt contains exactly ONE non-empty
+            #     line;
+            #   - that line fullmatches the anchored regex for
+            #     the contradictory-state shape (ISO timestamp,
+            #     quiescence_not_established, numeric pgid, all
+            #     empty member/note lists);
+            #   - any additional line or extra text on the same
+            #     line makes the test fail.
             tf = sb.audit / "trap-failure.txt"
             if tf.exists():
-                body = tf.read_text()
-                self.assertIn("quiescence_not_established", body,
-                              "unexpected trap-failure content: "
-                              + repr(body))
-                self.assertIn("group_exists=True", body)
-                self.assertIn("scan_complete=True", body)
-                self.assertIn("non_zombie_members=[]", body)
-                self.assertIn("zombie_members=[]", body)
+                _assert_trap_failure_is_only_contradictory_state(
+                    self, tf,
+                )
         finally:
             sb.cleanup()
 
@@ -1762,6 +1807,135 @@ class R7ProcScanFailClosedTests(unittest.TestCase):
             "the contradiction (no members + group exists + no "
             "zombies) regardless.",
         )
+
+
+class R10TrapFailureMarkerExactnessTests(unittest.TestCase):
+    """R10: prove the SIGINT test's exactness assertion truly
+    rejects extra content in `trap-failure.txt`. Under R9, the
+    check used only `assertIn` on individual substrings, so a
+    marker containing the expected fields PLUS an extra failure
+    line (e.g., `take_snapshot(post)`) would still pass. The R10
+    helper `_assert_trap_failure_is_only_contradictory_state`
+    now uses (a) an exactly-one-line count check and (b) an
+    anchored fullmatch regex. These tests construct synthetic
+    trap-failure files and verify both rejection paths.
+
+    No driver invocation — this is a pure unit test of the
+    assertion helper's rejection behaviour."""
+
+    def setUp(self):
+        self._tmp = Path(mkdtemp(prefix="r10-marker-"))
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write_marker(self, body: str) -> Path:
+        p = self._tmp / "trap-failure.txt"
+        p.write_text(body)
+        return p
+
+    # A well-formed contradictory-state line the driver could
+    # legitimately write.
+    _GOOD_LINE = (
+        "2026-09-26T14:00:00.000Z quiescence_not_established: "
+        "pgid=12345 group_exists=True scan_complete=True "
+        "non_zombie_members=[] zombie_members=[] "
+        "scan_error_notes=[]"
+    )
+
+    def test_pattern_fullmatch_accepts_the_expected_shape(self):
+        self.assertRegex(self._GOOD_LINE,
+                         _CONTRADICTORY_STATE_MARKER_RE)
+
+    def test_helper_accepts_marker_with_exactly_one_good_line(self):
+        tf = self._write_marker(self._GOOD_LINE + "\n")
+        _assert_trap_failure_is_only_contradictory_state(self, tf)
+
+    def test_helper_rejects_two_lines_even_if_first_matches(self):
+        """R10 reviewer's exact failure mode: a marker whose
+        first line is the contradictory-state record and whose
+        second line reports a separate `take_snapshot(post)`
+        failure. Under R9 substring checks this would pass;
+        under R10 the line-count assertion fails."""
+        body = (
+            self._GOOD_LINE + "\n"
+            "2026-09-26T14:00:01.000Z take_snapshot(post): "
+            "RuntimeError: gcloud CLI returned rc=1\n"
+        )
+        tf = self._write_marker(body)
+        with self.assertRaises(AssertionError) as cm:
+            _assert_trap_failure_is_only_contradictory_state(self, tf)
+        self.assertIn("exactly one non-empty line", str(cm.exception))
+
+    def test_helper_rejects_extra_text_appended_to_the_same_line(self):
+        """R9 substring checks would pass an augmented single
+        line because every `assertIn` substring is still
+        present. Anchored fullmatch rejects it."""
+        body = self._GOOD_LINE + " EXTRA_FAILURE_TEXT\n"
+        tf = self._write_marker(body)
+        with self.assertRaises(AssertionError) as cm:
+            _assert_trap_failure_is_only_contradictory_state(self, tf)
+        self.assertIn("fullmatch", str(cm.exception))
+
+    def test_helper_rejects_zombie_present(self):
+        """Fail-closed rule requires empty zombie_members — a
+        marker with a visible zombie represents an OK state
+        that the driver would have accepted as quiescent, so it
+        should not appear in trap-failure.txt at all. If one
+        did appear, the exactness check rejects it."""
+        body = (
+            "2026-09-26T14:00:00.000Z quiescence_not_established: "
+            "pgid=12345 group_exists=True scan_complete=True "
+            "non_zombie_members=[] zombie_members=[9999] "
+            "scan_error_notes=[]\n"
+        )
+        tf = self._write_marker(body)
+        with self.assertRaises(AssertionError):
+            _assert_trap_failure_is_only_contradictory_state(self, tf)
+
+    def test_helper_rejects_live_member_present(self):
+        body = (
+            "2026-09-26T14:00:00.000Z quiescence_not_established: "
+            "pgid=12345 group_exists=True scan_complete=True "
+            "non_zombie_members=[42] zombie_members=[] "
+            "scan_error_notes=[]\n"
+        )
+        tf = self._write_marker(body)
+        with self.assertRaises(AssertionError):
+            _assert_trap_failure_is_only_contradictory_state(self, tf)
+
+    def test_helper_rejects_scan_incomplete_marker(self):
+        body = (
+            "2026-09-26T14:00:00.000Z quiescence_not_established: "
+            "pgid=12345 group_exists=True scan_complete=False "
+            "non_zombie_members=[] zombie_members=[] "
+            "scan_error_notes=[]\n"
+        )
+        tf = self._write_marker(body)
+        with self.assertRaises(AssertionError):
+            _assert_trap_failure_is_only_contradictory_state(self, tf)
+
+    def test_helper_rejects_scan_error_note_present(self):
+        body = (
+            "2026-09-26T14:00:00.000Z quiescence_not_established: "
+            "pgid=12345 group_exists=True scan_complete=True "
+            "non_zombie_members=[] zombie_members=[] "
+            "scan_error_notes=['listdir(/proc): PermissionError']\n"
+        )
+        tf = self._write_marker(body)
+        with self.assertRaises(AssertionError):
+            _assert_trap_failure_is_only_contradictory_state(self, tf)
+
+    def test_helper_rejects_non_iso_timestamp(self):
+        body = (
+            "not-a-timestamp quiescence_not_established: "
+            "pgid=12345 group_exists=True scan_complete=True "
+            "non_zombie_members=[] zombie_members=[] "
+            "scan_error_notes=[]\n"
+        )
+        tf = self._write_marker(body)
+        with self.assertRaises(AssertionError):
+            _assert_trap_failure_is_only_contradictory_state(self, tf)
 
 
 if __name__ == "__main__":
