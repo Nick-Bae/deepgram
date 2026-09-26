@@ -38,6 +38,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -999,6 +1000,388 @@ class RosterCrossCheckMetricAlignmentTests(unittest.TestCase):
         f = rcc._build_metric_filter("svc", "europe-west4")
         self.assertIn('resource.labels.location="europe-west4"', f)
         self.assertNotIn("us-central1", f)
+
+
+class LoggingClientRealSignatureTests(unittest.TestCase):
+    """Round-4 tests: exercise the actual installed
+    `google-cloud-logging` and `google-cloud-monitoring` client
+    signatures instead of monkey-patching all of
+    `fetch_tick_events`. Also proves pagination retains the
+    round-3 bounded timeout and `retry=None` on every page.
+
+    A round-3 read-only production rehearsal caught that the
+    old high-level `logging_v2.Client.list_entries(...)` on the
+    installed v3.x package raised `TypeError` for the same
+    `timeout=` / `retry=` kwargs the tests had proven safe when
+    the whole function was mocked. Signature tests here would
+    have flagged that shape mismatch pre-merge."""
+
+    def test_list_log_entries_signature_accepts_our_kwargs(self):
+        """The generated `LoggingServiceV2Client.list_log_entries`
+        MUST accept `request=`, `timeout=`, `retry=`, and
+        `metadata=`. Round-3 defect: the OLD wrapper client did
+        not. Signature-drift on the installed version now trips
+        this test instead of only the operator's live run."""
+        import inspect
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2Client,
+        )
+        sig = inspect.signature(LoggingServiceV2Client.list_log_entries)
+        params = sig.parameters
+        for kw in ("request", "timeout", "retry", "metadata"):
+            self.assertIn(
+                kw, params,
+                f"installed google-cloud-logging {LoggingServiceV2Client.__module__} "
+                f"list_log_entries missing kwarg {kw!r} — package upgrade broke "
+                f"our call shape",
+            )
+
+    def test_list_time_series_signature_accepts_our_kwargs(self):
+        """Sibling compat test for the Monitoring pager. The
+        round-4 direction says do NOT change
+        `fetch_metric_samples` unless a real test demonstrates a
+        defect. This test guards the assumption that the current
+        `list_time_series(request, timeout=, retry=)` shape stays
+        valid on the installed version."""
+        import inspect
+        from google.cloud.monitoring_v3 import MetricServiceClient
+        sig = inspect.signature(MetricServiceClient.list_time_series)
+        params = sig.parameters
+        for kw in ("request", "timeout", "retry", "metadata"):
+            self.assertIn(
+                kw, params,
+                f"installed google-cloud-monitoring MetricServiceClient "
+                f"list_time_series missing kwarg {kw!r} — package upgrade "
+                f"broke our call shape",
+            )
+
+    def test_fetch_tick_events_pagination_retains_bounded_timeout_and_retry_none(self):
+        """Gapic `ListLogEntriesPager` re-invokes the underlying
+        `method` for each next-page fetch, passing back the same
+        `retry`, `timeout`, and `metadata` it was constructed
+        with. Prove that behavior with a real pager wrapped
+        around a method that records EVERY call's kwargs — not a
+        single-call assertion — so page 2, 3, … stay bounded.
+
+        Round-3 tests could not have caught this: they replaced
+        `fetch_tick_events` entirely, so no gapic pager was ever
+        exercised."""
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2Client,
+        )
+        from google.cloud.logging_v2.services.logging_service_v2.pagers import (
+            ListLogEntriesPager,
+        )
+        from google.cloud.logging_v2.types import (
+            ListLogEntriesRequest,
+            ListLogEntriesResponse,
+            LogEntry,
+        )
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        # Build 3 in-memory pages, 2 entries each = 6 valid ticks.
+        now_dt = datetime.now(timezone.utc)
+
+        def _mk_entry(rev, inst, offset_sec):
+            payload = struct_pb2.Struct()
+            payload.update({
+                "event": "reconciler_tick",
+                "instance_id": inst,
+                "owned_rooms": 0,
+            })
+            entry = LogEntry(
+                resource={
+                    "type": "cloud_run_revision",
+                    "labels": {
+                        "service_name": "worshiptranslate-backend",
+                        "location": "us-central1",
+                        "revision_name": rev,
+                    },
+                },
+                json_payload=payload,
+            )
+            ts = Timestamp()
+            ts.FromDatetime(now_dt - timedelta(seconds=offset_sec))
+            entry.timestamp = ts
+            return entry
+
+        page_1 = ListLogEntriesResponse(
+            entries=[_mk_entry("rev-a", "i-1", 10),
+                     _mk_entry("rev-a", "i-1", 45)],
+            next_page_token="tok1",
+        )
+        page_2 = ListLogEntriesResponse(
+            entries=[_mk_entry("rev-a", "i-2", 12),
+                     _mk_entry("rev-a", "i-2", 46)],
+            next_page_token="tok2",
+        )
+        page_3 = ListLogEntriesResponse(
+            entries=[_mk_entry("rev-b", "i-3", 8),
+                     _mk_entry("rev-b", "i-3", 44)],
+            next_page_token="",
+        )
+        pages_by_token = {"": page_1, "tok1": page_2, "tok2": page_3}
+
+        # `method` is what the pager invokes for every page. Record
+        # each call's kwargs so we can assert on ALL of them.
+        calls: list[dict] = []
+
+        def method(request, *, retry=None, timeout=None, metadata=()):
+            calls.append({
+                "page_token": getattr(request, "page_token", ""),
+                "retry": retry,
+                "timeout": timeout,
+            })
+            return pages_by_token[getattr(request, "page_token", "") or ""]
+
+        # Patch the LoggingServiceV2Client constructor so
+        # `fetch_tick_events` receives a client whose
+        # `list_log_entries` builds a real pager around `method`.
+        deadline_ceiling = 15.0
+
+        def fake_list_log_entries(request, *, retry=None, timeout=None, metadata=()):
+            # Record the initial call, then hand back a real pager
+            # that reuses the same retry+timeout for every subsequent
+            # page fetch.
+            initial = method(request, retry=retry, timeout=timeout, metadata=metadata)
+            return ListLogEntriesPager(
+                method=method,
+                request=request,
+                response=initial,
+                retry=retry,
+                timeout=timeout,
+                metadata=metadata,
+            )
+
+        class _FakeLoggingClient:
+            def __init__(self):
+                pass
+            def list_log_entries(self, request, *, retry=None, timeout=None, metadata=()):
+                return fake_list_log_entries(
+                    request, retry=retry, timeout=timeout, metadata=metadata,
+                )
+
+        with patch.object(
+            LoggingServiceV2Client, "__new__",
+            lambda cls, *a, **k: _FakeLoggingClient(),
+        ):
+            events = rcc.fetch_tick_events(
+                project=PRODUCTION_PROJECT,
+                service_name="worshiptranslate-backend",
+                region="us-central1",
+                tick_window_sec=300,
+                deadline=common.Deadline(60.0),
+                rpc_timeout=deadline_ceiling,
+            )
+
+        self.assertEqual(len(events), 6, f"consumed all pages: {events!r}")
+        # Same shape as production output — used later by cross_check.
+        self.assertEqual(events[0]["revision_name"], "rev-a")
+        self.assertEqual(events[0]["instance_id"], "i-1")
+        self.assertEqual(events[0]["owned_rooms"], 0)
+
+        # Round-4 assertion: EVERY page call (initial + subsequent)
+        # carried retry=None AND a bounded timeout <= our ceiling.
+        # The pager's construction records the initial call once
+        # via fake_list_log_entries, then makes 2 additional calls
+        # for pages 2 and 3.
+        self.assertGreaterEqual(len(calls), 3,
+                                f"expected ≥3 recorded page calls, got {len(calls)}")
+        for i, call in enumerate(calls):
+            self.assertIsNone(
+                call["retry"],
+                f"page {i} (token={call['page_token']!r}) lost retry=None: "
+                f"{call['retry']!r}",
+            )
+            self.assertIsInstance(
+                call["timeout"], (int, float),
+                f"page {i} lost bounded timeout: {call['timeout']!r}",
+            )
+            self.assertGreater(call["timeout"], 0)
+            self.assertLessEqual(
+                call["timeout"], deadline_ceiling,
+                f"page {i} exceeded rpc-timeout ceiling {deadline_ceiling}: "
+                f"{call['timeout']!r}",
+            )
+
+    def test_fetch_tick_events_passes_expected_request_shape(self):
+        """Verify the ListLogEntriesRequest built inside
+        fetch_tick_events pins service, region, event filter, and
+        uses the pinned page_size + resource_names."""
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2Client,
+        )
+        from google.cloud.logging_v2.services.logging_service_v2.pagers import (
+            ListLogEntriesPager,
+        )
+        from google.cloud.logging_v2.types import ListLogEntriesResponse
+
+        captured: dict = {}
+        empty_response = ListLogEntriesResponse(entries=[], next_page_token="")
+
+        def _method(request, *, retry=None, timeout=None, metadata=()):
+            return empty_response
+
+        class _CapturingClient:
+            def list_log_entries(self, request, *, retry=None, timeout=None, metadata=()):
+                captured["request"] = request
+                captured["retry"] = retry
+                captured["timeout"] = timeout
+                # Return a real (empty) pager so `for entry in pager`
+                # in fetch_tick_events works without special-casing.
+                return ListLogEntriesPager(
+                    method=_method,
+                    request=request,
+                    response=empty_response,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+
+        with patch.object(
+            LoggingServiceV2Client, "__new__",
+            lambda cls, *a, **k: _CapturingClient(),
+        ):
+            events = rcc.fetch_tick_events(
+                project=PRODUCTION_PROJECT,
+                service_name="worshiptranslate-backend",
+                region="us-central1",
+                tick_window_sec=300,
+                deadline=common.Deadline(60.0),
+                rpc_timeout=15.0,
+            )
+        # Empty pages -> empty tick roster; that is not an error
+        # for fetch_tick_events itself.
+        self.assertEqual(events, [])
+        req = captured["request"]
+        self.assertEqual(
+            list(req.resource_names),
+            [f"projects/{PRODUCTION_PROJECT}"],
+        )
+        self.assertIn("service_name=\"worshiptranslate-backend\"", req.filter)
+        self.assertIn("location=\"us-central1\"", req.filter)
+        self.assertIn("jsonPayload.event=\"reconciler_tick\"", req.filter)
+        self.assertEqual(req.order_by, "timestamp desc")
+        self.assertEqual(req.page_size, 1000)
+        self.assertIsNone(captured["retry"])
+        self.assertLessEqual(captured["timeout"], 15.0)
+        self.assertGreater(captured["timeout"], 0)
+
+
+class TickEntryExtractorTests(unittest.TestCase):
+    """Direct tests for `_extract_tick_entry` — proto → dict
+    conversion. Round-3 tests skipped this path entirely because
+    fetch_tick_events was fully mocked."""
+
+    def _mk_entry(self, *, rev="rev-a", inst="i-1", owned=0,
+                  offset_sec=10.0, empty_json=False):
+        from google.cloud.logging_v2.types import LogEntry
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        payload = struct_pb2.Struct()
+        if not empty_json:
+            payload.update({
+                "event": "reconciler_tick",
+                "instance_id": inst,
+                "owned_rooms": owned,
+            })
+        entry = LogEntry(
+            resource={
+                "type": "cloud_run_revision",
+                "labels": {
+                    "service_name": "worshiptranslate-backend",
+                    "location": "us-central1",
+                    "revision_name": rev,
+                },
+            },
+            json_payload=payload,
+        )
+        ts = Timestamp()
+        ts.FromDatetime(datetime.now(timezone.utc) - timedelta(seconds=offset_sec))
+        entry.timestamp = ts
+        return entry
+
+    def test_integral_float_owned_rooms_accepted(self):
+        """`google.protobuf.Struct` stores numbers as float64. A
+        legitimately zero `owned_rooms` therefore round-trips as
+        0.0 after `MessageToDict`, not int 0. The extractor must
+        accept integral floats."""
+        entry = self._mk_entry(owned=0)
+        out = rcc._extract_tick_entry(entry)
+        self.assertEqual(out["owned_rooms"], 0)
+        self.assertIsInstance(out["owned_rooms"], int)
+
+    def test_non_integral_float_rejected(self):
+        # Struct won't let us set a non-int owned_rooms via the
+        # normal `update({...:0.5})` path, so construct manually.
+        from google.cloud.logging_v2.types import LogEntry
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+        payload = struct_pb2.Struct()
+        payload.update({
+            "event": "reconciler_tick",
+            "instance_id": "i-1",
+            "owned_rooms": 0.5,
+        })
+        entry = LogEntry(
+            resource={"labels": {"revision_name": "rev-a"}},
+            json_payload=payload,
+        )
+        ts = Timestamp()
+        ts.FromDatetime(datetime.now(timezone.utc))
+        entry.timestamp = ts
+        with self.assertRaises(ValueError):
+            rcc._extract_tick_entry(entry)
+
+    def test_missing_json_payload_raises(self):
+        entry = self._mk_entry(empty_json=True)
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_tick_entry(entry)
+        self.assertIn("json_payload", str(ctx.exception))
+
+    def test_missing_revision_name_raises(self):
+        from google.cloud.logging_v2.types import LogEntry
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+        payload = struct_pb2.Struct()
+        payload.update({"instance_id": "i-1", "owned_rooms": 0})
+        entry = LogEntry(
+            resource={"labels": {}},  # no revision_name
+            json_payload=payload,
+        )
+        ts = Timestamp()
+        ts.FromDatetime(datetime.now(timezone.utc))
+        entry.timestamp = ts
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_tick_entry(entry)
+        self.assertIn("revision_name", str(ctx.exception))
+
+    def test_missing_instance_id_raises(self):
+        from google.cloud.logging_v2.types import LogEntry
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+        payload = struct_pb2.Struct()
+        payload.update({"owned_rooms": 0})
+        entry = LogEntry(
+            resource={"labels": {"revision_name": "rev-a"}},
+            json_payload=payload,
+        )
+        ts = Timestamp()
+        ts.FromDatetime(datetime.now(timezone.utc))
+        entry.timestamp = ts
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_tick_entry(entry)
+        self.assertIn("instance_id", str(ctx.exception))
+
+    def test_build_tick_filter_contains_service_region_event_ts(self):
+        f = rcc._build_tick_filter("svc-x", "asia-northeast1", 300)
+        self.assertIn('resource.type="cloud_run_revision"', f)
+        self.assertIn('resource.labels.service_name="svc-x"', f)
+        self.assertIn('resource.labels.location="asia-northeast1"', f)
+        self.assertIn('jsonPayload.event="reconciler_tick"', f)
+        self.assertIn('timestamp >=', f)
 
 
 if __name__ == "__main__":

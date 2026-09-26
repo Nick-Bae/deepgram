@@ -175,88 +175,153 @@ def _base_payload(args: argparse.Namespace) -> dict[str, Any]:
 # --- Cloud Logging pass ---------------------------------------------------
 
 
-def fetch_tick_events(
-    project: str, service_name: str, region: str, tick_window_sec: int,
-    deadline: Deadline, rpc_timeout: float,
-) -> list[dict[str, Any]]:
-    """Return every `reconciler_tick` JSON event in the window,
-    each as a dict:
-      {revision_name, instance_id, timestamp_iso, owned_rooms}
-    Raises on permission / RPC failure / malformed schema.
-
-    `region` pins `resource.labels.location` on the filter —
-    Cloud Run services are regional, so a same-named service in
-    another region would otherwise appear in the results."""
-    from google.cloud import logging_v2  # type: ignore
-    from google.api_core import exceptions as gax  # type: ignore
-
-    client = logging_v2.Client(project=project)
+def _build_tick_filter(service_name: str, region: str, tick_window_sec: int) -> str:
+    """Cloud Logging filter for reconciler_tick events. Extracted
+    so tests can assert its shape (region pinning, service pin,
+    event filter, timestamp bound) without exercising the full
+    fetch."""
     start = datetime.now(timezone.utc) - timedelta(seconds=tick_window_sec)
-    log_filter = (
+    return (
         f'resource.type="cloud_run_revision"\n'
         f'resource.labels.service_name="{service_name}"\n'
         f'resource.labels.location="{region}"\n'
         f'jsonPayload.event="reconciler_tick"\n'
         f'timestamp >= "{start.strftime("%Y-%m-%dT%H:%M:%SZ")}"'
     )
-    out: list[dict[str, Any]] = []
-    # `list_entries` handles pagination; we consume it to exhaustion
-    # inside the overall deadline.
-    entries = client.list_entries(
-        filter_=log_filter,
-        order_by=logging_v2.DESCENDING,
+
+
+def _extract_tick_entry(entry: Any) -> dict[str, Any]:
+    """Convert one `LogEntry` proto into the runbook's tick shape:
+      {revision_name, instance_id, timestamp_iso,
+       timestamp_epoch, owned_rooms}
+
+    Raises ValueError on any missing/wrong-typed field so the
+    caller can classify as rc=3 MALFORMED. Extracted so
+    round-4 tests can exercise proto-shape handling directly
+    without spinning up the whole fetch path.
+
+    `entry.json_payload` on the proto-plus wrapped LogEntry is a
+    `MapComposite` (proto-plus's dict-like wrapper around the
+    underlying google.protobuf.Struct). It is iterable, sized,
+    and can be passed to `dict(...)` — which returns plain
+    Python types (numbers become float64). `MessageToDict` does
+    NOT work on the MapComposite (no `.DESCRIPTOR`), so we
+    avoid it."""
+    json_payload = getattr(entry, "json_payload", None)
+    if json_payload is None or len(json_payload) == 0:
+        raise ValueError(
+            "reconciler_tick entry has missing/empty json_payload"
+        )
+    payload = dict(json_payload)
+
+    resource = getattr(entry, "resource", None)
+    resource_labels = dict(getattr(resource, "labels", {}) or {}) if resource else {}
+    rev = resource_labels.get("revision_name")
+    if not isinstance(rev, str) or not rev:
+        raise ValueError(
+            f"reconciler_tick entry has missing/wrong-typed "
+            f"resource.labels.revision_name: {rev!r}"
+        )
+    inst = payload.get("instance_id")
+    if not isinstance(inst, str) or not inst:
+        raise ValueError(
+            f"reconciler_tick entry has missing/wrong-typed "
+            f"jsonPayload.instance_id: {inst!r}"
+        )
+
+    # google.protobuf.Struct only carries numbers as `number_value`
+    # (float64), so `MessageToDict` returns floats even for integer
+    # source values. Accept floats that are exactly integral; reject
+    # bools (which are int subclass) and non-integral floats.
+    owned_raw = payload.get("owned_rooms")
+    if isinstance(owned_raw, bool):
+        raise ValueError(
+            f"reconciler_tick entry has bool owned_rooms: {owned_raw!r}"
+        )
+    if isinstance(owned_raw, int):
+        owned = owned_raw
+    elif isinstance(owned_raw, float) and owned_raw.is_integer():
+        owned = int(owned_raw)
+    else:
+        raise ValueError(
+            f"reconciler_tick entry has missing/wrong-typed "
+            f"jsonPayload.owned_rooms: {owned_raw!r}"
+        )
+
+    ts = getattr(entry, "timestamp", None)
+    if ts is None:
+        raise ValueError("reconciler_tick entry has no timestamp")
+    # `entry.timestamp` is a google.protobuf.Timestamp on the gapic
+    # LogEntry, but the pre-round-4 high-level client wrapped it as
+    # a Python datetime. Handle both so tests can pass either shape.
+    if hasattr(ts, "astimezone"):
+        ts_dt = ts.astimezone(timezone.utc)
+    elif hasattr(ts, "ToDatetime"):
+        ts_dt = ts.ToDatetime().replace(tzinfo=timezone.utc)
+    elif hasattr(ts, "seconds"):
+        ts_dt = datetime.fromtimestamp(
+            ts.seconds + getattr(ts, "nanos", 0) / 1e9, timezone.utc,
+        )
+    else:
+        raise ValueError(f"unsupported timestamp shape: {type(ts).__name__}")
+
+    return {
+        "revision_name": rev,
+        "instance_id": inst,
+        "timestamp_iso": ts_dt.isoformat(),
+        "timestamp_epoch": ts_dt.timestamp(),
+        "owned_rooms": owned,
+    }
+
+
+def fetch_tick_events(
+    project: str, service_name: str, region: str, tick_window_sec: int,
+    deadline: Deadline, rpc_timeout: float,
+) -> list[dict[str, Any]]:
+    """Return every `reconciler_tick` JSON event in the window,
+    each as a dict:
+      {revision_name, instance_id, timestamp_iso,
+       timestamp_epoch, owned_rooms}
+
+    Uses the generated `LoggingServiceV2Client.list_log_entries`
+    (`google.cloud.logging_v2` v3.x); the older high-level
+    `logging_v2.Client.list_entries(...)` on that same package
+    version did not accept `timeout=` / `retry=` and raised a
+    `TypeError` — a round-3 rehearsal caught that. The gapic
+    pager honors the initial `timeout` and `retry=None` on
+    EVERY page fetch, so subsequent pages remain bounded.
+
+    `region` pins `resource.labels.location` — Cloud Run services
+    are regional; a same-named service in another region would
+    otherwise appear in the results.
+
+    Raises on permission / RPC failure / malformed schema."""
+    from google.cloud.logging_v2.services.logging_service_v2 import (  # type: ignore
+        LoggingServiceV2Client,
+    )
+    from google.cloud.logging_v2.types import ListLogEntriesRequest  # type: ignore
+    from google.api_core import exceptions as gax  # type: ignore
+
+    client = LoggingServiceV2Client()
+    request = ListLogEntriesRequest(
+        resource_names=[f"projects/{project}"],
+        filter=_build_tick_filter(service_name, region, tick_window_sec),
+        order_by="timestamp desc",
         page_size=1000,
+    )
+    pager = client.list_log_entries(
+        request=request,
         timeout=deadline.rpc_timeout(rpc_timeout),
         retry=None,
     )
-    for entry in entries:
+    out: list[dict[str, Any]] = []
+    for entry in pager:
         if deadline.expired():
             raise TimeoutError(
                 f"deadline expired while reading reconciler_tick events "
                 f"(read {len(out)} so far)"
             )
-        payload = getattr(entry, "payload", None) or {}
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"reconciler_tick entry has non-dict payload: "
-                f"{type(payload).__name__}"
-            )
-        resource_labels = (
-            getattr(getattr(entry, "resource", None), "labels", None) or {}
-        )
-        rev = resource_labels.get("revision_name") if isinstance(resource_labels, dict) else None
-        inst = payload.get("instance_id")
-        owned = payload.get("owned_rooms")
-        ts = getattr(entry, "timestamp", None)
-        if not isinstance(rev, str) or not rev:
-            raise ValueError(
-                f"reconciler_tick entry has missing/wrong-typed "
-                f"resource.labels.revision_name: {rev!r}"
-            )
-        if not isinstance(inst, str) or not inst:
-            raise ValueError(
-                f"reconciler_tick entry has missing/wrong-typed "
-                f"jsonPayload.instance_id: {inst!r}"
-            )
-        if not isinstance(owned, int) or isinstance(owned, bool):
-            raise ValueError(
-                f"reconciler_tick entry has missing/wrong-typed "
-                f"jsonPayload.owned_rooms: {owned!r}"
-            )
-        if ts is None:
-            raise ValueError("reconciler_tick entry has no timestamp")
-        out.append({
-            "revision_name": rev,
-            "instance_id": inst,
-            "timestamp_iso": (
-                ts.astimezone(timezone.utc).isoformat()
-                if hasattr(ts, "astimezone") else str(ts)
-            ),
-            "timestamp_epoch": (
-                ts.timestamp() if hasattr(ts, "timestamp") else 0.0
-            ),
-            "owned_rooms": owned,
-        })
+        out.append(_extract_tick_entry(entry))
     return out
 
 
