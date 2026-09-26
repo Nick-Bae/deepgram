@@ -807,18 +807,23 @@ class RosterCrossCheckMetricAlignmentTests(unittest.TestCase):
     """
 
     def _pt(self, epoch: float, value: int):
-        from types import SimpleNamespace
-        from datetime import datetime, timezone
-        return SimpleNamespace(
-            interval=SimpleNamespace(
-                end_time=datetime.fromtimestamp(epoch, timezone.utc),
-            ),
-            # Provide both fields — the extractor prefers int64_value
-            # when truthy, else falls through to double_value.
-            value=SimpleNamespace(
-                int64_value=value, double_value=float(value),
-            ),
-        )
+        """R6-safe fixture: build a REAL `monitoring_v3.Point`.
+
+        R5's SimpleNamespace fixture set both `int64_value` and
+        `double_value` on the fake TypedValue. R6's strict
+        `_extract_point_value` inspects the proto oneof via
+        `WhichOneof('value')`, which is not available on
+        SimpleNamespace. Real protos preserve the oneof correctly
+        for `int64_value=0` (proto-plus emits the field into the
+        oneof even at the default value)."""
+        from google.cloud import monitoring_v3
+        from google.protobuf.timestamp_pb2 import Timestamp
+        end = Timestamp()
+        end.FromDatetime(datetime.fromtimestamp(epoch, timezone.utc))
+        return monitoring_v3.Point({
+            "interval": {"end_time": end},
+            "value": {"int64_value": int(value)},
+        })
 
     def _ts(self, rev: str, state: str, points: list[tuple[float, int]]):
         from types import SimpleNamespace
@@ -1747,6 +1752,318 @@ class ManualPaginationShrinkingTimeoutTests(unittest.TestCase):
             self.assertLessEqual(t, 30.0)
         self.assertLess(timeouts[-1], timeouts[0],
                         f"per-page timeouts must shrink; got {timeouts!r}")
+
+
+class PostRpcDeadlineEnforcementTests(unittest.TestCase):
+    """R6 blocker #1: enforce the outer deadline AFTER every page
+    RPC, DURING Logging entry processing, and BEFORE successful
+    return. R5's manual pagination checked the deadline BEFORE
+    each page RPC — but a final page whose RPC itself overran the
+    budget, or a large entry loop that overran during processing,
+    would have slipped through to a "successful" return."""
+
+    def _fake_clock(self):
+        state = {"t": 0.0}
+        return state, (lambda: state["t"])
+
+    # --- Logging: final-page RPC overruns budget ---------------
+
+    def test_fetch_tick_events_raises_after_final_page_rpc_overrun(self):
+        """Single page with `next_page_token=""`. The RPC returns
+        successfully with a real entry, but consumes 40s of a 30s
+        budget. R6 post-RPC gate must raise TimeoutError instead
+        of returning the buffered entry."""
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2Client,
+        )
+        from google.cloud.logging_v2.services.logging_service_v2.pagers import (
+            ListLogEntriesPager,
+        )
+        from google.cloud.logging_v2.types import (
+            ListLogEntriesResponse, LogEntry,
+        )
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        state, fake_monotonic = self._fake_clock()
+
+        payload = struct_pb2.Struct()
+        payload.update({
+            "event": "reconciler_tick",
+            "instance_id": "i-1",
+            "owned_rooms": 0,
+        })
+        entry = LogEntry(
+            resource={"labels": {"revision_name": "rev-a"}},
+            json_payload=payload,
+        )
+        ts = Timestamp()
+        ts.FromDatetime(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        entry.timestamp = ts
+
+        final_page = ListLogEntriesResponse(
+            entries=[entry], next_page_token="",
+        )
+
+        calls: list[dict] = []
+
+        def _method(request, *, retry=None, timeout=None, metadata=()):
+            calls.append({"timeout": timeout, "retry": retry})
+            # Overrun the outer budget in a single RPC.
+            state["t"] += 40.0
+            return final_page
+
+        class _FakeLoggingClient:
+            def list_log_entries(self, request, *, retry=None, timeout=None, metadata=()):
+                initial = _method(request, retry=retry, timeout=timeout, metadata=metadata)
+                return ListLogEntriesPager(
+                    method=_method,
+                    request=request,
+                    response=initial,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+
+        with patch.object(common.time, "monotonic", fake_monotonic), \
+             patch.object(LoggingServiceV2Client, "__new__",
+                          lambda cls, *a, **k: _FakeLoggingClient()):
+            with self.assertRaises(TimeoutError) as ctx:
+                rcc.fetch_tick_events(
+                    project=PRODUCTION_PROJECT,
+                    service_name="worshiptranslate-backend",
+                    region="us-central1",
+                    tick_window_sec=300,
+                    deadline=common.Deadline(30.0),
+                    rpc_timeout=15.0,
+                )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("after Cloud Logging page RPC returned",
+                      str(ctx.exception))
+
+    # --- Logging: entry-loop overruns budget -------------------
+
+    def test_fetch_tick_events_raises_during_entry_processing(self):
+        """RPC returns quickly with N entries; entry extraction
+        advances the fake clock, so somewhere mid-loop the budget
+        expires. R6 entry-loop gate must raise before extracting
+        the entry that would push us further past budget."""
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2Client,
+        )
+        from google.cloud.logging_v2.services.logging_service_v2.pagers import (
+            ListLogEntriesPager,
+        )
+        from google.cloud.logging_v2.types import (
+            ListLogEntriesResponse, LogEntry,
+        )
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        state, fake_monotonic = self._fake_clock()
+
+        def _entry(inst):
+            payload = struct_pb2.Struct()
+            payload.update({
+                "event": "reconciler_tick",
+                "instance_id": inst,
+                "owned_rooms": 0,
+            })
+            e = LogEntry(
+                resource={"labels": {"revision_name": "rev-a"}},
+                json_payload=payload,
+            )
+            ts = Timestamp()
+            ts.FromDatetime(datetime(2026, 1, 1, tzinfo=timezone.utc))
+            e.timestamp = ts
+            return e
+
+        page = ListLogEntriesResponse(
+            entries=[_entry("i-1"), _entry("i-2"), _entry("i-3")],
+            next_page_token="",
+        )
+
+        def _method(request, *, retry=None, timeout=None, metadata=()):
+            # RPC itself is fast.
+            state["t"] += 1.0
+            return page
+
+        class _FakeLoggingClient:
+            def list_log_entries(self, request, *, retry=None, timeout=None, metadata=()):
+                initial = _method(request, retry=retry, timeout=timeout, metadata=metadata)
+                return ListLogEntriesPager(
+                    method=_method,
+                    request=request,
+                    response=initial,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+
+        # Advance the clock inside _extract_tick_entry so entry
+        # processing consumes time. Deadline budget = 10s;
+        # each extract advances 5s. Iter 1 (t=1→check ok→extract
+        # →t=6). Iter 2 (t=6→check ok→extract→t=11). Iter 3 (t=11
+        # →check fires; TimeoutError).
+        original_extract = rcc._extract_tick_entry
+        def slow_extract(entry):
+            result = original_extract(entry)
+            state["t"] += 5.0
+            return result
+
+        with patch.object(common.time, "monotonic", fake_monotonic), \
+             patch.object(LoggingServiceV2Client, "__new__",
+                          lambda cls, *a, **k: _FakeLoggingClient()), \
+             patch.object(rcc, "_extract_tick_entry", slow_extract):
+            with self.assertRaises(TimeoutError) as ctx:
+                rcc.fetch_tick_events(
+                    project=PRODUCTION_PROJECT,
+                    service_name="worshiptranslate-backend",
+                    region="us-central1",
+                    tick_window_sec=300,
+                    deadline=common.Deadline(10.0),
+                    rpc_timeout=5.0,
+                )
+        self.assertIn("while processing Cloud Logging entries",
+                      str(ctx.exception))
+
+    # --- Monitoring: final-page RPC overruns budget ------------
+
+    def test_fetch_metric_samples_raises_after_final_page_rpc_overrun(self):
+        """Same shape as the tick-side final-page test: single
+        page with `next_page_token=""` whose RPC overruns the
+        outer budget. R6 post-RPC gate must raise."""
+        from google.cloud import monitoring_v3
+        from google.cloud.monitoring_v3.services.metric_service import (
+            MetricServiceClient,
+        )
+        from google.cloud.monitoring_v3.services.metric_service.pagers import (
+            ListTimeSeriesPager,
+        )
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        state, fake_monotonic = self._fake_clock()
+
+        end = Timestamp()
+        end.FromDatetime(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        series = monitoring_v3.TimeSeries({
+            "resource": {"labels": {"revision_name": "rev-a"}},
+            "metric": {"labels": {"state": "active"}},
+            "points": [monitoring_v3.Point({
+                "interval": {"end_time": end},
+                "value": {"int64_value": 1},
+            })],
+        })
+        final_page = monitoring_v3.ListTimeSeriesResponse(
+            time_series=[series], next_page_token="",
+        )
+
+        calls: list[dict] = []
+
+        def _method(request, *, retry=None, timeout=None, metadata=()):
+            calls.append({"timeout": timeout, "retry": retry})
+            state["t"] += 120.0  # overrun the outer 60s budget
+            return final_page
+
+        class _FakeMetricClient:
+            def list_time_series(self, request, *, retry=None, timeout=None, metadata=()):
+                initial = _method(request, retry=retry, timeout=timeout, metadata=metadata)
+                return ListTimeSeriesPager(
+                    method=_method,
+                    request=request,
+                    response=initial,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+
+        with patch.object(common.time, "monotonic", fake_monotonic), \
+             patch.object(MetricServiceClient, "__new__",
+                          lambda cls, *a, **k: _FakeMetricClient()):
+            with self.assertRaises(TimeoutError) as ctx:
+                rcc.fetch_metric_samples(
+                    project=PRODUCTION_PROJECT,
+                    service_name="worshiptranslate-backend",
+                    region="us-central1",
+                    lookback_sec=240,
+                    deadline=common.Deadline(60.0),
+                    rpc_timeout=30.0,
+                )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("after Cloud Monitoring page RPC returned",
+                      str(ctx.exception))
+
+
+class StrictOneofPointValueTests(unittest.TestCase):
+    """R6 blocker #2: `_extract_point_value` must inspect the real
+    TypedValue oneof and accept only `int64_value` (including
+    zero). Every other set branch, and every unset value, must
+    raise ValueError.
+
+    Real `monitoring_v3.TypedValue` protos preserve oneof
+    membership through proto-plus: `int64_value=0` still sets
+    the oneof to `"int64_value"`, so a legitimate scaled-to-zero
+    Cloud Run revision is accepted. `double_value=1.5`,
+    `bool_value=True`, `string_value="x"`, `distribution_value=…`,
+    and `TypedValue()` (no branch set) all fail closed."""
+
+    def _pt(self, typed_value):
+        from google.cloud import monitoring_v3
+        from google.protobuf.timestamp_pb2 import Timestamp
+        end = Timestamp()
+        end.FromDatetime(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        return monitoring_v3.Point({
+            "interval": {"end_time": end},
+            "value": typed_value,
+        })
+
+    def test_int64_zero_accepted(self):
+        from google.cloud import monitoring_v3
+        p = self._pt(monitoring_v3.TypedValue({"int64_value": 0}))
+        self.assertEqual(rcc._extract_point_value(p), 0)
+
+    def test_int64_nonzero_accepted(self):
+        from google.cloud import monitoring_v3
+        p = self._pt(monitoring_v3.TypedValue({"int64_value": 7}))
+        self.assertEqual(rcc._extract_point_value(p), 7)
+
+    def test_double_value_rejected(self):
+        from google.cloud import monitoring_v3
+        p = self._pt(monitoring_v3.TypedValue({"double_value": 1.5}))
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_point_value(p)
+        self.assertIn("double_value", str(ctx.exception))
+
+    def test_bool_value_rejected(self):
+        from google.cloud import monitoring_v3
+        p = self._pt(monitoring_v3.TypedValue({"bool_value": True}))
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_point_value(p)
+        self.assertIn("bool_value", str(ctx.exception))
+
+    def test_string_value_rejected(self):
+        from google.cloud import monitoring_v3
+        p = self._pt(monitoring_v3.TypedValue({"string_value": "x"}))
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_point_value(p)
+        self.assertIn("string_value", str(ctx.exception))
+
+    def test_distribution_value_rejected(self):
+        from google.cloud import monitoring_v3
+        # A default Distribution is enough — `WhichOneof('value')`
+        # returns `distribution_value` as long as the field is set.
+        p = self._pt(monitoring_v3.TypedValue({"distribution_value": {}}))
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_point_value(p)
+        self.assertIn("distribution_value", str(ctx.exception))
+
+    def test_unset_typed_value_rejected(self):
+        from google.cloud import monitoring_v3
+        p = self._pt(monitoring_v3.TypedValue())
+        with self.assertRaises(ValueError) as ctx:
+            rcc._extract_point_value(p)
+        self.assertIn("no oneof branch set", str(ctx.exception))
 
 
 if __name__ == "__main__":

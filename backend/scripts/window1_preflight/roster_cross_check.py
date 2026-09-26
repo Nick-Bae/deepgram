@@ -338,11 +338,37 @@ def fetch_tick_events(
         # frozen `per_page_timeout` from THIS iteration, defeating
         # the shrinking behavior we just installed.
         response = next(iter(pager.pages))
+        # R6: post-RPC deadline gate. The gapic pager's per-page
+        # timeout only bounds how long the RPC takes; a final
+        # `next_page_token=""` page whose RPC overran the outer
+        # budget would otherwise return successfully. Refuse here
+        # so wall-clock breach is never silent.
+        if deadline.expired():
+            raise TimeoutError(
+                f"deadline expired after Cloud Logging page RPC returned "
+                f"(read {len(out)} entries so far)"
+            )
         for entry in response.entries:
+            # R6: entry-loop deadline gate. A very large page could
+            # push us past the budget purely via extraction time.
+            if deadline.expired():
+                raise TimeoutError(
+                    f"deadline expired while processing Cloud Logging "
+                    f"entries (read {len(out)} entries so far)"
+                )
             out.append(_extract_tick_entry(entry))
         page_token = response.next_page_token
         if not page_token:
             break
+    # R6: pre-return deadline gate. Catches the case where the
+    # final entry's extraction (the last iteration's body) pushed
+    # us past the budget — the entry-loop check above only fires
+    # BEFORE each extract, so a slow last extract slips through.
+    if deadline.expired():
+        raise TimeoutError(
+            f"deadline expired before returning Cloud Logging results "
+            f"({len(out)} entries buffered)"
+        )
     return out
 
 
@@ -550,10 +576,28 @@ def fetch_metric_samples(
             retry=None,
         )
         response = next(iter(pager.pages))
+        # R6: post-RPC deadline gate. Same rationale as the tick
+        # side — a `next_page_token=""` final page whose RPC
+        # overran the outer budget would otherwise slip through
+        # to a "successful" aggregation.
+        if deadline.expired():
+            raise TimeoutError(
+                f"deadline expired after Cloud Monitoring page RPC returned "
+                f"(read {len(series_pages)} series so far)"
+            )
         series_pages.extend(response.time_series)
         page_token = response.next_page_token
         if not page_token:
             break
+    # R6: pre-aggregation deadline gate. `_aggregate_metric_series`
+    # has its own per-iteration check, but there is no gate between
+    # the last page RPC and the start of aggregation. Refuse here
+    # so wall-clock breach cannot hide behind that seam.
+    if deadline.expired():
+        raise TimeoutError(
+            f"deadline expired before aggregating Cloud Monitoring series "
+            f"({len(series_pages)} series buffered)"
+        )
     return _aggregate_metric_series(
         series_pages, now_epoch=now.timestamp(), deadline=deadline,
     )
@@ -580,14 +624,40 @@ def _extract_point_timestamp(point: Any) -> tuple[str, float]:
 
 
 def _extract_point_value(point: Any) -> int:
+    """Return the integer value of a TimeSeries `Point`.
+
+    `run.googleapis.com/container/instance_count` reports values
+    via `TypedValue.int64_value`. R5 accepted `double_value` as a
+    fallback and short-circuited on `int64_value=0` (falsy) so
+    `TypedValue(bool_value=True)` and `TypedValue(double_value=1.5)`
+    silently coerced to `int(0)` / `int(1)`. R6 rewrites to
+    inspect the real proto oneof and accept ONLY the
+    `int64_value` branch (including zero); every other set
+    branch — double, bool, string, distribution — and every
+    unset value raise ValueError.
+
+    Proto-plus wraps the raw protobuf message; the raw one is
+    available via `type(value).pb(value)`. `WhichOneof('value')`
+    returns the name of the set branch, or None if none is set."""
     value = getattr(point, "value", None)
     if value is None:
         raise ValueError("time-series point missing value")
-    if hasattr(value, "int64_value") and value.int64_value:
-        return int(value.int64_value)
-    if hasattr(value, "double_value"):
-        return int(value.double_value)
-    raise ValueError(f"unsupported time-series value shape: {value}")
+    if hasattr(type(value), "pb"):
+        pb = type(value).pb(value)
+    else:
+        pb = value
+    which = pb.WhichOneof("value") if hasattr(pb, "WhichOneof") else None
+    if which is None:
+        raise ValueError(
+            "time-series point TypedValue has no oneof branch set — "
+            "expected int64_value"
+        )
+    if which != "int64_value":
+        raise ValueError(
+            f"time-series point TypedValue oneof branch is {which!r} — "
+            f"only int64_value is accepted for instance_count"
+        )
+    return int(value.int64_value)
 
 
 # --- Cross-check + status roll-up -----------------------------------------
