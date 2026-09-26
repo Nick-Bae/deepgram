@@ -1384,5 +1384,370 @@ class TickEntryExtractorTests(unittest.TestCase):
         self.assertIn('timestamp >=', f)
 
 
+class RealMonitoringProtoAggregationTests(unittest.TestCase):
+    """R5 blocker #1: `_aggregate_metric_series` handled proto map
+    labels via `isinstance(labels, dict)`, which is False for the
+    real `monitoring_v3.TimeSeries.resource.labels` (a proto
+    MapField / MapComposite). Round-4 tests used
+    `SimpleNamespace(labels={...})` fixtures with plain dicts, so
+    they never exercised the real proto shape.
+
+    This suite builds actual `monitoring_v3.TimeSeries` protos and
+    proves the aggregator extracts revision_name, state, points,
+    and zero values correctly."""
+
+    def _mk_series(self, *, rev, state, points_iso_val, project="p"):
+        """Real `monitoring_v3.TimeSeries` proto — resource labels
+        via proto MapField, metric labels via proto MapField, and
+        points as `Point(interval=TimeInterval, value=TypedValue)`."""
+        from google.cloud import monitoring_v3
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        ts_points = []
+        for epoch, value in points_iso_val:
+            end = Timestamp()
+            end.FromDatetime(datetime.fromtimestamp(epoch, timezone.utc))
+            ts_points.append(monitoring_v3.Point({
+                "interval": {"end_time": end},
+                "value": {"int64_value": int(value)},
+            }))
+        return monitoring_v3.TimeSeries({
+            "resource": {
+                "type": "cloud_run_revision",
+                "labels": {
+                    "project_id": project,
+                    "service_name": "worshiptranslate-backend",
+                    "location": "us-central1",
+                    "revision_name": rev,
+                    "configuration_name": "worshiptranslate-backend",
+                },
+            },
+            "metric": {
+                "type": "run.googleapis.com/container/instance_count",
+                "labels": {"state": state},
+            },
+            "points": ts_points,
+        })
+
+    def test_aggregate_over_real_protos_extracts_revision_state_points(self):
+        now = time.time()
+        pages = [
+            self._mk_series(rev="rev-a", state="active",
+                            points_iso_val=[(now - 30, 2)]),
+            self._mk_series(rev="rev-a", state="idle",
+                            points_iso_val=[(now - 30, 1)]),
+        ]
+        out = rcc._aggregate_metric_series(
+            pages, now_epoch=now, deadline=common.Deadline(300.0),
+        )
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertEqual(entry["revision_name"], "rev-a")
+        self.assertEqual(entry["active_value"], 2)
+        self.assertEqual(entry["idle_value"], 1)
+        self.assertEqual(entry["active_plus_idle"], 3)
+
+    def test_aggregate_over_real_protos_handles_zero_values(self):
+        """A scaled-nearly-to-zero revision reports active=0,
+        idle=N. `TypedValue.int64_value=0` is falsy — the extractor's
+        first branch (`and value.int64_value`) short-circuits and
+        falls through to `double_value`, which is also 0 on an
+        int64-set point (unset oneof fields default to 0). The
+        aggregator must still record 0 correctly."""
+        now = time.time()
+        pages = [
+            self._mk_series(rev="rev-a", state="active",
+                            points_iso_val=[(now - 30, 0)]),
+            self._mk_series(rev="rev-a", state="idle",
+                            points_iso_val=[(now - 30, 3)]),
+        ]
+        out = rcc._aggregate_metric_series(
+            pages, now_epoch=now, deadline=common.Deadline(300.0),
+        )
+        self.assertEqual(len(out), 1)
+        entry = out[0]
+        self.assertEqual(entry["active_value"], 0)
+        self.assertEqual(entry["idle_value"], 3)
+        self.assertEqual(entry["active_plus_idle"], 3)
+
+    def test_aggregate_over_real_protos_rejects_unexpected_state(self):
+        now = time.time()
+        pages = [
+            self._mk_series(rev="rev-a", state="unknown_state",
+                            points_iso_val=[(now - 30, 1)]),
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            rcc._aggregate_metric_series(
+                pages, now_epoch=now, deadline=common.Deadline(300.0),
+            )
+        self.assertIn("state", str(ctx.exception))
+
+    def test_aggregate_over_real_protos_rejects_missing_revision_name(self):
+        from google.cloud import monitoring_v3
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        end = Timestamp()
+        end.FromDatetime(datetime.now(timezone.utc))
+        series = monitoring_v3.TimeSeries({
+            "resource": {"labels": {}},  # no revision_name
+            "metric": {"labels": {"state": "active"}},
+            "points": [monitoring_v3.Point({
+                "interval": {"end_time": end},
+                "value": {"int64_value": 1},
+            })],
+        })
+        with self.assertRaises(ValueError) as ctx:
+            rcc._aggregate_metric_series(
+                [series], now_epoch=time.time(),
+                deadline=common.Deadline(300.0),
+            )
+        self.assertIn("revision_name", str(ctx.exception))
+
+
+class ManualPaginationShrinkingTimeoutTests(unittest.TestCase):
+    """R5 blocker #2: manual per-page timeout control.
+
+    The gapic pager freezes the initial `timeout=` across every
+    next-page RPC. If the outer deadline shrinks below the frozen
+    `rpc_timeout`, later pages can still spend the full frozen
+    value each. Round-4 checked `deadline.expired()` BETWEEN pages
+    — but only AFTER the offending page RPC completed.
+
+    R5 recomputes `deadline.rpc_timeout(rpc_timeout)` before every
+    page and refuses to start a new page RPC once the deadline has
+    expired. Below, a fake clock advances between page fetches so
+    the recorded per-page timeouts strictly shrink, and a would-be
+    fourth page RPC is refused because expiry fires FIRST.
+    """
+
+    def _fake_clock(self):
+        """Returns (getter, setter). `common.Deadline` reads
+        `time.monotonic` at the module scope."""
+        state = {"t": 0.0}
+        return state, (lambda: state["t"])
+
+    # --- Cloud Logging manual pagination ------------------------
+
+    def test_fetch_tick_events_per_page_timeout_shrinks_and_refuses_after_expiry(self):
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2Client,
+        )
+        from google.cloud.logging_v2.services.logging_service_v2.pagers import (
+            ListLogEntriesPager,
+        )
+        from google.cloud.logging_v2.types import (
+            ListLogEntriesRequest,
+            ListLogEntriesResponse,
+            LogEntry,
+        )
+        from google.protobuf import struct_pb2
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        # Fake clock the Deadline reads.
+        state, fake_monotonic = self._fake_clock()
+
+        # Fixture: three pages with entries, all with non-empty
+        # next_page_tokens so the loop would attempt a fourth page.
+        def _mk_entry(rev, inst):
+            payload = struct_pb2.Struct()
+            payload.update({
+                "event": "reconciler_tick",
+                "instance_id": inst,
+                "owned_rooms": 0,
+            })
+            entry = LogEntry(
+                resource={"labels": {"revision_name": rev}},
+                json_payload=payload,
+            )
+            ts = Timestamp()
+            # Timestamp does not need to advance with fake clock —
+            # `_extract_tick_entry` reads it verbatim.
+            ts.FromDatetime(datetime(2026, 1, 1, tzinfo=timezone.utc))
+            entry.timestamp = ts
+            return entry
+
+        pages_by_token = {
+            "":     ListLogEntriesResponse(entries=[_mk_entry("rev-a", "i-1")],
+                                           next_page_token="tok1"),
+            "tok1": ListLogEntriesResponse(entries=[_mk_entry("rev-a", "i-2")],
+                                           next_page_token="tok2"),
+            "tok2": ListLogEntriesResponse(entries=[_mk_entry("rev-b", "i-3")],
+                                           next_page_token="tok3"),
+            # If a 4th RPC is attempted we'd hit this — the test
+            # proves we never do.
+            "tok3": ListLogEntriesResponse(entries=[], next_page_token=""),
+        }
+
+        # Per-page clock advance: page 1 costs 20s, page 2 costs
+        # 15s, page 3 costs 12s. With budget=45 and ceiling=15,
+        # per-page timeouts should be [15, 15, 10]. After page 3
+        # the clock is at 47s → deadline expired, would-be page 4
+        # refused.
+        page_costs = [20.0, 15.0, 12.0]
+
+        calls: list[dict] = []
+
+        def _method(request, *, retry=None, timeout=None, metadata=()):
+            token = getattr(request, "page_token", "") or ""
+            calls.append({
+                "page_token": token,
+                "timeout": timeout,
+                "retry": retry,
+                "monotonic_at_call": state["t"],
+            })
+            state["t"] += page_costs[len(calls) - 1]
+            return pages_by_token[token]
+
+        class _FakeLoggingClient:
+            def list_log_entries(self, request, *, retry=None, timeout=None, metadata=()):
+                initial = _method(request, retry=retry, timeout=timeout, metadata=metadata)
+                return ListLogEntriesPager(
+                    method=_method,
+                    request=request,
+                    response=initial,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+
+        with patch.object(common.time, "monotonic", fake_monotonic), \
+             patch.object(LoggingServiceV2Client, "__new__",
+                          lambda cls, *a, **k: _FakeLoggingClient()):
+            with self.assertRaises(TimeoutError) as ctx:
+                rcc.fetch_tick_events(
+                    project=PRODUCTION_PROJECT,
+                    service_name="worshiptranslate-backend",
+                    region="us-central1",
+                    tick_window_sec=300,
+                    deadline=common.Deadline(45.0),
+                    rpc_timeout=15.0,
+                )
+
+        # Refusal message must reference the pre-RPC expiry point.
+        self.assertIn("deadline expired", str(ctx.exception).lower())
+
+        # Exactly 3 RPCs happened; the 4th was refused pre-RPC.
+        self.assertEqual(len(calls), 3,
+                         f"expected 3 page RPCs before refusal, got {len(calls)}: "
+                         f"{[c['page_token'] for c in calls]!r}")
+
+        # Every call carried retry=None.
+        for c in calls:
+            self.assertIsNone(c["retry"], f"page {c['page_token']} lost retry=None")
+
+        # Per-page timeouts: [15, 15, 10] under the model above.
+        # Strictly stated: monotonic-non-increasing and shrinking
+        # by the end.
+        timeouts = [c["timeout"] for c in calls]
+        for t in timeouts:
+            self.assertGreater(t, 0)
+            self.assertLessEqual(t, 15.0)
+        self.assertLess(timeouts[-1], timeouts[0],
+                        f"per-page timeouts must shrink; got {timeouts!r}")
+
+        # Sanity: pre-RPC monotonic timestamps must be monotonically
+        # non-decreasing (clock only advances forward).
+        for i in range(1, len(calls)):
+            self.assertGreaterEqual(calls[i]["monotonic_at_call"],
+                                    calls[i-1]["monotonic_at_call"])
+
+    # --- Cloud Monitoring manual pagination --------------------
+
+    def test_fetch_metric_samples_per_page_timeout_shrinks_and_refuses_after_expiry(self):
+        from google.cloud import monitoring_v3
+        from google.cloud.monitoring_v3.services.metric_service import (
+            MetricServiceClient,
+        )
+        from google.cloud.monitoring_v3.services.metric_service.pagers import (
+            ListTimeSeriesPager,
+        )
+        from google.protobuf.timestamp_pb2 import Timestamp
+
+        state, fake_monotonic = self._fake_clock()
+
+        def _mk_series(rev, s):
+            end = Timestamp()
+            end.FromDatetime(datetime(2026, 1, 1, tzinfo=timezone.utc))
+            return monitoring_v3.TimeSeries({
+                "resource": {"labels": {"revision_name": rev}},
+                "metric": {"labels": {"state": s}},
+                "points": [monitoring_v3.Point({
+                    "interval": {"end_time": end},
+                    "value": {"int64_value": 1},
+                })],
+            })
+
+        pages_by_token = {
+            "":     monitoring_v3.ListTimeSeriesResponse(
+                       time_series=[_mk_series("rev-a", "active")],
+                       next_page_token="tok1"),
+            "tok1": monitoring_v3.ListTimeSeriesResponse(
+                       time_series=[_mk_series("rev-a", "idle")],
+                       next_page_token="tok2"),
+            "tok2": monitoring_v3.ListTimeSeriesResponse(
+                       time_series=[_mk_series("rev-b", "active")],
+                       next_page_token="tok3"),
+            "tok3": monitoring_v3.ListTimeSeriesResponse(
+                       time_series=[], next_page_token=""),
+        }
+        page_costs = [40.0, 30.0, 22.0]
+
+        calls: list[dict] = []
+
+        def _method(request, *, retry=None, timeout=None, metadata=()):
+            token = getattr(request, "page_token", "") or ""
+            calls.append({
+                "page_token": token,
+                "timeout": timeout,
+                "retry": retry,
+                "monotonic_at_call": state["t"],
+            })
+            state["t"] += page_costs[len(calls) - 1]
+            return pages_by_token[token]
+
+        class _FakeMetricClient:
+            def list_time_series(self, request, *, retry=None, timeout=None, metadata=()):
+                initial = _method(request, retry=retry, timeout=timeout, metadata=metadata)
+                return ListTimeSeriesPager(
+                    method=_method,
+                    request=request,
+                    response=initial,
+                    retry=retry,
+                    timeout=timeout,
+                    metadata=metadata,
+                )
+
+        with patch.object(common.time, "monotonic", fake_monotonic), \
+             patch.object(MetricServiceClient, "__new__",
+                          lambda cls, *a, **k: _FakeMetricClient()):
+            with self.assertRaises(TimeoutError) as ctx:
+                rcc.fetch_metric_samples(
+                    project=PRODUCTION_PROJECT,
+                    service_name="worshiptranslate-backend",
+                    region="us-central1",
+                    lookback_sec=240,
+                    deadline=common.Deadline(90.0),
+                    rpc_timeout=30.0,
+                )
+
+        self.assertIn("deadline expired", str(ctx.exception).lower())
+        self.assertEqual(len(calls), 3,
+                         f"expected 3 page RPCs before refusal, got {len(calls)}: "
+                         f"{[c['page_token'] for c in calls]!r}")
+        for c in calls:
+            self.assertIsNone(c["retry"], f"page {c['page_token']} lost retry=None")
+
+        timeouts = [c["timeout"] for c in calls]
+        # Budget=90, ceiling=30; costs 40/30/22.
+        # Page 1 (t=0):  min(30, 90) = 30. After: t=40.
+        # Page 2 (t=40): min(30, 50) = 30. After: t=70.
+        # Page 3 (t=70): min(30, 20) = 20. After: t=92 → expired.
+        for t in timeouts:
+            self.assertGreater(t, 0)
+            self.assertLessEqual(t, 30.0)
+        self.assertLess(timeouts[-1], timeouts[0],
+                        f"per-page timeouts must shrink; got {timeouts!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

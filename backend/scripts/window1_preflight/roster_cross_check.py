@@ -309,19 +309,40 @@ def fetch_tick_events(
         order_by="timestamp desc",
         page_size=1000,
     )
-    pager = client.list_log_entries(
-        request=request,
-        timeout=deadline.rpc_timeout(rpc_timeout),
-        retry=None,
-    )
+    # Manual page control: the gapic pager freezes the initial
+    # `timeout=` across every subsequent next-page RPC, so a
+    # per-page fetch could still spend the full `rpc_timeout`
+    # even after the outer deadline shrinks below it. Round-4
+    # relied on `deadline.expired()` between pages, which only
+    # noticed the breach AFTER the offending RPC completed.
+    # R5 re-computes `deadline.rpc_timeout(rpc_timeout)` before
+    # every page and refuses to start a new page RPC once
+    # the deadline has expired.
     out: list[dict[str, Any]] = []
-    for entry in pager:
+    page_token = ""
+    while True:
         if deadline.expired():
             raise TimeoutError(
-                f"deadline expired while reading reconciler_tick events "
-                f"(read {len(out)} so far)"
+                f"deadline expired before starting Cloud Logging page RPC "
+                f"(read {len(out)} entries so far)"
             )
-        out.append(_extract_tick_entry(entry))
+        per_page_timeout = deadline.rpc_timeout(rpc_timeout)
+        request.page_token = page_token
+        pager = client.list_log_entries(
+            request=request,
+            timeout=per_page_timeout,
+            retry=None,
+        )
+        # Consume only the first (already-fetched) page. Iterating
+        # the pager further would trigger next-page RPCs with the
+        # frozen `per_page_timeout` from THIS iteration, defeating
+        # the shrinking behavior we just installed.
+        response = next(iter(pager.pages))
+        for entry in response.entries:
+            out.append(_extract_tick_entry(entry))
+        page_token = response.next_page_token
+        if not page_token:
+            break
     return out
 
 
@@ -409,15 +430,26 @@ def _aggregate_metric_series(
             raise TimeoutError(
                 "deadline expired while reading Monitoring time-series"
             )
-        resource_labels = getattr(getattr(series, "resource", None), "labels", None) or {}
-        rev = resource_labels.get("revision_name") if isinstance(resource_labels, dict) else None
+        # `series.resource.labels` and `series.metric.labels` on a
+        # real `monitoring_v3.TimeSeries` proto are MapField /
+        # MapComposite objects, NOT Python dicts. Round-4 code
+        # gated on `isinstance(labels, dict)` and treated proto maps
+        # as empty — so a real prod series would raise
+        # "missing revision_name" regardless of the actual label
+        # value. Normalize with `dict(...)` so `.get()` behaves
+        # the same for proto maps and for the SimpleNamespace
+        # fixture dicts existing tests use.
+        resource_raw = getattr(getattr(series, "resource", None), "labels", None)
+        resource_labels = dict(resource_raw) if resource_raw else {}
+        rev = resource_labels.get("revision_name")
         if not isinstance(rev, str) or not rev:
             raise ValueError(
                 f"time-series has missing/wrong-typed "
                 f"resource.labels.revision_name: {rev!r}"
             )
-        metric_labels = getattr(getattr(series, "metric", None), "labels", None) or {}
-        state = metric_labels.get("state") if isinstance(metric_labels, dict) else None
+        metric_raw = getattr(getattr(series, "metric", None), "labels", None)
+        metric_labels = dict(metric_raw) if metric_raw else {}
+        state = metric_labels.get("state")
         if state not in ("active", "idle"):
             raise ValueError(
                 f"time-series has unexpected metric.labels.state={state!r}"
@@ -495,13 +527,35 @@ def fetch_metric_samples(
         "interval": interval,
         "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
     })
-    pages = client.list_time_series(
-        request=request,
-        timeout=deadline.rpc_timeout(rpc_timeout),
-        retry=None,
-    )
+    # Manual page control: same rationale as `fetch_tick_events`
+    # in R5. The gapic pager freezes the initial `timeout=` across
+    # every subsequent next-page RPC, and the outer deadline check
+    # inside `_aggregate_metric_series` only fires AFTER a page
+    # arrives. Re-compute `deadline.rpc_timeout(rpc_timeout)`
+    # before every page RPC; refuse to start a new page RPC once
+    # the deadline has expired.
+    series_pages: list = []
+    page_token = ""
+    while True:
+        if deadline.expired():
+            raise TimeoutError(
+                f"deadline expired before starting Cloud Monitoring page RPC "
+                f"(read {len(series_pages)} series so far)"
+            )
+        per_page_timeout = deadline.rpc_timeout(rpc_timeout)
+        request.page_token = page_token
+        pager = client.list_time_series(
+            request=request,
+            timeout=per_page_timeout,
+            retry=None,
+        )
+        response = next(iter(pager.pages))
+        series_pages.extend(response.time_series)
+        page_token = response.next_page_token
+        if not page_token:
+            break
     return _aggregate_metric_series(
-        pages, now_epoch=now.timestamp(), deadline=deadline,
+        series_pages, now_epoch=now.timestamp(), deadline=deadline,
     )
 
 
