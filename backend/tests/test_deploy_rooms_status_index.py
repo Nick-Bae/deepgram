@@ -2273,5 +2273,162 @@ class R11ProductionFixtureTests(unittest.TestCase):
             self.assertNotIn('"etag"', text, f"{name} contains etag")
 
 
+class R12PollUntilReadyBehaviorTests(unittest.TestCase):
+    """R12: direct unit coverage of `_poll_until_ready()` proving
+    that its exit condition is "ALL FOUR entries READY" — not
+    "CG_ASC READY". The R11 integration tests can't catch a
+    regression back to the R10 CG-only polling because the fake
+    CLI always keeps the three inherited COLLECTION-scope entries
+    READY throughout the fixture scenarios. This class mocks
+    `_current_rs_shape` + `time.monotonic` + `time.sleep` so the
+    poll loop is exercised deterministically without spawning a
+    subprocess and without real sleep."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "dep_drv_r12_poll", str(_DRIVER),
+        )
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+        self.audit_dir = Path(mkdtemp(prefix="r12-poll-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.audit_dir, ignore_errors=True)
+
+    def _entry(self, order, arr, scope, state):
+        return {"fieldPath": "status", "order": order,
+                "arrayConfig": arr, "queryScope": scope, "state": state}
+
+    def _shape(self, col_asc, col_desc, col_arr, cg_asc, uac=None):
+        """Build a canonical _current_rs_shape() return dict with
+        the four exact required entries and their states, sorted
+        the way the driver's own helper sorts them."""
+        entries = [
+            self._entry("ASCENDING", None, "COLLECTION", col_asc),
+            self._entry("ASCENDING", None, "COLLECTION_GROUP", cg_asc),
+            self._entry("DESCENDING", None, "COLLECTION", col_desc),
+            self._entry(None, "CONTAINS", "COLLECTION", col_arr),
+        ]
+        entries.sort(key=lambda c: (str(c.get("order") or ""),
+                                    str(c.get("arrayConfig") or ""),
+                                    str(c.get("queryScope") or "")))
+        return {"usesAncestorConfig": uac, "indexes": entries}
+
+    def test_poll_waits_for_all_four_ready_when_cg_ready_but_col_creating(self):
+        """R12 blocker: the reviewer's exact regression. On the
+        first observation the CG_ASC entry is already READY but
+        one COLLECTION-scope entry is still CREATING (the classic
+        transient Firestore state after making the override
+        explicit). The old CG-only polling implementation would
+        return early on iteration 1 (CG_ASC == READY → success).
+        R11's four-entry rule must keep polling — call
+        `_current_rs_shape` a SECOND time — and return only after
+        the second observation shows all four entries READY."""
+        from unittest import mock
+        # Iteration 1: CG READY + one COLLECTION-scope CREATING
+        shape_mixed = self._shape(
+            col_asc="CREATING", col_desc="READY",
+            col_arr="READY", cg_asc="READY",
+        )
+        # Iteration 2: all four READY
+        shape_all_ready = self._shape(
+            col_asc="READY", col_desc="READY",
+            col_arr="READY", cg_asc="READY",
+        )
+        shape_mock = mock.MagicMock(
+            side_effect=[shape_mixed, shape_all_ready])
+        # time.monotonic sequence: t=0.0 (deadline compute),
+        # t=0.05 (post-iter-1 deadline check). Timeout is 100s so
+        # 0.05 is comfortably inside.
+        monotonic_mock = mock.MagicMock(side_effect=[0.0, 0.05])
+        sleep_mock = mock.MagicMock(return_value=None)
+        with mock.patch.object(self.mod, "_current_rs_shape", shape_mock), \
+             mock.patch.object(self.mod.time, "monotonic", monotonic_mock), \
+             mock.patch.object(self.mod.time, "sleep", sleep_mock):
+            result = self.mod._poll_until_ready(
+                gcloud="/nonexistent-gcloud",
+                audit_dir=self.audit_dir,
+                timeout_sec=100.0,
+                interval_sec=0.1,
+                assert_present=True,
+            )
+        # 1. Poll returned READY.
+        self.assertEqual(result, "READY")
+        # 2. _current_rs_shape must have been called EXACTLY TWICE.
+        #    This is the regression signal: CG-only polling would
+        #    call it once and return early.
+        self.assertEqual(
+            shape_mock.call_count, 2,
+            "R12 regression: `_poll_until_ready` returned after "
+            "the first observation despite one COLLECTION-scope "
+            "entry being CREATING. The R11 contract requires "
+            "polling until ALL FOUR entries are READY — a "
+            "regression back to CG-only polling would have "
+            "called `_current_rs_shape` exactly once and returned "
+            f"CG_ASC's READY as success. call_count="
+            f"{shape_mock.call_count}"
+        )
+        # 3. Poll log records BOTH observations, proving neither
+        #    iteration was skipped or replaced.
+        log_lines = [
+            ln for ln in
+            (self.audit_dir / "poll" / "poll.log").read_text().splitlines()
+            if ln.strip()
+        ]
+        self.assertEqual(len(log_lines), 2,
+                         f"poll.log must record both observations; "
+                         f"got {log_lines!r}")
+        # 4. First observation carries CREATING; second does not.
+        self.assertIn("CREATING", log_lines[0])
+        self.assertNotIn("CREATING", log_lines[1])
+        # 5. time.sleep called exactly once between the two shape
+        #    reads (proves the loop did enter the wait branch).
+        self.assertEqual(sleep_mock.call_count, 1)
+
+    def test_poll_times_out_when_col_stuck_creating_despite_cg_ready(self):
+        """R12 blocker part 2: CG_ASC READY throughout but one
+        COLLECTION-scope entry never reaches READY within the
+        bounded deadline. R11 must raise `TimeoutError` — CG
+        readiness alone cannot satisfy the four-entry contract.
+
+        Under the R10 CG-only implementation this scenario would
+        have returned success immediately."""
+        from unittest import mock
+        stuck = self._shape(
+            col_asc="CREATING", col_desc="READY",
+            col_arr="READY", cg_asc="READY",
+        )
+        shape_mock = mock.MagicMock(return_value=stuck)
+        # monotonic sequence: t=0.0 (deadline compute → 1.0),
+        # t=1.1 (post-iter-1 deadline check exceeds).
+        monotonic_mock = mock.MagicMock(side_effect=[0.0, 1.1])
+        sleep_mock = mock.MagicMock(return_value=None)
+        with mock.patch.object(self.mod, "_current_rs_shape", shape_mock), \
+             mock.patch.object(self.mod.time, "monotonic", monotonic_mock), \
+             mock.patch.object(self.mod.time, "sleep", sleep_mock):
+            with self.assertRaises(TimeoutError) as cm:
+                self.mod._poll_until_ready(
+                    gcloud="/nonexistent-gcloud",
+                    audit_dir=self.audit_dir,
+                    timeout_sec=1.0,
+                    interval_sec=0.1,
+                    assert_present=True,
+                )
+        # Error message must reflect the last observed mixed state,
+        # proving CG readiness alone was insufficient.
+        msg = str(cm.exception)
+        self.assertIn("did not reach ALL-READY", msg)
+        self.assertIn("CREATING", msg,
+                      "TimeoutError must reference the still-"
+                      "CREATING state in its last-states summary")
+        # _current_rs_shape called once (iter 1 → deadline check
+        # exceeds → no iter 2).
+        self.assertEqual(shape_mock.call_count, 1)
+        # sleep was NEVER called — the deadline check exceeded
+        # before the sleep branch could run.
+        self.assertEqual(sleep_mock.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
