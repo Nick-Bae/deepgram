@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "3.3.0"  # R7: kernel-authoritative quiescence via killpg(pgid,0); fail-closed on any incomplete /proc scan while group still exists
+SCRIPT_VERSION = "3.4.0"  # R8: quiescence rule tightened — a still-existing group with zero visible members is contradictory (fail-closed) unless a zombie is also visible
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -416,24 +416,28 @@ def _pgid_alive_members(pgid: int) -> list[int]:
 
 
 def _wait_pgid_drained(pgid: int, timeout: float) -> _PgScan:
-    """Poll until quiescence is DEFINITELY established, or the
-    timeout elapses. Returns the final `_PgScan`.
+    """Poll `_pgid_scan(pgid)` until `_pgscan_is_quiescent()`
+    returns True, or the timeout elapses. Returns the final
+    `_PgScan`.
 
-    Quiescence conditions (either is sufficient):
-      (a) `killpg(pgid, 0)` reports ESRCH — kernel confirms no
-          member remains;
-      (b) a COMPLETE /proc scan finds no non-zombie members.
-
-    An incomplete scan while the group still exists is NEVER
-    accepted as quiescence — the caller inspects the return value
-    and treats that state as fail-closed."""
+    R8 finding: the loop must delegate the "is this drained"
+    decision to the single authoritative helper. Earlier versions
+    inlined a subset of the condition (`group_exists=False OR
+    (scan_complete AND no non-zombies)`) which admitted the
+    contradictory state `group_exists=True + scan_complete=True +
+    no members visible`. That state does happen transiently on
+    Linux: `_pgid_scan` calls `killpg(pgid, 0)` first (still
+    True while a zombie is unreaped) and then walks `/proc`
+    (during which init can reap the zombie, leaving an empty
+    view). Polling through that window resolves it to ESRCH on
+    the next iteration; using `_pgscan_is_quiescent` as the loop
+    predicate keeps us polling instead of accepting the
+    contradictory snapshot."""
     deadline = time.monotonic() + timeout
     last: "_PgScan | None" = None
     while time.monotonic() < deadline:
         last = _pgid_scan(pgid)
-        if not last.group_exists:
-            return last
-        if last.scan_complete and not last.non_zombie_members:
+        if _pgscan_is_quiescent(last):
             return last
         time.sleep(_TRAP_DRAIN_POLL_SEC)
     if last is None:
@@ -442,13 +446,42 @@ def _wait_pgid_drained(pgid: int, timeout: float) -> _PgScan:
 
 
 def _pgscan_is_quiescent(scan: _PgScan) -> bool:
-    """A scan proves quiescence if the kernel confirms the group
-    is gone, or a complete /proc scan found no non-zombie
-    members. An incomplete scan against a still-existing group is
-    NEVER quiescence (fail-closed)."""
+    """R8 finding: a scan proves quiescence only when either
+      (a) `killpg(pgid, 0)` reported ESRCH — the kernel confirms
+          the group is gone; or
+      (b) the group STILL exists, a complete /proc scan found
+          zero live non-zombie members, AND the scan saw at
+          least one zombie member.
+
+    (a) alone is authoritative. (b) tolerates the transient
+    state where the last live member has just exited but has not
+    yet been reaped by its parent — the process record is still
+    in /proc as state='Z' AND its pgrp still matches the group,
+    so the kernel keeps the group alive until the parent calls
+    wait(). Only that state proves "the group has members but
+    none can mutate anything" without relying on /proc
+    exhaustiveness alone.
+
+    R7 accepted `group_exists=True + complete scan + no visible
+    members` as quiescent. That is contradictory: `killpg(pgid,
+    0)` returns non-ESRCH iff at least one process is in the
+    group, so a completely-scanned empty result AGAINST a
+    live-per-kernel group means something exists that our /proc
+    view cannot see (pid-namespace difference, mount namespace,
+    or race). Fail-closed on that state — the caller will then
+    escalate to SIGKILL and re-check; the kernel authority
+    settles it after that."""
     if not scan.group_exists:
         return True
-    return scan.scan_complete and not scan.non_zombie_members
+    if not scan.scan_complete:
+        return False
+    if scan.non_zombie_members:
+        return False
+    # Group exists, scan is complete, no live members visible.
+    # Accept ONLY if the scan also saw a zombie — that proves
+    # the group's remaining member is an unreapable exited
+    # process, not something invisible to our /proc view.
+    return bool(scan.zombie_members)
 
 
 def _terminate_deploy_child() -> bool:

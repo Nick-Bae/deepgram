@@ -11,7 +11,7 @@ invoke the driver.
 
 | | |
 |---|---|
-| Driver script version | `3.3.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
+| Driver script version | `3.4.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
 | Approved PR #42 SHA to pin | recorded independently by the reviewer; passed as `--reviewer-approved-sha` and MUST equal `--pr42-sha` |
 | Script sha256 pin | recorded independently by the reviewer; passed as `--script-sha256`; driver re-hashes itself and refuses on mismatch |
 | Firebase CLI version required | `13.19.0` (passed as `--firebase-tools-version-pin`; bump requires re-running the fixture suite) |
@@ -81,18 +81,25 @@ the driver moves on:
    teardown (R6 finding 1). The drain sends SIGTERM to the PG,
    waits up to 5 s for kernel-authoritative quiescence, SIGKILLs
    any survivor, and waits up to 2 s more.
-3. **Kernel-authoritative quiescence check (R7 finding 1)** —
+3. **Kernel-authoritative quiescence check (R7 + R8)** —
    `killpg(pgid, 0)` is the *only* signal call that PROVES the
    group has been fully reaped (returns ESRCH). A `/proc` walk
    alone is insufficient because it can return an empty list on
    permission errors, mount-namespace differences, or transient
-   file-not-found conditions. The driver treats `killpg(pgid, 0)
-   == ESRCH` OR a `_pgid_scan` result with `scan_complete=True`
-   and no non-zombie members as quiescent. Any other combination
-   — including an incomplete `/proc` scan while the group still
-   exists — is FAIL-CLOSED: `trap-failure.txt` records the full
-   scan detail (including `scan_complete=False` and `scan_error_
-   notes`) and the driver exits **rc=6
+   file-not-found conditions. The driver treats a `_pgid_scan`
+   result as quiescent under exactly two conditions:
+   (a) `group_exists=False` (ESRCH — kernel authority); or
+   (b) `group_exists=True` AND `scan_complete=True` AND no live
+       non-zombie members AND **at least one visible zombie
+       member** — the group is only kept alive by unreapable
+       exited processes that cannot mutate anything.
+   The R8 requirement of "at least one visible zombie" closes
+   the false-quiescence hole where `killpg` says the group
+   exists but `/proc` shows nothing at all: that state proves
+   the scan cannot see what the kernel can (pid-namespace
+   difference, race, or hidden member). Every other combination
+   is FAIL-CLOSED: `trap-failure.txt` records the full scan
+   detail and the driver exits **rc=6
    (`deploy_group_quiescence_failed`)**. An rc=0 result is never
    returned when quiescence cannot be established.
 4. **Zombies are excluded from the live set** (R5 finding 1) —

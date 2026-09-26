@@ -1655,26 +1655,100 @@ class R7ProcScanFailClosedTests(unittest.TestCase):
         finally:
             sb.cleanup()
 
-    def test_pgscan_group_exists_flag_reflects_killpg_esrch(self):
-        """Unit-level: `_pgid_group_exists` must return False
-        (ESRCH) for a PGID with no members and True for the
-        current process's PG."""
+    def test_pgid_group_exists_mocked_killpg_semantics(self):
+        """R8: environment-independent version of the R7
+        `_pgid_group_exists` unit test. Mocks `os.killpg` so the
+        assertion isolates the mapping from signal-zero syscall
+        outcomes to the returned bool — no assumption about the
+        executor's pid or session namespace.
+
+        Contract under test:
+          - `killpg(pgid, 0)` returns cleanly → group exists.
+          - `ProcessLookupError` (ESRCH) → group absent.
+          - `PermissionError` (EPERM) → fail-closed as existing.
+          - Any other `OSError` → fail-closed as existing."""
+        from unittest import mock
         import importlib.util
         spec = importlib.util.spec_from_file_location(
-            "dep_drv_r7", str(_DRIVER),
+            "dep_drv_r8_mock", str(_DRIVER),
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        # Our own PG exists.
-        self.assertTrue(
-            mod._pgid_group_exists(os.getpgid(os.getpid())),
-            "current process's PG must be reported as existing",
+        fake_pgid = 12345
+        # Normal return → group exists.
+        with mock.patch.object(mod.os, "killpg", return_value=None):
+            self.assertTrue(mod._pgid_group_exists(fake_pgid))
+        # ProcessLookupError (ESRCH) → group absent.
+        with mock.patch.object(mod.os, "killpg",
+                               side_effect=ProcessLookupError()):
+            self.assertFalse(mod._pgid_group_exists(fake_pgid))
+        # PermissionError (EPERM) → fail-closed as existing.
+        with mock.patch.object(mod.os, "killpg",
+                               side_effect=PermissionError()):
+            self.assertTrue(mod._pgid_group_exists(fake_pgid))
+        # Generic OSError → fail-closed as existing.
+        with mock.patch.object(mod.os, "killpg",
+                               side_effect=OSError(1, "generic")):
+            self.assertTrue(mod._pgid_group_exists(fake_pgid))
+
+    def test_pgscan_is_quiescent_deterministic_assertions(self):
+        """R8 finding: the quiescence decision function must
+        distinguish 'kernel says group is gone' AND 'complete
+        scan proves only zombies remain' from the contradictory
+        state 'group exists, scan complete, but no members
+        visible'. The reviewer independently reproduced that
+        contradictory state against a real live grandchild and
+        R7 falsely declared quiescence.
+
+        These assertions are the R8 contract in tuple form."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "dep_drv_r8_q", str(_DRIVER),
         )
-        # An impossibly large PGID — no process could have that
-        # ID. killpg returns ESRCH.
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        Scan = mod._PgScan
+        q = mod._pgscan_is_quiescent
+
+        # Reviewer-required three cases:
         self.assertFalse(
-            mod._pgid_group_exists(2**30),
-            "an unused PGID must be reported as non-existent (ESRCH)",
+            q(Scan(True, [], [], True, [])),
+            "R8: contradictory state — group exists, complete "
+            "scan, no live members, NO zombies. Must fail closed.",
+        )
+        self.assertTrue(
+            q(Scan(True, [], [123], True, [])),
+            "R8: quiescent — group exists but only a zombie "
+            "member (unreapable, cannot mutate).",
+        )
+        self.assertTrue(
+            q(Scan(False, [], [], True, [])),
+            "R8: quiescent — ESRCH (kernel authority).",
+        )
+        # Additional coverage:
+        self.assertFalse(
+            q(Scan(True, [42], [], True, [])),
+            "not quiescent: live non-zombie member visible.",
+        )
+        self.assertFalse(
+            q(Scan(True, [], [], False, [])),
+            "not quiescent: incomplete scan against live group.",
+        )
+        self.assertFalse(
+            q(Scan(True, [42], [123], True, [])),
+            "not quiescent: live member outweighs visible zombies.",
+        )
+        self.assertTrue(
+            q(Scan(False, [42], [], True, [])),
+            "quiescent: kernel says group gone even if /proc "
+            "shows a stale live entry — the kernel is authority.",
+        )
+        self.assertFalse(
+            q(Scan(True, [], [], True, ["listdir(/proc): PermissionError"])),
+            "not quiescent: scan_error_notes signal an unreliable "
+            "scan; but note that the decision is dominated by "
+            "the contradiction (no members + group exists + no "
+            "zombies) regardless.",
         )
 
 
