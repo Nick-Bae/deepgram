@@ -11,7 +11,7 @@ invoke the driver.
 
 | | |
 |---|---|
-| Driver script version | `3.1.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
+| Driver script version | `3.2.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
 | Approved PR #42 SHA to pin | recorded independently by the reviewer; passed as `--reviewer-approved-sha` and MUST equal `--pr42-sha` |
 | Script sha256 pin | recorded independently by the reviewer; passed as `--script-sha256`; driver re-hashes itself and refuses on mismatch |
 | Firebase CLI version required | `13.19.0` (passed as `--firebase-tools-version-pin`; bump requires re-running the fixture suite) |
@@ -63,23 +63,45 @@ All under `--audit-dir`, all mode 700, all hashed:
 - `final/` — same shape as pre and post; taken after READY; diffed FULLY against pre for composites AND field overrides.
 - `deploy/deploy.stdout`, `deploy/deploy.stderr`, `deploy/deploy.rc`, `deploy/cmd.txt` — the exact firebase deploy invocation + output.
 
-## Signal handling
+## Signal handling and process-group quiescence
 
-Driver installs an atexit hook + SIGINT/SIGTERM handler that
-fires exactly once. The handler:
+The driver treats the deploy child's whole process group as a
+single lifecycle unit. Every phase enforces quiescence before
+the driver moves on:
 
-1. **SIGTERMs the deploy child's whole process group**, waits up to 5 s for **every member** to drain (not just the direct firebase child — R5 finding 1), **SIGKILLs any survivor**, and waits up to 2 s more. If any process is still alive after SIGKILL, the driver appends a line to `<audit>/trap-failure.txt` recording the surviving PIDs so the operator knows the post-snapshot cannot be trusted as a quiescent capture.
-2. Reaps the direct Popen child so no zombie remains.
-3. Takes the post-snapshot.
-4. Re-raises the original signal so the process exits with the canonical signal exit code.
+1. **PGID is captured at Popen** — the child is launched with
+   `start_new_session=True`, so it is process-group leader
+   immediately and its PGID equals its PID. The driver records
+   that value synchronously (R6 finding 1). Later trap code
+   never re-derives the PGID via `os.getpgid(popen.pid)` — that
+   call would fail with `ProcessLookupError` on a reaped leader,
+   which would leave a surviving descendant undetected.
+2. **A whole-PG drain runs on every `_deploy` exit path** —
+   normal rc=0, non-zero exit, timeout, and signal-triggered
+   teardown (R6 finding 1). The drain sends SIGTERM to the PG,
+   waits up to 5 s for every non-zombie member to disappear
+   from `/proc`, SIGKILLs any survivor, and waits up to 2 s
+   more. Zombie processes (`state == 'Z'`) are excluded — they
+   cannot run user code (R5 finding 1).
+3. **`trap-failure.txt` records the survivor list** if any
+   process outlives SIGKILL, and the driver exits **rc=6
+   (`deploy_group_quiescence_failed`)** — an rc=0 result is
+   not returned when quiescence cannot be established.
+4. The signal-handler trap additionally takes the post-snapshot
+   and re-raises the original signal so the process exits with
+   the canonical signal exit code.
 
-Fixtures under `R5ProcessGroupDrainTests` prove that a
-grandchild which installs `SIG_IGN` for SIGTERM does NOT
-survive the trap: only a whole-PG SIGKILL escalation
-(not a bare `Popen.wait()` on the direct child) prevents its
-delayed state mutation. The earlier R4 fixture
-`test_sigint_mid_deploy_terminates_process_group_and_prevents_late_mutation`
-continues to cover the default-SIGTERM-handling case.
+Fixture coverage:
+
+- `R6DeployGroupQuiescenceTests` — leader-exits-early race
+  (fake firebase forks a same-PG grandchild that installs
+  `SIG_IGN` for SIGTERM, then exits rc=0 immediately) and
+  normal-rc=0 race (successful deploy leaves a delayed-mutation
+  grandchild).
+- `R5ProcessGroupDrainTests` — grandchild ignoring SIGTERM
+  during a SIGINT-mid-deploy.
+- `test_sigint_mid_deploy_terminates_process_group_and_prevents_late_mutation`
+  (R4) — default-SIGTERM-handling grandchild during a SIGINT.
 
 ## Recovery is a compensating change, NOT a git revert
 

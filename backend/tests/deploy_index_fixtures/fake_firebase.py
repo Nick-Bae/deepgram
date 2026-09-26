@@ -42,6 +42,32 @@ State drives:
                                      the-whole-PG (not just wait()
                                      on the direct child) can
                                      prevent the mutation.
+    - "leader_exits_early_grandchild_ignores_sigterm" (R6) —
+                                     spawn a same-PG grandchild
+                                     that installs SIG_IGN for
+                                     SIGTERM AND would mutate
+                                     state after
+                                     `sabotage_mutation_delay`
+                                     seconds, then have the
+                                     direct firebase child EXIT
+                                     with rc=0 immediately. The
+                                     driver's `Popen.wait()`
+                                     returns rc=0 while the
+                                     grandchild remains alive.
+                                     Only a whole-PG drain that
+                                     runs on the rc=0 path can
+                                     prevent the mutation.
+    - "commit_success_grandchild_delayed_mutation" (R6) —
+                                     publishes rooms.status
+                                     override AND spawns a same-PG
+                                     grandchild that would mutate
+                                     state after
+                                     `sabotage_mutation_delay`
+                                     seconds. The direct firebase
+                                     child exits rc=0 as usual.
+                                     Only a whole-PG drain on the
+                                     normal-exit path stops the
+                                     late mutation.
     - "commit_regresses_after_ready" — CG_ASC observes READY once
                                      then MISSING (finding 7)
 """
@@ -314,6 +340,107 @@ def _apply_deploy_effect(state_path: Path, state: dict) -> None:
         os.kill(parent_pid, signal.SIGINT)
         # Hang: rely on the driver's SIGTERM/SIGKILL to end us.
         time.sleep(max(30.0, mutation_delay + 15.0))
+        return
+    if effect == "leader_exits_early_grandchild_ignores_sigterm":
+        # R6 finding 1a: the direct firebase child (this fake)
+        # EXITS immediately after forking a same-PG grandchild
+        # that installs SIG_IGN for SIGTERM. `Popen.wait()`
+        # returns rc=0 while the grandchild is still alive; the
+        # earlier code path resolved the PGID via
+        # `os.getpgid(popen.pid)` at trap time, so a reaped
+        # leader would have raised `ProcessLookupError` and the
+        # driver would have quietly returned without checking
+        # the descendant. R6 captures the PGID at Popen time and
+        # runs the drain on every exit path.
+        ready_path = state_path.parent / "sabotage_gc_ready_leader_exit.txt"
+        mutation_delay = float(state.get("sabotage_mutation_delay", 10.0))
+        pid = os.fork()
+        if pid == 0:
+            # Grandchild: same PG, SIGTERM-ignoring, delayed
+            # mutation.
+            try:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except Exception:
+                pass
+            try:
+                ready_path.write_text(f"{os.getpid()}\n")
+            except Exception:
+                pass
+            end = time.monotonic() + mutation_delay
+            while time.monotonic() < end:
+                time.sleep(0.25)
+            try:
+                cur = json.loads(state_path.read_text())
+                cur["late_child_mutation"] = True
+                cur["composites"] = cur.get("composites", []) + [{
+                    "collectionGroup": "sabotage_group_leader_exit",
+                    "fields": [{"fieldPath": "x",
+                                "order": "ASCENDING"}],
+                    "queryScope": "COLLECTION",
+                    "state": "READY",
+                }]
+                state_path.write_text(json.dumps(cur, indent=2) + "\n")
+            except Exception:
+                pass
+            os._exit(0)
+        # Parent (fake firebase): wait for the grandchild's
+        # ready marker so the test knows it exists, then EXIT
+        # rc=0 immediately — the driver sees a successful deploy
+        # yet a same-PG process remains.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not ready_path.exists():
+            time.sleep(0.05)
+        # Return rc=0 — the direct child completed successfully
+        # from the driver's point of view.
+        state["deploy_rc"] = 0
+        _save_state(state_path, state)
+        return
+    if effect == "commit_success_grandchild_delayed_mutation":
+        # R6 finding 1b: a successful deploy path (rooms.status
+        # published, poll_state_sequence armed to READY) AND a
+        # same-PG grandchild with a delayed mutation. If the R6
+        # drain does not run on the rc=0 path, the grandchild's
+        # mutation fires and corrupts the final snapshot.
+        _publish_rooms_status(state)
+        state["poll_state_sequence"] = ["READY"]
+        state["deploy_committed"] = True
+        ready_path = state_path.parent / "sabotage_gc_ready_success.txt"
+        mutation_delay = float(state.get("sabotage_mutation_delay", 10.0))
+        pid = os.fork()
+        if pid == 0:
+            try:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except Exception:
+                pass
+            try:
+                ready_path.write_text(f"{os.getpid()}\n")
+            except Exception:
+                pass
+            end = time.monotonic() + mutation_delay
+            while time.monotonic() < end:
+                time.sleep(0.25)
+            try:
+                cur = json.loads(state_path.read_text())
+                cur["late_child_mutation"] = True
+                cur["composites"] = cur.get("composites", []) + [{
+                    "collectionGroup": "sabotage_group_success",
+                    "fields": [{"fieldPath": "x",
+                                "order": "ASCENDING"}],
+                    "queryScope": "COLLECTION",
+                    "state": "READY",
+                }]
+                state_path.write_text(json.dumps(cur, indent=2) + "\n")
+            except Exception:
+                pass
+            os._exit(0)
+        # Wait for the grandchild's ready marker, then return
+        # rc=0. The parent must not linger — this scenario
+        # simulates a successful firebase invocation that leaves
+        # a background task behind.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not ready_path.exists():
+            time.sleep(0.05)
+        _save_state(state_path, state)
         return
     # R4 finding 4: post-READY late-mutation scenarios. These
     # arm a mutation that fake_gcloud applies AFTER the driver's

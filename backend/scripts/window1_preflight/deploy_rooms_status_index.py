@@ -37,15 +37,23 @@ Exit codes
 ----------
     0  success — deploy committed, READY, all diffs match
     1  usage / argparse (includes invalid env-var value)
-    2  preconditions (CLI missing, wrong version, ADC absent)
+    2  preconditions (CLI missing, wrong version, worktree pin
+       mismatch, driver-sha mismatch, non-empty audit dir)
     3  pre-snapshot failure
     4  target confirmation failure (project / database / firebase.json)
     5  static invariants / delta failure (PR #42 file wrong shape)
-    6  deploy command failed (non-zero or timeout)
+    6  deploy command failed — non-zero exit, timeout, OR a
+       descendant in the deploy process group outlived the direct
+       firebase child (`deploy_group_quiescence_failed`, R6)
     7  post-snapshot or post-snapshot diff failure
     8  polling failure (NEEDS_REPAIR / MISSING / timeout)
     9  final snapshot or final-diff failure
    99  internal / unexpected error
+
+Note: the driver does not explicitly validate Application
+Default Credentials — authentication is delegated to the gcloud
+and firebase CLIs and surfaces through their exit codes / stderr,
+not through a separate preconditions check.
 
 Environment variables
 ---------------------
@@ -96,7 +104,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "3.1.0"  # R5: full process-group drain (SIGTERM→wait→SIGKILL survivors→quiescence marker), env-default routed through rc=1, docstring cleanup
+SCRIPT_VERSION = "3.2.0"  # R6: capture _DEPLOY_PGID at Popen (no getpgid race), drain on every deploy exit path (incl. rc=0), non-quiescence fails rc=6
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -184,6 +192,26 @@ _POST_SNAPSHOT_TAKEN = False
 # yet-reaped child could still be flushing writes when we read
 # state.
 _DEPLOY_POPEN: "subprocess.Popen | None" = None
+# R6 finding 1: retained PGID of the deploy child. Captured
+# IMMEDIATELY after `subprocess.Popen(..., start_new_session=True)`
+# — that flag guarantees the child is session + process-group
+# leader, so PGID == PID at the moment Popen returns. Capturing
+# it synchronously eliminates the R5 race where `os.getpgid(pid)`
+# was called later (from `_terminate_deploy_child`) and could
+# fail with `ProcessLookupError` if the leader had already been
+# reaped, leaving no way to reach a surviving grandchild.
+_DEPLOY_PGID: "int | None" = None
+# R6: cached quiescence result. `_terminate_deploy_child()` is
+# called on every `_deploy` exit path AND from the trap; the trap
+# needs to see the drain result from an earlier `_deploy` call
+# without re-executing the drain (which would race the trap's
+# own snapshot). None means "no drain has run yet"; True/False is
+# the cached result of the most recent run.
+_LAST_DRAIN_QUIESCENT: "bool | None" = None
+# R6: last PGID we tried to drain — kept so a quiescence-failure
+# message from `_deploy` can name the group even after the
+# globals are cleared.
+_LAST_DEPLOY_PGID: "int | None" = None
 # R5 finding 1: shared marker path so `_terminate_deploy_child()`
 # can record a quiescence failure even when the trap installer
 # hasn't been reached (e.g., mid-deploy exception path from
@@ -269,7 +297,18 @@ def _wait_pgid_drained(pgid: int, timeout: float) -> list[int]:
     """Poll `_pgid_alive_members` until either empty or `timeout`
     seconds elapse. Returns the list of survivor PIDs at exit time
     (empty means fully drained). Uses monotonic time so a wall-clock
-    jump cannot short-circuit or overrun the grace budget."""
+    jump cannot short-circuit or overrun the grace budget.
+
+    Test hook: `PR42_TESTING_FORCE_DRAIN_SURVIVOR=1` in the
+    environment forces this helper to return a synthetic non-
+    empty list (`[pgid + 1]`) so tests can exercise the
+    quiescence-failure branch of `_terminate_deploy_child` /
+    `_deploy` without relying on a real SIGKILL-immune process
+    (which does not exist under POSIX). The env-var name is
+    long and unique so it cannot be flipped by accident in
+    production."""
+    if os.environ.get("PR42_TESTING_FORCE_DRAIN_SURVIVOR") == "1":
+        return [pgid + 1]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         alive = _pgid_alive_members(pgid)
@@ -279,44 +318,51 @@ def _wait_pgid_drained(pgid: int, timeout: float) -> list[int]:
     return _pgid_alive_members(pgid)
 
 
-def _terminate_deploy_child() -> None:
-    """R5 finding 1: SIGTERM the whole deploy process group, WAIT
-    for every member to drain (not just the direct firebase child),
-    SIGKILL survivors, then reap the direct Popen so no zombie is
-    left behind.
+def _terminate_deploy_child() -> bool:
+    """R5 finding 1 / R6 finding 1: SIGTERM the whole deploy
+    process group, WAIT for every member to drain (not just the
+    direct firebase child), SIGKILL survivors, then reap the
+    direct Popen so no zombie is left behind.
 
-    Prior versions waited only on the direct Popen. If a grandchild
-    (e.g., a node subprocess of firebase-tools) ignored SIGTERM,
-    `Popen.wait()` returned as soon as the direct child exited,
-    and the driver's post-snapshot could race the grandchild's
-    still-in-flight production writes.
+    R6: uses the PGID captured immediately after Popen (via
+    `_DEPLOY_PGID`) rather than a late `os.getpgid(popen.pid)`.
+    That earlier version had a race — if the direct firebase
+    child had already been reaped when the trap ran,
+    `getpgid()` raised `ProcessLookupError` and the driver
+    quietly waited on Popen, never checking whether a same-PG
+    descendant remained. The retained PGID stays valid even
+    after the leader exits (a PG can outlive its leader), so
+    walking `/proc` for its members still works.
 
-    Best-effort; swallows OSError so the trap's snapshot step can
-    still run. Records `<audit>/trap-failure.txt` if any process
-    outlives SIGKILL — that marker tells the operator the post-
-    snapshot cannot be trusted as a quiescent capture."""
-    global _DEPLOY_POPEN
+    Returns True if the group drained cleanly, False if any
+    non-zombie process was still alive after SIGKILL + its
+    grace window. Cached in `_LAST_DRAIN_QUIESCENT` so callers
+    that hit this on subsequent paths see the earlier result
+    without re-running.
+
+    Best-effort; swallows OSError so the trap's snapshot step
+    can still run. Records `<audit>/trap-failure.txt` on
+    quiescence failure so the operator sees the post-snapshot
+    cannot be trusted as a quiescent capture."""
+    global _DEPLOY_POPEN, _DEPLOY_PGID
+    global _LAST_DRAIN_QUIESCENT, _LAST_DEPLOY_PGID
     popen = _DEPLOY_POPEN
-    if popen is None:
-        return
+    pgid = _DEPLOY_PGID
+    if pgid is None:
+        # Either the deploy never started or drain already ran.
+        # Return the cached result — True by default (nothing to
+        # do), False if a prior run recorded a leak.
+        return True if _LAST_DRAIN_QUIESCENT is None else _LAST_DRAIN_QUIESCENT
+    # Consume the retained state; leave `_LAST_*` set so a second
+    # call (from the trap after `_deploy` already drained) sees
+    # the same answer without re-executing.
     _DEPLOY_POPEN = None
-    # Resolve the process group BEFORE we start signalling — once
-    # the leader exits the pgrp of any surviving grandchild is
-    # unchanged, so this identifier remains valid.
-    try:
-        pgid = os.getpgid(popen.pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        # Cannot identify the PG — best we can do is reap the
-        # direct child if it hasn't been reaped already.
-        try:
-            popen.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
-        return
+    _DEPLOY_PGID = None
+    _LAST_DEPLOY_PGID = pgid
 
-    # SIGTERM the ENTIRE group (not just the direct child).
+    # SIGTERM the ENTIRE group. The retained pgid is authoritative
+    # even if the group leader has already exited — process
+    # groups outlive their leader until every member is reaped.
     try:
         os.killpg(pgid, signal.SIGTERM)
     except (ProcessLookupError, OSError):
@@ -336,15 +382,20 @@ def _terminate_deploy_child() -> None:
         survivors = _wait_pgid_drained(pgid, timeout=TRAP_SIGKILL_GRACE_SEC)
 
     # Reap the direct child so its exit status is collected and no
-    # zombie remains.
-    try:
-        popen.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        pass
-    except Exception:
-        pass
+    # zombie remains. Skip if popen was already reaped elsewhere
+    # (e.g., `_deploy` called `proc.wait()` before we ran).
+    if popen is not None:
+        try:
+            popen.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
 
-    if survivors:
+    quiescent = not survivors
+    _LAST_DRAIN_QUIESCENT = quiescent
+
+    if not quiescent:
         # SIGKILL didn't clear the group — the post-snapshot cannot
         # be trusted as a quiescent capture. Record the survivors
         # so the operator can investigate; do NOT swallow.
@@ -352,6 +403,7 @@ def _terminate_deploy_child() -> None:
             "quiescence_not_established",
             f"pgid={pgid} pids_alive_after_sigkill={sorted(survivors)!r}",
         )
+    return quiescent
 
 
 def _install_trap(audit_dir: Path, gcloud: str) -> None:
@@ -897,10 +949,25 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
 
     R3 finding 6 + R4: the child runs in its own session so a
     signal to the driver doesn't leave firebase (and its
-    `firebase-tools` spawns) mutating production. The R4 driver
-    retains the full `Popen` object as `_DEPLOY_POPEN` — the trap
-    uses that to killpg AND wait() before snapshotting."""
-    global _DEPLOY_POPEN
+    `firebase-tools` spawns) mutating production. R4 retained
+    the Popen for the trap to killpg AND wait() before
+    snapshotting.
+
+    R6 finding 1: the driver ALSO retains the PGID (captured
+    synchronously from `proc.pid` — `start_new_session=True`
+    guarantees the child is PG leader, so PGID == PID), and runs
+    a whole-group drain on EVERY exit path: normal zero exit,
+    non-zero exit, timeout, or unhandled exception. Without this,
+    a grandchild that outlived the direct firebase child could
+    race the driver's post-snapshot and mutate production after
+    firebase returned rc=0.
+
+    If any process in the group is still alive after the drain's
+    SIGKILL grace window, the driver appends the survivors to
+    `<audit>/trap-failure.txt` (via `_terminate_deploy_child`)
+    AND exits with rc=6 (`deploy_group_quiescence_failed`) — an
+    rc=0 result is not permitted when quiescence is uncertain."""
+    global _DEPLOY_POPEN, _DEPLOY_PGID
     deploy_dir = audit_dir / "deploy"
     deploy_dir.mkdir(parents=True, exist_ok=True)
     deploy_dir.chmod(0o700)
@@ -914,6 +981,7 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
     (deploy_dir / "cmd.txt").write_text(json.dumps(cmd) + "\n")
     so = (deploy_dir / "deploy.stdout").open("wb")
     se = (deploy_dir / "deploy.stderr").open("wb")
+    rc: int = 0
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(worktree),
@@ -921,6 +989,15 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
             start_new_session=True,
         )
         _DEPLOY_POPEN = proc
+        # R6 finding 1: capture the PGID SYNCHRONOUSLY. With
+        # `start_new_session=True`, the child is session +
+        # process-group leader immediately after fork/exec, so
+        # PGID == PID. Doing this here (rather than deferring to
+        # `os.getpgid(popen.pid)` at trap time) makes the PGID
+        # retention race-free: even if the direct child is reaped
+        # before the trap runs, the retained PGID stays valid
+        # for `os.killpg` and `/proc` membership walks.
+        _DEPLOY_PGID = proc.pid
         try:
             rc = proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
@@ -928,15 +1005,35 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
                 f"\n\n[driver] firebase deploy timed out after "
                 f"{timeout_sec:.0f}s — terminating process group\n".encode()
             )
+            # _terminate_deploy_child clears _DEPLOY_POPEN /
+            # _DEPLOY_PGID and caches the quiescence result.
             _terminate_deploy_child()
             rc = 124  # matches GNU `timeout` exit code convention
     finally:
         so.close()
         se.close()
-        # Normal exit: child is already reaped by wait(). Clear
-        # the ref so the trap doesn't wait() again.
-        _DEPLOY_POPEN = None
+        # R6 finding 1: drain the PG on every exit path — success
+        # (rc=0), non-zero, timeout, or exception. A descendant in
+        # the same PG that outlived the direct child would race
+        # the post-snapshot. Idempotent: if the timeout branch
+        # already drained, this returns the cached result.
+        quiescent = _terminate_deploy_child()
     (deploy_dir / "deploy.rc").write_text(f"{rc}\n")
+
+    if not quiescent:
+        # R6 finding 1: an rc=0 result is not permitted when
+        # descendants outlived the direct child — the post-
+        # snapshot would race their in-flight writes. trap-
+        # failure.txt already lists the survivor PIDs.
+        pgid_str = str(_LAST_DEPLOY_PGID) if _LAST_DEPLOY_PGID else "?"
+        _die(
+            RC.DEPLOY, "deploy_group_quiescence_failed",
+            f"firebase deploy direct child exited rc={rc}, but "
+            f"descendants in pgid={pgid_str} did not drain after "
+            f"SIGTERM+SIGKILL. See trap-failure.txt for the "
+            f"survivor list. An rc=0 result is not returned when "
+            f"quiescence cannot be established."
+        )
     return rc
 
 
