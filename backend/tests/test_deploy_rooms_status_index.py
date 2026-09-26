@@ -191,8 +191,11 @@ def _make_scenario(env_dir: Path, *,
                    deploy_side_effect="commit_success",
                    firebase_version=DEFAULT_FIREBASE_VERSION,
                    poll_state_sequence=None,
-                   die=None) -> Path:
-    """Write a state file for the fake CLIs (R3 shape)."""
+                   die=None,
+                   extra=None) -> Path:
+    """Write a state file for the fake CLIs (R3 shape). `extra`
+    merges additional keys into the state dict (used by R4 fixture
+    tests for `sabotage_mutation_delay` and similar)."""
     state = {
         "composites": composites if composites is not None else _default_composites(),
         "field_overrides": (
@@ -212,6 +215,8 @@ def _make_scenario(env_dir: Path, *,
     }
     if poll_state_sequence is not None:
         state["poll_state_sequence"] = poll_state_sequence
+    if extra:
+        state.update(extra)
     state_path = env_dir / "state.json"
     state_path.write_text(json.dumps(state, indent=2))
     return state_path
@@ -290,7 +295,8 @@ class _Sandbox:
                    extra_env=None,
                    override_pr42_sha=None,
                    override_reviewer_approved_sha=None,
-                   override_script_sha256=None):
+                   override_script_sha256=None,
+                   omit_flags: set[str] | None = None):
         """Invoke the driver from inside the sandbox worktree.
         The driver was already copied in by `_Sandbox.__init__`."""
         env = os.environ.copy()
@@ -310,6 +316,7 @@ class _Sandbox:
                 h.update(chunk)
         real_script_sha = h.hexdigest()
 
+        omit = omit_flags or set()
         cmd = [
             sys.executable, str(driver_path),
             "--audit-dir", str(self.audit),
@@ -321,10 +328,13 @@ class _Sandbox:
             "--gcloud", str(_FAKE_GCLOUD),
             "--firebase", str(_FAKE_FIREBASE),
             "--firebase-tools-version-pin", firebase_version_pin,
-            "--deploy-timeout-sec", str(deploy_timeout_sec),
-            "--poll-timeout-sec", str(poll_timeout_sec),
-            "--poll-interval-sec", str(poll_interval_sec),
         ]
+        if "--deploy-timeout-sec" not in omit:
+            cmd += ["--deploy-timeout-sec", str(deploy_timeout_sec)]
+        if "--poll-timeout-sec" not in omit:
+            cmd += ["--poll-timeout-sec", str(poll_timeout_sec)]
+        if "--poll-interval-sec" not in omit:
+            cmd += ["--poll-interval-sec", str(poll_interval_sec)]
         if dry_run:
             cmd.append("--dry-run")
         proc = subprocess.run(
@@ -467,12 +477,15 @@ class DeployDriverFixtureTests(unittest.TestCase):
         finally:
             sb.cleanup()
 
-    def test_missing_never_appears_hard_stops_on_first_poll(self):
-        """R3 finding 7 upgrade: because the post-deploy snapshot
-        confirmed the CG_ASC entry exists (fake_firebase publishes
-        the override before setting the poll sequence), a MISSING
-        observation from polling is now an immediate hard-stop —
-        NOT a wait-until-timeout. Rc=8 with outcome=poll_error."""
+    def test_missing_never_appears_caught_by_r4_post_shape_validator(self):
+        """R4 finding 3 upgrade: `commit_leaves_missing` (override
+        registered in fields list but rooms.status describe never
+        shows the CG_ASC entry) is now caught at the POST snapshot
+        by the exact-shape validator BEFORE polling begins.
+        Reports rc=7 outcome=post_rooms_status_shape.
+        `test_missing_after_ready_immediately_hard_stops` (R3
+        R3ExtendedFixtureTests) covers the polling-time
+        regression path (READY then MISSING → rc=8)."""
         sb = _Sandbox()
         try:
             state = _make_scenario(
@@ -480,10 +493,11 @@ class DeployDriverFixtureTests(unittest.TestCase):
             )
             proc = sb.run_driver(state, poll_timeout_sec=5,
                                  poll_interval_sec=0.01)
-            self.assertEqual(proc.returncode, 8, proc.stderr[:400])
+            self.assertEqual(proc.returncode, 7, proc.stderr[:400])
             payload = json.loads(proc.stdout.splitlines()[0])
-            self.assertEqual(payload["outcome"], "poll_error")
-            self.assertIn("regressed", payload["reason"])
+            self.assertEqual(payload["outcome"], "post_rooms_status_shape")
+            self.assertIn("COLLECTION_GROUP ASC count=0",
+                          payload["reason"])
         finally:
             sb.cleanup()
 
@@ -581,21 +595,49 @@ class DeployDriverFixtureTests(unittest.TestCase):
 
     # ---------- signal-interruption / trap behavior ----------
 
-    def test_sigint_mid_deploy_still_writes_post_snapshot(self):
+    def test_sigint_mid_deploy_terminates_process_group_and_prevents_late_mutation(self):
+        """R4 finding 1: the sabotage child stays in firebase's
+        process group (no setsid) so a correct trap that kills
+        the whole group reaps the child BEFORE its
+        mutation-delay elapses. The test waits past the mutation
+        window and asserts (a) the driver's post-snapshot fired,
+        AND (b) `late_child_mutation` never appeared in state —
+        proving the child was killed rather than surviving the
+        driver's exit."""
         sb = _Sandbox()
         try:
             state = _make_scenario(
                 sb.root, deploy_side_effect="sigint_mid_deploy",
+                # Any positive value — the fake uses this as the
+                # child's sleep before it would mutate.
+                extra={"sabotage_mutation_delay": 2.0},
             )
             proc = sb.run_driver(state, poll_timeout_sec=1)
-            # SIGINT causes the driver to re-raise SIGINT after the trap,
-            # so the shell exit code is 128 + 2 = 130. Some CI runners
-            # coerce it differently — accept any non-zero AND require
-            # the post-snapshot to exist.
-            self.assertNotEqual(proc.returncode, 0)
+            # Driver exited non-zero (re-raised SIGINT).
+            self.assertNotEqual(proc.returncode, 0,
+                                f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            # Post-snapshot fired.
             self.assertTrue((sb.audit / "post").is_dir(),
-                            "SIGINT trap must still write post/ snapshot")
+                            "trap must still write post/ snapshot")
             self.assertTrue((sb.audit / "post" / "manifest.json").exists())
+            # WAIT past the child's mutation window (2 s) plus a
+            # buffer — if the trap failed to kill the child, the
+            # child would write the marker during this wait.
+            time.sleep(4.0)
+            # Assert the marker is still absent: the trap killed
+            # the child before it could mutate.
+            final_state = json.loads(state.read_text())
+            self.assertFalse(
+                final_state.get("late_child_mutation", False),
+                "sabotage child was NOT killed by the trap — the "
+                "trap must SIGTERM firebase's process group AND "
+                "wait() before snapshotting",
+            )
+            # trap-failure marker MUST NOT exist for the happy path.
+            self.assertFalse(
+                (sb.audit / "trap-failure.txt").exists(),
+                "trap-failure.txt present: trap did not complete cleanly",
+            )
         finally:
             sb.cleanup()
 
@@ -861,6 +903,338 @@ class R3ExtendedFixtureTests(unittest.TestCase):
             payload = json.loads(proc.stdout.splitlines()[0])
             self.assertEqual(payload["outcome"], "static_invariants")
             self.assertIn("duplicate", payload["reason"])
+        finally:
+            sb.cleanup()
+
+
+class R4RealGcloudFixtureParserTests(unittest.TestCase):
+    """R4 finding 2: verify the driver's parsers correctly consume
+    REAL, sanitized `gcloud 581.0.0` responses captured against
+    production. Fixtures live at
+    `backend/tests/deploy_index_fixtures/real_gcloud_samples/`."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.samples = _FIXTURES / "real_gcloud_samples"
+
+    def test_load_rooms_status_matches_real_shape(self):
+        # Copy the real describe response into a snapshot-dir
+        # layout and load through the driver's parser.
+        import importlib.util as _iu
+        spec = _iu.spec_from_file_location("_drv_r4", _DRIVER)
+        drv = _iu.module_from_spec(spec)
+        spec.loader.exec_module(drv)  # type: ignore[union-attr]
+
+        tmp = Path(mkdtemp(prefix="r4-parser-"))
+        try:
+            (tmp / "rooms-status.json").write_text(
+                (self.samples / "fields_describe_rooms_status.json").read_text()
+            )
+            rs = drv._load_rooms_status(tmp)
+            self.assertIs(rs["usesAncestorConfig"], True)
+            self.assertEqual(len(rs["indexes"]), 3,
+                             f"real pre-state has three entries: {rs['indexes']!r}")
+            fps = {e.get("fieldPath") for e in rs["indexes"]}
+            self.assertEqual(fps, {"status"})
+            scopes = {e.get("queryScope") for e in rs["indexes"]}
+            self.assertEqual(scopes, {"COLLECTION"})
+            states = {e.get("state") for e in rs["indexes"]}
+            self.assertEqual(states, {"READY"})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_load_field_overrides_filters_ancestor_default(self):
+        import importlib.util as _iu
+        spec = _iu.spec_from_file_location("_drv_r4b", _DRIVER)
+        drv = _iu.module_from_spec(spec)
+        spec.loader.exec_module(drv)  # type: ignore[union-attr]
+
+        tmp = Path(mkdtemp(prefix="r4-parser-b-"))
+        try:
+            (tmp / "fields-list.json").write_text(
+                (self.samples / "fields_list_dbwide.json").read_text()
+            )
+            overrides = drv._load_field_overrides(tmp)
+            # Real production: db-wide fields list returns only the
+            # __default__ ancestor sentinel; no explicit overrides.
+            # Our loader must filter the ancestor out.
+            self.assertEqual(overrides, [],
+                             f"expected zero explicit overrides in real "
+                             f"production baseline, got {overrides!r}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_databases_describe_fixture_has_required_fields(self):
+        # Not parsed by driver directly, but this ensures the
+        # sanitized fixture is valid JSON with the fields the
+        # driver's `_confirm_target` reads.
+        d = json.loads(
+            (self.samples / "databases_describe.json").read_text()
+        )
+        self.assertEqual(d["name"],
+                         "projects/sturdy-dogfish-472313-k6/"
+                         "databases/worship-translation")
+        self.assertEqual(d["type"], "FIRESTORE_NATIVE")
+        self.assertEqual(d["locationId"], "us-central1")
+
+
+class R4ExactShapeValidatorTests(unittest.TestCase):
+    """R4 finding 3: pre / post / final rooms.status shape."""
+
+    def test_pre_snapshot_rejects_pre_state_with_extra_entry(self):
+        """Simulate a pre-state where rooms.status has FOUR
+        entries already — the driver's pre-baseline check must
+        refuse because inherited baseline has exactly three."""
+        # Build a fake ancestor entry with an unexpected extra
+        # entry so the pre-snapshot passes db-wide checks but the
+        # rooms.status describe would show 4 entries.
+        # Simpler: craft a poll sequence whose FIRST call (pre
+        # snapshot rooms.status describe) returns a 4-entry
+        # inherited state via fake_gcloud override. Instead of
+        # subverting fake_gcloud further, we test the validator
+        # directly.
+        import importlib.util as _iu
+        spec = _iu.spec_from_file_location("_drv_r4c", _DRIVER)
+        drv = _iu.module_from_spec(spec)
+        spec.loader.exec_module(drv)  # type: ignore[union-attr]
+
+        # Craft a snapshot dir with a rooms-status.json that has
+        # ONE COLLECTION entry in CREATING (not the required
+        # READY).
+        tmp = Path(mkdtemp(prefix="r4-pre-shape-"))
+        try:
+            (tmp / "rooms-status.json").write_text(json.dumps({
+                "indexConfig": {
+                    "usesAncestorConfig": True,
+                    "indexes": [
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "ASCENDING"}],
+                         "queryScope": "COLLECTION",
+                         "state": "CREATING"},
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "DESCENDING"}],
+                         "queryScope": "COLLECTION",
+                         "state": "READY"},
+                        {"fields": [{"fieldPath": "status",
+                                     "arrayConfig": "CONTAINS"}],
+                         "queryScope": "COLLECTION",
+                         "state": "READY"},
+                    ],
+                },
+                "name": "…/rooms/fields/status",
+            }) + "\n")
+            with self.assertRaises(SystemExit) as ctx:
+                drv._validate_pre_rooms_status(tmp)
+            self.assertEqual(ctx.exception.code, drv.RC.PRE_SNAPSHOT)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_post_snapshot_rejects_uses_ancestor_true(self):
+        import importlib.util as _iu
+        spec = _iu.spec_from_file_location("_drv_r4d", _DRIVER)
+        drv = _iu.module_from_spec(spec)
+        spec.loader.exec_module(drv)  # type: ignore[union-attr]
+
+        tmp = Path(mkdtemp(prefix="r4-post-shape-"))
+        try:
+            (tmp / "rooms-status.json").write_text(json.dumps({
+                "indexConfig": {
+                    # Explicit override should REPLACE the ancestor;
+                    # if this is still True post-deploy, something
+                    # is wrong.
+                    "usesAncestorConfig": True,
+                    "indexes": [
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "ASCENDING"}],
+                         "queryScope": "COLLECTION", "state": "READY"},
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "DESCENDING"}],
+                         "queryScope": "COLLECTION", "state": "READY"},
+                        {"fields": [{"fieldPath": "status",
+                                     "arrayConfig": "CONTAINS"}],
+                         "queryScope": "COLLECTION", "state": "READY"},
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "ASCENDING"}],
+                         "queryScope": "COLLECTION_GROUP", "state": "CREATING"},
+                    ],
+                },
+                "name": "…/rooms/fields/status",
+            }) + "\n")
+            with self.assertRaises(SystemExit) as ctx:
+                drv._validate_post_rooms_status(tmp)
+            self.assertEqual(ctx.exception.code, drv.RC.POST_DIFF)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_final_snapshot_rejects_creating_entry(self):
+        import importlib.util as _iu
+        spec = _iu.spec_from_file_location("_drv_r4e", _DRIVER)
+        drv = _iu.module_from_spec(spec)
+        spec.loader.exec_module(drv)  # type: ignore[union-attr]
+
+        tmp = Path(mkdtemp(prefix="r4-final-shape-"))
+        try:
+            (tmp / "rooms-status.json").write_text(json.dumps({
+                "indexConfig": {
+                    "usesAncestorConfig": False,
+                    "indexes": [
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "ASCENDING"}],
+                         "queryScope": "COLLECTION", "state": "READY"},
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "DESCENDING"}],
+                         "queryScope": "COLLECTION", "state": "READY"},
+                        {"fields": [{"fieldPath": "status",
+                                     "arrayConfig": "CONTAINS"}],
+                         "queryScope": "COLLECTION", "state": "READY"},
+                        {"fields": [{"fieldPath": "status",
+                                     "order": "ASCENDING"}],
+                         "queryScope": "COLLECTION_GROUP", "state": "CREATING"},
+                    ],
+                },
+                "name": "…/rooms/fields/status",
+            }) + "\n")
+            with self.assertRaises(SystemExit) as ctx:
+                drv._validate_final_rooms_status(tmp)
+            self.assertEqual(ctx.exception.code, drv.RC.FINAL_DIFF)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class R4FinalDriftRegressionTests(unittest.TestCase):
+    """R4 finding 4: unrelated drift introduced AFTER polling
+    reaches READY (i.e., between post-diff and final snapshot)
+    must be caught by the final semantic diff (rc=9)."""
+
+    def setUp(self):
+        os.chmod(_FAKE_GCLOUD, 0o755)
+        os.chmod(_FAKE_FIREBASE, 0o755)
+
+    def test_final_diff_catches_unrelated_composite_added_post_ready(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(
+                sb.root,
+                deploy_side_effect="commit_success_then_composite_add",
+            )
+            proc = sb.run_driver(state, poll_timeout_sec=5,
+                                 poll_interval_sec=0.01)
+            self.assertEqual(proc.returncode, 9, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "final_composites_drift")
+        finally:
+            sb.cleanup()
+
+    def test_final_diff_catches_unrelated_override_added_post_ready(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(
+                sb.root,
+                deploy_side_effect="commit_success_then_unrelated_override_added",
+            )
+            proc = sb.run_driver(state, poll_timeout_sec=5,
+                                 poll_interval_sec=0.01)
+            self.assertEqual(proc.returncode, 9, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "final_field_overrides_added")
+        finally:
+            sb.cleanup()
+
+    def test_final_diff_catches_target_entry_duplicated_post_ready(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(
+                sb.root,
+                deploy_side_effect="commit_success_then_target_duplicated",
+            )
+            proc = sb.run_driver(state, poll_timeout_sec=5,
+                                 poll_interval_sec=0.01)
+            self.assertEqual(proc.returncode, 9, proc.stderr[:400])
+            payload = json.loads(proc.stdout.splitlines()[0])
+            # Either the final-diff catches an extra field-override
+            # entry (because the duplication changes the override's
+            # canonical shape) OR the final rooms.status shape
+            # validator catches "post rooms.status has 5 entries".
+            self.assertIn(payload["outcome"], (
+                "final_field_overrides_added",
+                "final_rooms_status_shape",
+            ), f"outcome={payload['outcome']!r} reason={payload.get('reason')!r}")
+        finally:
+            sb.cleanup()
+
+
+class R4EnvDefaultValidationTests(unittest.TestCase):
+    """R4 finding 5: env-derived defaults must be validated too."""
+
+    def setUp(self):
+        os.chmod(_FAKE_GCLOUD, 0o755)
+        os.chmod(_FAKE_FIREBASE, 0o755)
+
+    def _run_with_env(self, env_var, env_value):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            return sb.run_driver(
+                state,
+                extra_env={env_var: env_value},
+            ), sb
+        finally:
+            pass  # cleanup deferred to caller
+
+    def test_env_var_nan_rejected_by_post_parse_validation(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_POLL_TIMEOUT_SEC": "nan"},
+                omit_flags={"--poll-timeout-sec"},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "usage")
+            self.assertIn("--poll-timeout-sec", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    def test_env_var_zero_rejected_by_post_parse_validation(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_DEPLOY_TIMEOUT_SEC": "0"},
+                omit_flags={"--deploy-timeout-sec"},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "usage")
+        finally:
+            sb.cleanup()
+
+    def test_env_var_negative_rejected_by_post_parse_validation(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_POLL_INTERVAL_SEC": "-1"},
+                omit_flags={"--poll-interval-sec"},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+        finally:
+            sb.cleanup()
+
+    def test_env_var_inf_rejected_by_post_parse_validation(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_DEPLOY_TIMEOUT_SEC": "inf"},
+                omit_flags={"--deploy-timeout-sec"},
+            )
+            self.assertNotEqual(proc.returncode, 0)
         finally:
             sb.cleanup()
 

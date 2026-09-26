@@ -114,6 +114,12 @@ def _publish_rooms_status(state: dict) -> None:
     state.setdefault("field_overrides", []).append(
         _rooms_status_override_entry()
     )
+    # R4 fix: pre-snapshot's rooms.status describe advances the
+    # shared poll cursor before deploy, so post-deploy reads would
+    # start from index 1 instead of 0 of the intended sequence.
+    # Reset the cursor so the sequence is consumed as authored
+    # starting from the POST snapshot.
+    state["poll_state_cursor"] = 0
 
 
 def _apply_deploy_effect(state_path: Path, state: dict) -> None:
@@ -179,17 +185,33 @@ def _apply_deploy_effect(state_path: Path, state: dict) -> None:
         _save_state(state_path, state)
         return
     if effect == "sigint_mid_deploy":
-        # Fork a detached child that would mutate the state 2 s
-        # later, then SIGINT the parent driver. If the driver's
-        # trap does NOT terminate the deploy process group, the
-        # child survives and mutates state AFTER the post-snapshot.
-        # If the trap correctly kills the process group, the child
-        # is reaped BEFORE it mutates.
+        # R4 finding 1: fork a child that STAYS in the firebase
+        # process group (no setsid). If the driver's trap
+        # correctly SIGTERMs the process group AND wait()s, the
+        # child is killed before its sleep elapses, and the
+        # sabotage-mutation NEVER runs. If the driver only
+        # SIGINTs itself without killing the group, the sabotage
+        # child completes its sleep and writes the mutation
+        # marker.
+        ready_path = state_path.parent / "sabotage_child_ready.txt"
+        mutation_delay = float(state.get("sabotage_mutation_delay", 2.0))
         pid = os.fork()
         if pid == 0:
-            # Grandchild: detach and mutate later.
-            os.setsid()
-            time.sleep(2.0)
+            # Child: same process group as firebase (this fake).
+            # Write a ready marker BEFORE sleeping so the test can
+            # do a readiness handshake — the test waits for this
+            # file to appear before signaling the driver.
+            try:
+                ready_path.write_text(f"{os.getpid()}\n")
+            except Exception:
+                pass
+            # Sleep past the driver's expected termination window.
+            # If our PG is SIGTERM'd, this raises and we never
+            # reach the mutation. If not killed, we mutate.
+            try:
+                time.sleep(mutation_delay)
+            except Exception:
+                os._exit(0)
             try:
                 cur = json.loads(state_path.read_text())
                 cur["late_child_mutation"] = True
@@ -203,19 +225,70 @@ def _apply_deploy_effect(state_path: Path, state: dict) -> None:
             except Exception:
                 pass
             os._exit(0)
-        # Parent-of-child (still the fake firebase process): send
-        # SIGINT to the driver.
-        parent = os.getppid()
-        os.kill(parent, signal.SIGINT)
-        # Simulate a hanging deploy: sleep so the driver's trap
-        # gets a chance to observe us alive and terminate our
-        # process group. The grandchild we forked is NOT in this
-        # PG (setsid'd), so its survival depends on whether the
-        # driver knows to kill IT too — for our test, we simply
-        # verify that even the intended process-group kill of
-        # THIS process happens, and use `late_child_mutation` as
-        # the sabotage marker.
-        time.sleep(5.0)
+        # Parent (fake firebase): wait for the child's ready
+        # marker so the test knows the child exists before we
+        # signal the driver. Then SIGINT the driver and hang
+        # until the driver's trap terminates our process group.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not ready_path.exists():
+            time.sleep(0.05)
+        parent_pid = os.getppid()
+        os.kill(parent_pid, signal.SIGINT)
+        # Hang: the driver's trap should SIGTERM our whole group
+        # (us + child) within a few seconds. If we return here
+        # normally, the driver has not terminated the group and
+        # the sabotage child will complete its mutation.
+        time.sleep(max(15.0, mutation_delay + 5.0))
+        return
+    # R4 finding 4: post-READY late-mutation scenarios. These
+    # arm a mutation that fake_gcloud applies AFTER the driver's
+    # polling observes READY, so the FINAL snapshot picks up the
+    # drift.
+    if effect == "commit_success_then_composite_add":
+        _publish_rooms_status(state)
+        state["poll_state_sequence"] = ["READY"]
+        state["pending_late_mutation"] = {
+            "add_composite": {
+                "name": (
+                    "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
+                    "collectionGroups/unrelated/indexes/late_composite"
+                ),
+                "collectionGroup": "unrelated",
+                "fields": [{"fieldPath": "foo", "order": "ASCENDING"}],
+                "queryScope": "COLLECTION",
+                "state": "READY",
+            }
+        }
+        state["deploy_committed"] = True
+        _save_state(state_path, state)
+        return
+    if effect == "commit_success_then_unrelated_override_added":
+        _publish_rooms_status(state)
+        state["poll_state_sequence"] = ["READY"]
+        state["pending_late_mutation"] = {
+            "add_field_override": {
+                "name": (
+                    "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
+                    "collectionGroups/unrelated/fields/some_field"
+                ),
+                "indexConfig": {"indexes": [
+                    {"fields": [{"fieldPath": "some_field",
+                                 "order": "ASCENDING"}],
+                     "queryScope": "COLLECTION_GROUP", "state": "READY"},
+                ]},
+            }
+        }
+        state["deploy_committed"] = True
+        _save_state(state_path, state)
+        return
+    if effect == "commit_success_then_target_duplicated":
+        _publish_rooms_status(state)
+        state["poll_state_sequence"] = ["READY"]
+        state["pending_late_mutation"] = {
+            "duplicate_rooms_status_cg_asc": True,
+        }
+        state["deploy_committed"] = True
+        _save_state(state_path, state)
         return
     # Unknown effect: no-op.
 

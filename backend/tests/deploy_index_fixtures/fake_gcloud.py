@@ -80,14 +80,55 @@ def _get_flag(args, name: str) -> str | None:
 # --- composite list -----------------------------------------------------
 
 
-def _handle_composite_list(state: dict) -> None:
+def _maybe_apply_late_mutation(state_path: Path, state: dict) -> None:
+    """R4 finding 4: after polling reaches READY, arm a drift
+    mutation so the final snapshot observes unrelated changes.
+    `pending_late_mutation` is set by fake_firebase; when the
+    driver's polling has completed at least one READY tick
+    (`late_mutation_arm >= 1`), the next composite/fields call
+    applies the mutation to state before responding."""
+    if not state.get("late_mutation_arm"):
+        return
+    if state.get("late_mutation_applied"):
+        return
+    mutation = state.get("pending_late_mutation")
+    if not mutation:
+        return
+    # Apply the mutation.
+    for key, ops in mutation.items():
+        if key == "add_composite":
+            state.setdefault("composites", []).append(ops)
+        elif key == "add_field_override":
+            state.setdefault("field_overrides", []).append(ops)
+        elif key == "remove_field_override_at_index":
+            state.setdefault("field_overrides", []).pop(ops)
+        elif key == "duplicate_rooms_status_cg_asc":
+            # Append a second CG_ASC entry to the existing
+            # rooms.status override in `field_overrides`.
+            for fo in state.get("field_overrides", []):
+                name = fo.get("name") or ""
+                if name.endswith("/collectionGroups/rooms/fields/status"):
+                    fo["indexConfig"]["indexes"].append({
+                        "fields": [{"fieldPath": "status",
+                                    "order": "ASCENDING"}],
+                        "queryScope": "COLLECTION_GROUP",
+                        "state": "READY",
+                    })
+                    break
+    state["late_mutation_applied"] = True
+    _save_state(state_path, state)
+
+
+def _handle_composite_list(state: dict, state_path: Path) -> None:
+    _maybe_apply_late_mutation(state_path, state)
     print(json.dumps(state.get("composites", [])))
 
 
 # --- fields list (db-wide OR per-collection-group) ---------------------
 
 
-def _handle_fields_list(state: dict, args) -> None:
+def _handle_fields_list(state: dict, state_path: Path, args) -> None:
+    _maybe_apply_late_mutation(state_path, state)
     cg = _get_flag(args, "--collection-group")
     ancestor = state.get("ancestor_default_entry")
     all_entries = []
@@ -123,8 +164,29 @@ def _handle_fields_describe(state_path: Path, state: dict, args) -> None:
         idx = min(cursor, len(seq) - 1)
         current_cg_state = seq[idx]
         state["poll_state_cursor"] = cursor + 1
+        # R4 finding 4: after the first READY observation, arm
+        # the late-mutation marker so subsequent snapshot calls
+        # apply the pending drift.
+        if current_cg_state == "READY":
+            state["late_mutation_arm"] = int(state.get("late_mutation_arm", 0)) + 1
         _save_state(state_path, state)
-        print(json.dumps(_rooms_status_payload(state, current_cg_state)))
+        # Special-case: if a late mutation duplicates the CG_ASC
+        # entry, the FINAL describe should reflect that too. The
+        # `_rooms_status_payload` builder normally emits exactly
+        # one CG_ASC; consult `pending_late_mutation` to override.
+        payload = _rooms_status_payload(state, current_cg_state)
+        pending = state.get("pending_late_mutation") or {}
+        if (state.get("late_mutation_applied")
+                and pending.get("duplicate_rooms_status_cg_asc")):
+            # Add a second CG_ASC to the describe response so the
+            # final rooms.status shape validator (which counts
+            # CG_ASC entries == 1) fires.
+            payload["indexConfig"]["indexes"].append({
+                "fields": [{"fieldPath": "status", "order": "ASCENDING"}],
+                "queryScope": "COLLECTION_GROUP",
+                "state": "READY",
+            })
+        print(json.dumps(payload))
         return
     # Non-rooms.status describe: find matching override entry.
     for entry in state.get("field_overrides", []):
@@ -176,6 +238,14 @@ def _rooms_status_payload(state: dict, cg_asc_state: str) -> dict:
             entry("status", order="ASCENDING",
                   scope="COLLECTION_GROUP", state_val=cg_asc_state)
         )
+    # R4 finding 3: `usesAncestorConfig` flips to False once an
+    # explicit rooms.status override is published (via fake_firebase
+    # `commit_success`-style effects). Real gcloud behaves this
+    # way — an explicit override REPLACES the ancestor default.
+    has_explicit_override = any(
+        (e.get("name") or "").endswith("/collectionGroups/rooms/fields/status")
+        for e in state.get("field_overrides", [])
+    )
     return {
         "indexConfig": {
             "indexes": indexes,
@@ -183,7 +253,7 @@ def _rooms_status_payload(state: dict, cg_asc_state: str) -> dict:
                 "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
                 "collectionGroups/__default__/fields/*"
             ),
-            "usesAncestorConfig": True,
+            "usesAncestorConfig": not has_explicit_override,
         },
         "name": (
             "projects/sturdy-dogfish-472313-k6/databases/worship-translation/"
@@ -217,9 +287,9 @@ def main(argv):
 
     if "firestore" in argv and "indexes" in argv:
         if "composite" in argv and "list" in argv:
-            _handle_composite_list(state); return 0
+            _handle_composite_list(state, state_path); return 0
         if "fields" in argv and "list" in argv:
-            _handle_fields_list(state, argv); return 0
+            _handle_fields_list(state, state_path, argv); return 0
         if "fields" in argv and "describe" in argv:
             _handle_fields_describe(state_path, state, argv); return 0
     if "firestore" in argv and "databases" in argv and "describe" in argv:

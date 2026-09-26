@@ -11,7 +11,7 @@ invoke the driver.
 
 | | |
 |---|---|
-| Driver script version | `2.0.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
+| Driver script version | `3.0.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
 | Approved PR #42 SHA to pin | recorded independently by the reviewer; passed as `--reviewer-approved-sha` and MUST equal `--pr42-sha` |
 | Script sha256 pin | recorded independently by the reviewer; passed as `--script-sha256`; driver re-hashes itself and refuses on mismatch |
 | Firebase CLI version required | `13.19.0` (passed as `--firebase-tools-version-pin`; bump requires re-running the fixture suite) |
@@ -91,15 +91,26 @@ prior R2 checklist for the compensating-change procedure. A
 operator's checkout, not a copied copy elsewhere):
 
 ```bash
-# 1. Reviewer-approved artifacts to hand-carry:
-#    - APPROVED_SHA: the exact PR #42 head commit that was reviewed
-#    - SCRIPT_SHA256: sha256 of the reviewed driver file
-APPROVED_SHA="03a085c9…"   # replace with the reviewer's exact hex
-SCRIPT_SHA256="e585c08e…"  # sha256 of the reviewed driver file
+# 1. Reviewer-approved artifacts to hand-carry. DO NOT paste
+#    stale example SHAs — the reviewer's approval message
+#    contains the exact values for this deploy round.
+APPROVED_SHA="<REVIEWER_APPROVED_SHA_HERE>"    # 40-char hex
+SCRIPT_SHA256="<REVIEWER_APPROVED_SCRIPT_SHA256_HERE>"  # 64-char hex
 
 # 2. Detached worktree pinned to APPROVED_SHA.
 PR42_WORKTREE=$(mktemp -d -t pr42-deploy.XXXXXXXX)
-git fetch origin chore/rooms-status-collection-group-index
+git fetch origin main chore/rooms-status-collection-group-index
+
+# R4 finding 6: prove the reviewed head is BASED ON current
+# origin/main. A stale/rebased reviewed head that predates
+# main's advancement would deploy code that doesn't reflect
+# the current tree, and could silently miss composites or
+# rules changes that landed after the PR was reviewed.
+git merge-base --is-ancestor origin/main "$APPROVED_SHA" || {
+  echo "APPROVED_SHA $APPROVED_SHA does not contain origin/main HEAD" >&2
+  echo "→ rebase the PR onto main, get fresh reviewer approval" >&2
+  exit 2
+}
 
 # Independent equality check: what the PR head IS must equal
 # what the reviewer approved. Refuses a newer head silently.

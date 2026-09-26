@@ -87,7 +87,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "2.0.0"  # R3: db-wide snapshots, real proto shape, pre-deploy delta, hardened signal handling
+SCRIPT_VERSION = "3.0.0"  # R4: retained Popen + wait(), exact-shape rooms.status validators, env-default finiteness enforcement, final drift regressions
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -169,70 +169,93 @@ def _sha256(path: Path) -> str:
 # --- Global state for the post-snapshot trap ----------------------------
 
 _POST_SNAPSHOT_TAKEN = False
-# R3 finding 6: the driver tracks the deploy child so the trap can
-# terminate its process group before snapshotting. Without this the
-# child (firebase, and the tools it spawns) can continue mutating
-# production Firestore AFTER a signal-triggered snapshot appears to
-# capture the "final" state.
-_DEPLOY_CHILD_PGID: int | None = None
+# R4: the driver retains the Popen (not just the pgid) so the trap
+# can (a) terminate the process group AND (b) `wait()` on the child
+# to REAP it before snapshotting. Without wait(), a killed-but-not-
+# yet-reaped child could still be flushing writes when we read
+# state.
+_DEPLOY_POPEN: "subprocess.Popen | None" = None
 
 
 def _terminate_deploy_child() -> None:
-    """If a firebase-deploy child is still running, terminate its
-    entire process group and wait for it to reap. Best-effort;
-    swallows individual OSError so the caller can still snapshot."""
-    global _DEPLOY_CHILD_PGID
-    pgid = _DEPLOY_CHILD_PGID
-    if pgid is None:
+    """Terminate the retained deploy child's entire process group
+    and wait() on the Popen so the OS reaps it BEFORE the trap
+    snapshots. Best-effort; swallows individual OSError so the
+    caller can still snapshot."""
+    global _DEPLOY_POPEN
+    popen = _DEPLOY_POPEN
+    if popen is None:
         return
-    _DEPLOY_CHILD_PGID = None
+    _DEPLOY_POPEN = None
+    if popen.poll() is not None:
+        return  # already exited
+    try:
+        pgid = os.getpgid(popen.pid)
+    except (ProcessLookupError, PermissionError):
+        return
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    # Give the group up to 5 s to exit.
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)  # probe: is anyone left?
-        except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    # Still alive → SIGKILL the group.
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
         pass
+    # Wait up to 5 s for the group to exit, then SIGKILL.
+    try:
+        popen.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            popen.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            # Something is severely wrong — write a durable failure
+            # marker so the operator can see the trap couldn't reap.
+            pass
 
 
 def _install_trap(audit_dir: Path, gcloud: str) -> None:
     """Install a signal handler + atexit hook that:
-      1. terminates any running deploy child's process group so
-         firebase cannot keep mutating production after we start
-         snapshotting;
+      1. terminates the retained deploy Popen's process group and
+         waits for it to reap so firebase cannot keep mutating
+         production while we snapshot;
       2. writes the post-snapshot to `audit_dir/post/`;
-      3. re-raises the original signal so the process exits with
+      3. on ANY failure of step (1) or (2), writes a durable
+         failure marker `audit_dir/trap-failure.txt` and preserves
+         the exception so the operator sees exactly what went
+         wrong even after signal-triggered exit;
+      4. re-raises the original signal so the process exits with
          the canonical signal exit code.
     Fires exactly once across atexit + SIGINT + SIGTERM."""
     import atexit
+    trap_failure_path = audit_dir / "trap-failure.txt"
+
+    def _record_trap_failure(stage: str, exc: BaseException) -> None:
+        try:
+            with trap_failure_path.open("a") as f:
+                f.write(f"{_iso_now()} {stage}: "
+                        f"{type(exc).__name__}: {exc}\n")
+        except Exception:
+            # Even the marker write failed. Diag only.
+            _diag(f"CRITICAL: could not write trap-failure marker for {stage}")
 
     def _run_once():
         global _POST_SNAPSHOT_TAKEN
         if _POST_SNAPSHOT_TAKEN:
             return
         _POST_SNAPSHOT_TAKEN = True
-        # (1) Terminate child FIRST so any mutations happening
-        # during our snapshot cannot land.
+        # (1) Terminate + reap child FIRST. If this fails, we still
+        # try to snapshot, but the marker records that we cannot be
+        # certain firebase stopped mutating.
         try:
             _terminate_deploy_child()
-        except Exception as exc:  # pragma: no cover
-            _diag(f"trap terminate child: {type(exc).__name__}: {exc}")
+        except BaseException as exc:  # pragma: no cover
+            _record_trap_failure("terminate_deploy_child", exc)
         # (2) Snapshot.
         post_dir = audit_dir / "post"
         try:
             _take_snapshot(gcloud, post_dir, label="post")
-        except Exception as exc:  # pragma: no cover — snapshot best-effort
-            _diag(f"post-snapshot trap: {type(exc).__name__}: {exc}")
+        except BaseException as exc:
+            _record_trap_failure("take_snapshot(post)", exc)
 
     def _handler(signum, _frame):
         _run_once()
@@ -735,12 +758,12 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
     detached worktree with a bounded timeout. Returns rc; captures
     stdout/stderr into audit_dir/deploy/.
 
-    R3 finding 6: the child runs in its own session (new process
-    group) so a signal delivered to the driver alone doesn't leave
-    firebase (and its `firebase-tools` spawns) mutating production.
-    The `_DEPLOY_CHILD_PGID` module global tracks the group; the
-    signal trap terminates it before snapshotting."""
-    global _DEPLOY_CHILD_PGID
+    R3 finding 6 + R4: the child runs in its own session so a
+    signal to the driver doesn't leave firebase (and its
+    `firebase-tools` spawns) mutating production. The R4 driver
+    retains the full `Popen` object as `_DEPLOY_POPEN` — the trap
+    uses that to killpg AND wait() before snapshotting."""
+    global _DEPLOY_POPEN
     deploy_dir = audit_dir / "deploy"
     deploy_dir.mkdir(parents=True, exist_ok=True)
     deploy_dir.chmod(0o700)
@@ -758,11 +781,9 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
         proc = subprocess.Popen(
             cmd, cwd=str(worktree),
             stdout=so, stderr=se,
-            # Put the child in its own process group so signals
-            # can target the whole subtree.
             start_new_session=True,
         )
-        _DEPLOY_CHILD_PGID = os.getpgid(proc.pid)
+        _DEPLOY_POPEN = proc
         try:
             rc = proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
@@ -775,10 +796,9 @@ def _deploy(firebase: str, worktree: Path, timeout_sec: float,
     finally:
         so.close()
         se.close()
-        # Whether by normal exit or by termination, the child (and
-        # its group) is no longer active; clear the marker so the
-        # signal trap doesn't try to terminate a reaped PGID.
-        _DEPLOY_CHILD_PGID = None
+        # Normal exit: child is already reaped by wait(). Clear
+        # the ref so the trap doesn't wait() again.
+        _DEPLOY_POPEN = None
     (deploy_dir / "deploy.rc").write_text(f"{rc}\n")
     return rc
 
@@ -899,6 +919,163 @@ def _positive_finite_float(kind: str, name: str):
             )
         return value
     return _check
+
+
+def _validate_positive_finite_or_die(name: str, value) -> float:
+    """R4 finding 5: argparse does not run the `type=` validator
+    on `default=` values, so environment-derived defaults could
+    bypass `_positive_finite_float()`. This post-parse validation
+    re-checks the resolved value regardless of source (CLI flag,
+    env var, or hard-coded constant)."""
+    import math
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        _die(RC.USAGE, "usage",
+             f"{name}: expected a positive finite float, got {value!r}")
+    if not math.isfinite(v):
+        _die(RC.USAGE, "usage",
+             f"{name}: expected a finite float, got {value!r}")
+    if v <= 0:
+        _die(RC.USAGE, "usage",
+             f"{name}: expected a positive float > 0, got {value!r}")
+    return v
+
+
+# --- Exact-shape rooms.status validators (R4 finding 3) ---------------
+
+
+def _validate_pre_rooms_status(snapshot_dir: Path) -> None:
+    """Pre-deploy inherited baseline: rooms.status describe must
+    show `usesAncestorConfig == true` and EXACTLY three
+    COLLECTION-scope entries — ASC, DESC, ARRAY_CONTAINS — all
+    READY — with nested `fieldPath == "status"`. No
+    COLLECTION_GROUP entry may exist."""
+    rs = _load_rooms_status(snapshot_dir)
+    problems: list[str] = []
+    if rs.get("usesAncestorConfig") is not True:
+        problems.append(
+            f"pre rooms.status usesAncestorConfig={rs.get('usesAncestorConfig')!r}, "
+            f"expected True"
+        )
+    entries = rs.get("indexes", [])
+    if len(entries) != 3:
+        problems.append(
+            f"pre rooms.status has {len(entries)} entries, expected 3"
+        )
+    required = {
+        ("ASCENDING", None, "COLLECTION"),
+        ("DESCENDING", None, "COLLECTION"),
+        (None, "CONTAINS", "COLLECTION"),
+    }
+    actual = {
+        (e.get("order"), e.get("arrayConfig"), e.get("queryScope"))
+        for e in entries
+    }
+    missing = required - actual
+    extra = actual - required
+    if missing:
+        problems.append(f"pre missing entries: {sorted(missing, key=str)!r}")
+    if extra:
+        problems.append(f"pre unexpected entries: {sorted(extra, key=str)!r}")
+    for i, e in enumerate(entries):
+        if e.get("state") != "READY":
+            problems.append(f"pre entries[{i}] state={e.get('state')!r} != READY")
+        if e.get("fieldPath") != "status":
+            problems.append(f"pre entries[{i}] fieldPath={e.get('fieldPath')!r} != status")
+    if problems:
+        _die(RC.PRE_SNAPSHOT, "pre_rooms_status_shape",
+             "; ".join(problems))
+
+
+def _validate_post_rooms_status(snapshot_dir: Path) -> None:
+    """Post-deploy: rooms.status must show `usesAncestorConfig ==
+    false` (explicit override took over), FOUR entries with
+    nested `fieldPath == "status"`, three COLLECTION-scope
+    entries READY, and one COLLECTION_GROUP ASCENDING entry in
+    {CREATING, READY}."""
+    rs = _load_rooms_status(snapshot_dir)
+    problems: list[str] = []
+    if rs.get("usesAncestorConfig") is not False:
+        problems.append(
+            f"post rooms.status usesAncestorConfig={rs.get('usesAncestorConfig')!r}, "
+            f"expected False"
+        )
+    entries = rs.get("indexes", [])
+    if len(entries) != 4:
+        problems.append(
+            f"post rooms.status has {len(entries)} entries, expected 4"
+        )
+    for i, e in enumerate(entries):
+        if e.get("fieldPath") != "status":
+            problems.append(f"post entries[{i}] fieldPath={e.get('fieldPath')!r} != status")
+    col_asc = [e for e in entries
+               if e.get("order") == "ASCENDING"
+               and e.get("queryScope") == "COLLECTION"]
+    col_desc = [e for e in entries
+                if e.get("order") == "DESCENDING"
+                and e.get("queryScope") == "COLLECTION"]
+    col_arr = [e for e in entries
+               if e.get("arrayConfig") == "CONTAINS"
+               and e.get("queryScope") == "COLLECTION"]
+    cg_asc = [e for e in entries
+              if e.get("order") == "ASCENDING"
+              and e.get("queryScope") == "COLLECTION_GROUP"]
+    if len(col_asc) != 1 or col_asc[0].get("state") != "READY":
+        problems.append(f"post COLLECTION ASC entries={col_asc!r}")
+    if len(col_desc) != 1 or col_desc[0].get("state") != "READY":
+        problems.append(f"post COLLECTION DESC entries={col_desc!r}")
+    if len(col_arr) != 1 or col_arr[0].get("state") != "READY":
+        problems.append(f"post COLLECTION ARRAY_CONTAINS entries={col_arr!r}")
+    if len(cg_asc) != 1:
+        problems.append(f"post COLLECTION_GROUP ASC count={len(cg_asc)}, expected 1")
+    elif cg_asc[0].get("state") not in ("CREATING", "READY"):
+        problems.append(f"post CG_ASC state={cg_asc[0].get('state')!r} not in "
+                        f"{{CREATING, READY}}")
+    if problems:
+        _die(RC.POST_DIFF, "post_rooms_status_shape",
+             "; ".join(problems))
+
+
+def _validate_final_rooms_status(snapshot_dir: Path) -> None:
+    """Final: same shape as post except all four entries MUST
+    be READY."""
+    rs = _load_rooms_status(snapshot_dir)
+    problems: list[str] = []
+    if rs.get("usesAncestorConfig") is not False:
+        problems.append(
+            f"final rooms.status usesAncestorConfig={rs.get('usesAncestorConfig')!r}, "
+            f"expected False"
+        )
+    entries = rs.get("indexes", [])
+    if len(entries) != 4:
+        problems.append(
+            f"final rooms.status has {len(entries)} entries, expected 4"
+        )
+    for i, e in enumerate(entries):
+        if e.get("fieldPath") != "status":
+            problems.append(f"final entries[{i}] fieldPath={e.get('fieldPath')!r} != status")
+        if e.get("state") != "READY":
+            problems.append(f"final entries[{i}] state={e.get('state')!r} != READY")
+    required = {
+        ("ASCENDING", None, "COLLECTION"),
+        ("DESCENDING", None, "COLLECTION"),
+        (None, "CONTAINS", "COLLECTION"),
+        ("ASCENDING", None, "COLLECTION_GROUP"),
+    }
+    actual = {
+        (e.get("order"), e.get("arrayConfig"), e.get("queryScope"))
+        for e in entries
+    }
+    if actual != required:
+        problems.append(
+            f"final entry-shape mismatch: "
+            f"missing={sorted(required - actual, key=str)!r} "
+            f"extra={sorted(actual - required, key=str)!r}"
+        )
+    if problems:
+        _die(RC.FINAL_DIFF, "final_rooms_status_shape",
+             "; ".join(problems))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1145,17 +1322,34 @@ def _desired_field_overrides(pre_overrides: list[dict]) -> list[dict]:
 def main(argv: list[str]) -> int:
     args = _build_parser().parse_args(argv)
 
+    # R4 finding 5: argparse `type=` isn't re-run on `default=`
+    # values, so env-var-provided defaults could contain nan/inf/
+    # negative/zero and bypass `_positive_finite_float`. Re-check
+    # each numeric arg post-parse regardless of source.
+    args.deploy_timeout_sec = _validate_positive_finite_or_die(
+        "--deploy-timeout-sec", args.deploy_timeout_sec,
+    )
+    args.poll_timeout_sec = _validate_positive_finite_or_die(
+        "--poll-timeout-sec", args.poll_timeout_sec,
+    )
+    args.poll_interval_sec = _validate_positive_finite_or_die(
+        "--poll-interval-sec", args.poll_interval_sec,
+    )
+
     # 0. Preconditions
     _check_preconditions(args)
 
     audit_dir = Path(args.audit_dir).resolve()
 
-    # 1. Pre-snapshot
+    # 1. Pre-snapshot + inherited-baseline validator
     try:
         _take_snapshot(args.gcloud, audit_dir / "pre", label="pre")
     except Exception as exc:
         _die(RC.PRE_SNAPSHOT, "pre_snapshot",
              f"{type(exc).__name__}: {exc}")
+    # R4 finding 3: assert pre rooms.status shape
+    # (usesAncestorConfig=True, 3 COLLECTION READY entries, no CG).
+    _validate_pre_rooms_status(audit_dir / "pre")
 
     # 2. Target confirm (also cross-checks the REAL remote via
     #    gcloud firestore databases describe from the pre-snapshot).
@@ -1260,6 +1454,11 @@ def main(argv: list[str]) -> int:
         _die(RC.DEPLOY, "deploy_nonzero",
              f"firebase deploy rc={deploy_rc}")
 
+    # 7b. R4 finding 3: validate post rooms.status shape
+    # (usesAncestorConfig=False, 4 entries, three COLLECTION READY
+    # + CG_ASC ∈ {CREATING, READY}, nested fieldPath="status").
+    _validate_post_rooms_status(audit_dir / "post")
+
     # 8. Semantic diff — post vs pre AND vs desired
     try:
         pre_comp = _load_composite(audit_dir / "pre")
@@ -1339,6 +1538,10 @@ def main(argv: list[str]) -> int:
     #     AND the intended CG_ASC entry is present and READY.
     try:
         _take_snapshot(args.gcloud, audit_dir / "final", label="final")
+        # R4 finding 3: assert final rooms.status shape
+        # (usesAncestorConfig=False, exactly the 4 required entries,
+        # all READY, nested fieldPath="status").
+        _validate_final_rooms_status(audit_dir / "final")
         pre_comp = _load_composite(audit_dir / "pre")
         final_comp = _load_composite(audit_dir / "final")
         pre_over = _load_field_overrides(audit_dir / "pre")
