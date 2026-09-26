@@ -1239,5 +1239,166 @@ class R4EnvDefaultValidationTests(unittest.TestCase):
             sb.cleanup()
 
 
+class R5EnvDefaultValidationTests(unittest.TestCase):
+    """R5 finding 2: env-var resolution happens post-parse and
+    routes every invalid value through rc=1 (usage). Prior R4
+    code applied `float(os.environ.get(...))` at parser
+    construction, which raised `ValueError` before argparse ran
+    and let a non-numeric value bubble out as rc=99 (internal)."""
+
+    def setUp(self):
+        os.chmod(_FAKE_GCLOUD, 0o755)
+        os.chmod(_FAKE_FIREBASE, 0o755)
+
+    def test_env_var_non_numeric_deploy_timeout_is_usage_not_internal(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_DEPLOY_TIMEOUT_SEC": "abc"},
+                omit_flags={"--deploy-timeout-sec"},
+            )
+            self.assertEqual(proc.returncode, 1,
+                             f"expected rc=1 (usage), got {proc.returncode}. "
+                             f"stdout={proc.stdout} stderr={proc.stderr}")
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["rc"], 1)
+            self.assertEqual(payload["outcome"], "usage")
+            # Reason must name the offending env var so the
+            # operator knows exactly what to fix.
+            self.assertIn("PR42_DEPLOY_TIMEOUT_SEC", payload["reason"])
+            self.assertIn("abc", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    def test_env_var_non_numeric_poll_timeout_is_usage_not_internal(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_POLL_TIMEOUT_SEC": "not-a-number"},
+                omit_flags={"--poll-timeout-sec"},
+            )
+            self.assertEqual(proc.returncode, 1)
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "usage")
+            self.assertIn("PR42_POLL_TIMEOUT_SEC", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    def test_env_var_non_numeric_poll_interval_is_usage_not_internal(self):
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_POLL_INTERVAL_SEC": "xyz"},
+                omit_flags={"--poll-interval-sec"},
+            )
+            self.assertEqual(proc.returncode, 1)
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "usage")
+            self.assertIn("PR42_POLL_INTERVAL_SEC", payload["reason"])
+        finally:
+            sb.cleanup()
+
+    def test_env_var_empty_string_is_usage_not_internal(self):
+        # An empty string is set but non-numeric; the driver must
+        # not treat it as "unset" (which would silently use the
+        # hard default), and must not raise ValueError.
+        sb = _Sandbox()
+        try:
+            state = _make_scenario(sb.root)
+            proc = sb.run_driver(
+                state,
+                extra_env={"PR42_POLL_TIMEOUT_SEC": ""},
+                omit_flags={"--poll-timeout-sec"},
+            )
+            self.assertEqual(proc.returncode, 1)
+            payload = json.loads(proc.stdout.splitlines()[0])
+            self.assertEqual(payload["outcome"], "usage")
+        finally:
+            sb.cleanup()
+
+
+class R5ProcessGroupDrainTests(unittest.TestCase):
+    """R5 finding 1: the deploy trap must SIGTERM the whole
+    process group, wait for every member (not just the direct
+    firebase child) to drain, and SIGKILL survivors. A grandchild
+    that installs SIG_IGN for SIGTERM must not survive to mutate
+    production after `Popen.wait()` on the direct child returns."""
+
+    def setUp(self):
+        os.chmod(_FAKE_GCLOUD, 0o755)
+        os.chmod(_FAKE_FIREBASE, 0o755)
+
+    def test_grandchild_ignoring_sigterm_is_killed_before_it_can_mutate(self):
+        """The fixture forks a grandchild that:
+          - stays in firebase's process group (no setsid),
+          - installs SIG_IGN for SIGTERM,
+          - would perform a state mutation after
+            `sabotage_mutation_delay` seconds unless SIGKILLed.
+
+        If the driver only waits on the direct Popen child, the
+        grandchild survives SIGTERM and completes the mutation.
+        The R5 fix walks the process group, escalates to SIGKILL
+        on survivors, and only then takes the post-snapshot."""
+        sb = _Sandbox()
+        try:
+            # Mutation delay > driver's SIGTERM grace (5 s) +
+            # SIGKILL grace (2 s) so the grandchild can only die
+            # by SIGKILL escalation, never by natural wake.
+            state = _make_scenario(
+                sb.root,
+                deploy_side_effect="sigint_mid_deploy_grandchild_ignores_sigterm",
+                extra={"sabotage_mutation_delay": 12.0},
+            )
+            proc = sb.run_driver(state, poll_timeout_sec=1)
+            self.assertNotEqual(proc.returncode, 0,
+                                f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            # Post-snapshot fired.
+            self.assertTrue((sb.audit / "post").is_dir(),
+                            "trap must still write post/ snapshot")
+            # Wait past the grandchild's mutation window PLUS the
+            # driver's SIGTERM grace: if the driver did not
+            # escalate to SIGKILL on the whole PG, the grandchild
+            # would wake and mutate state during this wait.
+            time.sleep(15.0)
+            final_state = json.loads(state.read_text())
+            self.assertFalse(
+                final_state.get("late_child_mutation", False),
+                "R5 regression: grandchild that ignored SIGTERM "
+                "was NOT killed by the trap. The driver must "
+                "SIGTERM the process group, wait for every member "
+                "to drain, and SIGKILL survivors before "
+                "snapshotting — waiting on the direct Popen child "
+                "alone is insufficient.",
+            )
+        finally:
+            sb.cleanup()
+
+    def test_pgid_alive_members_reads_proc_correctly(self):
+        """Unit-level: `_pgid_alive_members` returns the current
+        process's PID for the current process's PG. Guards
+        against a `/proc` parse regression that would make the
+        drain wait unable to see live processes."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "dep_drv", str(_DRIVER),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        pgid = os.getpgid(os.getpid())
+        alive = mod._pgid_alive_members(pgid)
+        self.assertIn(os.getpid(), alive,
+                      "our own PID must appear in the PG membership listing")
+        # Every entry should look like a plausible PID.
+        for pid in alive:
+            self.assertIsInstance(pid, int)
+            self.assertGreater(pid, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

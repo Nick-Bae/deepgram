@@ -5,11 +5,12 @@ diffs of every composite index and field override, bounded
 deploy + polling, and a signal-safe post-snapshot trap.
 
 This is the versioned operator driver for PR #42. It is
-invoked from `deploy_rooms_status_index.sh` (thin operator
-wrapper) or directly from CI fixture tests. All external CLI
-paths (`gcloud`, `firebase`) come from env vars so the same
-driver runs against real production CLIs AND against the
-fake-CLI fixture harness under `backend/tests/deploy_index_fixtures/`.
+invoked directly by the operator (or by CI fixture tests) as
+a plain Python script — there is no shell wrapper. All
+external CLI paths (`gcloud`, `firebase`) come from env vars
+or CLI flags so the same driver runs against real production
+CLIs AND against the fake-CLI fixture harness under
+`backend/tests/deploy_index_fixtures/`.
 
 Contract
 --------
@@ -20,6 +21,10 @@ Contract
 - Always takes a post-deploy snapshot regardless of outcome
   (success, non-zero, timeout, or SIGINT/SIGTERM) via a signal
   handler that mirrors the shell EXIT-trap idiom.
+- On signal-triggered exit, the trap SIGTERMs the deploy
+  process group, waits for EVERY member to drain (not just the
+  direct firebase child), SIGKILLs survivors, and records
+  `<audit>/trap-failure.txt` if any member outlives SIGKILL.
 - Diffs post-snapshot against pre-snapshot AND the desired
   state semantically — every composite index and every field
   override, not just `rooms.status`.
@@ -31,7 +36,7 @@ Contract
 Exit codes
 ----------
     0  success — deploy committed, READY, all diffs match
-    1  usage / argparse
+    1  usage / argparse (includes invalid env-var value)
     2  preconditions (CLI missing, wrong version, ADC absent)
     3  pre-snapshot failure
     4  target confirmation failure (project / database / firebase.json)
@@ -44,22 +49,26 @@ Exit codes
 
 Environment variables
 ---------------------
-- `PR42_INDEX_AUDIT_DIR` — root of the audit directory tree.
-  Must exist, be owner-only, and be empty at driver start.
-- `PR42_HELPER_SHA` — the exact PR #42 head commit to pin the
-  detached worktree to. See `deploy_rooms_status_index.sh`.
-- `PR42_WORKTREE` — path to the detached worktree pinned to
-  `PR42_HELPER_SHA`.
-- `PR42_FIREBASE_TOOLS_VERSION_PIN` — exact `firebase-tools`
-  version the driver requires (matches `firebase --version`).
-- `PR42_GCLOUD` — path to gcloud (defaults to `gcloud`).
-- `PR42_FIREBASE` — path to firebase (defaults to `firebase`).
+- `PR42_GCLOUD` — path to gcloud (defaults to `gcloud`; can
+  also be set via `--gcloud`).
+- `PR42_FIREBASE` — path to firebase (defaults to `firebase`;
+  can also be set via `--firebase`).
 - `PR42_DEPLOY_TIMEOUT_SEC` — deploy hard cap (default 300).
+  Value must be a positive finite float; non-numeric or
+  non-positive values exit rc=1 (usage).
 - `PR42_POLL_TIMEOUT_SEC` — READY polling budget (default 1800).
-- `PR42_POLL_INTERVAL_SEC` — poll interval (default 30).
-- `PR42_DRY_RUN` — set to `1` to skip only the `firebase deploy`
-  invocation; all snapshots/diffs still run. Used by the
-  fixture tests' "would-run-clean" scenario.
+  Same validation as above.
+- `PR42_POLL_INTERVAL_SEC` — poll interval (default 30). Same
+  validation as above.
+
+CLI-only flags (no env fallback)
+--------------------------------
+- `--dry-run` — preparation-only mode: run preconditions,
+  pre-snapshot, target confirmation, static invariants, AND
+  the pre-deploy semantic delta. SKIP the firebase deploy
+  invocation, the post-snapshot diff, the poll loop, and the
+  final-snapshot diff. Used by the fixture tests'
+  "would-run-clean" scenario.
 
 Fixture-test wiring
 -------------------
@@ -87,7 +96,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = "3.0.0"  # R4: retained Popen + wait(), exact-shape rooms.status validators, env-default finiteness enforcement, final drift regressions
+SCRIPT_VERSION = "3.1.0"  # R5: full process-group drain (SIGTERM→wait→SIGKILL survivors→quiescence marker), env-default routed through rc=1, docstring cleanup
 
 # --- Exit codes ---------------------------------------------------------
 
@@ -175,77 +184,205 @@ _POST_SNAPSHOT_TAKEN = False
 # yet-reaped child could still be flushing writes when we read
 # state.
 _DEPLOY_POPEN: "subprocess.Popen | None" = None
+# R5 finding 1: shared marker path so `_terminate_deploy_child()`
+# can record a quiescence failure even when the trap installer
+# hasn't been reached (e.g., mid-deploy exception path from
+# `_deploy`). Set by `_install_trap`.
+_TRAP_FAILURE_PATH: "Path | None" = None
+# R5 finding 1: trap timing constants. Kept as module attributes
+# so tests can monkey-patch shorter values for fast regressions.
+# Production values match the shell EXIT-trap idiom: SIGTERM, wait
+# 5 s, SIGKILL, wait 2 s.
+TRAP_SIGTERM_GRACE_SEC = 5.0
+TRAP_SIGKILL_GRACE_SEC = 2.0
+# Poll interval while waiting for the process group to drain. Fast
+# enough to catch a quick exit; slow enough not to spin.
+_TRAP_DRAIN_POLL_SEC = 0.05
+
+
+def _record_trap_failure_line(stage: str, detail: str) -> None:
+    """Best-effort append to `<audit>/trap-failure.txt`. Signal-safe:
+    catches every exception so a broken filesystem cannot break the
+    trap's cleanup path. Used by both the SIGTERM/SIGKILL drain path
+    (`_terminate_deploy_child`) and the snapshot path (`_run_once`)."""
+    if _TRAP_FAILURE_PATH is None:
+        return
+    try:
+        with _TRAP_FAILURE_PATH.open("a") as f:
+            f.write(f"{_iso_now()} {stage}: {detail}\n")
+    except Exception:
+        _diag(f"CRITICAL: could not write trap-failure marker for {stage}")
+
+
+def _pgid_alive_members(pgid: int) -> list[int]:
+    """R5 finding 1: return the PIDs currently in `pgid`, read from
+    `/proc/*/stat`. Direct-child `Popen.wait()` is insufficient — a
+    grandchild that ignores SIGTERM can survive it, leaving a live
+    process in the group that continues to mutate production while
+    the driver takes its post-snapshot.
+
+    Reads `stat` and takes field-3 (`pgrp`) after the parenthesized
+    comm. Never raises: signal-handler-safe. On non-Linux platforms
+    `/proc` is absent → returns []; the driver runs on Linux CI +
+    Cloud Run + the operator's WSL/Linux host, so this coverage is
+    the deployment surface."""
+    alive: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except (FileNotFoundError, PermissionError, OSError):
+        return alive
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                data = f.read()
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            continue
+        rparen = data.rfind(")")
+        if rparen < 0:
+            continue
+        # After `) `: state, ppid, pgrp, ...
+        fields = data[rparen + 2:].split()
+        if len(fields) < 3:
+            continue
+        # Skip zombies: state='Z' means the process has exited and
+        # is waiting for its parent to reap it. A zombie cannot run
+        # user code or issue syscalls — SIGKILL is a no-op on it —
+        # so counting it as "alive" would falsely trigger the
+        # quiescence-not-established marker whenever the direct
+        # deploy child dies before the driver's `popen.wait()`
+        # reaches it.
+        state = fields[0]
+        if state == "Z":
+            continue
+        try:
+            if int(fields[2]) == pgid:
+                alive.append(pid)
+        except ValueError:
+            continue
+    return alive
+
+
+def _wait_pgid_drained(pgid: int, timeout: float) -> list[int]:
+    """Poll `_pgid_alive_members` until either empty or `timeout`
+    seconds elapse. Returns the list of survivor PIDs at exit time
+    (empty means fully drained). Uses monotonic time so a wall-clock
+    jump cannot short-circuit or overrun the grace budget."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive = _pgid_alive_members(pgid)
+        if not alive:
+            return []
+        time.sleep(_TRAP_DRAIN_POLL_SEC)
+    return _pgid_alive_members(pgid)
 
 
 def _terminate_deploy_child() -> None:
-    """Terminate the retained deploy child's entire process group
-    and wait() on the Popen so the OS reaps it BEFORE the trap
-    snapshots. Best-effort; swallows individual OSError so the
-    caller can still snapshot."""
+    """R5 finding 1: SIGTERM the whole deploy process group, WAIT
+    for every member to drain (not just the direct firebase child),
+    SIGKILL survivors, then reap the direct Popen so no zombie is
+    left behind.
+
+    Prior versions waited only on the direct Popen. If a grandchild
+    (e.g., a node subprocess of firebase-tools) ignored SIGTERM,
+    `Popen.wait()` returned as soon as the direct child exited,
+    and the driver's post-snapshot could race the grandchild's
+    still-in-flight production writes.
+
+    Best-effort; swallows OSError so the trap's snapshot step can
+    still run. Records `<audit>/trap-failure.txt` if any process
+    outlives SIGKILL — that marker tells the operator the post-
+    snapshot cannot be trusted as a quiescent capture."""
     global _DEPLOY_POPEN
     popen = _DEPLOY_POPEN
     if popen is None:
         return
     _DEPLOY_POPEN = None
-    if popen.poll() is not None:
-        return  # already exited
+    # Resolve the process group BEFORE we start signalling — once
+    # the leader exits the pgrp of any surviving grandchild is
+    # unchanged, so this identifier remains valid.
     try:
         pgid = os.getpgid(popen.pid)
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError, OSError):
+        # Cannot identify the PG — best we can do is reap the
+        # direct child if it hasn't been reaped already.
+        try:
+            popen.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
         return
+
+    # SIGTERM the ENTIRE group (not just the direct child).
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, OSError):
         pass
-    # Wait up to 5 s for the group to exit, then SIGKILL.
-    try:
-        popen.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
+
+    # Wait for every process in the group to drain.
+    survivors = _wait_pgid_drained(pgid, timeout=TRAP_SIGTERM_GRACE_SEC)
+
+    if survivors:
+        # At least one process ignored (or was slow to handle)
+        # SIGTERM. Escalate to SIGKILL on the whole group and give
+        # them a short window to be reaped.
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             pass
-        try:
-            popen.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            # Something is severely wrong — write a durable failure
-            # marker so the operator can see the trap couldn't reap.
-            pass
+        survivors = _wait_pgid_drained(pgid, timeout=TRAP_SIGKILL_GRACE_SEC)
+
+    # Reap the direct child so its exit status is collected and no
+    # zombie remains.
+    try:
+        popen.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+
+    if survivors:
+        # SIGKILL didn't clear the group — the post-snapshot cannot
+        # be trusted as a quiescent capture. Record the survivors
+        # so the operator can investigate; do NOT swallow.
+        _record_trap_failure_line(
+            "quiescence_not_established",
+            f"pgid={pgid} pids_alive_after_sigkill={sorted(survivors)!r}",
+        )
 
 
 def _install_trap(audit_dir: Path, gcloud: str) -> None:
     """Install a signal handler + atexit hook that:
-      1. terminates the retained deploy Popen's process group and
-         waits for it to reap so firebase cannot keep mutating
-         production while we snapshot;
+      1. terminates the retained deploy Popen's whole process group
+         and waits for it to reap so firebase (and any descendant)
+         cannot keep mutating production while we snapshot;
       2. writes the post-snapshot to `audit_dir/post/`;
-      3. on ANY failure of step (1) or (2), writes a durable
+      3. on ANY failure of step (1) or (2), appends to the durable
          failure marker `audit_dir/trap-failure.txt` and preserves
          the exception so the operator sees exactly what went
          wrong even after signal-triggered exit;
       4. re-raises the original signal so the process exits with
          the canonical signal exit code.
     Fires exactly once across atexit + SIGINT + SIGTERM."""
+    global _TRAP_FAILURE_PATH
     import atexit
-    trap_failure_path = audit_dir / "trap-failure.txt"
+    _TRAP_FAILURE_PATH = audit_dir / "trap-failure.txt"
 
     def _record_trap_failure(stage: str, exc: BaseException) -> None:
-        try:
-            with trap_failure_path.open("a") as f:
-                f.write(f"{_iso_now()} {stage}: "
-                        f"{type(exc).__name__}: {exc}\n")
-        except Exception:
-            # Even the marker write failed. Diag only.
-            _diag(f"CRITICAL: could not write trap-failure marker for {stage}")
+        _record_trap_failure_line(stage, f"{type(exc).__name__}: {exc}")
 
     def _run_once():
         global _POST_SNAPSHOT_TAKEN
         if _POST_SNAPSHOT_TAKEN:
             return
         _POST_SNAPSHOT_TAKEN = True
-        # (1) Terminate + reap child FIRST. If this fails, we still
-        # try to snapshot, but the marker records that we cannot be
-        # certain firebase stopped mutating.
+        # (1) Terminate + drain group FIRST. If quiescence cannot
+        # be established, `_terminate_deploy_child` records that
+        # into trap-failure.txt itself; we still try to snapshot
+        # so the operator has a post-image to inspect.
         try:
             _terminate_deploy_child()
         except BaseException as exc:  # pragma: no cover
@@ -922,11 +1059,12 @@ def _positive_finite_float(kind: str, name: str):
 
 
 def _validate_positive_finite_or_die(name: str, value) -> float:
-    """R4 finding 5: argparse does not run the `type=` validator
-    on `default=` values, so environment-derived defaults could
-    bypass `_positive_finite_float()`. This post-parse validation
-    re-checks the resolved value regardless of source (CLI flag,
-    env var, or hard-coded constant)."""
+    """R4 finding 5 / R5 finding 2: argparse does not run the
+    `type=` validator on `default=` values, so environment-derived
+    defaults would bypass `_positive_finite_float()`. This post-
+    parse validation re-checks the resolved value regardless of
+    source (CLI flag, env var, or hard-coded constant) AND routes
+    every failure through rc=1 (usage) — never rc=99 (internal)."""
     import math
     try:
         v = float(value)
@@ -940,6 +1078,33 @@ def _validate_positive_finite_or_die(name: str, value) -> float:
         _die(RC.USAGE, "usage",
              f"{name}: expected a positive float > 0, got {value!r}")
     return v
+
+
+def _resolve_timeout_arg(cli_value: "float | None", flag_name: str,
+                        env_name: str,
+                        hard_default: "float | int") -> float:
+    """R5 finding 2: resolve a numeric argument from (a) the CLI
+    flag if present, otherwise (b) the environment variable if
+    set, otherwise (c) the hard-coded default. Every source is
+    validated through `_validate_positive_finite_or_die`, so a
+    non-numeric env var (e.g., `PR42_POLL_TIMEOUT_SEC=abc`) exits
+    rc=1 (usage) instead of raising `ValueError` at parser
+    construction — that ValueError would have been mapped to
+    rc=99 (internal), violating the documented contract."""
+    if cli_value is not None:
+        # Already went through argparse `type=`; but re-validate to
+        # keep a single fail path and to guard against unexpected
+        # code paths setting it directly.
+        return _validate_positive_finite_or_die(flag_name, cli_value)
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return _validate_positive_finite_or_die(flag_name, hard_default)
+    # Combined label so the error message names BOTH the env var
+    # the operator set AND the flag it maps to — a value like
+    # PR42_POLL_TIMEOUT_SEC=abc surfaces as
+    # `PR42_POLL_TIMEOUT_SEC (env fallback for --poll-timeout-sec)`.
+    combined = f"{env_name} (env fallback for {flag_name})"
+    return _validate_positive_finite_or_die(combined, raw)
 
 
 # --- Exact-shape rooms.status validators (R4 finding 3) ---------------
@@ -1109,23 +1274,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--firebase", default=os.environ.get("PR42_FIREBASE", "firebase"))
     p.add_argument("--firebase-tools-version-pin", required=True,
                    help="Required output of `firebase --version` (exact match)")
+    # R5 finding 2: env-var resolution is deferred to `main()` so a
+    # non-numeric env value (e.g., PR42_POLL_TIMEOUT_SEC=abc) exits
+    # rc=1 (usage) via `_validate_positive_finite_or_die`. Prior
+    # versions used `default=float(os.environ.get(...))`, which
+    # raised `ValueError` at parser CONSTRUCTION time — before
+    # argparse ran — and bubbled out as rc=99 (internal), violating
+    # the documented contract that invalid input is a usage error.
+    # A `None` default here means "no CLI flag given"; the resolver
+    # in `main()` then reads the env var (or the hard-coded default)
+    # under validation.
     p.add_argument(
         "--deploy-timeout-sec",
         type=_positive_finite_float("float", "--deploy-timeout-sec"),
-        default=float(os.environ.get(
-            "PR42_DEPLOY_TIMEOUT_SEC", DEFAULT_DEPLOY_TIMEOUT_SEC)),
+        default=None,
     )
     p.add_argument(
         "--poll-timeout-sec",
         type=_positive_finite_float("float", "--poll-timeout-sec"),
-        default=float(os.environ.get(
-            "PR42_POLL_TIMEOUT_SEC", DEFAULT_POLL_TIMEOUT_SEC)),
+        default=None,
     )
     p.add_argument(
         "--poll-interval-sec",
         type=_positive_finite_float("float", "--poll-interval-sec"),
-        default=float(os.environ.get(
-            "PR42_POLL_INTERVAL_SEC", DEFAULT_POLL_INTERVAL_SEC)),
+        default=None,
     )
     p.add_argument("--dry-run", action="store_true",
                    help=(
@@ -1322,18 +1494,23 @@ def _desired_field_overrides(pre_overrides: list[dict]) -> list[dict]:
 def main(argv: list[str]) -> int:
     args = _build_parser().parse_args(argv)
 
-    # R4 finding 5: argparse `type=` isn't re-run on `default=`
-    # values, so env-var-provided defaults could contain nan/inf/
-    # negative/zero and bypass `_positive_finite_float`. Re-check
-    # each numeric arg post-parse regardless of source.
-    args.deploy_timeout_sec = _validate_positive_finite_or_die(
-        "--deploy-timeout-sec", args.deploy_timeout_sec,
+    # R5 finding 2: resolve numeric args post-parse from
+    # (CLI flag > env var > hard-coded default), routing every
+    # validation failure through rc=1 (usage). Prior R4 code
+    # applied `float(os.environ.get(...))` at parser construction,
+    # which raised `ValueError` before argparse ran and was mapped
+    # to rc=99 (internal). See `_resolve_timeout_arg`.
+    args.deploy_timeout_sec = _resolve_timeout_arg(
+        args.deploy_timeout_sec, "--deploy-timeout-sec",
+        "PR42_DEPLOY_TIMEOUT_SEC", DEFAULT_DEPLOY_TIMEOUT_SEC,
     )
-    args.poll_timeout_sec = _validate_positive_finite_or_die(
-        "--poll-timeout-sec", args.poll_timeout_sec,
+    args.poll_timeout_sec = _resolve_timeout_arg(
+        args.poll_timeout_sec, "--poll-timeout-sec",
+        "PR42_POLL_TIMEOUT_SEC", DEFAULT_POLL_TIMEOUT_SEC,
     )
-    args.poll_interval_sec = _validate_positive_finite_or_die(
-        "--poll-interval-sec", args.poll_interval_sec,
+    args.poll_interval_sec = _resolve_timeout_arg(
+        args.poll_interval_sec, "--poll-interval-sec",
+        "PR42_POLL_INTERVAL_SEC", DEFAULT_POLL_INTERVAL_SEC,
     )
 
     # 0. Preconditions

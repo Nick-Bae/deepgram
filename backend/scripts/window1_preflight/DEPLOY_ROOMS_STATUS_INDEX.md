@@ -11,7 +11,7 @@ invoke the driver.
 
 | | |
 |---|---|
-| Driver script version | `3.0.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
+| Driver script version | `3.1.0` (`SCRIPT_VERSION` in `deploy_rooms_status_index.py`) |
 | Approved PR #42 SHA to pin | recorded independently by the reviewer; passed as `--reviewer-approved-sha` and MUST equal `--pr42-sha` |
 | Script sha256 pin | recorded independently by the reviewer; passed as `--script-sha256`; driver re-hashes itself and refuses on mismatch |
 | Firebase CLI version required | `13.19.0` (passed as `--firebase-tools-version-pin`; bump requires re-running the fixture suite) |
@@ -68,12 +68,18 @@ All under `--audit-dir`, all mode 700, all hashed:
 Driver installs an atexit hook + SIGINT/SIGTERM handler that
 fires exactly once. The handler:
 
-1. Terminates the deploy child's process group (SIGTERM, then SIGKILL after 5 s if still alive) so firebase cannot keep mutating.
-2. Takes the post-snapshot.
-3. Re-raises the original signal so the process exits with the canonical signal exit code.
+1. **SIGTERMs the deploy child's whole process group**, waits up to 5 s for **every member** to drain (not just the direct firebase child — R5 finding 1), **SIGKILLs any survivor**, and waits up to 2 s more. If any process is still alive after SIGKILL, the driver appends a line to `<audit>/trap-failure.txt` recording the surviving PIDs so the operator knows the post-snapshot cannot be trusted as a quiescent capture.
+2. Reaps the direct Popen child so no zombie remains.
+3. Takes the post-snapshot.
+4. Re-raises the original signal so the process exits with the canonical signal exit code.
 
-The fixture `test_sigint_mid_deploy_still_writes_post_snapshot`
-proves the trap fires under operator Ctrl-C.
+Fixtures under `R5ProcessGroupDrainTests` prove that a
+grandchild which installs `SIG_IGN` for SIGTERM does NOT
+survive the trap: only a whole-PG SIGKILL escalation
+(not a bare `Popen.wait()` on the direct child) prevents its
+delayed state mutation. The earlier R4 fixture
+`test_sigint_mid_deploy_terminates_process_group_and_prevents_late_mutation`
+continues to cover the default-SIGTERM-handling case.
 
 ## Recovery is a compensating change, NOT a git revert
 
@@ -155,34 +161,32 @@ invariants, AND the pre-deploy semantic delta, then stops. It
 does not invoke `firebase deploy`, does not poll, does not take
 post/final snapshots.
 
-## Test evidence for R3
+## Test evidence
 
 `backend/tests/test_deploy_rooms_status_index.py` exercises the
 driver's failure modes under a fake-CLI harness in
-`backend/tests/deploy_index_fixtures/`. The R3 suite adds:
+`backend/tests/deploy_index_fixtures/`. Coverage evolved across
+rounds:
 
-- **finding 1/9**: unknown-collection-group override in pre-state → pre-deploy delta refuses
-- **finding 3**: pre-deploy delta refuses on unrelated remote override
-- **finding 3**: pre-deploy delta refuses on remote composite present
-- **finding 3**: dry-run runs pre-deploy delta and refuses bad pre-state
-- **finding 5**: `--reviewer-approved-sha` != `--pr42-sha` → rc=2
-- **finding 5**: `--script-sha256` mismatch → rc=2
-- **finding 7**: MISSING observation after post-deploy → immediate rc=8 poll_error
-- **finding 8**: `gcloud firestore databases describe` locationId mismatch → rc=4
-- **finding 8**: databases describe name mismatch → rc=4
-- **finding 8**: zero / NaN timeout rejected by argparse (rc≠0)
-- **finding 8**: strict schema — unknown top-level key rejected
-- **finding 8**: strict schema — duplicate entries rejected
+- **R3** — nested-shape state model, pre-deploy semantic delta,
+  reviewer-approved-SHA + script-sha256 hash equality, remote
+  database confirmation, strict-schema invariants,
+  MISSING-after-READY hard-stop.
+- **R4** — real-gcloud fixture parser tests, exact-shape
+  rooms.status validators for pre/post/final snapshots,
+  final-drift regressions (composite / override / duplicated
+  target added after READY), and env-default finite-value
+  enforcement.
+- **R5** — full process-group drain on the SIGINT/SIGTERM trap
+  (grandchild that installs `SIG_IGN` for SIGTERM is SIGKILLed
+  before it can mutate; `trap-failure.txt` records survivors on
+  quiescence failure), and env-var non-numeric values routed
+  through rc=1 (usage) rather than rc=99 (internal).
 
-Plus the R2 fixtures updated to the R3 nested-shape state model:
-success, dry-run preparation checkpoint, deploy command failure,
-NEEDS_REPAIR, polling timeout, dirty worktree, HEAD mismatch,
-non-empty audit dir, wrong target project, bad firebase version
-pin, malformed PR #42 config, unexpected composite deletion
-(pre-deploy delta refusal), unexpected composite addition
-(post-diff), SIGINT mid-deploy.
-
-Local run: 28/28 fixture tests + 10/10 static tests = **38/38 pass**.
+Local run: fixture tests + static tests = **See the round's
+tests transcript for the exact pass count** — regenerated each
+round with `pytest -v` and delivered alongside the review
+artifacts.
 
 Run locally with:
 

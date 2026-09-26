@@ -32,6 +32,16 @@ State drives:
                                      a background child that
                                      WOULD mutate state 2 s later
                                      if not killed (finding 6)
+    - "sigint_mid_deploy_grandchild_ignores_sigterm"  (R5) —
+                                     SIGINT parent driver; spawn a
+                                     grandchild in the same PG that
+                                     installs SIG_IGN for SIGTERM
+                                     and would mutate state after
+                                     `sabotage_mutation_delay`
+                                     seconds. Only a SIGKILL-of-
+                                     the-whole-PG (not just wait()
+                                     on the direct child) can
+                                     prevent the mutation.
     - "commit_regresses_after_ready" — CG_ASC observes READY once
                                      then MISSING (finding 7)
 """
@@ -239,6 +249,71 @@ def _apply_deploy_effect(state_path: Path, state: dict) -> None:
         # normally, the driver has not terminated the group and
         # the sabotage child will complete its mutation.
         time.sleep(max(15.0, mutation_delay + 5.0))
+        return
+    if effect == "sigint_mid_deploy_grandchild_ignores_sigterm":
+        # R5 finding 1: the grandchild STAYS in this process's
+        # group AND installs SIG_IGN for SIGTERM. `Popen.wait()`
+        # on the direct firebase child (this fake) is not enough
+        # to prove quiescence: only a SIGKILL of the entire PG,
+        # OR a per-member drain that includes the grandchild,
+        # keeps the delayed mutation from running.
+        #
+        # We schedule the mutation past the driver's SIGTERM
+        # grace + SIGKILL grace so the driver MUST reach the
+        # SIGKILL path (or wait long enough for a natural exit,
+        # which by design never happens within the test window).
+        ready_path = state_path.parent / "sabotage_gc_ready.txt"
+        mutation_delay = float(state.get("sabotage_mutation_delay", 10.0))
+        pid = os.fork()
+        if pid == 0:
+            # Grandchild: ignore SIGTERM. SIGKILL cannot be caught
+            # or ignored, so if the driver escalates it, we die.
+            try:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except Exception:
+                pass
+            try:
+                ready_path.write_text(f"{os.getpid()}\n")
+            except Exception:
+                pass
+            # Sleep past the driver's SIGTERM + SIGKILL grace
+            # windows so the ONLY way we reach the mutation is if
+            # the driver failed to escalate to SIGKILL on the PG.
+            #
+            # `time.sleep` is signal-interruptible in Python 3.5+,
+            # but with SIG_IGN installed, SIGTERM never becomes a
+            # deliverable signal for us, so the sleep is NOT
+            # interrupted by SIGTERM (only by an uncatchable one,
+            # or by natural expiration).
+            end = time.monotonic() + mutation_delay
+            while time.monotonic() < end:
+                time.sleep(0.25)
+            try:
+                cur = json.loads(state_path.read_text())
+                cur["late_child_mutation"] = True
+                cur["composites"] = cur.get("composites", []) + [{
+                    "collectionGroup": "sabotage_group_gc",
+                    "fields": [{"fieldPath": "x", "order": "ASCENDING"}],
+                    "queryScope": "COLLECTION",
+                    "state": "READY",
+                }]
+                state_path.write_text(json.dumps(cur, indent=2) + "\n")
+            except Exception:
+                pass
+            os._exit(0)
+        # Parent (fake firebase): wait for the grandchild's ready
+        # marker so the test knows it's alive before we signal
+        # the driver. Then SIGINT the driver and hang for a long
+        # time — long enough that a driver that only waits on the
+        # DIRECT child (us) but not on the PG would then race the
+        # grandchild's mutation.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not ready_path.exists():
+            time.sleep(0.05)
+        parent_pid = os.getppid()
+        os.kill(parent_pid, signal.SIGINT)
+        # Hang: rely on the driver's SIGTERM/SIGKILL to end us.
+        time.sleep(max(30.0, mutation_delay + 15.0))
         return
     # R4 finding 4: post-READY late-mutation scenarios. These
     # arm a mutation that fake_gcloud applies AFTER the driver's
