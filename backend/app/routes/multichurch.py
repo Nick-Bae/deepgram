@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import StreamingResponse
@@ -10,9 +11,50 @@ from pydantic import BaseModel, Field
 from app import validators
 from app.auth.firebase_auth import AuthenticatedUser, get_current_user_required
 from app.auth.guards import require_org_role
+from app.security_log import security_event
 from app.socket_manager import manager
 from app.services.multichurch_store import multichurch_store
 from app.services.script_store import script_store
+
+
+_MAINT_TRUE = frozenset({"1", "true", "yes", "on"})
+_MAINT_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def require_maintenance_unlocked() -> None:
+    """Refuse start requests when maintenance-lock is active.
+
+    Parsing is fail-closed. `MAINTENANCE_LOCK_ACTIVE` unset or empty or a
+    recognised false value (`0`, `false`, `no`, `off` — case-insensitive)
+    allows the request through. A recognised true value (`1`, `true`,
+    `yes`, `on` — case-insensitive) or ANY other non-empty value refuses
+    with HTTP 503 + `Retry-After: 60` + body `{"detail": "maintenance"}`.
+    Unknown non-empty values are treated as "lock" so a typo cannot
+    silently open the gate.
+
+    This function is used as a router-level dependency on both start
+    routes (so it runs before authentication, slug lookup, authorization,
+    billing and room creation) and is also invoked defensively at the
+    top of `_start_service_for_org` for any future caller that bypasses
+    the routes.
+    """
+    raw = os.getenv("MAINTENANCE_LOCK_ACTIVE", "") or ""
+    v = raw.strip().lower()
+    if v == "" or v in _MAINT_FALSE:
+        return
+    security_event(
+        "start_service_refused_maintenance",
+        detail="maintenance_lock_active",
+        maintenance_lock_active_value_class=(
+            "explicit_true" if v in _MAINT_TRUE else "unknown_fail_closed"
+        ),
+    )
+    raise HTTPException(
+        status_code=503,
+        detail="maintenance",
+        headers={"Retry-After": "60"},
+    )
+
 
 def _cleanup_room_local_state(org_id: str, room_id: str) -> None:
     # Deferred import: main.py imports this router at load time.
@@ -71,6 +113,10 @@ def _start_service_for_org(
     payload: StartServiceRequest,
     current_user: AuthenticatedUser,
 ):
+    # Defense-in-depth: the router-level dependency on both start routes
+    # already refuses under maintenance BEFORE authentication. This call
+    # covers any future direct-import caller that bypasses the routes.
+    require_maintenance_unlocked()
     host_uid = current_user.uid
     allowed = multichurch_store.authorize_host(org_id, host_uid=host_uid, host_token=None)
     if not allowed:
@@ -292,7 +338,10 @@ def update_org_profile(
         raise HTTPException(status_code=403, detail=str(exc) or "forbidden") from exc
 
 
-@router.post("/org/{org_id}/service/{service_key}/start")
+@router.post(
+    "/org/{org_id}/service/{service_key}/start",
+    dependencies=[Depends(require_maintenance_unlocked)],
+)
 def start_service(
     *,
     org_id: str = Path(pattern=validators.ORG_ID),
@@ -308,7 +357,10 @@ def start_service(
     )
 
 
-@router.post("/c/{slug}/service/{service_key}/start")
+@router.post(
+    "/c/{slug}/service/{service_key}/start",
+    dependencies=[Depends(require_maintenance_unlocked)],
+)
 def start_service_by_slug(
     *,
     slug: str = Path(pattern=validators.CHURCH_SLUG),
