@@ -12,3 +12,12 @@ fakeredis>=2.20
 # production dep is reshuffled.
 PyYAML>=6.0
 
+# Google Cloud SDKs for the Window 1 preflight helpers
+# (backend/scripts/window1_preflight/{count_live_rooms,roster_cross_check}.py).
+# These helpers are review-only tooling — they never run in the
+# production Docker image, so declaring them dev-only keeps the
+# production install lean. Both are the current stable versions
+# as of the helper PR.
+google-cloud-logging>=3.10
+google-cloud-monitoring>=2.20
+
