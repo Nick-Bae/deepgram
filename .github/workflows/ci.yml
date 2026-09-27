@@ -99,6 +99,7 @@ jobs:
           pytest \
             tests/test_sweeper_atomic.py::FirestoreAtomicIdleTerminationTests \
             tests/test_deploy_gate_firestore.py::DeployGateFirestoreTests \
+            tests/test_deploy_gate_writer.py::DeployGateWriterFirestoreTests \
             -v --junitxml=/tmp/emulator-tests.xml
 
       - name: Fail if emulator tests skipped or none ran
