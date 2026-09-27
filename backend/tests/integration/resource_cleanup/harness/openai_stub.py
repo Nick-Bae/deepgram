@@ -29,18 +29,59 @@ except ImportError:  # pragma: no cover
     )
 
 
-# Extract the last unique-looking marker token from the transcript so
-# the test can assert it survived the pipeline. The F-15 test embeds
-# a hex marker like "cross-process-abc123" in the transcript it pushes
-# through the Deepgram stub; that same token must appear in the
-# translated payload the listener receives.
+# Extract a unique-looking marker token from the transcript so the
+# test can assert it survived the pipeline. Marker shape is any
+# lowercase-with-dashes prefix followed by a hex tail — the specific
+# prefix identifies which test emitted the marker (baseline-,
+# cross-process-, post-sigterm-, isolation-, cross-, handover-…),
+# but the stub does not need an allowlist. A prefix allowlist would
+# silently drop tests that use a new marker name (e.g. F-25's
+# `isolation-*` and F-26's `cross-*` were both dropped by an earlier
+# regex, making their assertions impossible to satisfy).
+#
+# CRITICAL SUBTLETY: production prompts (see app/utils/translate.py
+# around L1568-1602) look like:
+#
+#   [recent_context_block]
+#   Previous English sentence: <old translated line — contains an
+#     OLDER marker>
+#   IMPORTANT: ...
+#
+#   Current text:
+#   <the fresh input with the NEW marker>
+#
+# A naive whole-prompt regex returns the PREVIOUS marker, so the
+# stub echoes the previous translation and the test's fresh-marker
+# assertion times out. Fix: prefer the LAST `Current text:` block
+# and search only its body. Fall back to a whole-text search only
+# when the prompt has no `Current text:` section at all (matches
+# the `user_content = masked_text` branch in translate.py).
+#
+# Boundary lookarounds keep the regex from extracting a
+# valid-looking suffix from an INVALID token:
+#   - `(?<![a-z0-9_-])` — the character immediately before the
+#     match must not be a lowercase letter, digit, underscore, or
+#     dash. This rejects tokens like `no_underscore-abc123` where
+#     the "underscore-abc123" suffix would otherwise look like a
+#     valid marker.
+#   - `(?![a-f0-9])` — the match cannot end in the middle of a
+#     longer hex run.
+# Digits are allowed inside the prefix (after the leading letter)
+# so markers like `gate2-rollout-ab34` still match.
 _MARKER_RE = re.compile(
-    r"(?:cross-process|baseline|post-sigterm)-[a-f0-9]{4,}"
+    r"(?<![a-z0-9_-])[a-z][a-z0-9-]*-[a-f0-9]{4,}(?![a-f0-9])"
+)
+_CURRENT_TEXT_RE = re.compile(
+    r"Current text:\s*", re.IGNORECASE,
 )
 
 
 def _extract_marker(text: str) -> str:
-    m = _MARKER_RE.search(text or "")
+    body = text or ""
+    matches = list(_CURRENT_TEXT_RE.finditer(body))
+    if matches:
+        body = body[matches[-1].end():]
+    m = _MARKER_RE.search(body)
     if not m:
         return ""
     return m.group(0)

@@ -109,6 +109,16 @@ class BackendProcess:
         env.setdefault("CORS_ALLOW_ORIGINS", "http://localhost")
         env.setdefault("ROOM_SWEEPER_INTERVAL_SEC", "60")
         env.setdefault("ROOM_IDLE_TIMEOUT_SEC", "900")
+        # E2E test-only auth substitution — invoked by launching the
+        # harness bootstrap in start() when E2E_STUB_AUTH_MAPPING is
+        # set on the parent process. Production code (backend/app/)
+        # is imported unchanged; only firebase_auth.verify_id_token_value
+        # is monkey-patched in the child process before uvicorn serves
+        # its first request. See harness/e2e_uvicorn_bootstrap.py.
+        for e2e_key in ("E2E_STUB_AUTH_MAPPING",):
+            outer = os.environ.get(e2e_key)
+            if outer:
+                env[e2e_key] = outer
         env.update(self.config.extra_env)
         return env
 
@@ -121,26 +131,66 @@ class BackendProcess:
             suffix=".log",
         )
         self.log_file = os.fdopen(log_fd, "w")
-        # Run uvicorn against the real app entrypoint.
-        cmd = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "app.main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(self.config.port),
-            "--log-level",
-            "info",
-        ]
+        # If the caller has set E2E_STUB_AUTH_MAPPING, launch through
+        # the harness bootstrap. The bootstrap imports the real app
+        # module unchanged, monkey-patches
+        # `firebase_auth.verify_id_token_value` in-process, then
+        # starts uvicorn. Production code is never touched.
+        env = self.env()
+        if os.environ.get("E2E_STUB_AUTH_MAPPING"):
+            bootstrap = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "e2e_uvicorn_bootstrap.py",
+            )
+            # Ensure the bootstrap can `import app.*`. Without this,
+            # running `python <path>/e2e_uvicorn_bootstrap.py` puts
+            # the harness dir on sys.path[0] and `import app` fails.
+            # The bootstrap ALSO does sys.path.insert as belt-and-
+            # braces, but PYTHONPATH is the standard mechanism.
+            backend_root = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "..", "..",
+                )
+            )
+            existing = env.get("PYTHONPATH") or ""
+            env["PYTHONPATH"] = (
+                backend_root + (os.pathsep + existing if existing else "")
+            )
+            cmd = [
+                sys.executable,
+                bootstrap,
+                "--host", "127.0.0.1",
+                "--port", str(self.config.port),
+                "--app", "app.main:app",
+                "--log-level", "info",
+            ]
+        else:
+            # Default path — run uvicorn directly against the real
+            # entrypoint. F-25 and every non-auth-exercising test
+            # use this.
+            cmd = [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "app.main:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.config.port),
+                "--log-level",
+                "info",
+            ]
         # Working directory: the backend package root, so `app.main`
         # resolves. Callers ensure they run from backend/.
+        # Use the `env` we built above (may have PYTHONPATH added for
+        # the bootstrap path). Do NOT call self.env() again — that
+        # would drop the PYTHONPATH override.
         self.proc = subprocess.Popen(
             cmd,
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
-            env=self.env(),
+            env=env,
         )
 
     def wait_ready(self, *, timeout: float = 30.0) -> None:

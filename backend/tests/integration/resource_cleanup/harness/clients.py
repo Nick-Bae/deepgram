@@ -116,6 +116,13 @@ class ListenerClient:
     async def is_open(self) -> bool:
         return _ws_looks_open(self.ws)
 
+    def reader_alive(self) -> bool:
+        """Return True when the background reader task exists and has
+        not completed. An open socket alone does not prove that
+        frames are being collected — the reader could have crashed
+        with an exception or been cancelled by teardown."""
+        return self._reader_task is not None and not self._reader_task.done()
+
     async def wait_closed(self, *, timeout: float = 10.0) -> None:
         if self.ws is None:
             return
