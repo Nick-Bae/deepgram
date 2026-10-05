@@ -126,10 +126,10 @@ def test_capture_bounds_at_serialized_bytes(capsys, monkeypatch):
     # contributes a thread_name of 800 chars.
     assert event["truncated_reason"] == "serialized_bytes", (
         f"expected serialized_bytes truncation, got {event['truncated_reason']!r}; "
-        f"estimate={event.get('serialized_bytes_estimate')}"
+        f"actual={event.get('serialized_bytes_actual')}"
     )
-    assert "serialized_bytes_estimate" in event
-    assert isinstance(event["serialized_bytes_estimate"], int)
-    assert event["serialized_bytes_estimate"] <= STACK_CAPTURE_MAX_SERIALIZED_BYTES + 10_000, (
-        "serialized_bytes_estimate should be close to the configured ceiling"
+    assert "serialized_bytes_actual" in event
+    assert isinstance(event["serialized_bytes_actual"], int)
+    assert event["serialized_bytes_actual"] <= STACK_CAPTURE_MAX_SERIALIZED_BYTES, (
+        "serialized_bytes_actual must not exceed the configured ceiling"
     )

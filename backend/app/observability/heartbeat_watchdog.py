@@ -38,7 +38,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from typing import Callable, Deque, Optional
+from typing import Any, Callable, Deque, Optional
 
 import json as _size_json
 
@@ -46,6 +46,7 @@ from .constants import (
     HEARTBEAT_STALL_THRESHOLD_S,
     HEARTBEAT_TICK_INTERVAL_S,
     HEARTBEAT_WATCHDOG_CHECK_INTERVAL_S,
+    STACK_CAPTURE_HEADER_BYTES_BUDGET,
     STACK_CAPTURE_HOUR_CAP,
     STACK_CAPTURE_MAX_FRAMES_PER_THREAD,
     STACK_CAPTURE_MAX_SERIALIZED_BYTES,
@@ -56,7 +57,7 @@ from .constants import (
     WATCHDOG_RECOVERY_MIN_INTERVAL_S,
     WATCHDOG_RECOVERY_WINDOW_S,
 )
-from ._emit import emit
+from ._emit import emit, instance_id as _emit_instance_id
 
 
 # Repo root — stripped from frame paths so emissions are low-cardinality and
@@ -131,17 +132,45 @@ class _RateLimiter:
             return "allow"
 
 
-def _frame_json_size(frame: dict) -> int:
-    """Return the number of bytes a frame will add to the serialized burst.
+# 16-char placeholder for the sha256[:16] frames_sha256 digest. Used during
+# staging ONLY — the real digest replaces it before emission. 16 hex chars
+# in both cases, so byte counts are identical.
+_FRAMES_SHA256_PLACEHOLDER = "0" * 16
 
-    Approximate: use json.dumps with sort_keys so the estimate is stable.
-    We care about ordering of magnitude, not exact byte count.
+
+def _frame_envelope_size(frame: dict) -> int:
+    """Return the exact UTF-8 byte count for the `stack_frames` event this
+    frame will emit, matching the envelope `emit()` produces (plus +1 for
+    newline). Used by the staging-time truncation decision so the aggregate
+    aligns with the post-emit measurement.
     """
+    # Build the full envelope that `_emit_stack_frames` will pass to `emit()`,
+    # then serialize with the same rules `emit()` uses. We don't yet know the
+    # real digest; use a 16-char placeholder (same width as the real digest).
+    env = {
+        "component": "heartbeat_watchdog",
+        "event": "stack_frames",
+        "frame_index": frame.get("frame_index", 0),
+        "frames_sha256": _FRAMES_SHA256_PLACEHOLDER,
+        "function": frame.get("function", ""),
+        "file": frame.get("file", ""),
+        "instance_id": _emit_instance_id(),
+        "line": int(frame.get("line", 0)),
+        "schema_version": "1",
+        "severity": "WARNING",
+        "thread_name": frame.get("thread_name", ""),
+    }
     try:
-        return len(_size_json.dumps(frame, ensure_ascii=False, sort_keys=True)) + 1  # +1 for newline
+        return len(_size_json.dumps(env, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")) + 1
     except Exception:
-        # Fallback: assume a modest frame size if serialization fails.
-        return 256
+        # Fallback: assume a modest full-envelope size if serialization fails.
+        return 512
+
+
+def _frame_json_size(frame: dict) -> int:
+    """Back-compat shim — forwards to the full-envelope size calculation so
+    the staging-time accumulator aligns with post-emit UTF-8 bytes."""
+    return _frame_envelope_size(frame)
 
 
 class _CaptureResult:
@@ -154,8 +183,17 @@ class _CaptureResult:
       - thread_count_captured: threads whose frames made it into `frames`.
       - frames_captured_total: len(frames).
       - truncated: whether any cap was hit.
-      - truncated_reason: enum, one of none|threads|frames_per_thread|serialized_bytes.
-      - serialized_bytes_estimate: int, byte accumulator at stop.
+      - truncated_reason: PRIMARY reason, enum one of
+        {none|threads|frames_per_thread|serialized_bytes}. Retained for
+        backward compatibility — readers of this telemetry should prefer
+        `truncated_reasons` when present.
+      - truncated_reasons: list of all caps that fired, in evaluation order
+        (threads > frames_per_thread > serialized_bytes). Empty when
+        `truncated=False`. Added by the follow-up remediation.
+      - staged_bytes_accumulator: internal byte-count during capture staging,
+        used ONLY to decide when to stop staging frames. The emitted
+        `serialized_bytes_actual` is the authoritative post-emit measurement
+        (see `_emit_stack_capture`).
     """
 
     __slots__ = (
@@ -166,7 +204,8 @@ class _CaptureResult:
         "frames_captured_total",
         "truncated",
         "truncated_reason",
-        "serialized_bytes_estimate",
+        "truncated_reasons",
+        "staged_bytes_accumulator",
     )
 
     def __init__(self) -> None:
@@ -177,7 +216,8 @@ class _CaptureResult:
         self.frames_captured_total: int = 0
         self.truncated: bool = False
         self.truncated_reason: str = "none"
-        self.serialized_bytes_estimate: int = 0
+        self.truncated_reasons: list[str] = []
+        self.staged_bytes_accumulator: int = 0
 
 
 def _capture_stack_frames() -> _CaptureResult:
@@ -243,10 +283,15 @@ def _capture_stack_frames() -> _CaptureResult:
                 "function": func,
                 "line": int(line),
             }
-            # Cap 3: cumulative serialized bytes.
+            # Cap 3: cumulative serialized bytes (staging-time accumulator
+            # drives truncation; the emitted `serialized_bytes_actual` is
+            # the post-emit measurement computed in `_emit_stack_capture`).
+            # Reserve HEADER_BYTES_BUDGET for the stack_capture header so the
+            # final aggregate (header + frames) stays under the cap.
             frame_bytes = _frame_json_size(frame_dict)
-            projected = result.serialized_bytes_estimate + frame_bytes
-            if projected > STACK_CAPTURE_MAX_SERIALIZED_BYTES:
+            projected = result.staged_bytes_accumulator + frame_bytes
+            effective_max = STACK_CAPTURE_MAX_SERIALIZED_BYTES - STACK_CAPTURE_HEADER_BYTES_BUDGET
+            if projected > effective_max:
                 bytes_truncated = True
                 # Record the digest from what we have so far and return.
                 result.digest = hashlib.sha256(
@@ -265,7 +310,7 @@ def _capture_stack_frames() -> _CaptureResult:
 
             result.frames.append(frame_dict)
             canonical_lines.append(f"{thread_name}|{rel}|{func}|{line}")
-            result.serialized_bytes_estimate = projected
+            result.staged_bytes_accumulator = projected
             frame_index += 1
             thread_contributed = True
 
@@ -292,21 +337,62 @@ def _assign_truncation(
     frames_truncated_any: bool,
     bytes_truncated: bool,
 ) -> None:
-    """Apply the earliest-wins priority to the truncation flags."""
+    """Populate `truncated`, `truncated_reason` (primary, earliest-wins) and
+    `truncated_reasons` (bounded list, all caps that fired, in evaluation
+    order).
+
+    Primary reason retained for backward compatibility; readers of this
+    telemetry should prefer `truncated_reasons` when present.
+    """
+    reasons: list[str] = []
     if threads_truncated:
-        result.truncated = True
-        result.truncated_reason = "threads"
-        return
+        reasons.append("threads")
     if frames_truncated_any:
-        result.truncated = True
-        result.truncated_reason = "frames_per_thread"
-        return
+        reasons.append("frames_per_thread")
     if bytes_truncated:
+        reasons.append("serialized_bytes")
+    if reasons:
         result.truncated = True
-        result.truncated_reason = "serialized_bytes"
-        return
-    result.truncated = False
-    result.truncated_reason = "none"
+        result.truncated_reason = reasons[0]
+        result.truncated_reasons = reasons
+    else:
+        result.truncated = False
+        result.truncated_reason = "none"
+        result.truncated_reasons = []
+
+
+def _envelope_bytes(
+    event: str,
+    *,
+    severity: str,
+    component: str,
+    **fields: Any,
+) -> int:
+    """Return the exact UTF-8 byte count that `emit()` will write for the
+    given event + fields, including the trailing newline.
+
+    Mirrors the `emit()` serialization contract (json.dumps with
+    ensure_ascii=False + sort_keys=True + default=str, then +1 for newline).
+    Reserved envelope keys cannot be overridden by caller fields; same
+    precedence as `emit()`.
+    """
+    env: dict[str, Any] = {
+        "event": event,
+        "schema_version": "1",
+        "severity": severity if severity in {"DEBUG", "INFO", "NOTICE", "WARNING", "ERROR"} else "INFO",
+        "component": component,
+        "instance_id": _emit_instance_id(),
+    }
+    for k, v in fields.items():
+        if k in env:
+            continue
+        env[k] = v
+    try:
+        return len(_size_json.dumps(env, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")) + 1
+    except Exception:
+        # Serialization failure here is itself unlikely; return a sentinel
+        # that will tend to overestimate rather than overflow silently.
+        return 1024
 
 
 def _emit_stack_capture(
@@ -321,27 +407,71 @@ def _emit_stack_capture(
     Primary form: pass a `_CaptureResult` from `_capture_stack_frames` so the
     header carries the full bounded-capture cardinality + truncation info.
 
+    `serialized_bytes_actual` is the post-measurement aggregate UTF-8 byte
+    count across THIS header event plus every `stack_frames` event that will
+    follow. Replaces the pre-emit staging estimate shipped in the Scope 1
+    remediation. The value is computed by fixed-point iteration: the header's
+    own byte length depends on the digit count of `serialized_bytes_actual`,
+    so we rebuild the header with the running aggregate until the length
+    stabilizes (converges in at most a handful of iterations because
+    digit-count grows only on crossing powers of ten and the aggregate is
+    bounded above by STACK_CAPTURE_MAX_SERIALIZED_BYTES).
+
     Legacy form (kept for the pre-remediation no-sensitive-labels test and
     any ad-hoc caller that only had `thread_count` + `digest`): pass those
     kwargs instead. Truncation fields default to the "no truncation known"
     representation.
     """
     if result is not None:
+        base_fields: dict[str, Any] = {
+            "stall_seconds": round(stall_seconds, 3),
+            "thread_count": int(result.thread_count_captured),
+            "thread_count_captured": int(result.thread_count_captured),
+            "thread_count_total": int(result.thread_count_total),
+            "frames_captured_total": int(result.frames_captured_total),
+            "truncated": bool(result.truncated),
+            "truncated_reason": str(result.truncated_reason),
+            "truncated_reasons": list(result.truncated_reasons),
+            "frames_sha256": result.digest,
+        }
+        # Sum the exact bytes every stack_frames event will emit.
+        frame_bytes_total = 0
+        for f in result.frames:
+            frame_bytes_total += _envelope_bytes(
+                "stack_frames",
+                severity="WARNING",
+                component="heartbeat_watchdog",
+                frames_sha256=result.digest,
+                frame_index=f["frame_index"],
+                thread_name=f["thread_name"],
+                file=f["file"],
+                function=f["function"],
+                line=f["line"],
+            )
+        # Fixed-point iteration on the aggregate — the header's byte length
+        # depends on the digit count of `serialized_bytes_actual`.
+        aggregate = 0
+        for _ in range(8):
+            header_bytes = _envelope_bytes(
+                "stack_capture",
+                severity="WARNING",
+                component="heartbeat_watchdog",
+                serialized_bytes_actual=int(aggregate),
+                **base_fields,
+            )
+            next_aggregate = header_bytes + frame_bytes_total
+            if next_aggregate == aggregate:
+                break
+            aggregate = next_aggregate
         emit(
             "stack_capture",
             severity="WARNING",
             component="heartbeat_watchdog",
-            stall_seconds=round(stall_seconds, 3),
-            thread_count=int(result.thread_count_captured),
-            thread_count_captured=int(result.thread_count_captured),
-            thread_count_total=int(result.thread_count_total),
-            frames_captured_total=int(result.frames_captured_total),
-            truncated=bool(result.truncated),
-            truncated_reason=str(result.truncated_reason),
-            serialized_bytes_estimate=int(result.serialized_bytes_estimate),
-            frames_sha256=result.digest,
+            serialized_bytes_actual=int(aggregate),
+            **base_fields,
         )
         return
+    # Legacy call-shape — ad-hoc callers that only knew thread_count + digest.
     emit(
         "stack_capture",
         severity="WARNING",
@@ -353,7 +483,8 @@ def _emit_stack_capture(
         frames_captured_total=0,
         truncated=False,
         truncated_reason="none",
-        serialized_bytes_estimate=0,
+        truncated_reasons=[],
+        serialized_bytes_actual=0,
         frames_sha256=str(digest or ""),
     )
 
@@ -404,9 +535,12 @@ def _emit_watchdog_recovery(
             component="heartbeat_watchdog",
             recovery_count_since_start=int(recovery_count),
         )
-    except BaseException:
+    except Exception:
         # Recovery emission failure is also swallowed — the whole point is
-        # that nothing from this path can terminate the thread.
+        # that nothing from this path can terminate the thread. Follow-up
+        # narrows this from `BaseException` to `Exception` so SystemExit,
+        # KeyboardInterrupt, GeneratorExit, and asyncio.CancelledError still
+        # propagate as intended.
         pass
 
 
@@ -443,14 +577,18 @@ def _watchdog_run(
         # ----- normal check interval sleep (always unconditional) -----
         try:
             sleep_fn(check_interval_s)
-        except BaseException:
+        except Exception:
             # A sleep failure is itself unrecoverable (clock corruption etc.)
-            # Return cleanly; the daemon thread exits.
+            # Return cleanly; the daemon thread exits. Follow-up narrows
+            # from BaseException to Exception — SystemExit / KeyboardInterrupt
+            # / GeneratorExit / asyncio.CancelledError now propagate.
             return
         if state.stop_event.is_set():
             return
 
-        # ----- iteration body — any exception is swallowed -----
+        # ----- iteration body — any Exception is swallowed; BaseException
+        # subclasses (SystemExit, KeyboardInterrupt, GeneratorExit,
+        # asyncio.CancelledError) propagate so the parent context can act.
         try:
             if pending_cooldown:
                 # Post-capture cooldown: observe a longer wait before
@@ -459,7 +597,7 @@ def _watchdog_run(
                 # threshold delta here. Still unconditional sleep.
                 try:
                     sleep_fn(stall_threshold_s)
-                except BaseException:
+                except Exception:
                     return
                 pending_cooldown = False
                 # Re-baseline so the next pass measures a fresh stall window.
@@ -490,11 +628,14 @@ def _watchdog_run(
             # Flag that the next loop iteration should perform the cooldown
             # sleep (keeps the sleep unconditional + bounded).
             pending_cooldown = True
-        except BaseException:
-            # Any failure inside the iteration body (capture raise, emission
-            # raise, enumerate raise, serialization raise) must NOT terminate
-            # the thread. Record a recovery event and continue to the next
-            # iteration. The recovery emission is itself best-effort.
+        except Exception:
+            # Any `Exception` subclass inside the iteration body (capture
+            # raise, emission raise, enumerate raise, serialization raise)
+            # must NOT terminate the thread. Record a recovery event and
+            # continue to the next iteration. The recovery emission is
+            # itself best-effort. Follow-up narrows this from BaseException
+            # to Exception so SystemExit / KeyboardInterrupt / GeneratorExit
+            # / asyncio.CancelledError propagate instead of being swallowed.
             recovery_count += 1
             try:
                 _emit_watchdog_recovery(
@@ -502,7 +643,7 @@ def _watchdog_run(
                     recovery_count,
                     time_fn() if callable(time_fn) else time.time(),
                 )
-            except BaseException:
+            except Exception:
                 pass
 
 

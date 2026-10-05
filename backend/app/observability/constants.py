@@ -38,6 +38,12 @@ STACK_CAPTURE_WINDOW_S: float = 3600.0           # sliding window for the hour c
 # Cloud Logging.
 STACK_CAPTURE_MAX_THREADS: int = 64             # cap on threads emitted per capture
 STACK_CAPTURE_MAX_FRAMES_PER_THREAD: int = 128  # cap on frames emitted per thread
+# Reserve a budget for the stack_capture HEADER event in the staging-time
+# truncation decision. The header is roughly ~400-600 bytes depending on
+# truncated_reasons list length and the digit count of
+# serialized_bytes_actual; 1024 is a conservative upper bound that keeps the
+# aggregate (header + frames) under STACK_CAPTURE_MAX_SERIALIZED_BYTES.
+STACK_CAPTURE_HEADER_BYTES_BUDGET: int = 1024
 # Conservative Cloud Logging-safe aggregate serialized-bytes cap. Google Cloud
 # Logging rejects log entries whose `textPayload`/`jsonPayload` exceed 256 KB
 # per entry; we stop emitting at 192 KB (75% of ceiling) so one capture burst

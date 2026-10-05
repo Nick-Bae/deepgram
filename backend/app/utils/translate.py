@@ -460,16 +460,25 @@ def _log_translation_example(
         with open(_TRANSLATION_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
-        print(f"[TX] Failed to log translation example: {exc}")
+        # Follow-up remediation: guard the legacy error-log print. An EPIPE
+        # on stdout while reporting another error must NOT escape this
+        # function and alter translation handling. `except Exception` so
+        # SystemExit / KeyboardInterrupt / GeneratorExit still propagate.
+        try:
+            print(f"[TX] Failed to log translation example: {exc}")
+        except Exception:
+            pass
     finally:
-        # Review defect #3 remediation: the TX_LOG print must be strictly
-        # best-effort — a stdout EPIPE or any other print failure MUST NOT
-        # alter translation output, exception propagation, or any cleanup
-        # that follows. The outer try/except guarantees this.
+        # Review defect #3 remediation + follow-up: the TX_LOG print must be
+        # strictly best-effort — a stdout EPIPE or any other `Exception`
+        # subclass must NOT alter translation output, exception propagation,
+        # or any cleanup that follows. Follow-up narrows the catch from
+        # BaseException to Exception so SystemExit / KeyboardInterrupt /
+        # GeneratorExit still propagate as intended.
         try:
             _write_ms = (_tx_time.monotonic() - _write_t0) * 1000.0
             print(f"[TX_LOG] write_ms={_write_ms:.3f}")
-        except BaseException:
+        except Exception:
             pass
 
 
