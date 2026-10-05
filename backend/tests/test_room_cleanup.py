@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import fakeredis.aioredis as fake_aio
+from fakeredis import FakeServer as _PubFakeServer
 
 from app.socket_manager import ConnectionManager
 from app.services.redis_pubsub import RedisPubSub
@@ -65,7 +66,7 @@ def _fresh_pubsub(*, start_reader: bool = True) -> RedisPubSub:
 
     async def _fake_start() -> None:
         ps._started = True
-        server = fake_aio.FakeServer()
+        server = _PubFakeServer()
         ps._pub = fake_aio.FakeRedis(server=server, decode_responses=True)
         ps._sub = fake_aio.FakeRedis(server=server, decode_responses=True)
         await ps._pub.ping()

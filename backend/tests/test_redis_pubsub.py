@@ -16,6 +16,7 @@ import unittest
 
 # fakeredis provides an in-memory redis.asyncio.Redis workalike.
 import fakeredis.aioredis as fake_aio
+from fakeredis import FakeServer as _PubFakeServer
 
 from app.env import ENV
 
@@ -29,7 +30,7 @@ def _make_pubsub(delivered):
 
     async def _fake_start():
         ps._started = True
-        server = fake_aio.FakeServer()
+        server = _PubFakeServer()
         ps._pub = fake_aio.FakeRedis(server=server, decode_responses=True)
         ps._sub = fake_aio.FakeRedis(server=server, decode_responses=True)
         await ps._pub.ping()
@@ -187,7 +188,7 @@ class ConnectionManagerBroadcastTests(unittest.IsolatedAsyncioTestCase):
         prev_enabled = _singleton._enabled
         prev_connected = _singleton._connected
 
-        server = fake_aio.FakeServer()
+        server = _PubFakeServer()
         _singleton._pub = fake_aio.FakeRedis(server=server, decode_responses=True)
         _singleton._enabled = True
         _singleton._connected = True
