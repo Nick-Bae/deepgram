@@ -268,8 +268,13 @@ def _capture_stack_frames() -> _CaptureResult:
         except Exception:
             continue
 
-        # Cap 2: frames per thread.
-        thread_frames = extracted[:STACK_CAPTURE_MAX_FRAMES_PER_THREAD]
+        # Cap 2: frames per thread. Retain the INNERMOST (deepest) frames —
+        # those are the ones currently executing, which carry the actual
+        # diagnostic signal for a CPU-pin. `traceback.extract_stack` returns
+        # frames outermost-first, so a tail slice `[-N:]` keeps the deepest
+        # N (defect 4 remediation; the previous slice `[:N]` dropped exactly
+        # the frames we needed).
+        thread_frames = extracted[-STACK_CAPTURE_MAX_FRAMES_PER_THREAD:]
         if len(extracted) > STACK_CAPTURE_MAX_FRAMES_PER_THREAD:
             frames_truncated_any = True
 

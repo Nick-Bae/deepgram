@@ -16,6 +16,13 @@ LAG_P99_ERROR_MS: float = 500.0          # severity bumps to ERROR when p99 ≥ 
 # --- asyncio task-count sampler ---------------------------------------------
 TASK_COUNT_EMIT_INTERVAL_S: float = 30.0
 TASK_COUNT_WINDOW_SAMPLES: int = 2       # tracked for delta_30s (prev vs current)
+# SCOPE.md § M2: WARNING severity ONLY after the asyncio task count has
+# increased by at least TASK_COUNT_WARNING_DELTA from a defined BASELINE
+# for TASK_COUNT_WARNING_CONSECUTIVE CONSECUTIVE samples. This is a
+# delta-FROM-BASELINE rule, not a delta_30s absolute-threshold rule.
+# Baseline semantics are documented in task_count.py's module docstring.
+TASK_COUNT_WARNING_DELTA: int = 10
+TASK_COUNT_WARNING_CONSECUTIVE: int = 3
 
 # --- process CPU sampler ----------------------------------------------------
 PROCESS_CPU_EMIT_INTERVAL_S: float = 30.0

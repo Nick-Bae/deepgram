@@ -1,4 +1,10 @@
-"""Executor-queue sampler emits numeric queue_depth and active_workers."""
+"""Executor-queue sampler emits numeric queue_depth and worker_threads_total.
+
+Field renamed from `active_workers` to `worker_threads_total` per the
+defect-3 remediation: the executor's `_threads` attribute counts SPAWNED
+worker threads, which stay alive after their futures complete, so the
+field was misleadingly labeled "active."
+"""
 from __future__ import annotations
 
 import asyncio
@@ -27,7 +33,7 @@ def _events(captured: str, name: str) -> list[dict]:
     return out
 
 
-def test_executor_queue_emits_queue_depth_and_active_workers(capsys):
+def test_executor_queue_emits_queue_depth_and_worker_threads_total(capsys):
     try:
         from app.observability.executor_queue import start_executor_queue_sampler
     except ImportError as exc:
@@ -54,5 +60,5 @@ def test_executor_queue_emits_queue_depth_and_active_workers(capsys):
         assert e.get("schema_version") == "1"
         assert e.get("component") == "executor"
         assert "queue_depth" in e and isinstance(e["queue_depth"], int)
-        assert "active_workers" in e and isinstance(e["active_workers"], int)
+        assert "worker_threads_total" in e and isinstance(e["worker_threads_total"], int)
         assert "max_workers" in e and isinstance(e["max_workers"], int)

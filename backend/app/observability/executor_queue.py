@@ -9,6 +9,15 @@ Uses private `ThreadPoolExecutor._work_queue` because the public API does
 not expose queue depth. This is explicitly flagged in SCOPE and the report
 as a Python-version-fragile attribute; the sampler guards every access and
 degrades gracefully if the attribute is missing.
+
+Defect 3 remediation (2026-10-05 review): the previous emission used
+`active_workers=len(executor._threads)`, which is the count of SPAWNED
+worker threads — not currently-busy ones. ThreadPoolExecutor keeps workers
+alive after their futures complete, so `_threads` grows monotonically up
+to `max_workers`. We rename the field to `worker_threads_total` so the
+name matches what is actually measured. A reliable "busy workers" metric
+would require instrumenting the submit/future-done path, which is out of
+Scope 1.
 """
 from __future__ import annotations
 
@@ -45,7 +54,12 @@ def _max_workers(executor: Any) -> int:
     return -1
 
 
-def _active_threads(executor: Any) -> int:
+def _worker_threads_total(executor: Any) -> int:
+    """Count of SPAWNED worker threads in the pool, not currently-busy
+    workers. `ThreadPoolExecutor` keeps spawned workers alive until the
+    pool is shut down; this value grows monotonically up to `max_workers`
+    and does not decrease when work completes. Name reflects reality
+    (defect 3 remediation)."""
     threads = getattr(executor, "_threads", None)
     if threads is None:
         return -1
@@ -55,34 +69,46 @@ def _active_threads(executor: Any) -> int:
         return -1
 
 
+def _executor_queue_tick() -> None:
+    """One sampler tick. Extracted from the async loop so tests can
+    exercise emission deterministically."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover
+        return
+    executor = _resolve_default_executor(loop)
+    if executor is None:
+        emit(
+            "executor_queue",
+            severity="INFO",
+            component="executor",
+            queue_depth=0,
+            worker_threads_total=0,
+            max_workers=0,
+            executor_initialized=False,
+        )
+        return
+    emit(
+        "executor_queue",
+        severity="INFO",
+        component="executor",
+        queue_depth=_queue_depth(executor),
+        # `worker_threads_total` measures the number of worker threads
+        # currently spawned by the default ThreadPoolExecutor (lazy up to
+        # `max_workers`); these threads may be idle. True busy-worker count
+        # is not measured — see Defect 3 remediation note. The field was
+        # previously named `active_workers`, which was misleading because
+        # ThreadPoolExecutor keeps spawned workers alive after their futures
+        # complete.
+        worker_threads_total=_worker_threads_total(executor),
+        max_workers=_max_workers(executor),
+        executor_initialized=True,
+    )
+
+
 async def _executor_queue_loop(emit_interval_s: float) -> None:
     while True:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:  # pragma: no cover
-            return
-        executor = _resolve_default_executor(loop)
-        if executor is None:
-            # No default executor materialised yet — report that explicitly.
-            emit(
-                "executor_queue",
-                severity="INFO",
-                component="executor",
-                queue_depth=0,
-                active_workers=0,
-                max_workers=0,
-                executor_initialized=False,
-            )
-        else:
-            emit(
-                "executor_queue",
-                severity="INFO",
-                component="executor",
-                queue_depth=_queue_depth(executor),
-                active_workers=_active_threads(executor),
-                max_workers=_max_workers(executor),
-                executor_initialized=True,
-            )
+        _executor_queue_tick()
         try:
             await asyncio.sleep(emit_interval_s)
         except asyncio.CancelledError:
