@@ -448,12 +448,22 @@ def _log_translation_example(
     if org_id:
         record["org_id"] = org_id
 
+    # Observability M3: emit a `[TX_LOG] write_ms=<float>` marker on every
+    # call so Cloud Logging can derive a numeric write-duration metric.
+    # NEVER log transcript text, token, uid, or any other sensitive field —
+    # the marker carries only the numeric duration. See
+    # backend/app/observability/SCOPE.md § M3.
+    import time as _tx_time
+    _write_t0 = _tx_time.monotonic()
     try:
         _ensure_data_dir()
         with open(_TRANSLATION_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
         print(f"[TX] Failed to log translation example: {exc}")
+    finally:
+        _write_ms = (_tx_time.monotonic() - _write_t0) * 1000.0
+        print(f"[TX_LOG] write_ms={_write_ms:.3f}")
 
 
 def log_corrected_translation(
