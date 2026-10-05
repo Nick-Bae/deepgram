@@ -462,8 +462,15 @@ def _log_translation_example(
     except Exception as exc:
         print(f"[TX] Failed to log translation example: {exc}")
     finally:
-        _write_ms = (_tx_time.monotonic() - _write_t0) * 1000.0
-        print(f"[TX_LOG] write_ms={_write_ms:.3f}")
+        # Review defect #3 remediation: the TX_LOG print must be strictly
+        # best-effort — a stdout EPIPE or any other print failure MUST NOT
+        # alter translation output, exception propagation, or any cleanup
+        # that follows. The outer try/except guarantees this.
+        try:
+            _write_ms = (_tx_time.monotonic() - _write_t0) * 1000.0
+            print(f"[TX_LOG] write_ms={_write_ms:.3f}")
+        except BaseException:
+            pass
 
 
 def log_corrected_translation(

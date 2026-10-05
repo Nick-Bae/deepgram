@@ -40,13 +40,21 @@ import traceback
 from collections import deque
 from typing import Callable, Deque, Optional
 
+import json as _size_json
+
 from .constants import (
     HEARTBEAT_STALL_THRESHOLD_S,
     HEARTBEAT_TICK_INTERVAL_S,
     HEARTBEAT_WATCHDOG_CHECK_INTERVAL_S,
     STACK_CAPTURE_HOUR_CAP,
+    STACK_CAPTURE_MAX_FRAMES_PER_THREAD,
+    STACK_CAPTURE_MAX_SERIALIZED_BYTES,
+    STACK_CAPTURE_MAX_THREADS,
     STACK_CAPTURE_MIN_INTERVAL_S,
     STACK_CAPTURE_WINDOW_S,
+    WATCHDOG_RECOVERY_HOUR_CAP,
+    WATCHDOG_RECOVERY_MIN_INTERVAL_S,
+    WATCHDOG_RECOVERY_WINDOW_S,
 )
 from ._emit import emit
 
@@ -123,15 +131,64 @@ class _RateLimiter:
             return "allow"
 
 
-def _capture_stack_frames() -> tuple[str, list[dict]]:
-    """Capture a redacted stack-frame record for every live thread.
+def _frame_json_size(frame: dict) -> int:
+    """Return the number of bytes a frame will add to the serialized burst.
 
-    Returns `(frames_sha256_16hex, frames_list)` where each frame is
-    `{thread_name, file, function, line, frame_index}`. The sha256 is of the
-    canonical concatenation of frames; it serves as a stable correlation id
-    across captures of the same stack shape.
+    Approximate: use json.dumps with sort_keys so the estimate is stable.
+    We care about ordering of magnitude, not exact byte count.
     """
-    frames: list[dict] = []
+    try:
+        return len(_size_json.dumps(frame, ensure_ascii=False, sort_keys=True)) + 1  # +1 for newline
+    except Exception:
+        # Fallback: assume a modest frame size if serialization fails.
+        return 256
+
+
+class _CaptureResult:
+    """Bounded-capture staging record. Return value of `_capture_stack_frames`.
+
+    Fields:
+      - digest: short sha256 of the canonical frame listing (correlation id).
+      - frames: the per-frame dicts that will be emitted (after bounds).
+      - thread_count_total: actual threads at capture time.
+      - thread_count_captured: threads whose frames made it into `frames`.
+      - frames_captured_total: len(frames).
+      - truncated: whether any cap was hit.
+      - truncated_reason: enum, one of none|threads|frames_per_thread|serialized_bytes.
+      - serialized_bytes_estimate: int, byte accumulator at stop.
+    """
+
+    __slots__ = (
+        "digest",
+        "frames",
+        "thread_count_total",
+        "thread_count_captured",
+        "frames_captured_total",
+        "truncated",
+        "truncated_reason",
+        "serialized_bytes_estimate",
+    )
+
+    def __init__(self) -> None:
+        self.digest: str = ""
+        self.frames: list[dict] = []
+        self.thread_count_total: int = 0
+        self.thread_count_captured: int = 0
+        self.frames_captured_total: int = 0
+        self.truncated: bool = False
+        self.truncated_reason: str = "none"
+        self.serialized_bytes_estimate: int = 0
+
+
+def _capture_stack_frames() -> _CaptureResult:
+    """Capture a redacted stack-frame record, bounded by thread count,
+    frames per thread, and total serialized bytes.
+
+    Review defect #2 remediation. Returns a `_CaptureResult` with all counts
+    populated so the caller can emit the `stack_capture` header with the
+    cardinality + truncation information before the per-frame lines.
+    """
+    result = _CaptureResult()
     try:
         current_frames = sys._current_frames()
     except Exception:
@@ -143,36 +200,161 @@ def _capture_stack_frames() -> tuple[str, list[dict]]:
     except Exception:
         pass
 
+    result.thread_count_total = len(current_frames)
+
     canonical_lines: list[str] = []
     frame_index = 0
-    for thread_id, frame in current_frames.items():
+
+    # Deterministic ordering: by thread id, so repeated captures of the
+    # same wedge produce the same sha256 (correlation ID stable).
+    ordered_items = sorted(current_frames.items(), key=lambda kv: kv[0])
+
+    # Truncation-reason priority (ordered — earliest-wins):
+    #   1. "threads"            — thread count exceeded the cap. Earliest signal.
+    #   2. "frames_per_thread"  — one or more threads had their frame list cut.
+    #   3. "serialized_bytes"   — total bytes forced early stop during serialization.
+    # Multiple caps can apply at once; the earliest-stage cap wins so the
+    # operator sees the first point at which data was lost. "none" otherwise.
+    threads_truncated = len(ordered_items) > STACK_CAPTURE_MAX_THREADS
+    frames_truncated_any = False
+    bytes_truncated = False
+
+    captured_items = ordered_items[:STACK_CAPTURE_MAX_THREADS]
+
+    for thread_id, frame in captured_items:
         thread_name = name_by_id.get(thread_id, f"<unknown-{thread_id}>")
-        for file, line, func, _code in traceback.extract_stack(frame):
+        try:
+            extracted = traceback.extract_stack(frame)
+        except Exception:
+            continue
+
+        # Cap 2: frames per thread.
+        thread_frames = extracted[:STACK_CAPTURE_MAX_FRAMES_PER_THREAD]
+        if len(extracted) > STACK_CAPTURE_MAX_FRAMES_PER_THREAD:
+            frames_truncated_any = True
+
+        thread_contributed = False
+        for file, line, func, _code in thread_frames:
             rel = _rel_path(file)
-            frames.append(
-                {
-                    "frame_index": frame_index,
-                    "thread_name": thread_name,
-                    "file": rel,
-                    "function": func,
-                    "line": int(line),
-                }
-            )
+            frame_dict = {
+                "frame_index": frame_index,
+                "thread_name": thread_name,
+                "file": rel,
+                "function": func,
+                "line": int(line),
+            }
+            # Cap 3: cumulative serialized bytes.
+            frame_bytes = _frame_json_size(frame_dict)
+            projected = result.serialized_bytes_estimate + frame_bytes
+            if projected > STACK_CAPTURE_MAX_SERIALIZED_BYTES:
+                bytes_truncated = True
+                # Record the digest from what we have so far and return.
+                result.digest = hashlib.sha256(
+                    "\n".join(canonical_lines).encode("utf-8")
+                ).hexdigest()[:16]
+                result.frames_captured_total = len(result.frames)
+                if thread_contributed:
+                    result.thread_count_captured += 1
+                _assign_truncation(
+                    result,
+                    threads_truncated=threads_truncated,
+                    frames_truncated_any=frames_truncated_any,
+                    bytes_truncated=bytes_truncated,
+                )
+                return result
+
+            result.frames.append(frame_dict)
             canonical_lines.append(f"{thread_name}|{rel}|{func}|{line}")
+            result.serialized_bytes_estimate = projected
             frame_index += 1
+            thread_contributed = True
 
-    digest = hashlib.sha256("\n".join(canonical_lines).encode("utf-8")).hexdigest()[:16]
-    return digest, frames
+        if thread_contributed:
+            result.thread_count_captured += 1
+
+    result.frames_captured_total = len(result.frames)
+    result.digest = hashlib.sha256(
+        "\n".join(canonical_lines).encode("utf-8")
+    ).hexdigest()[:16]
+    _assign_truncation(
+        result,
+        threads_truncated=threads_truncated,
+        frames_truncated_any=frames_truncated_any,
+        bytes_truncated=bytes_truncated,
+    )
+    return result
 
 
-def _emit_stack_capture(stall_seconds: float, thread_count: int, digest: str) -> None:
+def _assign_truncation(
+    result: "_CaptureResult",
+    *,
+    threads_truncated: bool,
+    frames_truncated_any: bool,
+    bytes_truncated: bool,
+) -> None:
+    """Apply the earliest-wins priority to the truncation flags."""
+    if threads_truncated:
+        result.truncated = True
+        result.truncated_reason = "threads"
+        return
+    if frames_truncated_any:
+        result.truncated = True
+        result.truncated_reason = "frames_per_thread"
+        return
+    if bytes_truncated:
+        result.truncated = True
+        result.truncated_reason = "serialized_bytes"
+        return
+    result.truncated = False
+    result.truncated_reason = "none"
+
+
+def _emit_stack_capture(
+    stall_seconds: float,
+    result: Optional["_CaptureResult"] = None,
+    *,
+    thread_count: Optional[int] = None,
+    digest: Optional[str] = None,
+) -> None:
+    """Emit a `stack_capture` header event.
+
+    Primary form: pass a `_CaptureResult` from `_capture_stack_frames` so the
+    header carries the full bounded-capture cardinality + truncation info.
+
+    Legacy form (kept for the pre-remediation no-sensitive-labels test and
+    any ad-hoc caller that only had `thread_count` + `digest`): pass those
+    kwargs instead. Truncation fields default to the "no truncation known"
+    representation.
+    """
+    if result is not None:
+        emit(
+            "stack_capture",
+            severity="WARNING",
+            component="heartbeat_watchdog",
+            stall_seconds=round(stall_seconds, 3),
+            thread_count=int(result.thread_count_captured),
+            thread_count_captured=int(result.thread_count_captured),
+            thread_count_total=int(result.thread_count_total),
+            frames_captured_total=int(result.frames_captured_total),
+            truncated=bool(result.truncated),
+            truncated_reason=str(result.truncated_reason),
+            serialized_bytes_estimate=int(result.serialized_bytes_estimate),
+            frames_sha256=result.digest,
+        )
+        return
     emit(
         "stack_capture",
         severity="WARNING",
         component="heartbeat_watchdog",
         stall_seconds=round(stall_seconds, 3),
-        thread_count=int(thread_count),
-        frames_sha256=digest,
+        thread_count=int(thread_count or 0),
+        thread_count_captured=int(thread_count or 0),
+        thread_count_total=int(thread_count or 0),
+        frames_captured_total=0,
+        truncated=False,
+        truncated_reason="none",
+        serialized_bytes_estimate=0,
+        frames_sha256=str(digest or ""),
     )
 
 
@@ -200,6 +382,34 @@ def _emit_suppressed(reason: str) -> None:
     )
 
 
+def _emit_watchdog_recovery(
+    recovery_rate_limiter: "_RateLimiter",
+    recovery_count: int,
+    now: float,
+) -> None:
+    """Emit a rate-limited `watchdog_recovery` event with low-cardinality payload.
+
+    Review defect #1 remediation. The event carries ONLY the fixed envelope
+    plus `recovery_count_since_start`. No exception text, no exception type,
+    no args, no locals, no stack text, no identifiers of any kind. If the
+    rate limiter suppresses, emit nothing (silent).
+    """
+    try:
+        decision = recovery_rate_limiter.check_and_record(now)
+        if decision != "allow":
+            return
+        emit(
+            "watchdog_recovery",
+            severity="WARNING",
+            component="heartbeat_watchdog",
+            recovery_count_since_start=int(recovery_count),
+        )
+    except BaseException:
+        # Recovery emission failure is also swallowed — the whole point is
+        # that nothing from this path can terminate the thread.
+        pass
+
+
 def _watchdog_run(
     state: HeartbeatState,
     *,
@@ -208,59 +418,92 @@ def _watchdog_run(
     rate_limiter: _RateLimiter,
     time_fn: Callable[[], float] = time.time,
     sleep_fn: Callable[[float], None] = time.sleep,
+    recovery_rate_limiter: Optional["_RateLimiter"] = None,
 ) -> None:
     """Watchdog main loop — runs in a daemon thread.
 
     `time_fn` and `sleep_fn` are injectable for deterministic testing.
+
+    Review defect #1 remediation: every iteration is wrapped in a broad
+    try/except. Any exception from stack capture, emission, or any other
+    inner call is swallowed; the thread emits a rate-limited
+    `watchdog_recovery` event and continues. The sleep is unconditional so a
+    repeated-failure path cannot turn into a tight CPU loop.
     """
+    recovery_limiter = recovery_rate_limiter or _RateLimiter(
+        min_interval_s=WATCHDOG_RECOVERY_MIN_INTERVAL_S,
+        hour_cap=WATCHDOG_RECOVERY_HOUR_CAP,
+        window_s=WATCHDOG_RECOVERY_WINDOW_S,
+    )
     last_seen_counter = state.counter
     last_seen_ts = state.last_tick_ts
+    recovery_count = 0
+    pending_cooldown = False
     while not state.stop_event.is_set():
+        # ----- normal check interval sleep (always unconditional) -----
         try:
             sleep_fn(check_interval_s)
-        except Exception:
+        except BaseException:
+            # A sleep failure is itself unrecoverable (clock corruption etc.)
+            # Return cleanly; the daemon thread exits.
             return
         if state.stop_event.is_set():
             return
-        current_counter = state.counter
-        current_last_tick_ts = state.last_tick_ts
-        now = time_fn()
-        if current_counter != last_seen_counter:
-            # Loop made progress since our last check — reset the detection
-            # baseline but keep observing.
-            last_seen_counter = current_counter
-            last_seen_ts = current_last_tick_ts
-            continue
-        # Counter has NOT advanced since the previous watchdog iteration.
-        # Compute how long the heartbeat has been silent, measured from the
-        # heartbeat's own last tick timestamp.
-        stall_s = max(0.0, now - current_last_tick_ts)
-        if stall_s < stall_threshold_s:
-            continue
-        # Loop is stalled — attempt a capture, honouring rate limits.
-        decision = rate_limiter.check_and_record(now)
-        if decision == "allow":
-            digest, frames = _capture_stack_frames()
-            _emit_stack_capture(
-                stall_seconds=stall_s,
-                thread_count=sum(1 for _ in threading.enumerate()),
-                digest=digest,
-            )
-            _emit_stack_frames(digest, frames)
-        else:
-            _emit_suppressed(reason=decision)
-        # After emission (or suppression) wait at least `stall_threshold_s`
-        # before considering the SAME stall again — avoids a tight re-check
-        # loop while the loop is still wedged. The rate limiter would also
-        # suppress a flood of captures, but adding this delay keeps the
-        # watchdog thread's own CPU footprint negligible.
+
+        # ----- iteration body — any exception is swallowed -----
         try:
-            sleep_fn(stall_threshold_s)
-        except Exception:
-            return
-        # Re-baseline so the next pass measures a fresh stall window.
-        last_seen_counter = state.counter
-        last_seen_ts = state.last_tick_ts
+            if pending_cooldown:
+                # Post-capture cooldown: observe a longer wait before
+                # re-detecting the SAME stall. The outer loop's
+                # `sleep_fn(check_interval_s)` ran once; add the stall-
+                # threshold delta here. Still unconditional sleep.
+                try:
+                    sleep_fn(stall_threshold_s)
+                except BaseException:
+                    return
+                pending_cooldown = False
+                # Re-baseline so the next pass measures a fresh stall window.
+                last_seen_counter = state.counter
+                last_seen_ts = state.last_tick_ts
+                continue
+
+            current_counter = state.counter
+            current_last_tick_ts = state.last_tick_ts
+            now = time_fn()
+            if current_counter != last_seen_counter:
+                # Loop made progress — reset detection baseline, keep observing.
+                last_seen_counter = current_counter
+                last_seen_ts = current_last_tick_ts
+                continue
+            # Counter has NOT advanced. How long has the heartbeat been silent?
+            stall_s = max(0.0, now - current_last_tick_ts)
+            if stall_s < stall_threshold_s:
+                continue
+            # Loop is stalled — attempt a capture, honouring rate limits.
+            decision = rate_limiter.check_and_record(now)
+            if decision == "allow":
+                result = _capture_stack_frames()
+                _emit_stack_capture(stall_seconds=stall_s, result=result)
+                _emit_stack_frames(result.digest, result.frames)
+            else:
+                _emit_suppressed(reason=decision)
+            # Flag that the next loop iteration should perform the cooldown
+            # sleep (keeps the sleep unconditional + bounded).
+            pending_cooldown = True
+        except BaseException:
+            # Any failure inside the iteration body (capture raise, emission
+            # raise, enumerate raise, serialization raise) must NOT terminate
+            # the thread. Record a recovery event and continue to the next
+            # iteration. The recovery emission is itself best-effort.
+            recovery_count += 1
+            try:
+                _emit_watchdog_recovery(
+                    recovery_limiter,
+                    recovery_count,
+                    time_fn() if callable(time_fn) else time.time(),
+                )
+            except BaseException:
+                pass
 
 
 async def _heartbeat_tick(state: HeartbeatState, tick_interval_s: float) -> None:

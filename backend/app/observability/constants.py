@@ -31,3 +31,23 @@ HEARTBEAT_STALL_THRESHOLD_S: float = 5.0         # if counter hasn't advanced in
 STACK_CAPTURE_MIN_INTERVAL_S: float = 60.0       # at most one stack capture per minute
 STACK_CAPTURE_HOUR_CAP: int = 3                  # at most this many stack captures per hour
 STACK_CAPTURE_WINDOW_S: float = 3600.0           # sliding window for the hour cap
+
+# --- stack-capture SIZE caps (review defect #2 remediation) -----------------
+# Rate limiting controls FREQUENCY of captures; these constants bound the
+# SIZE of each capture event so one pathological snapshot cannot overwhelm
+# Cloud Logging.
+STACK_CAPTURE_MAX_THREADS: int = 64             # cap on threads emitted per capture
+STACK_CAPTURE_MAX_FRAMES_PER_THREAD: int = 128  # cap on frames emitted per thread
+# Conservative Cloud Logging-safe aggregate serialized-bytes cap. Google Cloud
+# Logging rejects log entries whose `textPayload`/`jsonPayload` exceed 256 KB
+# per entry; we stop emitting at 192 KB (75% of ceiling) so one capture burst
+# — one `stack_capture` header + N `stack_frames` lines — collectively stays
+# well under the per-entry ceiling even accounting for ingestion overhead and
+# the structured envelope that Cloud Logging wraps each line in.
+STACK_CAPTURE_MAX_SERIALIZED_BYTES: int = 192_000
+
+# Shared across watchdog recovery emissions. Reusing the stack-capture
+# limits keeps a single logical cadence for watchdog-side rate limiting.
+WATCHDOG_RECOVERY_MIN_INTERVAL_S: float = STACK_CAPTURE_MIN_INTERVAL_S
+WATCHDOG_RECOVERY_HOUR_CAP: int = STACK_CAPTURE_HOUR_CAP
+WATCHDOG_RECOVERY_WINDOW_S: float = STACK_CAPTURE_WINDOW_S
