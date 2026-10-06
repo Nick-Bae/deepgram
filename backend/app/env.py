@@ -70,6 +70,19 @@ class ENV:
     # a hung Redis connection would otherwise stall all listener/host
     # registration on this instance).
     REDIS_COMMAND_TIMEOUT_SEC: float = float(os.getenv("REDIS_COMMAND_TIMEOUT_SEC", "5"))
+    # In-process probe task cadence + per-tick deadline (PR #31 §3 W7).
+    # Interval: how often the adapter publishes a probe marker on its
+    # OWN probe channel and awaits its own subscriber. Deadline: how
+    # long the probe task waits for the round-trip before emitting
+    # `redis_probe_failed`. Interval bounds match PR #31 §3's stated
+    # range; deadline bound conservatively avoids masking a stuck
+    # subscriber behind a too-lenient window.
+    REDIS_PROBE_INTERVAL_SEC: float = max(
+        10.0, min(300.0, float(os.getenv("REDIS_PROBE_INTERVAL_SEC", "30")))
+    )
+    REDIS_PROBE_DEADLINE_SEC: float = max(
+        0.5, min(10.0, float(os.getenv("REDIS_PROBE_DEADLINE_SEC", "2")))
+    )
     INSTANCE_ID: str = _env_str("INSTANCE_ID", default=f"inst-{uuid.uuid4().hex[:12]}")
 
     @classmethod
