@@ -178,6 +178,10 @@ def test_on_shutdown_only_cancels_tasks_and_stops_pubsub() -> None:
         # -> no call name; caught by ast walk of Import nodes only.
         # Logging
         "print",
+        # Scope 1 observability (2026-10-04 incident response): stops
+        # samplers + joins the watchdog thread. NOT a Firestore write,
+        # NOT a client broadcast — satisfies the test's correctness bar.
+        "_observability_stop_all",
     }
     unexpected = called - allowed
     assert not unexpected, (

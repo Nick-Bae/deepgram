@@ -448,12 +448,38 @@ def _log_translation_example(
     if org_id:
         record["org_id"] = org_id
 
+    # Observability M3: emit a `[TX_LOG] write_ms=<float>` marker on every
+    # call so Cloud Logging can derive a numeric write-duration metric.
+    # NEVER log transcript text, token, uid, or any other sensitive field —
+    # the marker carries only the numeric duration. See
+    # backend/app/observability/SCOPE.md § M3.
+    import time as _tx_time
+    _write_t0 = _tx_time.monotonic()
     try:
         _ensure_data_dir()
         with open(_TRANSLATION_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
-        print(f"[TX] Failed to log translation example: {exc}")
+        # Follow-up remediation: guard the legacy error-log print. An EPIPE
+        # on stdout while reporting another error must NOT escape this
+        # function and alter translation handling. `except Exception` so
+        # SystemExit / KeyboardInterrupt / GeneratorExit still propagate.
+        try:
+            print(f"[TX] Failed to log translation example: {exc}")
+        except Exception:
+            pass
+    finally:
+        # Review defect #3 remediation + follow-up: the TX_LOG print must be
+        # strictly best-effort — a stdout EPIPE or any other `Exception`
+        # subclass must NOT alter translation output, exception propagation,
+        # or any cleanup that follows. Follow-up narrows the catch from
+        # BaseException to Exception so SystemExit / KeyboardInterrupt /
+        # GeneratorExit still propagate as intended.
+        try:
+            _write_ms = (_tx_time.monotonic() - _write_t0) * 1000.0
+            print(f"[TX_LOG] write_ms={_write_ms:.3f}")
+        except Exception:
+            pass
 
 
 def log_corrected_translation(

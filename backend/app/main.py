@@ -1329,10 +1329,27 @@ async def _on_startup():
     else:
         print("[ROOM_RECONCILER] disabled (ROOM_RECONCILER_ENABLED=0)")
 
+    # Observability — purely additive. Starts after all existing startup
+    # logic so a failure here cannot break room/reconciler/redis bootstrap.
+    # See backend/app/observability/SCOPE.md.
+    try:
+        from app.observability import start_all as _observability_start_all
+        _observability_start_all(app)
+    except Exception as _obs_exc:
+        print(f"[OBSERVABILITY][startup-failed] {_obs_exc!r}")
+
 
 @app.on_event("shutdown")
 async def _on_shutdown():
     global _room_sweeper_task, _room_reconciler_task, _room_reconciler
+    # Observability shutdown runs FIRST so its watchdog thread stops cleanly
+    # before the rest of the app tears down. Guarded — a failure here must
+    # not prevent reconciler/sweeper shutdown.
+    try:
+        from app.observability import stop_all as _observability_stop_all
+        await _observability_stop_all()
+    except Exception as _obs_exc:
+        print(f"[OBSERVABILITY][shutdown-failed] {_obs_exc!r}")
     if _room_reconciler_task and not _room_reconciler_task.done():
         _room_reconciler_task.cancel()
         try:
