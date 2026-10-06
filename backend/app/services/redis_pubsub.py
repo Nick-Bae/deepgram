@@ -151,6 +151,67 @@ def _emit(event: str, severity: str, **fields: Any) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Gate E remediation — safe exception classifier.
+#
+# Maps any BaseException to a BOUNDED enum string. Callers that previously
+# emitted ``error=repr(exc)`` (which leaks ``str(exc)`` and ``exc.args``
+# into Cloud Logging — potentially including host, port, password, URL,
+# room ID, or transcript via a reflected redis-py exception message) now
+# emit ``error_class=_classify_failure(exc)`` + a STATIC message. The
+# bounded return set is enforced by callers; this helper never returns
+# anything else.
+#
+# Important: the classifier does NOT swallow ``CancelledError``. It
+# returns the label ``"cancelled"`` to let the caller log it under the
+# same contract, but the caller must still re-raise (or continue the
+# cancellation path) rather than treating it as an ordinary failure.
+# ---------------------------------------------------------------------------
+
+_ERROR_CLASS_ALLOWED = frozenset({
+    "authentication", "timeout", "connection",
+    "redis_response", "cancelled", "unexpected",
+})
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """Return a bounded error-class enum string. Never raises."""
+    # Order matters: CancelledError is a BaseException subclass.
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    # redis-py exceptions — import lazily so the classifier works even
+    # when redis is uninstalled (disabled-mode or test environments).
+    try:
+        import redis.exceptions as _re  # type: ignore
+    except Exception:
+        _re = None  # type: ignore
+    if _re is not None:
+        auth_types = []
+        for name in ("AuthenticationError", "AuthenticationWrongNumberOfArgsError"):
+            t = getattr(_re, name, None)
+            if t is not None:
+                auth_types.append(t)
+        if auth_types and isinstance(exc, tuple(auth_types)):
+            return "authentication"
+        _re_timeout = getattr(_re, "TimeoutError", None)
+        if _re_timeout is not None and isinstance(exc, _re_timeout):
+            return "timeout"
+        _re_conn = getattr(_re, "ConnectionError", None)
+        if _re_conn is not None and isinstance(exc, _re_conn):
+            return "connection"
+        _re_response = getattr(_re, "ResponseError", None)
+        if _re_response is not None and isinstance(exc, _re_response):
+            return "redis_response"
+    # Standard library connection errors
+    if isinstance(exc, ConnectionRefusedError):
+        return "connection"
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "connection"
+    return "unexpected"
+
+
 def _channel_name(org_id: str, room_id: str) -> str:
     return f"{ENV.REDIS_CHANNEL_PREFIX}:org:{org_id}:room:{room_id}"
 
@@ -426,8 +487,8 @@ class RedisPubSub:
                                 "WARNING",
                                 reason="publish_failed",
                                 probe_id=probe_id,
-                                error=repr(exc),
-                                message=f"redis probe publish failed: {exc}",
+                                error_class=_classify_failure(exc),
+                                message="redis probe publish failed",
                             )
                         else:
                             _emit(
@@ -435,8 +496,8 @@ class RedisPubSub:
                                 "WARNING",
                                 reason="exception",
                                 probe_id=probe_id,
-                                error=repr(exc),
-                                message=f"redis probe raised: {exc}",
+                                error_class=_classify_failure(exc),
+                                message="redis probe raised",
                             )
                         continue
                     rtt_ms = int(round((time.monotonic() - t_publish) * 1000))
@@ -472,8 +533,8 @@ class RedisPubSub:
                     EVENT_PROBE_FAILED,
                     "WARNING",
                     reason="loop_exception",
-                    error=repr(exc),
-                    message=f"redis probe loop iteration failed: {exc}",
+                    error_class=_classify_failure(exc),
+                    message="redis probe loop iteration failed",
                 )
 
     async def start(self) -> None:
@@ -553,16 +614,18 @@ class RedisPubSub:
                 timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
             )
             self._connected = True
+            # Gate E remediation 1: endpoint fields removed. The host /
+            # port are sensitive private-VPC values; they appear in no
+            # structured field and no message string. Keep only bounded
+            # operational knobs useful for alert filters.
             _emit(
                 EVENT_STARTED,
                 "INFO",
-                host=ENV.REDIS_HOST,
-                port=ENV.REDIS_PORT,
+                enabled=True,
                 prefix=ENV.REDIS_CHANNEL_PREFIX,
-                message=(
-                    f"redis pubsub started host={ENV.REDIS_HOST}:{ENV.REDIS_PORT} "
-                    f"prefix={ENV.REDIS_CHANNEL_PREFIX} instance={ENV.INSTANCE_ID}"
-                ),
+                probe_interval_s=ENV.REDIS_PROBE_INTERVAL_SEC,
+                probe_deadline_s=ENV.REDIS_PROBE_DEADLINE_SEC,
+                message="redis_pubsub started",
             )
         except asyncio.TimeoutError:
             self._connected = False
@@ -589,9 +652,9 @@ class RedisPubSub:
                 EVENT_INITIAL_CONNECT_FAILED,
                 "WARNING",
                 reason="refused",
-                error=repr(exc),
+                error_class=_classify_failure(exc),
                 message=(
-                    f"redis pubsub initial connect failed; reader loop will retry: {exc}"
+                    "redis pubsub initial connect failed; reader loop will retry"
                 ),
             )
 
@@ -638,10 +701,10 @@ class RedisPubSub:
                     EVENT_RECONNECT_FAILED,
                     "WARNING",
                     reason="probe_initial_subscribe_failed",
-                    error=repr(exc),
+                    error_class=_classify_failure(exc),
                     message=(
-                        f"redis pubsub probe channel initial subscribe failed: {exc} — "
-                        f"will retry via reader loop reconnect"
+                        "redis pubsub probe channel initial subscribe failed — "
+                        "will retry via reader loop reconnect"
                     ),
                 )
                 self._connected = False  # force reader loop into _reconnect
@@ -915,8 +978,8 @@ class RedisPubSub:
                 _emit(
                     EVENT_READER_ERROR,
                     "WARNING",
-                    error=repr(exc),
-                    message=f"pubsub reader error: {exc}",
+                    error_class=_classify_failure(exc),
+                    message="pubsub reader error",
                 )
                 # get_message() raising almost always means the subscriber's
                 # transport dropped. Flip _connected so the next iteration
@@ -1017,10 +1080,9 @@ class RedisPubSub:
                         reason="bulk_subscribe_failed",
                         rooms_desired=len(desired),
                         probe_desired=bool(probe_channel),
-                        error=repr(exc),
+                        error_class=_classify_failure(exc),
                         message=(
-                            f"redis pubsub bulk resubscribe failed ({len(desired)} rooms): "
-                            f"{exc} — will retry"
+                            "redis pubsub bulk resubscribe failed — will retry"
                         ),
                     )
                     self._connected = False
@@ -1045,8 +1107,8 @@ class RedisPubSub:
                 EVENT_RECONNECT_FAILED,
                 "WARNING",
                 reason="ping_failed",
-                error=repr(exc),
-                message=f"redis reconnect failed: {exc}",
+                error_class=_classify_failure(exc),
+                message="redis reconnect failed",
             )
             self._connected = False
 
