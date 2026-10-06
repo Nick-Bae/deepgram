@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
@@ -31,9 +32,208 @@ DeliveryCallback = Callable[[str, str, dict], Awaitable[None]]
 _BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0)
 _ENVELOPE_VERSION = 1
 
+# PR #31 §3 (W1) structured-event schema. Every adapter event now
+# emits one JSON line on stdout via `_emit` so Cloud Run parses it
+# into `jsonPayload` and log-based metrics can filter on
+# `jsonPayload.event="..."` and extract `jsonPayload.instance_id` as
+# a metric label — no more textPayload regex, no more dependence on
+# whatever root-logger level uvicorn ends up applying. The `print`
+# path bypasses `logging` entirely, which is deliberate (see PR #31
+# §3 W1 and PR #32's F-27 harness log-level pitfall).
+
+_EVENT_SCHEMA_VERSION = 1
+
+# Canonical event names — used by metric filters and by tests that
+# assert the adapter emits the right event for a given code path.
+# Any change here MUST be paired with a metric-filter update in
+# `ops/monitoring/reconciler/` per PR #31 §3.
+EVENT_STARTED = "redis_pubsub_started"
+EVENT_INITIAL_CONNECT_FAILED = "redis_pubsub_initial_connect_failed"
+EVENT_RECONNECTING = "redis_pubsub_reconnecting"
+EVENT_RECONNECTED = "redis_pubsub_reconnected"
+EVENT_RECONNECT_FAILED = "redis_pubsub_reconnect_failed"
+EVENT_READER_ERROR = "redis_pubsub_reader_error"
+# Probe events (task #127) are declared here so the catalogue is
+# complete but are NOT emitted by this PR — the probe task itself
+# lands in the probe-integration branch.
+EVENT_PROBE_OK = "redis_probe_ok"
+EVENT_PROBE_FAILED = "redis_probe_failed"
+
+
+# Fields whose values are set by the emitter itself and cannot be
+# overridden by callers. Enforced by putting them LAST in the payload
+# dict so a caller-provided `**fields` mapping cannot silently
+# replace the identity/schema labels the metric filters key on.
+_EMIT_RESERVED_FIELDS = frozenset({
+    "event",
+    "severity",
+    "component",
+    "instance_id",
+    "schema_version",
+    "ts",
+})
+
+
+def _emit(event: str, severity: str, **fields: Any) -> None:
+    """Emit one structured-JSON operational event line to stdout.
+
+    Fields ALWAYS produced by the emitter itself (reserved; caller
+    cannot override): `event`, `severity`, `component`,
+    `instance_id`, `schema_version`, `ts`. If a caller passes any
+    of those names in `**fields`, the caller value is DROPPED — the
+    emitter's value wins. Silent-drop rather than raise so a
+    monitoring bug can never take down the adapter recovery path.
+
+    `message` is a caller-provided free-form string field; it is
+    populated when the caller passes a `message=` kwarg so F-27 and
+    other consumers that grep for a human-readable substring keep
+    working during the transition. Metric filters key off `event`
+    regardless.
+
+    Uses `print` directly, not `logging`, so:
+      1. The line reaches stdout regardless of the root logger level
+         (the exact pitfall PR #32's F-27 hit under uvicorn's
+         `logging.config.dictConfig`).
+      2. Cloud Run's log-parser reliably sees a single JSON object
+         per line, populating `jsonPayload.event` etc.
+
+    `flush=True` because uvicorn workers can otherwise buffer stdout
+    across a few seconds when a shutdown is in flight, and startup /
+    reconnect events are exactly the ones an operator needs to see
+    IMMEDIATELY during a window.
+
+    Output failures (BrokenPipeError, IOError, permission denied on
+    an alternate stream, etc.) are SUPPRESSED. The emitter is
+    best-effort by contract: a logging failure MUST NOT interrupt a
+    connection-state change or recovery scheduling. Losing one
+    telemetry line to a broken stdout is strictly better than
+    aborting `start()` and leaving the reader task unscheduled.
+    """
+    # Caller fields FIRST, reserved fields LAST — dict-merge order
+    # ensures the reserved fields survive any collision.
+    payload = {
+        **fields,
+        "event": event,
+        "severity": severity,
+        "component": "redis_pubsub",
+        "instance_id": ENV.INSTANCE_ID,
+        "schema_version": _EVENT_SCHEMA_VERSION,
+        "ts": _iso_now(),
+    }
+    try:
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        # Serialisation itself failed — e.g. a caller passed a value
+        # that even `default=str` can't reduce. Fall back to a
+        # minimal envelope so the metric filter still gets the event.
+        try:
+            line = json.dumps(
+                {
+                    "event": event,
+                    "severity": severity,
+                    "component": "redis_pubsub",
+                    "instance_id": ENV.INSTANCE_ID,
+                    "schema_version": _EVENT_SCHEMA_VERSION,
+                    "ts": _iso_now(),
+                    "message": "emit_serialisation_failed",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        except Exception:
+            return  # nothing we can do
+    try:
+        print(line, file=sys.stdout, flush=True)
+    except Exception:
+        # BrokenPipeError, IOError, closed-stdout, replaced-with-
+        # raising-mock — all swallowed. See docstring: telemetry is
+        # best-effort.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Gate E remediation — safe exception classifier.
+#
+# Maps any BaseException to a BOUNDED enum string. Callers that previously
+# emitted ``error=repr(exc)`` (which leaks ``str(exc)`` and ``exc.args``
+# into Cloud Logging — potentially including host, port, password, URL,
+# room ID, or transcript via a reflected redis-py exception message) now
+# emit ``error_class=_classify_failure(exc)`` + a STATIC message. The
+# bounded return set is enforced by callers; this helper never returns
+# anything else.
+#
+# Important: the classifier does NOT swallow ``CancelledError``. It
+# returns the label ``"cancelled"`` to let the caller log it under the
+# same contract, but the caller must still re-raise (or continue the
+# cancellation path) rather than treating it as an ordinary failure.
+# ---------------------------------------------------------------------------
+
+_ERROR_CLASS_ALLOWED = frozenset({
+    "authentication", "timeout", "connection",
+    "redis_response", "cancelled", "unexpected",
+})
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """Return a bounded error-class enum string. Never raises."""
+    # Order matters: CancelledError is a BaseException subclass.
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    # redis-py exceptions — import lazily so the classifier works even
+    # when redis is uninstalled (disabled-mode or test environments).
+    try:
+        import redis.exceptions as _re  # type: ignore
+    except Exception:
+        _re = None  # type: ignore
+    if _re is not None:
+        auth_types = []
+        for name in ("AuthenticationError", "AuthenticationWrongNumberOfArgsError"):
+            t = getattr(_re, name, None)
+            if t is not None:
+                auth_types.append(t)
+        if auth_types and isinstance(exc, tuple(auth_types)):
+            return "authentication"
+        _re_timeout = getattr(_re, "TimeoutError", None)
+        if _re_timeout is not None and isinstance(exc, _re_timeout):
+            return "timeout"
+        _re_conn = getattr(_re, "ConnectionError", None)
+        if _re_conn is not None and isinstance(exc, _re_conn):
+            return "connection"
+        _re_response = getattr(_re, "ResponseError", None)
+        if _re_response is not None and isinstance(exc, _re_response):
+            return "redis_response"
+    # Standard library connection errors
+    if isinstance(exc, ConnectionRefusedError):
+        return "connection"
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "connection"
+    return "unexpected"
+
 
 def _channel_name(org_id: str, room_id: str) -> str:
     return f"{ENV.REDIS_CHANNEL_PREFIX}:org:{org_id}:room:{room_id}"
+
+
+# Probe channels are single-instance loopback (each backend
+# subscribes to its OWN probe channel; another backend never
+# subscribes here — that's why per-instance coverage of the
+# probe is by construction). See PR #31 §3 W7 + the probe task
+# design in that section.
+def _probe_channel_name(instance_id: str) -> str:
+    return f"{ENV.REDIS_CHANNEL_PREFIX}:probe:{instance_id}"
+
+
+def _parse_probe_channel(channel: str) -> str:
+    """Return the `instance_id` if `channel` matches the probe
+    shape, otherwise empty string. Called from `_dispatch` BEFORE
+    the production `_parse_channel` so probe traffic gets its own
+    callback + suppression policy."""
+    prefix = f"{ENV.REDIS_CHANNEL_PREFIX}:probe:"
+    if not channel.startswith(prefix):
+        return ""
+    return channel[len(prefix):]
 
 
 def _seq_key(org_id: str, room_id: str) -> str:
@@ -61,6 +261,38 @@ class RedisPubSub:
         self._lock = asyncio.Lock()
         self._connected = False
 
+        # PR #31 §3 W7 — probe path. The adapter subscribes to its
+        # OWN probe channel (`{prefix}:probe:{instance_id}`) so a
+        # per-instance in-process probe can publish + await its
+        # own message-round-trip, exercising the same `_pub` and
+        # `_pubsub` clients production broadcasts use. A separate
+        # `_probe_callback` receives the probe message so it
+        # bypasses the production self-suppression check (the
+        # publisher IS the intended recipient here, unlike
+        # production broadcasts).
+        self._probe_callback: Optional[Callable[[dict], Awaitable[None]]] = None
+        # Whether this instance's probe subscription is currently
+        # tracked as "desired" (analogous to `_ref_counts` for
+        # production channels). Set unconditionally in `start()`
+        # so `_reconnect`'s bulk resubscribe includes the probe
+        # channel from that point on.
+        self._probe_subscription_desired: bool = False
+        # Whether the current live pubsub connection has an active
+        # SUBSCRIBE for the probe channel (analogous to
+        # `_subscribed` for production channels).
+        self._probe_subscribed: bool = False
+        # The 30 s in-process probe task. Set by `start()` if the
+        # probe callback was registered; cancelled by `stop()`
+        # BEFORE `_teardown_clients()` so no attempt runs against
+        # a torn-down client.
+        self._probe_task: Optional[asyncio.Task] = None
+        # Per-tick probe_id → future map. The probe callback
+        # (installed by `enable_probe_task()` in the default case,
+        # or by the caller via `set_probe_callback` in a test/
+        # override case) resolves the matching future when a probe
+        # envelope arrives.
+        self._probe_pending: Dict[str, asyncio.Future] = {}
+
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -82,6 +314,228 @@ class RedisPubSub:
     def set_delivery_callback(self, cb: DeliveryCallback) -> None:
         """Called by ConnectionManager to receive incoming subscribed messages."""
         self._callback = cb
+
+    def set_probe_callback(self, cb: Callable[[dict], Awaitable[None]]) -> None:
+        """Register the probe-delivery callback (PR #31 §3 W7).
+
+        Called by whichever component owns the in-process probe task
+        (currently `RedisPubSub._probe_loop`, which is scheduled by
+        `start()` when the probe callback is registered before the
+        adapter is started). Receives the FULL envelope dict — the
+        probe task correlates responses by the envelope's
+        `probe_id` field, so the callback must forward the whole
+        object rather than just a payload.
+
+        Setting the probe callback also flags the probe subscription
+        as desired so `_reconnect`'s bulk resubscribe includes it.
+        Callers that want the probe active must call this BEFORE
+        `start()`, or call `start()` again after registering (which
+        no-ops because `_started=True`; the resubscribe pattern is
+        the intended re-arm)."""
+        self._probe_callback = cb
+        self._probe_subscription_desired = True
+
+    def enable_probe_task(self) -> None:
+        """Install the DEFAULT in-process probe machinery:
+          - Register a class-owned probe callback that resolves the
+            per-tick future in `_probe_pending`.
+          - Flag the probe subscription as desired so both the
+            initial `start()` and every `_reconnect` include the
+            probe channel in their SUBSCRIBE.
+
+        The 30 s probe task itself is scheduled by `start()` when
+        this flag is set. Callers that want to override the probe
+        callback (e.g. for testing) should use `set_probe_callback`
+        instead — this method's callback is a no-op override target
+        via that same setter.
+
+        Idempotent — calling twice does nothing extra."""
+        if self._probe_callback is not None:
+            self._probe_subscription_desired = True
+            return
+
+        async def _default_probe_callback(envelope: dict) -> None:
+            probe_id = envelope.get("probe_id")
+            if not isinstance(probe_id, str):
+                return
+            fut = self._probe_pending.pop(probe_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(envelope)
+
+        self._probe_callback = _default_probe_callback
+        self._probe_subscription_desired = True
+
+    async def _probe_attempt(
+        self, channel: str, envelope: dict, fut: asyncio.Future,
+    ) -> None:
+        """One publish + response-await round. Wrapped by the
+        caller in `asyncio.wait_for(..., timeout=deadline)` so a
+        single deadline covers publish AND response — matching
+        PR #35 review round 2. Never emits directly; the caller
+        classifies the outcome.
+
+        Contract for the caller's classification:
+          - publish raises → `fut` remains NOT-done, exception
+            propagates. Caller sees `fut.done() is False` and
+            classifies as `reason=publish_failed`.
+          - publish succeeds, callback raises later → `fut` is
+            resolved (with the exception) BEFORE the await
+            re-raises. Caller sees `fut.done() is True` and
+            classifies as `reason=exception`.
+          - timeout → `asyncio.wait_for` cancels this coroutine
+            and raises `TimeoutError` in the caller. `fut` is
+            still not-done in the current stack, but the caller
+            handles `TimeoutError` as its own branch before the
+            generic exception branch. `finally` in the caller
+            pops the pending entry and cancels the future.
+        """
+        # `self._pub` MAY be None at this point if `stop()` is
+        # racing us. Bail cleanly rather than raising AttributeError.
+        pub = self._pub
+        if pub is None:
+            raise ConnectionError("adapter shutting down; no pub client")
+        await pub.publish(
+            channel, json.dumps(envelope, ensure_ascii=False),
+        )
+        await fut
+
+    async def _probe_loop(self) -> None:
+        """PR #31 §3 W7 — in-process probe loop.
+
+        On each tick:
+          1. Skip if disconnected — the reader loop's `_reconnect`
+             path will bring the connection back and re-subscribe
+             the probe channel; publishing during a known-broken
+             state would only emit a spurious failure.
+          2. Skip if the probe subscription is not currently active
+             on the live pubsub connection (`_probe_subscribed`)
+             — same reasoning.
+          3. Generate a fresh probe_id, create a per-tick future,
+             stash it in `_probe_pending`, publish the envelope on
+             this instance's own probe channel, then `wait_for` the
+             callback to resolve the future within
+             `REDIS_PROBE_DEADLINE_SEC`.
+          4. On success: emit `redis_probe_ok` with `rtt_ms`.
+          5. On timeout OR any exception: emit `redis_probe_failed`
+             with `reason`.
+
+        Cancelled cleanly by `stop()`. Handles CancelledError as a
+        normal shutdown signal — no failure emit on cancel."""
+        interval = float(ENV.REDIS_PROBE_INTERVAL_SEC)
+        deadline = float(ENV.REDIS_PROBE_DEADLINE_SEC)
+        channel = _probe_channel_name(ENV.INSTANCE_ID)
+        while self._started:
+            try:
+                await asyncio.sleep(interval)
+                if not self._started:
+                    return
+                if not self._connected or self._pub is None or not self._probe_subscribed:
+                    # Skip this tick — connection state is not
+                    # steady. Not a probe failure: the reader-loop
+                    # reconnect is what recovers it, and A5/A6 page
+                    # on THAT signal.
+                    continue
+                probe_id = f"probe-{time.monotonic_ns():x}"
+                fut: asyncio.Future = asyncio.get_running_loop().create_future()
+                self._probe_pending[probe_id] = fut
+                envelope = {
+                    "v": _ENVELOPE_VERSION,
+                    "publisher": ENV.INSTANCE_ID,
+                    "ts": _iso_now(),
+                    "is_probe": True,
+                    "probe_id": probe_id,
+                }
+                t_publish = time.monotonic()
+                try:
+                    # ONE deadline covers publish + response wait.
+                    # The earlier code only bounded `wait_for(fut)`,
+                    # so a hung `_pub.publish()` would sit forever
+                    # and no failure would ever emit. Wrapping the
+                    # full attempt in one `wait_for` fixes that.
+                    try:
+                        await asyncio.wait_for(
+                            self._probe_attempt(
+                                channel, envelope, fut,
+                            ),
+                            timeout=deadline,
+                        )
+                    except asyncio.TimeoutError:
+                        _emit(
+                            EVENT_PROBE_FAILED,
+                            "WARNING",
+                            reason="timeout",
+                            probe_id=probe_id,
+                            deadline_seconds=deadline,
+                            message=(
+                                f"redis probe did not round-trip within "
+                                f"{deadline:.2f}s"
+                            ),
+                        )
+                        continue
+                    except Exception as exc:
+                        # Distinguish publish-failure from
+                        # response-callback exceptions by asking
+                        # whether the future was resolved at all.
+                        # A future that never resolved AND was not
+                        # cancelled by the timeout branch above
+                        # means publish raised before we could
+                        # wait — the correlation callback would
+                        # then never fire on its own.
+                        if not fut.done():
+                            _emit(
+                                EVENT_PROBE_FAILED,
+                                "WARNING",
+                                reason="publish_failed",
+                                probe_id=probe_id,
+                                error_class=_classify_failure(exc),
+                                message="redis probe publish failed",
+                            )
+                        else:
+                            _emit(
+                                EVENT_PROBE_FAILED,
+                                "WARNING",
+                                reason="exception",
+                                probe_id=probe_id,
+                                error_class=_classify_failure(exc),
+                                message="redis probe raised",
+                            )
+                        continue
+                    rtt_ms = int(round((time.monotonic() - t_publish) * 1000))
+                    _emit(
+                        EVENT_PROBE_OK,
+                        "INFO",
+                        probe_id=probe_id,
+                        rtt_ms=rtt_ms,
+                        message=f"redis probe ok rtt_ms={rtt_ms}",
+                    )
+                finally:
+                    # ALWAYS clean up the pending entry — including
+                    # on CancelledError (which propagates through
+                    # this `finally` on its way out). Leaving
+                    # entries behind would let `stop()` return with
+                    # `_probe_pending` non-empty, and a subsequent
+                    # `start()` on the same instance would inherit
+                    # dead references.
+                    self._probe_pending.pop(probe_id, None)
+                    if not fut.done():
+                        fut.cancel()
+            except asyncio.CancelledError:
+                # `stop()` cancels this task; treat as a normal
+                # shutdown signal. Do NOT emit a failure event —
+                # cancellation is expected.
+                raise
+            except Exception as exc:
+                # An unexpected error in the loop body itself
+                # (not in publish/await, which are handled above).
+                # Emit and continue so a single bad tick doesn't
+                # kill the loop forever.
+                _emit(
+                    EVENT_PROBE_FAILED,
+                    "WARNING",
+                    reason="loop_exception",
+                    error_class=_classify_failure(exc),
+                    message="redis probe loop iteration failed",
+                )
 
     async def start(self) -> None:
         """Start the pub/sub adapter.
@@ -160,28 +614,48 @@ class RedisPubSub:
                 timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
             )
             self._connected = True
-            log.info(
-                "redis pubsub started host=%s:%s prefix=%s instance=%s",
-                ENV.REDIS_HOST, ENV.REDIS_PORT, ENV.REDIS_CHANNEL_PREFIX, ENV.INSTANCE_ID,
+            # Gate E remediation 1: endpoint fields removed. The host /
+            # port are sensitive private-VPC values; they appear in no
+            # structured field and no message string. Keep only bounded
+            # operational knobs useful for alert filters.
+            _emit(
+                EVENT_STARTED,
+                "INFO",
+                enabled=True,
+                prefix=ENV.REDIS_CHANNEL_PREFIX,
+                probe_interval_s=ENV.REDIS_PROBE_INTERVAL_SEC,
+                probe_deadline_s=ENV.REDIS_PROBE_DEADLINE_SEC,
+                message="redis_pubsub started",
             )
         except asyncio.TimeoutError:
             self._connected = False
-            # Distinct wording so the operator can tell TCP-accepted-but-hung
-            # apart from connection-refused. Same recognizable prefix as the
-            # generic branch so the metric/filter picks up both.
-            log.warning(
-                "redis pubsub initial connect failed: PING timed out after "
-                "%.2fs (TCP accepted but no reply); reader loop will retry",
-                ENV.REDIS_COMMAND_TIMEOUT_SEC,
+            # Distinct `reason` field so the operator (and A5) can
+            # tell TCP-accepted-but-hung apart from connection-refused.
+            # Same `event` name so the metric/filter picks up both.
+            _emit(
+                EVENT_INITIAL_CONNECT_FAILED,
+                "WARNING",
+                reason="timeout",
+                timeout_seconds=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+                message=(
+                    f"redis pubsub initial connect failed: PING timed out after "
+                    f"{ENV.REDIS_COMMAND_TIMEOUT_SEC:.2f}s "
+                    f"(TCP accepted but no reply); reader loop will retry"
+                ),
             )
         except Exception as exc:
             self._connected = False
-            # Distinct log string — recognisable by the metric filter and
-            # by tests that need to detect the initial-failure event
-            # before restoring the network path.
-            log.warning(
-                "redis pubsub initial connect failed; reader loop will retry: %s",
-                exc,
+            # `reason=refused` covers ConnectionError shape; anything
+            # else surfaces via the message field for forensic
+            # inspection (still under the same `event` name).
+            _emit(
+                EVENT_INITIAL_CONNECT_FAILED,
+                "WARNING",
+                reason="refused",
+                error_class=_classify_failure(exc),
+                message=(
+                    "redis pubsub initial connect failed; reader loop will retry"
+                ),
             )
 
         # ALWAYS schedule the reader loop. If _connected=False, the
@@ -191,6 +665,49 @@ class RedisPubSub:
         self._reader_task = asyncio.create_task(
             self._reader_loop(), name="redis-pubsub-reader",
         )
+
+        # PR #31 §3 W7 — probe task. Scheduled whenever a probe
+        # callback has been registered (whether via
+        # `enable_probe_task()` or an explicit `set_probe_callback`).
+        # Loop skips ticks while `_connected=False`, so it's safe to
+        # start it even when the initial ping failed.
+        if self._probe_subscription_desired:
+            self._probe_task = asyncio.create_task(
+                self._probe_loop(), name="redis-pubsub-probe",
+            )
+
+        # PR #31 §3 W7 — if the probe callback has been registered
+        # AND the initial ping succeeded, subscribe to this
+        # instance's own probe channel here so the probe task can
+        # publish + receive on its first tick. On ping failure the
+        # subscribe happens on the reader loop's next `_reconnect`
+        # pass, which reads `_probe_subscription_desired` and adds
+        # the probe channel to the bulk SUBSCRIBE. Both paths write
+        # `_probe_subscribed=True` on success.
+        if self._connected and self._probe_subscription_desired:
+            try:
+                await asyncio.wait_for(
+                    self._pubsub.subscribe(_probe_channel_name(ENV.INSTANCE_ID)),
+                    timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
+                )
+                self._probe_subscribed = True
+            except Exception as exc:
+                # Non-fatal — reader loop's `_reconnect` path will
+                # pick this up in the next reconnect cycle. Emit a
+                # warning so the operator can see the initial
+                # probe-subscribe failed even though `start()` did
+                # not itself fail.
+                _emit(
+                    EVENT_RECONNECT_FAILED,
+                    "WARNING",
+                    reason="probe_initial_subscribe_failed",
+                    error_class=_classify_failure(exc),
+                    message=(
+                        "redis pubsub probe channel initial subscribe failed — "
+                        "will retry via reader loop reconnect"
+                    ),
+                )
+                self._connected = False  # force reader loop into _reconnect
 
     async def _teardown_clients(self) -> None:
         """Close and null out the pub/sub client objects. Idempotent."""
@@ -225,10 +742,28 @@ class RedisPubSub:
         """
         # Nothing to do only when we have neither the started flag nor
         # any lingering client objects.
-        if not self._started and self._pub is None and self._sub is None and self._pubsub is None:
+        if (
+            not self._started
+            and self._pub is None
+            and self._sub is None
+            and self._pubsub is None
+            and self._probe_task is None
+        ):
             return
         self._started = False
         self._connected = False
+        # PR #31 §3 W7 — probe task MUST be cancelled BEFORE
+        # `_teardown_clients()` so no probe attempt runs against a
+        # torn-down `_pub` / `_pubsub` client. Cancel before the
+        # reader task so the reader can drain any final probe
+        # dispatch it already saw without the probe task racing to
+        # publish again.
+        if self._probe_task and not self._probe_task.done():
+            self._probe_task.cancel()
+            try:
+                await self._probe_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -237,6 +772,12 @@ class RedisPubSub:
                 pass
         await self._teardown_clients()
         self._reader_task = None
+        self._probe_task = None
+        self._probe_subscribed = False
+        # Leave `_probe_subscription_desired` unchanged so a
+        # subsequent `start()` on the same instance re-arms the
+        # probe channel without a second `set_probe_callback()`
+        # call.
         self._subscribed.clear()
         self._ref_counts.clear()
 
@@ -420,7 +961,10 @@ class RedisPubSub:
                     continue
                 # Nothing subscribed yet — don't poll get_message (redis client
                 # raises when no channels are set on some versions/backends).
-                if not self._subscribed:
+                # Nothing subscribed (production OR probe) — don't
+                # poll get_message (the redis client raises on some
+                # versions when no channels are set).
+                if not self._subscribed and not self._probe_subscribed:
                     await asyncio.sleep(0.05)
                     continue
                 attempt = 0
@@ -431,7 +975,12 @@ class RedisPubSub:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.warning("pubsub reader error: %s", exc)
+                _emit(
+                    EVENT_READER_ERROR,
+                    "WARNING",
+                    error_class=_classify_failure(exc),
+                    message="pubsub reader error",
+                )
                 # get_message() raising almost always means the subscriber's
                 # transport dropped. Flip _connected so the next iteration
                 # enters _reconnect and rebuilds the client; otherwise the
@@ -444,7 +993,13 @@ class RedisPubSub:
 
     async def _reconnect(self, attempt: int) -> None:
         delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
-        log.info("redis pubsub reconnecting in %.1fs (attempt %d)", delay, attempt + 1)
+        _emit(
+            EVENT_RECONNECTING,
+            "INFO",
+            attempt=attempt + 1,
+            delay_seconds=delay,
+            message=f"redis pubsub reconnecting in {delay:.1f}s (attempt {attempt + 1})",
+        )
         await asyncio.sleep(delay)
         try:
             import redis.asyncio as aioredis  # type: ignore
@@ -471,64 +1026,132 @@ class RedisPubSub:
             async with self._lock:
                 self._pubsub = self._sub.pubsub(ignore_subscribe_messages=True)
                 self._subscribed.clear()
+                self._probe_subscribed = False
                 desired = [k for k, count in self._ref_counts.items() if count > 0]
-                if not desired:
+                # PR #31 §3 W7 — probe channel is part of the desired
+                # subscription set whenever the caller has registered
+                # a probe callback. Include it in the SAME bulk
+                # SUBSCRIBE so probe resubscription is atomic with
+                # production channel resubscription.
+                probe_channel = (
+                    _probe_channel_name(ENV.INSTANCE_ID)
+                    if self._probe_subscription_desired
+                    else None
+                )
+                if not desired and not probe_channel:
                     self._connected = True
-                    log.info("redis pubsub reconnected; 0 rooms to resubscribe")
+                    _emit(
+                        EVENT_RECONNECTED,
+                        "INFO",
+                        rooms_resubscribed=0,
+                        message="redis pubsub reconnected; 0 rooms to resubscribe",
+                    )
                     return
                 # Single bulk SUBSCRIBE so the whole reconciliation is bounded
                 # by ONE REDIS_COMMAND_TIMEOUT_SEC, regardless of how many
                 # rooms are on this instance. Per-room timeout could stall
                 # _lock for N × timeout seconds on a hung connection.
                 channels = [_channel_name(*key) for key in desired]
+                if probe_channel:
+                    channels.append(probe_channel)
                 try:
                     await asyncio.wait_for(
                         self._pubsub.subscribe(*channels),
                         timeout=ENV.REDIS_COMMAND_TIMEOUT_SEC,
                     )
                 except asyncio.TimeoutError:
-                    log.warning(
-                        "redis pubsub bulk resubscribe timeout (%d rooms) — will retry",
-                        len(desired),
+                    _emit(
+                        EVENT_RECONNECT_FAILED,
+                        "WARNING",
+                        reason="bulk_subscribe_timeout",
+                        rooms_desired=len(desired),
+                        probe_desired=bool(probe_channel),
+                        message=(
+                            f"redis pubsub bulk resubscribe timeout "
+                            f"({len(desired)} rooms) — will retry"
+                        ),
                     )
                     self._connected = False
                     return
                 except Exception as exc:
-                    log.warning(
-                        "redis pubsub bulk resubscribe failed (%d rooms): %s — will retry",
-                        len(desired), exc,
+                    _emit(
+                        EVENT_RECONNECT_FAILED,
+                        "WARNING",
+                        reason="bulk_subscribe_failed",
+                        rooms_desired=len(desired),
+                        probe_desired=bool(probe_channel),
+                        error_class=_classify_failure(exc),
+                        message=(
+                            "redis pubsub bulk resubscribe failed — will retry"
+                        ),
                     )
                     self._connected = False
                     return
                 # All-or-nothing on the bulk call: if wait_for returned, every
                 # channel was accepted. Populate _subscribed accordingly.
                 self._subscribed.update(desired)
+                if probe_channel:
+                    self._probe_subscribed = True
                 self._connected = True
-                log.info(
-                    "redis pubsub reconnected; %d rooms resubscribed (bulk)",
-                    len(self._subscribed),
+                _emit(
+                    EVENT_RECONNECTED,
+                    "INFO",
+                    rooms_resubscribed=len(self._subscribed),
+                    message=(
+                        f"redis pubsub reconnected; "
+                        f"{len(self._subscribed)} rooms resubscribed (bulk)"
+                    ),
                 )
         except Exception as exc:
-            log.warning("redis reconnect failed: %s", exc)
+            _emit(
+                EVENT_RECONNECT_FAILED,
+                "WARNING",
+                reason="ping_failed",
+                error_class=_classify_failure(exc),
+                message="redis reconnect failed",
+            )
             self._connected = False
 
     async def _dispatch(self, msg: dict) -> None:
-        if self._callback is None:
-            return
         try:
             channel = msg.get("channel") or ""
             data = msg.get("data")
             if not channel or data is None:
                 return
-            org_id, room_id = _parse_channel(channel)
-            if not org_id or not room_id:
-                return
             envelope = json.loads(data) if isinstance(data, (str, bytes)) else data
             if not isinstance(envelope, dict):
                 return
+
+            # PR #31 §3 W7 — probe branch. Probe messages are
+            # self-published on `{prefix}:probe:{instance_id}` and
+            # the intended recipient IS the publisher itself, so we
+            # deliberately DO NOT apply the self-suppression check.
+            # Probe channel matched → deliver to the probe callback
+            # and return; never fall through to production dispatch.
+            probe_instance = _parse_probe_channel(channel)
+            if probe_instance:
+                if self._probe_callback is None:
+                    return
+                # `is_probe=True` marker on the envelope for defence
+                # in depth — a channel-name discriminator is
+                # sufficient for correctness but the marker makes
+                # the branch obvious in incident review.
+                if not envelope.get("is_probe"):
+                    return
+                await self._probe_callback(envelope)
+                return
+
+            # Production branch.
+            if self._callback is None:
+                return
+            org_id, room_id = _parse_channel(channel)
+            if not org_id or not room_id:
+                return
             # Skip messages we published from this instance. broadcast_room
             # already delivered them locally; re-delivering here would double
-            # up on the publisher instance (see design doc §8a).
+            # up on the publisher instance (see design doc §8a). The probe
+            # branch above deliberately bypasses this check — see PR #31
+            # §3 W7.
             if envelope.get("publisher") == ENV.INSTANCE_ID:
                 return
             payload = envelope.get("message")
