@@ -1128,13 +1128,28 @@ async def _room_sweeper_loop() -> None:
     while True:
         try:
             await asyncio.sleep(max(15, ROOM_SWEEPER_INTERVAL_SEC))
-            candidate_rooms = multichurch_store.stale_live_rooms(
-                idle_seconds=max(60, ROOM_IDLE_TIMEOUT_SEC),
-                max_duration_seconds=max(600, ROOM_MAX_DURATION_SEC),
+            # Offload the two synchronous Firestore stream iterations to
+            # the default ThreadPoolExecutor so the asyncio event loop
+            # stays responsive to the observability heartbeat (and any
+            # other coroutine) during the stream page fetches. Same
+            # pattern as the `live_rooms` call a few lines below.
+            # Sequential, not parallel — order (stale → enforce) is
+            # preserved to match the pre-fix behaviour. See
+            # GATE-B-DIAGNOSTIC-FOLLOWUP.md.
+            _loop = asyncio.get_running_loop()
+            candidate_rooms = await _loop.run_in_executor(
+                None,
+                lambda: multichurch_store.stale_live_rooms(
+                    idle_seconds=max(60, ROOM_IDLE_TIMEOUT_SEC),
+                    max_duration_seconds=max(600, ROOM_MAX_DURATION_SEC),
+                ),
             )
             candidate_rooms.extend(
-                multichurch_store.enforce_live_usage_caps(
-                    tick_seconds=max(60, ROOM_USAGE_TICK_SEC),
+                await _loop.run_in_executor(
+                    None,
+                    lambda: multichurch_store.enforce_live_usage_caps(
+                        tick_seconds=max(60, ROOM_USAGE_TICK_SEC),
+                    ),
                 )
             )
             seen_room_keys = {
