@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import sys
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
@@ -29,7 +30,45 @@ log = logging.getLogger("redis_pubsub")
 RoomKey = Tuple[str, str]
 DeliveryCallback = Callable[[str, str, dict], Awaitable[None]]
 
-_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0)
+# Guard against pathological `attempt` values. With base=5 cap=60, the cap
+# saturates by attempt 4; this bound only prevents `2**attempt` arithmetic
+# overflow if a caller ever hands in a huge integer.
+_ATTEMPT_SHIFT_CEIL = 30
+
+
+def _backoff_delay(
+    attempt: int,
+    *,
+    base: Optional[float] = None,
+    cap: Optional[float] = None,
+    rng: Optional[random.Random] = None,
+) -> Tuple[float, bool]:
+    """Capped exponential backoff with equal jitter.
+
+    ceiling = min(cap, base * 2**attempt)
+    delay   = ceiling/2 + U(0, ceiling/2)
+
+    - `attempt` starts at 0 (first retry uses the base-sized window).
+    - The lower-half floor prevents a zero-delay busy loop.
+    - The jitter prevents synchronized multi-instance retries.
+    - Returns (delay_seconds, delay_capped_bool).
+    - Base/cap default to ENV values; override only in tests.
+    - A custom `rng` lets tests inject a deterministic Random instance.
+    """
+    if base is None:
+        base = ENV.REDIS_RECONNECT_BASE_SEC
+    if cap is None:
+        cap = ENV.REDIS_RECONNECT_CAP_SEC
+    safe_attempt = max(0, min(int(attempt), _ATTEMPT_SHIFT_CEIL))
+    unbounded = base * (2 ** safe_attempt)
+    capped = unbounded >= cap
+    ceiling = cap if capped else unbounded
+    half = ceiling / 2.0
+    gen = rng if rng is not None else random
+    delay = half + gen.uniform(0.0, half)
+    return (delay, capped)
+
+
 _ENVELOPE_VERSION = 1
 
 # PR #31 §3 (W1) structured-event schema. Every adapter event now
@@ -957,7 +996,7 @@ class RedisPubSub:
             try:
                 if self._pubsub is None or not self._connected:
                     await self._reconnect(attempt)
-                    attempt = min(attempt + 1, len(_BACKOFF_SECONDS) - 1)
+                    attempt = attempt + 1
                     continue
                 # Nothing subscribed yet — don't poll get_message (redis client
                 # raises when no channels are set on some versions/backends).
@@ -988,17 +1027,19 @@ class RedisPubSub:
                 # and this instance stops receiving terminal broadcasts —
                 # provider sessions leak.
                 self._connected = False
-                attempt = min(attempt + 1, len(_BACKOFF_SECONDS) - 1)
-                await asyncio.sleep(_BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)])
+                attempt = attempt + 1
+                delay, _capped = _backoff_delay(attempt)
+                await asyncio.sleep(delay)
 
     async def _reconnect(self, attempt: int) -> None:
-        delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
+        delay, capped = _backoff_delay(attempt)
         _emit(
             EVENT_RECONNECTING,
             "INFO",
-            attempt=attempt + 1,
-            delay_seconds=delay,
-            message=f"redis pubsub reconnecting in {delay:.1f}s (attempt {attempt + 1})",
+            attempt=attempt,
+            delay_ms=int(round(delay * 1000)),
+            delay_capped=capped,
+            message="redis pubsub reconnecting",
         )
         await asyncio.sleep(delay)
         try:
