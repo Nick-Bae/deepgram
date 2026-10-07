@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import os
 import uuid
 from pathlib import Path
@@ -22,6 +23,23 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in {"1", "true", "yes", "on"}
+
+
+def _env_float_clamped(name: str, default: float, lo: float, hi: float) -> float:
+    """Parse an env float, falling back to `default` on empty / non-finite /
+    non-positive values, then clamping to [lo, hi]. Positive-only semantics —
+    callers must only use this for durations that are nonsensical at zero
+    or below. If `default` itself is outside [lo, hi], it is clamped too."""
+    raw = (os.getenv(name) or "").strip()
+    val = default
+    if raw:
+        try:
+            parsed = float(raw)
+            if math.isfinite(parsed) and parsed > 0:
+                val = parsed
+        except (TypeError, ValueError):
+            pass
+    return max(lo, min(hi, val))
 
 
 class ENV:
@@ -82,6 +100,19 @@ class ENV:
     )
     REDIS_PROBE_DEADLINE_SEC: float = max(
         0.5, min(10.0, float(os.getenv("REDIS_PROBE_DEADLINE_SEC", "2")))
+    )
+    # Reconnect backoff — capped exponential with equal jitter.
+    # On attempt N: ceiling = min(cap, base * 2^N); delay = ceiling/2 + U(0, ceiling/2).
+    # Base is the initial retry window; cap bounds growth. Empty / non-finite /
+    # non-positive input falls back to the documented default, then clamps.
+    # Operator note: if `cap < base`, the clamp lifts cap up to base (its `lo`
+    # bound is `REDIS_RECONNECT_BASE_SEC`), so the effective cap becomes the
+    # base. This keeps the ceiling non-negative; a smaller cap is not supported.
+    REDIS_RECONNECT_BASE_SEC: float = _env_float_clamped(
+        "REDIS_RECONNECT_BASE_SEC", default=5.0, lo=0.1, hi=60.0
+    )
+    REDIS_RECONNECT_CAP_SEC: float = _env_float_clamped(
+        "REDIS_RECONNECT_CAP_SEC", default=60.0, lo=REDIS_RECONNECT_BASE_SEC, hi=300.0
     )
     INSTANCE_ID: str = _env_str("INSTANCE_ID", default=f"inst-{uuid.uuid4().hex[:12]}")
 

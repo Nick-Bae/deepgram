@@ -704,8 +704,11 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
     """_reconnect() bulk resubscription: success, timeout, error, empty, race."""
 
     def _patch_zero_backoff(self):
+        # Post-remediation: `_BACKOFF_SECONDS` is replaced by `_backoff_delay`.
+        # Collapse the function to a zero-delay no-op so these tests remain
+        # focused on bulk-subscribe semantics rather than real wait durations.
         import app.services.redis_pubsub as mod
-        return patch.object(mod, "_BACKOFF_SECONDS", (0.0, 0.0, 0.0, 0.0))
+        return patch.object(mod, "_backoff_delay", lambda a, **kw: (0.0, False))
 
     def _fake_redis_class(self, pubsub_obj):
         """Build a fake Redis class whose instances return the given pubsub.
