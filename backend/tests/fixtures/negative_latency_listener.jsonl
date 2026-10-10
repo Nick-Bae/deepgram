@@ -1,0 +1,5 @@
+{"event": "listener_capture_start", "ts": "2001-09-09T01:46:40.000+00:00Z"}
+{"event": "resolved", "orgId": "org1", "roomId": "room_X", "serviceKey": "sk", "ts": "2001-09-09T01:46:40.000+00:00Z"}
+{"event": "ws_open", "room_id": "room_X", "ts": "2001-09-09T01:46:40.050+00:00Z"}
+{"event": "ws_message", "format": "modern", "seq": 77, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-X", "text_length": 10, "ts": "2001-09-09T01:46:45.000+00:00Z"}
+{"event": "ws_message", "format": "legacy", "seq": 77, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-X", "text_length": 10, "ts": "2001-09-09T01:46:45.000+00:00Z"}

@@ -9,6 +9,9 @@ import {
 } from "../utils/streamContext";
 import { enforceSecureProtocol } from "../utils/urls";
 import { isTerminalRoomClose } from "./wsCloseClassify";
+// F2 v5: shared retry policy. Previously duplicated inline — now consulted
+// by both frontend hooks via one source of truth. See wsRetryPolicy.ts.
+import { TERMINAL_CLOSE_CODES, retryDecision } from "./wsRetryPolicy";
 
 type StartOptions = {
   sourceLang?: string;
@@ -76,10 +79,12 @@ function wsDeepgramURL(opts?: StartOptions, streamContext?: StreamContext) {
   if (streamContext?.orgId) params.set("orgId", streamContext.orgId);
   if (streamContext?.roomId) params.set("roomId", streamContext.roomId);
   if (streamContext?.churchSlug) params.set("churchSlug", streamContext.churchSlug);
-  const hostToken = getHostTokenFromSession();
-  if (hostToken) params.set("hostToken", hostToken);
-  const idToken = getAuthTokenFromSession();
-  if (idToken) params.set("idToken", idToken);
+  // F2 follow-up v2: BOTH credentials travel on the WebSocket
+  // Sec-WebSocket-Protocol header, never in the URL. The host-upgrade
+  // token (`hostToken`) IS a credential — it authorizes host role
+  // without membership — so it is NOT appended to the URL query here.
+  // See the `new WebSocket(url, [...])` call site below for the
+  // RFC-6455-compliant subprotocol list.
 
   const suffix = params.toString() ? `?${params.toString()}` : "";
   try {
@@ -258,18 +263,52 @@ export function useDeepgramProducer(): DeepgramProducerController {
     }
   }
 
+  // F2 v5: bounded reconnect uses the shared `retryDecision` policy
+  // (lib/wsRetryPolicy.ts). Host cap is higher than the listener cap
+  // because a mid-session host should not get dropped by a transient
+  // ID-token refresh race. `scheduleReconnect` observes the last close
+  // code so terminal 4401/4403 — already handled in `onclose` — never
+  // reach this path; `exhausted` is the normal end state.
+  const MAX_RECONNECT_ATTEMPTS = 12;
+  const lastCloseCodeRef = useRef<number>(1006);
+  const lastCloseReasonRef = useRef<string>("");
+
   function scheduleReconnect() {
     if (!shouldRunRef.current) return;
     clearReconnectTimer();
-    const attempt = reconnectAttemptRef.current++;
-    const baseDelay = Math.min(8000, 600 * Math.pow(2, attempt));
-    const jitter = 0.5 + Math.random() * 0.5;
-    const delay = Math.round(baseDelay * jitter);
+    const attempt = reconnectAttemptRef.current;
+    const decision = retryDecision({
+      attempt,
+      maxAttempts: MAX_RECONNECT_ATTEMPTS,
+      closeCode: lastCloseCodeRef.current,
+      closeReason: lastCloseReasonRef.current,
+      baseDelayMs: 600,
+      maxDelayMs: 8000,
+      jitter01: Math.random(),
+    });
+    if (decision.kind === "terminal") {
+      console.warn("[deepgram-producer] terminal", { reason: decision.reason, attempts: attempt });
+      shouldRunRef.current = false;
+      releaseMediaPipeline();
+      applyInputMuted(false);
+      setErrorMsg(
+        decision.reason === "auth"
+          ? "Authentication failed. Please sign in again."
+          : decision.reason === "forbidden"
+          ? "You are not authorized to host this room."
+          : decision.reason === "roomEnded"
+          ? "Room has ended."
+          : "Lost connection and could not reconnect. Please refresh and sign in again."
+      );
+      setStatus("error");
+      return;
+    }
+    reconnectAttemptRef.current = decision.nextAttempt;
     setStatus("starting");
     reconnectTimerRef.current = setTimeout(() => {
       reconnectTimerRef.current = null;
       connectWebSocket();
-    }, delay);
+    }, decision.delayMs);
   }
 
   function connectWebSocket() {
@@ -284,14 +323,44 @@ export function useDeepgramProducer(): DeepgramProducerController {
       return;
     }
     const url = wsDeepgramURL(startOptionsRef.current, streamContextRef.current);
+    // F2 follow-up v2 — RFC 6455 §4.2.2 compliance:
+    //
+    // The browser requires the server to echo back one of the
+    // subprotocols we offered. We offer BOTH the literal "bearer" AND
+    // the `bearer.<idToken>` carrier. The backend verifies the token
+    // from the carrier and replies with `subprotocol="bearer"`
+    // (never with the token-bearing entry). The host-upgrade token
+    // follows the same pattern via the `host-token` literal + carrier
+    // pair. Neither credential ever appears in the URL.
+    //
+    // On a bad-token reject-before-accept, the browser JS observes
+    // close code=1006, wasClean=false (the WebSocket spec hides the
+    // underlying 403 from JS). The reconnect loop in this file already
+    // bounds attempts via `reconnectAttemptRef` + the terminal-close
+    // classifier, so a bad token does not spin unbounded.
+    const idTokenForProtocol = getAuthTokenFromSession();
+    const hostTokenForProtocol = getHostTokenFromSession();
+    const subprotocols: string[] = [];
+    if (idTokenForProtocol) {
+      subprotocols.push("bearer", `bearer.${idTokenForProtocol}`);
+    }
+    if (hostTokenForProtocol) {
+      subprotocols.push("host-token", `host-token.${hostTokenForProtocol}`);
+    }
     try {
-      const ws = new WebSocket(url);
+      const ws = subprotocols.length
+        ? new WebSocket(url, subprotocols)
+        : new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
+      // Note: We intentionally do NOT reset reconnectAttemptRef on open.
+      // A pure `open` event can fire for a server that will immediately
+      // close (RFC 6455 §4.2.2 handshake-fail-after-upgrade); only real
+      // bytes arriving via onmessage confirm the handshake succeeded.
+      // Reset is moved to onmessage below.
       ws.onopen = () => {
         if (wsRef.current !== ws) return;
-        reconnectAttemptRef.current = 0;
         terminalErrorRef.current = false;
         setErrorMsg(null);
         setStatus("streaming");
@@ -314,7 +383,45 @@ export function useDeepgramProducer(): DeepgramProducerController {
       };
 
       ws.onclose = (event) => {
-        if (wsRef.current === ws) wsRef.current = null;
+        // F2 v6 — stale-socket + unmount guard. A late onclose from an
+        // OLD socket (whose replacement was already constructed) MUST
+        // NOT mutate the replacement's state. Without this guard a
+        // delayed 4401 from a prior socket would release the mic +
+        // terminate the active host session that just succeeded. Same
+        // hazard after unmount — `shouldRunRef` is already false, but
+        // the terminal/release branch below runs regardless of that
+        // flag, so we have to bail at the TOP.
+        if (!shouldRunRef.current || wsRef.current !== ws) {
+          // If this is a replaced socket, close/null the local handle
+          // only (do not touch wsRef — that now points at the live one).
+          return;
+        }
+        wsRef.current = null;
+        // F2 v5: record close code/reason for `scheduleReconnect` to
+        // feed into the shared retry-policy decision function.
+        lastCloseCodeRef.current = event.code || 1006;
+        lastCloseReasonRef.current = event.reason || "";
+        // F2 v5: terminal auth (4401 bad bearer, 4403 host-forbidden)
+        // released the media pipeline immediately — no retry, no mic
+        // reprompt loop. The subprotocol-reject frame is observable in
+        // the test harness via `event.code`; browsers may surface it as
+        // 1006 instead (RFC 6455 hides the HTTP 403 from JS), and the
+        // attempts cap handles that case.
+        if (TERMINAL_CLOSE_CODES.has(event.code)) {
+          console.warn("[FE][DG][terminal-auth]", { code: event.code });
+          shouldRunRef.current = false;
+          terminalErrorRef.current = true;
+          clearReconnectTimer();
+          releaseMediaPipeline();
+          applyInputMuted(false);
+          setErrorMsg(
+            event.code === 4401
+              ? "Authentication failed. Please sign in again."
+              : "You are not authorized to host this room."
+          );
+          setStatus("error");
+          return;
+        }
         // Terminal (room_ended / 4001) vs transient (1001, 1006,
         // 1012 SIGTERM from Uvicorn, network drops). Classify BEFORE
         // the shouldRunRef / terminalErrorRef checks so a room_ended
@@ -358,12 +465,24 @@ export function useDeepgramProducer(): DeepgramProducerController {
       };
 
       ws.onerror = () => {
+        // F2 v6 — stale/unmount guard: a late onerror from a replaced
+        // socket must not surface an error on the live session.
+        if (!shouldRunRef.current || wsRef.current !== ws) return;
         setErrorMsg("WebSocket error");
         setStatus("error");
         try { ws.close(); } catch {}
       };
 
       ws.onmessage = (e) => {
+        // F2 v6 — stale/unmount guard (prevents a replaced socket from
+        // (a) resetting the live socket's retry counter via a late
+        // message, (b) feeding stray data into application state).
+        if (!shouldRunRef.current || wsRef.current !== ws) return;
+        // Confirmed byte reception: handshake truly succeeded. Only now
+        // reset the retry counter. See the comment on `ws.onopen` above.
+        if (reconnectAttemptRef.current !== 0) {
+          reconnectAttemptRef.current = 0;
+        }
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === "error") {

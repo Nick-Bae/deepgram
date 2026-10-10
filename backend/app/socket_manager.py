@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Callable, Dict, List, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from fastapi import WebSocket
 
@@ -232,8 +232,11 @@ class ConnectionManager:
                 self.note_host_disconnected(ws)
                 raise RuntimeError("host_subscription_not_ready")
 
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
+    async def connect(self, ws: WebSocket, subprotocol: Optional[str] = None):
+        if subprotocol:
+            await ws.accept(subprotocol=subprotocol)
+        else:
+            await ws.accept()
         self.active.add(ws)
 
     def join_room(self, ws: WebSocket, org_id: str, room_id: str, role: str = "listener") -> int:

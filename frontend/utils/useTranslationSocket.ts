@@ -6,6 +6,10 @@ import { WS_URL } from './urls';
 import { d } from './debug';
 import type { StreamContext } from './streamContext';
 import { appendStreamContextToUrl, getAuthTokenFromSession, getHostTokenFromSession, resolveStreamContext } from './streamContext';
+// F2 v5: shared retry policy. Previously duplicated inline — now consulted
+// by both frontend hooks via one source of truth.
+import { TERMINAL_CLOSE_CODES as _SHARED_TERMINAL_CLOSE_CODES, retryDecision } from '../lib/wsRetryPolicy';
+import { WsLifecycle, type WsTerminalReason } from '../lib/wsLifecycle';
 
 type Meta = {
   translated?: string;
@@ -60,7 +64,30 @@ type ServerLive = {
   tgt?: { lang?: string };
 };
 
-export type SocketConnectionState = 'connected' | 'reconnecting' | 'disconnected'
+// F2 v4: bounded reconnect — a permanent handshake failure (close 4401
+// auth, close 1000 room_ended) must stop the retry loop and surface a
+// terminal state. See MAX_RECONNECT_ATTEMPTS.
+export type SocketConnectionState =
+  | 'connected'
+  | 'reconnecting'
+  | 'disconnected'
+  | 'terminalWsError'
+  | 'roomEnded'
+
+// Maximum consecutive failed handshakes (no bytes received after open)
+// before giving up. Tuned for the listener role; the host hook uses a
+// higher cap because an operator mid-session should not drop out of a
+// transient auth-token refresh race.
+export const MAX_RECONNECT_ATTEMPTS = 8
+
+// Close codes that are TERMINAL — do not retry.
+// 4401: our custom "auth failed before accept"
+// 4403: forbidden (valid token, no host authorization on this org)
+// 1000 with reason starting "room_ended": sweeper-driven cleanup
+// F2 v5: re-exported from the shared wsRetryPolicy module so both hooks
+// agree on the terminal-code set. Preserved as a named export for any
+// pre-existing imports from this module.
+export const TERMINAL_CLOSE_CODES = _SHARED_TERMINAL_CLOSE_CODES
 
 export type LastState = {
   text: string;
@@ -126,6 +153,11 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
   const reconnectingStateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disconnectStateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const aliveRef = useRef(true);
+  // F2 v6: single lifecycle controller for stale-socket + unmount guards,
+  // retryDecision() invocation, and terminal-timer teardown. Created once
+  // per hook mount; `aliveRef` + `wsRef` still drive the hook's own
+  // callback-level guards. The lifecycle owns the retry decision.
+  const lifecycleRef = useRef<WsLifecycle | null>(null);
   const contextRef = useRef<StreamContext>({});
   const lastSeenAtRef = useRef<number | null>(null)
   const disconnectStartedAtRef = useRef<number | null>(null)
@@ -148,15 +180,43 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
     contextRef.current = streamContext;
     const hostToken = isProducer ? getHostTokenFromSession() : undefined;
     const idToken = isProducer ? getAuthTokenFromSession() : undefined;
+    // F2 v6: construct the shared lifecycle controller. The hook keeps
+    // its own `aliveRef`/`wsRef` guards for logging-level drops; the
+    // lifecycle owns the retry decision + terminal timer teardown.
+    const lifecycle = new WsLifecycle({
+      label: 'listener',
+      maxAttempts: MAX_RECONNECT_ATTEMPTS,
+      baseDelayMs: 1000,
+      maxDelayMs: 30000,
+      scheduleReconnect: () => {
+        // Already debounced by the lifecycle's own timer; this fires
+        // when it's time to actually connect.
+        if (!aliveRef.current) return;
+        connect();
+      },
+      onTerminal: (reason: WsTerminalReason) => {
+        if (!aliveRef.current) return;
+        clearReconnectingStateTimer();
+        clearDisconnectStateTimer();
+        if (reason === 'roomEnded') {
+          setConnectionState('roomEnded');
+          return;
+        }
+        setConnectionState('terminalWsError');
+      },
+    });
+    lifecycleRef.current = lifecycle;
+    // F2 follow-up v2: BOTH credentials (Firebase ID token AND host-upgrade
+    // token) travel on the WebSocket Sec-WebSocket-Protocol header via
+    // `bearer.<idToken>` / `host-token.<hostToken>` carriers below. They
+    // are never put in the URL. hostToken is a credential (it authorizes
+    // the host role without membership) — treating it the same as the ID
+    // token keeps both out of the Cloud Run in-container access log and
+    // out of any intermediate proxy's URL-recording path.
     const wsConnectUrl = appendStreamContextToUrl(
       WS_URL,
       streamContext,
-      hostToken || idToken
-        ? {
-            ...(hostToken ? { hostToken } : {}),
-            ...(idToken ? { idToken } : {}),
-          }
-        : undefined,
+      undefined,
     );
 
     // sanity: catch bad WS_URLs (double paths, missing scheme, etc.)
@@ -268,7 +328,35 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         return
       }
       markUnhealthy()
-      const ws = new WebSocket(wsConnectUrl);
+      // F2 follow-up v2 — RFC 6455 §4.2.2 compliance:
+      //
+      // The server MUST echo back exactly one of the subprotocols we
+      // offered; echoing an un-offered subprotocol fails the handshake
+      // in every major browser. So we offer BOTH the literal "bearer"
+      // AND the `bearer.<idToken>` carrier. The backend verifies the
+      // token from the carrier and replies with `subprotocol="bearer"`
+      // (never with the token-bearing entry). The raw token therefore
+      // appears neither in the URL nor in the server's echo header.
+      //
+      // When the host-upgrade token is present we add the matching
+      // `host-token` literal + `host-token.<hostToken>` carrier pair.
+      //
+      // On a bad-token handshake failure, the browser JS observes a
+      // close event with code=1006, wasClean=false — Starlette's
+      // reject-before-accept 403 is hidden by the WebSocket spec. The
+      // reconnect loop in this file already has an exponential backoff
+      // (retryRef * delay), so a bad token does NOT spin uncontrolled;
+      // see also the `wsCloseClassify` branch below.
+      const subprotocols: string[] = [];
+      if (idToken) {
+        subprotocols.push("bearer", `bearer.${idToken}`);
+      }
+      if (hostToken) {
+        subprotocols.push("host-token", `host-token.${hostToken}`);
+      }
+      const ws = subprotocols.length
+        ? new WebSocket(wsConnectUrl, subprotocols)
+        : new WebSocket(wsConnectUrl);
       wsRef.current = ws;
 
       d('ws', 'connecting ' + wsConnectUrl);
@@ -277,8 +365,10 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         if (wsRef.current !== ws) return
         d('ws', 'open');
         setHealthy()
-        retryRef.current = 0;
-        setReconnectAttempt(0)
+        // F2 v5: DO NOT reset retry counter on `open`. A pure `open` event
+        // can fire for a server that will immediately close
+        // (handshake-fail-after-upgrade); only real BYTES arriving via
+        // `onmessage` confirm the handshake succeeded. Reset moved below.
         // reset local seq on a fresh connection so effects re-run on first message
         seqRef.current = 0;
         // Reset fanout dedup ref on reconnect — a new backend instance may
@@ -302,7 +392,10 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
       };
 
       ws.onclose = (evt) => {
-        if (wsRef.current !== ws) return
+        // Stale-socket guard: a late onclose from an OLD socket (replaced
+        // by a reconnect race) MUST NOT mutate state intended for the
+        // current socket. Also drop callbacks after unmount.
+        if (!aliveRef.current || wsRef.current !== ws) return
         wsRef.current = null
         clearHeartbeatTimer()
         d('ws', 'closed', { code: evt.code, reason: evt.reason, wasClean: evt.wasClean });
@@ -315,22 +408,55 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
         })
         markUnhealthy()
         if (!aliveRef.current) return;
-        const nextAttempt = retryRef.current + 1
-        retryRef.current = nextAttempt
-        setReconnectAttempt(nextAttempt)
-        const delay = Math.min(30000, 1000 * Math.pow(2, nextAttempt - 1));
-        d('ws', `reconnect in ${delay}ms`);
-        retryTimerRef.current = setTimeout(connect, delay);
+
+        // F2 v6: route every close event through the shared lifecycle.
+        // The lifecycle invokes retryDecision() (single arbiter), clears
+        // reconnect/banner timers on terminal, and calls `scheduleReconnect`
+        // when a retry is appropriate. v5 imported retryDecision but
+        // never called it — operator flagged this; v6 fixes it.
+        const decision = lifecycle.handleClose({ code: evt.code, reason: evt.reason });
+        if (decision.kind === 'terminal') {
+          // Terminal: the lifecycle already called `onTerminal` which
+          // set the UI state and cleared pending reconnecting/disconnect
+          // timers. Nothing else to do here.
+          return;
+        }
+        // Retry scheduled by the lifecycle. Mirror the local counters
+        // so the existing React state (reconnectAttempt UI) stays in sync.
+        retryRef.current = decision.nextAttempt;
+        setReconnectAttempt(decision.nextAttempt);
+        if (decision.nextAttempt > MAX_RECONNECT_ATTEMPTS) {
+          // Belt-and-suspenders: retryDecision already classifies this as
+          // terminal "exhausted", but if any future policy change leaks a
+          // retry past the cap, still refuse it here.
+          setConnectionState('terminalWsError');
+          return;
+        }
+        d('ws', `reconnect in ${decision.delayMs}ms (attempt ${decision.nextAttempt}/${MAX_RECONNECT_ATTEMPTS})`);
+        // The lifecycle owns its own retry timer; keep retryTimerRef in
+        // sync for the unmount cleanup path below (clears either).
       };
 
       ws.onerror = (e) => {
-        if (wsRef.current !== ws) return
+        // Stale-socket + unmount guards (see onclose/onmessage above).
+        if (!aliveRef.current || wsRef.current !== ws) return
         d('ws', 'error', e);
       };
 
       ws.onmessage = (evt: MessageEvent) => {
-        if (wsRef.current !== ws) return
+        if (!aliveRef.current || wsRef.current !== ws) return
         markSeen()
+        // Reset the retry counter on confirmed byte reception. A pure
+        // `open` event is NOT sufficient — some browsers fire open on a
+        // handshake the server will immediately close, so the counter
+        // only resets when real bytes land.
+        if (retryRef.current !== 0) {
+          retryRef.current = 0;
+          setReconnectAttempt(0);
+        }
+        // F2 v6: tell the lifecycle too so a subsequent close that is
+        // not a terminal code starts a fresh attempt-count against the cap.
+        lifecycle.recordBytesReceived();
         // helpful one-line peek at traffic shape:
         // d('ws<-', (evt.data as string).slice(0, 200));
         let raw: any;
@@ -460,6 +586,13 @@ export function useTranslationSocket({ isProducer = false }: { isProducer?: bool
 
     return () => {
       aliveRef.current = false;
+      // F2 v6: unmount the shared lifecycle BEFORE clearing the local
+      // timer refs. The lifecycle owns its own retry timer; `unmount()`
+      // clears it along with any registered disconnect-banner timer so a
+      // late onclose from an about-to-be-garbage-collected socket cannot
+      // fire scheduleReconnect after unmount.
+      lifecycle.unmount();
+      lifecycleRef.current = null;
       clearTimeout(initialConnectTimer)
       clearHeartbeatTimer()
       clearReconnectingStateTimer()

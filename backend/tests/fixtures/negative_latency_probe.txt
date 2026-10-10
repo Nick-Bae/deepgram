@@ -1,0 +1,4 @@
+# v4 fixture: listener recv BEFORE host emit (clock drift / replay).
+# D1 and D6 must NOT be classified PASS — the join flags
+# impossible_negative_latency=True and forces INCONCLUSIVE.
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"org1","roomId":"room_X","t0Ms":1000000010000,"audioChunkStartMs":1000000010000,"firstPostResetAudioMs":1000000010000,"speechFinalMs":1000000011000,"dT2Ms":1200,"dT3Ms":1400,"segmentId":"seg-X","broadcastSeq":77}

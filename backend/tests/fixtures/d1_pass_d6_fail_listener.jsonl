@@ -1,0 +1,5 @@
+{"event": "listener_capture_start", "ts": "2001-09-09T01:46:40.000+00:00Z"}
+{"event": "ws_open", "room_id": "room_abc", "ts": "2001-09-09T01:46:40.100+00:00Z"}
+{"event": "ws_message", "format": "modern", "seq": 501, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "long-utt-1", "text_length": 24, "ts": "2001-09-09T01:47:02.000+00:00Z"}
+{"event": "ws_message", "format": "legacy", "seq": 501, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "long-utt-1", "text_length": 24, "ts": "2001-09-09T01:47:02.000+00:00Z"}
+{"event": "ws_close", "ts": "2001-09-09T01:47:03.000+00:00Z"}

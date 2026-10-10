@@ -12,3 +12,11 @@ fakeredis>=2.20
 # production dep is reshuffled.
 PyYAML>=6.0
 
+
+# F2 evidence (operator-mandated): without this plugin, every
+# `pytest.mark.timeout(N)` marker in the suite is a silent no-op. The
+# tests in backend/tests/test_pytest_timeout_actually_enabled.py prove
+# the plugin is installed AND actively firing, including a
+# subprocess-driven specific-message assertion against
+# "Failed: Timeout ... from pytest-timeout".
+pytest-timeout==2.4.0
