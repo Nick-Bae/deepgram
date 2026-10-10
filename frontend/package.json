@@ -15,10 +15,14 @@
     "lint": "next lint",
     "test:viewer-display": "node --test --experimental-strip-types utils/viewerDisplay.test.ts utils/viewerRoomLifecycle.test.ts",
     "test:ws-close-classify": "node --test --experimental-strip-types lib/wsCloseClassify.test.ts",
-    "test": "npm run test:viewer-display && npm run test:ws-close-classify",
+    "test:ws-retry-policy": "node --test --experimental-strip-types lib/wsRetryPolicy.test.ts",
+    "test": "npm run test:viewer-display && npm run test:ws-close-classify && npm run test:ws-retry-policy && npm run test:ws-lifecycle && npm run test:ws-lifecycle-wiring && npm run test:hook-wiring",
     "check": "node utils/check-status.js",
     "qr": "node utils/show-qr.js",
-    "dev-all": "npm run update-env && concurrently -k -n BACKEND,FRONTEND \"npm:backend:lan\" \"npm:dev:lan\" && npm run check && npm run qr"
+    "dev-all": "npm run update-env && concurrently -k -n BACKEND,FRONTEND \"npm:backend:lan\" \"npm:dev:lan\" && npm run check && npm run qr",
+    "test:ws-lifecycle": "node --test --experimental-strip-types lib/wsLifecycle.test.ts",
+    "test:ws-lifecycle-wiring": "node --test --experimental-strip-types lib/wsLifecycle.wiring.test.ts",
+    "test:hook-wiring": "node --test --experimental-strip-types lib/hookWiring.test.ts"
   },
   "dependencies": {
     "axios": "^1.8.4",

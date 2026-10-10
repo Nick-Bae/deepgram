@@ -1,0 +1,8 @@
+# Discriminator fixture: operator held speech for 17 s (long utterance).
+# audioChunkStart = 1000000000000 ms (D6 anchor; first audio chunk)
+# speechFinal     = 1000000017000 ms (D1 anchor; Deepgram speech_final event)
+# listener recv   = 1000000022000 ms (both modern and legacy identical)
+# D1 = recv - speechFinal =  5 000 ms  ≤ 10 000 ms  → PASS
+# D6 = recv - audioChunkStart = 22 000 ms  > 15 000 ms → FAIL
+# The validator must distinguish these two outcomes for this fixture.
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"test2","roomId":"room_abc","t0Ms":1000000000000,"audioChunkStartMs":1000000000000,"speechFinalMs":1000000017000,"utteranceEndAbsMs":1000000017000,"dT1Ms":16000,"dT2Ms":21500,"dT3Ms":21700,"speechFinalDeltaMs":17000,"utteranceEndMs":17000,"segmentId":"long-utt-1","broadcastSeq":501}

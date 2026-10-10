@@ -1,0 +1,11 @@
+# Fixture: F2 smoke-style probe log (5 utterances).
+# All timestamps are absolute epoch milliseconds.
+# audioChunkStartMs is the D6 anchor (first audio chunk IN the utterance).
+# speechFinalMs is the D1 anchor (Deepgram speech_final=True receipt).
+# Each probe payload has broadcastSeq set so the listener-side join is unambiguous.
+# Lines starting with `#` or without `[LATENCY_PROBE]` are ignored by the parser.
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"test2","roomId":"room_abc","t0Ms":1000000000000,"audioChunkStartMs":1000000000000,"speechFinalMs":1000000002000,"utteranceEndAbsMs":1000000002000,"dT1Ms":1500,"dT2Ms":2200,"dT3Ms":2400,"speechFinalDeltaMs":2000,"utteranceEndMs":2000,"segmentId":"seg-1","broadcastSeq":1}
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"test2","roomId":"room_abc","t0Ms":1000000003000,"audioChunkStartMs":1000000003000,"speechFinalMs":1000000005500,"utteranceEndAbsMs":1000000005500,"dT1Ms":1800,"dT2Ms":2600,"dT3Ms":2800,"speechFinalDeltaMs":2500,"utteranceEndMs":2500,"segmentId":"seg-2","broadcastSeq":2}
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"test2","roomId":"room_abc","t0Ms":1000000006000,"audioChunkStartMs":1000000006000,"speechFinalMs":1000000008000,"utteranceEndAbsMs":1000000008000,"dT1Ms":2000,"dT2Ms":12000,"dT3Ms":12500,"speechFinalDeltaMs":2000,"utteranceEndMs":2000,"segmentId":"seg-3","broadcastSeq":3}
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"test2","roomId":"room_abc","t0Ms":1000000020000,"audioChunkStartMs":1000000020000,"speechFinalMs":1000000022000,"utteranceEndAbsMs":1000000022000,"dT1Ms":1500,"dT2Ms":2500,"dT3Ms":2700,"speechFinalDeltaMs":2000,"utteranceEndMs":2000,"segmentId":"seg-4","broadcastSeq":4}
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"test2","roomId":"room_abc","t0Ms":1000000030000,"audioChunkStartMs":1000000030000,"speechFinalMs":1000000032000,"utteranceEndAbsMs":1000000032000,"dT1Ms":1500,"dT2Ms":2500,"dT3Ms":2700,"speechFinalDeltaMs":2000,"utteranceEndMs":2000,"segmentId":"seg-99","broadcastSeq":99}

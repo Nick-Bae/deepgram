@@ -39,6 +39,19 @@ from app.services.multichurch_store import multichurch_store
 from app.services.room_reconciler import RoomReconciler
 from app.services import google_tts as google_tts_service
 from app.latency_probe import LatencyProbe
+from app.access_log_filter import install_id_token_scrubber
+from app.auth.ws_auth import (
+    extract_ws_bearer,
+    extract_ws_host_token_sync,
+    parse_subprotocol_header,
+    select_ws_subprotocol,
+    _hashed_uid as _ws_hashed_uid,
+)
+
+# F2 follow-up — defense-in-depth: scrub idToken=... from uvicorn.access
+# log lines produced by legacy query-param clients during the migration
+# window. The primary fix is the subprotocol auth path (ws_auth).
+install_id_token_scrubber()
 from app.utils.hangul import strip_ko_particles
 from app.utils.translate import (
     _preprocess_source_text,
@@ -1487,12 +1500,27 @@ async def ws_translate(ws: WebSocket):
             return
         _ws_viewer_ip_conns[_viewer_ip] = _current + 1
 
+    # F2 follow-up v2: honor the client's `bearer.<token>` subprotocol offer
+    # via RFC-6455-compliant negotiation. The server echoes back `"bearer"`
+    # ONLY if the client offered BOTH the literal `"bearer"` AND at least
+    # one `bearer.<token>` carrier. A carrier-only offer still authenticates
+    # the token (back-compat), but the server does NOT echo any subprotocol
+    # — echoing an un-offered subprotocol would fail the browser handshake.
+    _raw_sp_hdr: Optional[str] = None
+    try:
+        _hdrs = getattr(ws, "headers", None)
+        _raw_sp_hdr = _hdrs.get("sec-websocket-protocol") if _hdrs else None
+    except Exception:
+        _raw_sp_hdr = None
+    _offered_list = parse_subprotocol_header(_raw_sp_hdr)
+    _selected_subproto = select_ws_subprotocol(_offered_list)
+
     # The IP counter is incremented BEFORE ws.accept(). If accept fails (client
     # aborted mid-handshake), the outer try/finally at the message-loop level
     # is never reached, so decrement here to avoid a phantom-slot leak that
     # would eventually block real listeners from this IP.
     try:
-        await manager.connect(ws)
+        await manager.connect(ws, subprotocol=_selected_subproto)
     except Exception:
         with _ws_viewer_ip_lock:
             _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
@@ -1515,8 +1543,26 @@ async def ws_translate(ws: WebSocket):
     # Only accept a UID that has been cryptographically verified via Firebase ID token.
     # Raw hostUid from query params is intentionally ignored — it can be trivially spoofed
     # by anyone who knows an admin's Firebase UID.
-    host_uid_claim = _uid_from_id_token(qctx.get("idToken"))
-    host_token_claim = qctx.get("hostToken")
+    # F2 follow-up: prefer subprotocol-based bearer token (keeps JWT off URL
+    # + Cloud Run access logs). Fall back to legacy query-param during the
+    # migration window. If both are absent, host_uid_claim stays None and
+    # the connection proceeds as a listener (listener auth is still handled
+    # downstream by _can_host).
+    _ws_user, _ws_legacy = await extract_ws_bearer(
+        ws, legacy_query_token=qctx.get("idToken"), path="/ws/translate"
+    )
+    host_uid_claim = _ws_user.uid if _ws_user else None
+    # F2 follow-up v2: host-upgrade token is a credential (authorizes host
+    # role without membership) and MUST NOT travel in the URL. Prefer the
+    # `host-token.<raw>` subprotocol carrier; fall back to the legacy
+    # `hostToken=<raw>` query param (emits a rate-limited deprecation event).
+    _ht, _ht_legacy = extract_ws_host_token_sync(
+        subprotocol_header=_raw_sp_hdr,
+        legacy_query_token=qctx.get("hostToken"),
+        path="/ws/translate",
+        uid_hash_for_log=_ws_hashed_uid(host_uid_claim),
+    )
+    host_token_claim = _ht
     joined_service_key = qctx.get("serviceKey")
     joined_church_slug = qctx.get("churchSlug")
     prompt_overrides_cache: dict[str, tuple[float, tuple[Optional[str], Optional[str]]]] = {}
@@ -2311,9 +2357,33 @@ async def ws_stt_deepgram(websocket: WebSocket):
     )
     service_key = ctx.get("serviceKey")
     church_slug = ctx.get("churchSlug")
-    # Raw hostUid from query params is not accepted — only a Firebase-verified idToken.
-    host_uid_claim = _uid_from_id_token(ctx.get("idToken"))
-    host_token_claim = ctx.get("hostToken")
+    # F2 follow-up: subprotocol-based bearer auth. Verify BEFORE accept so an
+    # unauthenticated caller never gets an accepted connection to a host
+    # resource. Falls back to legacy query-param during migration (emits a
+    # deprecation event on success; token bytes never logged).
+    _ws_user, _ws_legacy = await extract_ws_bearer(
+        websocket, legacy_query_token=ctx.get("idToken"), path="/ws/stt/deepgram"
+    )
+    host_uid_claim = _ws_user.uid if _ws_user else None
+    # F2 follow-up v2: subprotocol-based host-upgrade token (see /ws/translate).
+    _raw_sp_hdr_stt: Optional[str] = None
+    try:
+        _hdrs = getattr(websocket, "headers", None)
+        _raw_sp_hdr_stt = _hdrs.get("sec-websocket-protocol") if _hdrs else None
+    except Exception:
+        _raw_sp_hdr_stt = None
+    _offered_list_stt = parse_subprotocol_header(_raw_sp_hdr_stt)
+    _selected_subproto_stt = select_ws_subprotocol(_offered_list_stt)
+    _ht_stt, _ht_legacy_stt = extract_ws_host_token_sync(
+        subprotocol_header=_raw_sp_hdr_stt,
+        legacy_query_token=ctx.get("hostToken"),
+        path="/ws/stt/deepgram",
+        uid_hash_for_log=_ws_hashed_uid(host_uid_claim),
+    )
+    host_token_claim = _ht_stt
+    _offered_bearer_carrier_stt = any(
+        p.startswith("bearer.") and p != "bearer." for p in _offered_list_stt
+    )
     early_commit = str(websocket.query_params.get("early") or websocket.query_params.get("early_commit") or "").lower() in {"1", "true", "yes", "on"}
     dg_language = _deepgram_language_preference(src_lang_full)
     # dg_keywords is resolved after auth + websocket accept (needs org/room context)
@@ -2321,10 +2391,23 @@ async def ws_stt_deepgram(websocket: WebSocket):
     # Reject BEFORE accepting — prevents establishing Deepgram/OpenAI sessions
     # for unauthenticated callers and eliminates accept-then-close race.
     # org_id is always required; anonymous callers cannot use this endpoint.
-    if not org_id or not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+    # F2 follow-up: distinguish 4401 (invalid/absent auth) from 4403 (valid
+    # token but no host authorization on this org) so clients + logs can
+    # tell apart "retry with a fresh token" from "wrong room".
+    if _offered_bearer_carrier_stt and host_uid_claim is None:
         security_event("ws_auth_rejected", path="/ws/stt/deepgram", org_id=org_id or "",
-                       ip=_security_client_ip(websocket), detail="host_auth_failed")
+                       ip=_security_client_ip(websocket), detail="invalid_bearer")
+        await websocket.close(code=4401)
+        return
+    if not org_id:
+        security_event("ws_auth_rejected", path="/ws/stt/deepgram", org_id="",
+                       ip=_security_client_ip(websocket), detail="missing_org")
         await websocket.close(code=1008)
+        return
+    if not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+        security_event("ws_auth_rejected", path="/ws/stt/deepgram", org_id=org_id,
+                       ip=_security_client_ip(websocket), detail="host_auth_failed")
+        await websocket.close(code=4403 if host_uid_claim else 1008)
         return
     if not room_id:
         security_event("ws_auth_rejected", path="/ws/stt/deepgram", org_id=org_id,
@@ -2332,7 +2415,13 @@ async def ws_stt_deepgram(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    await websocket.accept()
+    # RFC 6455: echo back only a subprotocol the client offered.
+    # `select_ws_subprotocol` returns `"bearer"` only when the client
+    # offered BOTH the literal "bearer" AND a `bearer.<token>` carrier.
+    if _selected_subproto_stt:
+        await websocket.accept(subprotocol=_selected_subproto_stt)
+    else:
+        await websocket.accept()
 
     # Refuse a host WS opening against a room that's already ended. Without
     # this, a stale host reconnect (or race with End Service) would open a
@@ -3213,6 +3302,13 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 )
 
             if not partial:
+                # F2 follow-up: record the terminal broadcast seq + segment_id
+                # on the probe so an offline analyzer can join host emits to
+                # listener receipts via (room_id, broadcastSeq) or segmentId.
+                try:
+                    probe.record_broadcast(assigned_seq, meta_payload.get("segment_id"))
+                except Exception:
+                    pass
                 probe.emit_and_reset()
 
             if not partial and org_id and room_id and clean_src and translated:
@@ -4195,6 +4291,15 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
                 print(f"[DG][A] final: speech_final={speech_final} src='{pending_src or ''}'")
 
+                if speech_final:
+                    # F2 follow-up: anchor the D1 "utterance end" reference at
+                    # the Deepgram speech_final=True arrival. Segment id (if any)
+                    # is captured at terminal broadcast via record_broadcast.
+                    try:
+                        probe.mark_utterance_end()
+                    except Exception:
+                        pass
+
                 if speech_final and pending_src:
                     if looks_complete(pending_src):
                         held_src = None
@@ -4380,13 +4485,44 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
     )
     service_key = ctx.get("serviceKey")
     church_slug = ctx.get("churchSlug")
-    host_uid_claim = _uid_from_id_token(ctx.get("idToken"))
-    host_token_claim = ctx.get("hostToken")
+    # F2 follow-up v5: subprotocol-based bearer + host-token auth (parity with /ws/stt/deepgram).
+    _ws_user, _ws_legacy = await extract_ws_bearer(
+        websocket, legacy_query_token=ctx.get("idToken"), path="/ws/stt/openai-realtime-translate"
+    )
+    host_uid_claim = _ws_user.uid if _ws_user else None
+    _raw_sp_hdr_oai: Optional[str] = None
+    try:
+        _hdrs = getattr(websocket, "headers", None)
+        _raw_sp_hdr_oai = _hdrs.get("sec-websocket-protocol") if _hdrs else None
+    except Exception:
+        _raw_sp_hdr_oai = None
+    _offered_list_oai = parse_subprotocol_header(_raw_sp_hdr_oai)
+    _selected_subproto_oai = select_ws_subprotocol(_offered_list_oai)
+    _ht_oai, _ht_legacy_oai = extract_ws_host_token_sync(
+        subprotocol_header=_raw_sp_hdr_oai,
+        legacy_query_token=ctx.get("hostToken"),
+        path="/ws/stt/openai-realtime-translate",
+        uid_hash_for_log=_ws_hashed_uid(host_uid_claim),
+    )
+    host_token_claim = _ht_oai
+    _offered_bearer_carrier_oai = any(
+        p.startswith("bearer.") and p != "bearer." for p in _offered_list_oai
+    )
 
-    if not org_id or not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+    if _offered_bearer_carrier_oai and host_uid_claim is None:
         security_event("ws_auth_rejected", path="/ws/stt/openai-realtime-translate", org_id=org_id or "",
-                       ip=_security_client_ip(websocket), detail="host_auth_failed")
+                       ip=_security_client_ip(websocket), detail="invalid_bearer")
+        await websocket.close(code=4401)
+        return
+    if not org_id:
+        security_event("ws_auth_rejected", path="/ws/stt/openai-realtime-translate", org_id="",
+                       ip=_security_client_ip(websocket), detail="missing_org")
         await websocket.close(code=1008)
+        return
+    if not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+        security_event("ws_auth_rejected", path="/ws/stt/openai-realtime-translate", org_id=org_id,
+                       ip=_security_client_ip(websocket), detail="host_auth_failed")
+        await websocket.close(code=4403 if host_uid_claim else 1008)
         return
     if not room_id:
         security_event("ws_auth_rejected", path="/ws/stt/openai-realtime-translate", org_id=org_id,
@@ -4396,12 +4532,19 @@ async def ws_stt_openai_realtime_translate(websocket: WebSocket):
 
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        await websocket.accept()
+        if _selected_subproto_oai:
+            await websocket.accept(subprotocol=_selected_subproto_oai)
+        else:
+            await websocket.accept()
         await websocket.send_json({"type": "error", "message": "OPENAI_API_KEY is not configured"})
         await websocket.close(code=1011)
         return
 
-    await websocket.accept()
+    # RFC 6455: echo back only a subprotocol the client offered.
+    if _selected_subproto_oai:
+        await websocket.accept(subprotocol=_selected_subproto_oai)
+    else:
+        await websocket.accept()
 
     # See Deepgram handler for rationale on the ended-room gate + recheck.
     try:
@@ -4813,18 +4956,59 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     )
     service_key = ctx.get("serviceKey")
     church_slug = ctx.get("churchSlug")
-    host_uid_claim = _uid_from_id_token(ctx.get("idToken"))
-    host_token_claim = ctx.get("hostToken")
+    # F2 follow-up v5: subprotocol-based bearer + host-token auth (parity with /ws/stt/deepgram).
+    _ws_user, _ws_legacy = await extract_ws_bearer(
+        websocket, legacy_query_token=ctx.get("idToken"), path="/ws/stt/gemini-live-translate"
+    )
+    host_uid_claim = _ws_user.uid if _ws_user else None
+    _raw_sp_hdr_gem: Optional[str] = None
+    try:
+        _hdrs = getattr(websocket, "headers", None)
+        _raw_sp_hdr_gem = _hdrs.get("sec-websocket-protocol") if _hdrs else None
+    except Exception:
+        _raw_sp_hdr_gem = None
+    _offered_list_gem = parse_subprotocol_header(_raw_sp_hdr_gem)
+    _selected_subproto_gem = select_ws_subprotocol(_offered_list_gem)
+    _ht_gem, _ht_legacy_gem = extract_ws_host_token_sync(
+        subprotocol_header=_raw_sp_hdr_gem,
+        legacy_query_token=ctx.get("hostToken"),
+        path="/ws/stt/gemini-live-translate",
+        uid_hash_for_log=_ws_hashed_uid(host_uid_claim),
+    )
+    host_token_claim = _ht_gem
+    _offered_bearer_carrier_gem = any(
+        p.startswith("bearer.") and p != "bearer." for p in _offered_list_gem
+    )
 
-    if not org_id or not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+    if _offered_bearer_carrier_gem and host_uid_claim is None:
         security_event(
             "ws_auth_rejected",
             path="/ws/stt/gemini-live-translate",
             org_id=org_id or "",
             ip=_security_client_ip(websocket),
-            detail="host_auth_failed",
+            detail="invalid_bearer",
+        )
+        await websocket.close(code=4401)
+        return
+    if not org_id:
+        security_event(
+            "ws_auth_rejected",
+            path="/ws/stt/gemini-live-translate",
+            org_id="",
+            ip=_security_client_ip(websocket),
+            detail="missing_org",
         )
         await websocket.close(code=1008)
+        return
+    if not _can_host(org_id, host_uid=host_uid_claim, host_token=host_token_claim):
+        security_event(
+            "ws_auth_rejected",
+            path="/ws/stt/gemini-live-translate",
+            org_id=org_id,
+            ip=_security_client_ip(websocket),
+            detail="host_auth_failed",
+        )
+        await websocket.close(code=4403 if host_uid_claim else 1008)
         return
     if not room_id:
         security_event(
@@ -4839,7 +5023,10 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
 
     api_key = gemini_api_key()
     if not api_key:
-        await websocket.accept()
+        if _selected_subproto_gem:
+            await websocket.accept(subprotocol=_selected_subproto_gem)
+        else:
+            await websocket.accept()
         await websocket.send_json(
             {
                 "type": "error",
@@ -4849,7 +5036,11 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         await websocket.close(code=1011)
         return
 
-    await websocket.accept()
+    # RFC 6455: echo back only a subprotocol the client offered.
+    if _selected_subproto_gem:
+        await websocket.accept(subprotocol=_selected_subproto_gem)
+    else:
+        await websocket.accept()
 
     try:
         _room_live_pre = multichurch_store.is_room_live(org_id, room_id)

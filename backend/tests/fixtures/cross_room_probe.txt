@@ -1,0 +1,5 @@
+# v4 fixture: TWO rooms, SAME seq=5 in each.
+# Each probe has distinct roomId; the join MUST key on (room_id, seq) and
+# produce 2 joins, not 1 cross-room collision.
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"org1","roomId":"room_A","t0Ms":1000000000000,"audioChunkStartMs":1000000000000,"firstPostResetAudioMs":1000000000000,"speechFinalMs":1000000001500,"dT2Ms":1500,"dT3Ms":1700,"speechFinalDeltaMs":1500,"segmentId":"seg-A-5","broadcastSeq":5}
+[LATENCY_PROBE] {"engine":"deepgram","orgId":"org1","roomId":"room_B","t0Ms":1000000010000,"audioChunkStartMs":1000000010000,"firstPostResetAudioMs":1000000010000,"speechFinalMs":1000000011500,"dT2Ms":1500,"dT3Ms":1700,"speechFinalDeltaMs":1500,"segmentId":"seg-B-5","broadcastSeq":5}

@@ -1,0 +1,12 @@
+{"event": "listener_capture_start", "ts": "2001-09-09T01:46:40.000+00:00Z"}
+{"event": "resolved", "orgId": "test2", "roomId": "room_abc", "serviceKey": "sun-11am", "ts": "2001-09-09T01:46:40.000+00:00Z"}
+{"event": "ws_open", "room_id": "room_abc", "ts": "2001-09-09T01:46:40.100+00:00Z"}
+{"event": "ws_message", "format": "modern", "seq": 1, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-1", "text_length": 10, "ts": "2001-09-09T01:46:42.500+00:00Z"}
+{"event": "ws_message", "format": "legacy", "seq": 1, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-1", "text_length": 10, "ts": "2001-09-09T01:46:42.500+00:00Z"}
+{"event": "ws_message", "format": "modern", "seq": 2, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-2", "text_length": 12, "ts": "2001-09-09T01:46:46.100+00:00Z"}
+{"event": "ws_message", "format": "legacy", "seq": 2, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-2", "text_length": 12, "ts": "2001-09-09T01:46:46.100+00:00Z"}
+{"event": "ws_message", "format": "modern", "seq": 3, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-3", "text_length": 20, "ts": "2001-09-09T01:47:04.000+00:00Z"}
+{"event": "ws_message", "format": "legacy", "seq": 3, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-3", "text_length": 20, "ts": "2001-09-09T01:47:04.000+00:00Z"}
+{"event": "ws_message", "format": "modern", "seq": 777, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-mystery", "text_length": 8, "ts": "2001-09-09T01:47:20.000+00:00Z"}
+{"event": "ws_message", "format": "legacy", "seq": 777, "meta_is_final": true, "meta_partial": false, "meta_segment_id": "seg-mystery", "text_length": 8, "ts": "2001-09-09T01:47:20.000+00:00Z"}
+{"event": "ws_close", "ts": "2001-09-09T01:48:00.000+00:00Z"}
