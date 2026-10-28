@@ -107,11 +107,14 @@ from app.gemini_live import (
     GEMINI_INPUT_SAMPLE_RATE,
     GEMINI_LIVE_TRANSLATE_MODEL,
     GEMINI_OUTPUT_SAMPLE_RATE,
+    GeminiLiveSession,
+    HandlerBuffers as GeminiHandlerBuffers,
     Pcm16Downsampler48To16,
     PcmChunkBuffer,
     api_key as gemini_api_key,
     audio_message as gemini_audio_message,
-    merge_transcript as merge_gemini_transcript,
+    build_handler_callbacks as build_gemini_handler_callbacks,
+    run_recovery_dispatch as run_gemini_recovery_dispatch,
     parse_server_content as parse_gemini_server_content,
     setup_message as gemini_setup_message,
     target_language_code as gemini_target_language_code,
@@ -5053,35 +5056,30 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
             pass
         return
 
-    gemini = None
-    try:
-        gemini = await websockets.connect(
+    # GeminiLiveSession coordinates connect + setup + GoAway-triggered
+    # bounded replacement. The handler keeps a reference to `session` and
+    # uses session.send/session.recv so both audio sending and receiving
+    # transparently follow the swap on resumable rotation.
+    async def _gemini_connect():
+        return await websockets.connect(
             gemini_websocket_url(api_key),
             ping_interval=20,
             ping_timeout=20,
             close_timeout=5,
             max_size=16 * 1024 * 1024,
         )
-        await gemini.send(gemini_setup_message(target_language))
 
-        setup_complete = False
-        while not setup_complete:
-            raw_setup = await asyncio.wait_for(gemini.recv(), timeout=20)
-            try:
-                setup_event = json.loads(raw_setup)
-            except Exception:
-                continue
-            if setup_event.get("setupComplete") is not None:
-                setup_complete = True
-                break
-            if setup_event.get("error"):
-                raise RuntimeError(str(setup_event.get("error")))
+    session = GeminiLiveSession(
+        target_language=target_language,
+        connect_cb=_gemini_connect,
+    )
+    try:
+        await session.open()
     except Exception as exc:
-        if gemini is not None:
-            try:
-                await asyncio.wait_for(gemini.close(), timeout=3.0)
-            except Exception:
-                pass
+        try:
+            await session.close()
+        except Exception:
+            pass
         await websocket.send_json(
             {
                 "type": "error",
@@ -5098,11 +5096,10 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
     except (Exception, asyncio.CancelledError) as exc:
         print(f"[GEMINI-LIVE][register_host_failed] org={org_id} room={room_id} err={exc}")
         manager.unregister_host_shutdown_callback(websocket)
-        if gemini is not None:
-            try:
-                await asyncio.wait_for(gemini.close(), timeout=3.0)
-            except Exception:
-                pass
+        try:
+            await session.close()
+        except Exception:
+            pass
         try:
             await websocket.close(code=1011)
         except Exception:
@@ -5117,11 +5114,10 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         _room_live_post = True
     if not _room_live_post:
         manager.note_host_disconnected(websocket)
-        if gemini is not None:
-            try:
-                await asyncio.wait_for(gemini.close(), timeout=3.0)
-            except Exception:
-                pass
+        try:
+            await session.close()
+        except Exception:
+            pass
         try:
             await websocket.close(code=1000, reason="room_ended")
         except Exception:
@@ -5129,8 +5125,7 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         return
 
     seq = 0
-    output_buffer = ""
-    source_buffer = ""
+    _buffers = GeminiHandlerBuffers()
     flush_task: asyncio.Task | None = None
     last_audio_touch_ts = 0.0
     total_audio_bytes = 0
@@ -5273,13 +5268,13 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
             print("[GEMINI-LIVE][audio-broadcast][error]", exc)
 
     async def _commit_output(reason: str) -> None:
-        nonlocal output_buffer, source_buffer, flush_task
-        text = output_buffer.strip()
+        nonlocal flush_task
+        text = _buffers.output.strip()
         if not text:
             return
-        src_text = source_buffer.strip()
-        output_buffer = ""
-        source_buffer = ""
+        src_text = _buffers.source.strip()
+        _buffers.output = ""
+        _buffers.source = ""
         flush_task = None
         print(f"[GEMINI-LIVE][commit][{reason}] '{text[:80]}'")
         await _broadcast_translation(text, partial=False, src_text=src_text)
@@ -5289,12 +5284,12 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         nonlocal flush_task
         if flush_task and not flush_task.done():
             flush_task.cancel()
-        snapshot = output_buffer
+        snapshot = _buffers.output
 
         async def _flush_if_idle() -> None:
             try:
                 await asyncio.sleep(delay)
-                if output_buffer and output_buffer == snapshot:
+                if _buffers.output and _buffers.output == snapshot:
                     await _commit_output("idle")
             except asyncio.CancelledError:
                 pass
@@ -5302,8 +5297,17 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         flush_task = asyncio.create_task(_flush_if_idle())
 
     async def _send_pcm16(pcm16: bytes) -> None:
-        if pcm16:
-            await gemini.send(gemini_audio_message(pcm16))
+        if not pcm16:
+            return
+        # Session.send returns False for benign transient drops (rotation in
+        # flight, GoAway observed, session closed). We do NOT retry: a replay
+        # could duplicate a frame already applied before the old WS closed.
+        # If the session has permanently closed, raise to end the sender
+        # task cleanly; otherwise continue — a planned rotation must NOT
+        # terminate the audio stream.
+        delivered = await session.send(gemini_audio_message(pcm16))
+        if not delivered and session.closed:
+            raise RuntimeError("gemini session closed")
 
     async def from_client_to_gemini() -> None:
         nonlocal last_audio_touch_ts, total_audio_bytes
@@ -5348,67 +5352,34 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
         finally:
             closed.set()
 
+    def _cancel_flush_on_interrupted() -> None:
+        if flush_task and not flush_task.done():
+            flush_task.cancel()
+
+    callbacks = build_gemini_handler_callbacks(
+        _buffers,
+        send_to_producer=_send_to_producer,
+        broadcast_translation=lambda text, partial, src: _broadcast_translation(
+            text, partial=partial, src_text=src
+        ),
+        broadcast_audio=_broadcast_audio,
+        commit_output=_commit_output,
+        on_interrupted=_cancel_flush_on_interrupted,
+        is_closed=closed.is_set,
+        schedule_idle_flush=_schedule_idle_flush,
+    )
+
     async def from_gemini_to_server() -> None:
-        nonlocal output_buffer, source_buffer
+        # Delegates to the SAME dispatch function the tests call, and uses
+        # the SAME callbacks builder — so handler wiring and test wiring
+        # cannot diverge in either direction.
         try:
-            async for raw in gemini:
-                try:
-                    event = json.loads(raw)
-                except Exception:
-                    continue
-
-                if event.get("error"):
-                    error = event.get("error")
-                    message = error.get("message") if isinstance(error, dict) else str(error)
-                    await _send_to_producer(
-                        {
-                            "type": "error",
-                            "message": message or "Gemini Live Translate error",
-                        }
-                    )
-                    break
-
-                content = parse_gemini_server_content(event)
-                if content.interrupted:
-                    output_buffer = ""
-                    source_buffer = ""
-                    if flush_task and not flush_task.done():
-                        flush_task.cancel()
-
-                if content.input_transcript:
-                    source_buffer = merge_gemini_transcript(
-                        source_buffer,
-                        content.input_transcript,
-                    )
-                    await _send_to_producer(
-                        {"type": "stt.partial", "text": source_buffer.strip()}
-                    )
-
-                if content.output_transcript:
-                    output_buffer = merge_gemini_transcript(
-                        output_buffer,
-                        content.output_transcript,
-                    )
-                    await _broadcast_translation(
-                        output_buffer,
-                        partial=True,
-                        src_text=source_buffer,
-                    )
-                    _schedule_idle_flush()
-
-                for audio_data in content.audio_chunks:
-                    await _broadcast_audio(audio_data)
-
-                if content.turn_complete:
-                    await _commit_output("turn_complete")
-        except Exception as exc:
+            await run_gemini_recovery_dispatch(session, callbacks)
+        except Exception as exc:  # pragma: no cover — defensive
             if not closed.is_set():
                 print("[GEMINI-LIVE][gemini->server][error]", exc)
-                await _send_to_producer(
-                    {
-                        "type": "error",
-                        "message": f"Gemini Live Translate disconnected: {str(exc)[:180]}",
-                    }
+                await callbacks.send_error(
+                    f"Gemini Live Translate disconnected: {str(exc)[:180]}"
                 )
         finally:
             closed.set()
@@ -5433,11 +5404,10 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
             await asyncio.wait_for(_commit_output("shutdown"), timeout=3.0)
         except Exception:
             pass
-        if gemini is not None:
-            try:
-                await asyncio.wait_for(gemini.close(), timeout=3.0)
-            except Exception:
-                pass
+        try:
+            await session.close()
+        except Exception:
+            pass
         manager.note_host_disconnected(websocket)
         if total_audio_bytes > 0:
             audio_secs = total_audio_bytes / _GEMINI_LIVE_TRANSLATE_BYTES_PER_SECOND
