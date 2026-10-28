@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as _dt
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import urlencode
+
+
+def _utc_iso() -> str:
+    """UTC ISO-8601 timestamp for observability markers.
+
+    Uses `datetime.now(datetime.UTC)` (deprecation-safe on Python 3.12+).
+    Logged values are opaque timestamps only; never credentials.
+    """
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 GEMINI_LIVE_TRANSLATE_MODEL = os.getenv(
@@ -369,6 +382,7 @@ class GeminiLiveSession:
         setup_timeout_s: float = 20.0,
         replacement_total_timeout_s: float = 25.0,
         close_grace_s: float = 3.0,
+        session_id: Optional[str] = None,
     ) -> None:
         self._target_language = target_language
         self._connect = connect_cb
@@ -378,6 +392,11 @@ class GeminiLiveSession:
         self._setup_timeout = setup_timeout_s
         self._replacement_total_timeout = replacement_total_timeout_s
         self._close_grace = close_grace_s
+        # Opaque per-session correlation id for observability only. Caller
+        # may supply one (handler mints a UUID4 per host WS); otherwise a
+        # fresh UUID4 is minted here. NEVER a resumption handle, NEVER a
+        # credential, NEVER derived from client identity.
+        self._session_id: str = session_id or uuid.uuid4().hex
 
         self._ws: Any = None
         # `_rotation_in_flight` is True from the moment rotate() starts
@@ -427,6 +446,10 @@ class GeminiLiveSession:
     def rotation_generation(self) -> int:
         return self._rotation_generation
 
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
     # ---- Open ----
     async def open(self) -> None:
         async with self._lock:
@@ -440,6 +463,14 @@ class GeminiLiveSession:
             # path so `resumable=False` behavior stays consistent.
             for upd in staged:
                 self.on_resumption_update(upd)
+        # Observability marker. Credential-free: UTC timestamp, opaque
+        # session correlation id, and the starting rotation generation.
+        # NEVER logs resumption handles, auth tokens, or raw server frames.
+        print(
+            f"[GEMINI-LIVE][session_open] utc={_utc_iso()} "
+            f"session_id={self._session_id} gen={self._rotation_generation}",
+            flush=True,
+        )
 
     async def _await_setup_complete(
         self, ws: Any
@@ -673,6 +704,15 @@ class GeminiLiveSession:
                 self._goaway_observed = False
                 self._rotation_generation += 1
                 swap_committed = True
+                # Observability marker — emitted ONLY after the swap
+                # commits (i.e. the new WS is now the active socket and
+                # rotation_generation has advanced). Credential-free:
+                # UTC timestamp, opaque session_id, new generation.
+                print(
+                    f"[GEMINI-LIVE][rotation] utc={_utc_iso()} "
+                    f"session_id={self._session_id} gen={self._rotation_generation}",
+                    flush=True,
+                )
 
                 # Only AFTER the swap: apply any staged resumption updates
                 # from the replacement's setup. Failure never reaches here.
@@ -766,6 +806,13 @@ class GeminiLiveSession:
                 await asyncio.wait_for(ws.close(), timeout=self._close_grace)
             except Exception:
                 pass
+        # Observability marker. Credential-free: UTC timestamp, opaque
+        # session_id, and the final rotation_generation at shutdown.
+        print(
+            f"[GEMINI-LIVE][session_close] utc={_utc_iso()} "
+            f"session_id={self._session_id} gen={self._rotation_generation}",
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------

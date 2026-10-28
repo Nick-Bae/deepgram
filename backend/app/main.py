@@ -1,6 +1,6 @@
 
 # backend/app/main.py
-import os, json, asyncio, logging, time, re, base64
+import os, json, asyncio, logging, time, re, base64, uuid
 from collections import deque
 from threading import Lock
 from typing import Optional, Any, Callable, Awaitable, Dict, Set, Tuple
@@ -5069,9 +5069,13 @@ async def ws_stt_gemini_live_translate(websocket: WebSocket):
             max_size=16 * 1024 * 1024,
         )
 
+    # Per-handler opaque session correlation id for observability.
+    # Credential-free; not derived from client identity or room id.
+    _gemini_session_id = uuid.uuid4().hex
     session = GeminiLiveSession(
         target_language=target_language,
         connect_cb=_gemini_connect,
+        session_id=_gemini_session_id,
     )
     try:
         await session.open()
