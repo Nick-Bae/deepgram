@@ -853,12 +853,27 @@ def test_openai_realtime_positive_round_trip_audio_to_translation(openai_positiv
 
 
 class _MockGeminiUpstreamWS(_MockUpstreamWS):
-    """Gemini-specific extension: adds `recv()` for the setup handshake.
+    """Gemini-specific extension supporting BOTH recv()-based consumers and
+    the base-class __aiter__ consumer.
 
-    Gemini Live uses a two-phase upstream protocol: (1) send setup message,
-    recv() setupComplete event, (2) async-iterate for ongoing events. This
-    stub returns setupComplete on the first recv(), then the base class
-    __aiter__ yields the canned transcript event after audio is received.
+    Real ``websockets.WebSocketClientProtocol`` exposes both ``recv()`` and
+    ``__aiter__``; either should produce the same sequence of events. This
+    stub mirrors that:
+
+      1. First ``recv()`` returns ``setupComplete`` so the handler's
+         setup-handshake loop exits.
+      2. The canned translation event waits for ``_audio_received`` — the
+         base class's audio gate — so setup payloads alone cannot release
+         it (preserves the v10 hardening: real audio must reach the
+         upstream before any translation is yielded).
+      3. The canned event is emitted exactly once, sharing the base
+         class's ``_yielded`` flag with ``__anext__``. Whichever delivery
+         path runs first wins; the other sees ``_yielded=True`` and does
+         not re-emit.
+      4. Subsequent receives (after the canned has been delivered) wait
+         for shutdown via ``_release`` and then simulate a valid normal
+         WebSocket close (code 1000) — mirroring real ``recv()`` behavior
+         when the peer closes cleanly.
     """
     def __init__(self, canned_text_frame: str):
         super().__init__(canned_text_frame)
@@ -869,20 +884,41 @@ class _MockGeminiUpstreamWS(_MockUpstreamWS):
         if self._setup_recv_count == 1:
             # Return setupComplete so the handler's setup-handshake loop exits.
             return json.dumps({"setupComplete": {}})
-        # Subsequent recv() calls block until released (handler shouldn't
-        # call recv again — it iterates via async for raw in gemini).
+        if not self._yielded:
+            # Wait for actual audio to reach the upstream (shared gate
+            # with __anext__), then emit the single canned event exactly
+            # once. Flipping `_yielded` keeps __anext__ consistent so
+            # recv() and iteration cannot both deliver the frame.
+            await self._audio_received.wait()
+            self._yielded = True
+            return self._canned
+        # Canned already delivered — block until shutdown and simulate a
+        # valid normal WebSocket close so the recovery dispatcher sees
+        # code=1000 and exits cleanly without surfacing a client error.
         await self._release.wait()
         from websockets.exceptions import ConnectionClosedOK
-        raise ConnectionClosedOK(None, None)
+        from websockets.frames import Close
+        raise ConnectionClosedOK(Close(1000, ""), None, False)
 
 
 @pytest.fixture
 def gemini_positive_app(monkeypatch):
     """Positive-round-trip fixture for Gemini Live.
 
-    Handler uses ``websockets.connect`` to Gemini Live URL (main.py:5058).
-    Needs ``gemini_api_key`` populated. Canned response is a
-    serverContent event with an output_transcript segment.
+    Handler uses ``websockets.connect`` to Gemini Live URL. Needs
+    ``gemini_api_key`` populated. Canned response is a serverContent
+    event with an output_transcript segment.
+
+    The stub (``_MockGeminiUpstreamWS``) supports both the legacy
+    ``async for raw in gemini`` iterator consumer AND the newer
+    ``await session.recv()`` consumer used by the recovery coordinator
+    (``GeminiLiveSession`` + ``run_recovery_dispatch``). Both paths
+    emit at most one canned event (shared ``_yielded`` flag) and only
+    AFTER real audio has reached the upstream (shared
+    ``_audio_received`` gate). After the canned event is delivered,
+    subsequent receives wait for shutdown and surface a valid normal
+    WebSocket close (code 1000) that the dispatcher interprets as a
+    clean exit.
     """
     _shared_server_mocks(monkeypatch)
 
