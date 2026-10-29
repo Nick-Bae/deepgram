@@ -1127,12 +1127,7 @@ async def stripe_webhook(
             pending_emails.append({"event": "subscription_started", "plan_key": requested_plan.key})
 
     elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
-        # Obsolete-subscription reconciliation (fix review item #2):
-        # if the event's subscription id does NOT match the org's
-        # current stripeSubscriptionId AND the current subscription is
-        # in an active-shaped state, this event is for a stale/orphan
-        # subscription — do NOT overwrite the current one. Mark the
-        # event completed with no billing mutation.
+        # Obsolete-subscription guard (pre-reconciliation).
         incoming_sub_id = str(payload_obj.get("id") or "").strip()
         current_sub_id = str(next_billing.get("stripeSubscriptionId") or "").strip()
         current_status = _clean(next_billing.get("status")).lower()
@@ -1162,9 +1157,38 @@ async def stripe_webhook(
                 return {"ok": True, "eventId": event_id, "obsoleteSubscription": True, "noop": reason}
             return {"ok": True, "eventId": event_id, "obsoleteSubscription": True}
 
+        # Fix review item #1 (v6): current-state reconciliation.
+        # The event payload is a POINT-IN-TIME snapshot and Stripe
+        # does NOT guarantee ordering by `created`. A later-delivered
+        # older event for the same subscription could carry stale
+        # status/price/cancel_at_period_end — using it directly
+        # restores canceled subs to active, downgrades upgrades, etc.
+        # Retrieve the CURRENT subscription from Stripe and build the
+        # snapshot from THAT instead of the payload. For
+        # `subscription.deleted` the retrieval may 404 — treat that
+        # as "subscription is gone", which matches the deleted event.
+        reconciled_payload: Dict[str, Any] = payload_obj
+        if event_type != "customer.subscription.deleted":
+            try:
+                sub_live = _stripe_client().retrieve_subscription(
+                    subscription_id=incoming_sub_id,
+                )
+                if isinstance(sub_live, dict) and sub_live:
+                    reconciled_payload = sub_live
+            except StripeClientError as exc:
+                # Fix review item #2: transient retrieval failures
+                # must NOT complete the event. Raise 502 so Stripe
+                # retries; the event stays claimed (and ages out).
+                logger.warning(
+                    "subscription_reconcile_retrieve_failed org=%s sub=%s: %s",
+                    org_id, incoming_sub_id, exc,
+                )
+                raise HTTPException(
+                    status_code=502, detail="stripe_reconcile_failed",
+                ) from exc
         next_billing = _merge_subscription_snapshot(
             billing=next_billing,
-            stripe_subscription=payload_obj,
+            stripe_subscription=reconciled_payload,
             now=now,
         )
         stripe_status = _clean(next_billing.get("status")).lower()
@@ -1219,30 +1243,13 @@ async def stripe_webhook(
             next_billing["graceEndsAt"] = next_billing.get("graceEndsAt")
 
     elif event_type == "invoice.payment_succeeded":
-        # Reconcile against the invoice's subscription: only act when
-        # the invoice refers to the CURRENT subscription id (obsolete-
-        # subscription invoices are no-ops) AND the current stored
-        # state is a payment-not-yet-recovered status. This prevents a
-        # delayed `payment_succeeded` from toggling status on an
-        # unrelated subscription.
-        invoice_sub_id = _clean(payload_obj.get("subscription"))
-        current_sub_id = _clean(next_billing.get("stripeSubscriptionId"))
-        current_status = _clean(next_billing.get("status")).lower()
-        if invoice_sub_id and current_sub_id and invoice_sub_id == current_sub_id:
-            if current_status in {"past_due", "incomplete", "unpaid"}:
-                next_billing["status"] = "active"
-                next_billing["graceEndsAt"] = None
-                pending_emails.append({"event": "payment_recovered"})
-
-    elif event_type == "invoice.payment_failed":
-        # Reconcile against the invoice's subscription id and the
-        # subscription's CURRENT state (fix review item #1 v5): an
-        # older `payment_failed` retry arriving after Stripe has
-        # already recovered the subscription must NOT overwrite the
-        # recovered state. We retrieve the subscription's current
-        # status (mocked locally; real Stripe in prod) and only apply
-        # when Stripe itself still reports a payment-not-recovered
-        # status. Obsolete-subscription invoices are no-ops.
+        # Fix review item #1 (v6): on `payment_succeeded`, retrieve
+        # the subscription from Stripe and act on its CURRENT state.
+        # The old gate — "current stored status in {past_due, ...}
+        # AND same subscription id" — would set `active` when an
+        # OLDER invoice.payment_succeeded arrives while the
+        # subscription is still past_due for newer debt. Reconciling
+        # against Stripe prevents that.
         invoice_sub_id = _clean(payload_obj.get("subscription"))
         current_sub_id = _clean(next_billing.get("stripeSubscriptionId"))
         if invoice_sub_id and current_sub_id and invoice_sub_id == current_sub_id:
@@ -1250,19 +1257,54 @@ async def stripe_webhook(
                 sub_live = _stripe_client().retrieve_subscription(
                     subscription_id=invoice_sub_id,
                 )
-                stripe_status = _status_from_stripe(
-                    str((sub_live or {}).get("status") or ""),
-                    fallback_status=_clean(next_billing.get("status")).lower(),
+            except StripeClientError as exc:
+                # Fix review item #2 (v6): required reconciliation
+                # must remain retryable. Raise 502 so Stripe retries;
+                # event is NOT completed.
+                logger.warning(
+                    "payment_succeeded_reconcile_retrieve_failed org=%s sub=%s: %s",
+                    org_id, invoice_sub_id, exc,
+                )
+                raise HTTPException(
+                    status_code=502, detail="stripe_reconcile_failed",
+                ) from exc
+            stripe_status = _status_from_stripe(
+                str((sub_live or {}).get("status") or ""),
+                fallback_status=_clean(next_billing.get("status")).lower(),
+            )
+            current_local_status = _clean(next_billing.get("status")).lower()
+            # Only transition to active when Stripe itself reports
+            # active AND we were in a recovery-eligible state locally.
+            if stripe_status == "active" and current_local_status in {"past_due", "incomplete", "unpaid"}:
+                next_billing["status"] = "active"
+                next_billing["graceEndsAt"] = None
+                pending_emails.append({"event": "payment_recovered"})
+
+    elif event_type == "invoice.payment_failed":
+        # Fix review item #1 (v5+v6): reconcile against Stripe's
+        # current subscription status. Only apply when Stripe itself
+        # still reports a payment-not-recovered status.
+        invoice_sub_id = _clean(payload_obj.get("subscription"))
+        current_sub_id = _clean(next_billing.get("stripeSubscriptionId"))
+        if invoice_sub_id and current_sub_id and invoice_sub_id == current_sub_id:
+            try:
+                sub_live = _stripe_client().retrieve_subscription(
+                    subscription_id=invoice_sub_id,
                 )
             except StripeClientError as exc:
+                # Fix review item #2 (v6): make retrieval failure
+                # retryable (raise 502; event stays claimed).
                 logger.warning(
                     "payment_failed_reconcile_retrieve_sub_failed org=%s sub=%s: %s",
                     org_id, invoice_sub_id, exc,
                 )
-                # Conservative fallback: do nothing. A follow-up
-                # customer.subscription.updated event will carry the
-                # authoritative status.
-                stripe_status = "active"
+                raise HTTPException(
+                    status_code=502, detail="stripe_reconcile_failed",
+                ) from exc
+            stripe_status = _status_from_stripe(
+                str((sub_live or {}).get("status") or ""),
+                fallback_status=_clean(next_billing.get("status")).lower(),
+            )
             if stripe_status in {"past_due", "unpaid", "incomplete"}:
                 next_billing["status"] = "past_due"
                 if not next_billing.get("graceEndsAt"):

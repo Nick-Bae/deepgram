@@ -35,6 +35,16 @@ def _sign_stripe_payload(payload: bytes, secret: str, *, timestamp: int | None =
 
 
 class _FakeStripeClient:
+    # Fix review item #1 (v6): reconciliation retrieves subscriptions
+    # from Stripe. Tests that stimulate `customer.subscription.*` or
+    # `invoice.payment_*` events must publish the "current" state the
+    # reconciliation sees. Populate this dict (keyed by subscription
+    # id) BEFORE invoking the webhook; otherwise the default
+    # `retrieve_subscription` below returns a canonical active
+    # Starter subscription.
+    def __init__(self) -> None:
+        self.sub_states: dict = {}
+
     def create_customer(
         self,
         *,
@@ -74,6 +84,8 @@ class _FakeStripeClient:
         return {"url": f"https://billing.stripe.test/portal/{customer_id}?return={return_url}"}
 
     def retrieve_subscription(self, *, subscription_id: str) -> dict:
+        if subscription_id in self.sub_states:
+            return dict(self.sub_states[subscription_id])
         now_ts = int(time.time())
         return {
             "id": subscription_id,
@@ -98,7 +110,10 @@ class BillingRouteTests(unittest.TestCase):
         self.store = InMemoryMultiChurchStore()
         self.auth_patch = patch.object(auth_routes, "multichurch_store", self.store)
         self.billing_patch = patch.object(billing_routes, "multichurch_store", self.store)
-        self.stripe_patch = patch.object(billing_routes, "_stripe_client", lambda: _FakeStripeClient())
+        # Shared fake client so tests can register retrieve_subscription
+        # overrides on `self.fake_client.sub_states`.
+        self.fake_client = _FakeStripeClient()
+        self.stripe_patch = patch.object(billing_routes, "_stripe_client", lambda: self.fake_client)
         self.auth_patch.start()
         self.billing_patch.start()
         self.stripe_patch.start()
@@ -567,6 +582,17 @@ class BillingRouteTests(unittest.TestCase):
         existing["graceEndsAt"] = None
         self.store.set_org_billing_profile(org_id=org_id, billing=existing)
 
+        # Reconciliation retrieves the subscription — mirror the
+        # payload-reported state (past_due) so the reconciled view
+        # matches the event's intent.
+        self.fake_client.sub_states["sub_123"] = {
+            "id": "sub_123", "customer": "cus_123", "status": "past_due",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 86400,
+            "metadata": {"orgId": org_id, "planKey": "starter"},
+            "items": {"data": [{"price": {"id": "price_starter"}}]},
+        }
         event = {
             "id": "evt_123",
             "type": "customer.subscription.updated",

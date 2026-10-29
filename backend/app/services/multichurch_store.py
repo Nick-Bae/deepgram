@@ -1508,6 +1508,14 @@ class InMemoryMultiChurchStore:
                 plan_key=str(org.get("plan") or "trial"),
                 now=now,
             )
+            # Fix review item #3 (v6): EVERY billing writer must bump
+            # `billing.updatedAt`. The CAS token lives in this field,
+            # so a writer that leaves it unchanged lets a stale
+            # concurrent webhook overwrite its work. Previously
+            # `_normalize_billing_state` preserved any input
+            # `updatedAt` — now `set_org_billing_profile` always
+            # stamps `now` after normalization.
+            merged["updatedAt"] = now
             org["billing"] = merged
             org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
             org["status"] = "trial" if str(merged.get("status") or "").strip().lower() == "trialing" else str(
@@ -4714,6 +4722,9 @@ class FirestoreMultiChurchStore:
             plan_key=str(org.get("plan") or "trial"),
             now=now,
         )
+        # Fix review item #3 (v6): every billing writer must bump
+        # billing.updatedAt. See InMemoryMultiChurchStore counterpart.
+        merged["updatedAt"] = now
         normalized_status = str(merged.get("status") or "").strip().lower()
         org_ref.set(
             {

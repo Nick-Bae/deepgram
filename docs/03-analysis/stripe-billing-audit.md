@@ -7,6 +7,31 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage sixth pass (2026-10-29, after aaaca878)
+
+Reviewer flagged three remaining blockers against aaaca878. All three addressed.
+
+### Issue 1 — Reconcile against the current subscription on every event path
+- **Problem**: v5 only reconciled `invoice.payment_failed`. The `customer.subscription.*` branch merged `payload_obj` directly, so a stale `subscription.updated` reporting `active` could restore access after `subscription.deleted`, revert a Growth upgrade to Starter, etc. `invoice.payment_succeeded` checked identity + local status but not current Stripe state, so an older succeeded invoice set `active` while newer debt was still outstanding.
+- **Fix**: on `customer.subscription.created`/`updated`, retrieve the subscription from Stripe and use that payload (not the event's). `subscription.deleted` is terminal; retrieve is skipped (the event IS the current state). `invoice.payment_succeeded` and `invoice.payment_failed` both retrieve the subscription and only act when Stripe's status matches the direction of the event. Retrieval failures raise `HTTPException(502, "stripe_reconcile_failed")` so Stripe retries; the event is NOT completed.
+- **Regressions** (`B10_SubscriptionReconciliationAgainstCurrentStripeState`):
+  - `test_deleted_then_older_updated_active_does_not_restore`
+  - `test_older_updated_with_starter_after_growth_upgrade_does_not_revert`
+  - `test_payment_succeeded_for_older_invoice_does_not_restore_active`
+
+### Issue 2 — Transient retrieval failures remain retryable
+- **Problem**: v5 swallowed `StripeClientError` by assigning `stripe_status="active"` and completing the event. A transient Stripe outage would permanently drop a `payment_failed`.
+- **Fix**: every reconciliation retrieval now raises `HTTPException(502)` on failure. The event stays claimed (and ages out of its lease per the existing claim/complete logic), so Stripe retries succeed once Stripe is reachable again.
+- **Regression** (`B11_TransientRetrievalErrorRemainsRetryable`):
+  - `test_payment_failed_retry_converges_after_transient_retrieve_error` — first delivery raises 502 (retrieve fails); event stays uncompleted; lease aged out; second delivery (retrieve recovers, reports past_due) completes and persists past_due.
+
+### Issue 3 — CAS covers every billing writer
+- **Problem**: `set_org_billing_profile` preserved the input dict's `updatedAt`. `_create_missing_stripe_customer` (called from `/checkout-session`) passes a dict whose `updatedAt` is unchanged, so a concurrent webhook's CAS passed and overwrote the new customer reference.
+- **Fix**: both stores' `set_org_billing_profile` now **always** stamp `billing["updatedAt"] = now` AFTER normalization — covering every caller regardless of what they passed. Combined with v5's checkout-mutation bumps, the full set of billing writers (claim, record, set, atomic apply) uniformly participate in CAS.
+- **Regressions** (`B12_CreateMissingStripeCustomerBumpsCAS`):
+  - `test_create_missing_customer_bumps_billing_updated_at` — unit-level: `set_org_billing_profile` overrides any supplied `updatedAt`.
+  - `test_webhook_cas_catches_concurrent_customer_create` — barrier-driven interleaving: webhook paused after billing read; `_create_missing_stripe_customer` actually runs with a mocked client; webhook resumes → 409 → customer reference preserved.
+
 ## Boundary-coverage fifth pass (2026-10-29, after 02546a70)
 
 Reviewer flagged two remaining root problems. Both addressed here.

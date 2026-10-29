@@ -296,17 +296,19 @@ class H3_PortalPlanChangeHonorsPriceIdResolution(_AuditBase):
         self.store.set_org_billing_profile(org_id=org_id, billing=billing)
 
         now_ts = int(time.time())
+        sub_state = {
+            "id": "sub_h3", "customer": "cus_h3", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": now_ts,
+            "current_period_end": now_ts + 30 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "starter"},  # STALE on sub
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        self.fake_client.sub_states["sub_h3"] = sub_state
         event = {
             "id": "evt_h3_upgrade",
             "type": "customer.subscription.updated",
-            "data": {"object": {
-                "id": "sub_h3", "customer": "cus_h3", "status": "active",
-                "cancel_at_period_end": False,
-                "current_period_start": now_ts,
-                "current_period_end": now_ts + 30 * 86400,
-                "metadata": {"orgId": org_id, "planKey": "starter"},  # STALE
-                "items": {"data": [{"price": {"id": "price_growth"}}]},
-            }},
+            "data": {"object": sub_state},
         }
         raw = json.dumps(event).encode("utf-8")
         asyncio.run(
@@ -333,17 +335,19 @@ class H3_PortalPlanChangeHonorsPriceIdResolution(_AuditBase):
         self.store.set_org_billing_profile(org_id=org_id, billing=billing)
 
         now_ts = int(time.time())
+        sub_state = {
+            "id": "sub_h3a", "customer": "cus_h3a", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": now_ts,
+            "current_period_end": now_ts + 365 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "starter"},
+            "items": {"data": [{"price": {"id": "price_growth_annual"}}]},
+        }
+        self.fake_client.sub_states["sub_h3a"] = sub_state
         event = {
             "id": "evt_h3a_annual",
             "type": "customer.subscription.updated",
-            "data": {"object": {
-                "id": "sub_h3a", "customer": "cus_h3a", "status": "active",
-                "cancel_at_period_end": False,
-                "current_period_start": now_ts,
-                "current_period_end": now_ts + 365 * 86400,
-                "metadata": {"orgId": org_id, "planKey": "starter"},
-                "items": {"data": [{"price": {"id": "price_growth_annual"}}]},
-            }},
+            "data": {"object": sub_state},
         }
         raw = json.dumps(event).encode("utf-8")
         asyncio.run(
@@ -407,16 +411,18 @@ class H5_FailedWriteRetryIsNotDeduped(_AuditBase):
         self.store.set_org_billing_profile(org_id=org_id, billing=billing)
 
         now_ts = int(time.time())
+        sub_state = {
+            "id": "sub_h5", "customer": "cus_h5", "status": "past_due",
+            "cancel_at_period_end": False,
+            "current_period_start": now_ts,
+            "current_period_end": now_ts + 30 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "starter"},
+            "items": {"data": [{"price": {"id": "price_starter"}}]},
+        }
+        self.fake_client.sub_states["sub_h5"] = sub_state
         event = {
             "id": "evt_h5", "type": "customer.subscription.updated",
-            "data": {"object": {
-                "id": "sub_h5", "customer": "cus_h5", "status": "past_due",
-                "cancel_at_period_end": False,
-                "current_period_start": now_ts,
-                "current_period_end": now_ts + 30 * 86400,
-                "metadata": {"orgId": org_id, "planKey": "starter"},
-                "items": {"data": [{"price": {"id": "price_starter"}}]},
-            }},
+            "data": {"object": sub_state},
         }
         raw = json.dumps(event).encode("utf-8")
         sig = _sign_stripe_payload(raw, "whsec_audit")
@@ -673,16 +679,18 @@ class M4b_SubscriptionWithOrgIdMetadataMatches(_AuditBase):
     def test_subscription_metadata_orgid_resolves(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-m4b", slug="m4b-church", name="M4b Church")
         now_ts = int(time.time())
+        sub_state = {
+            "id": "sub_m4b", "customer": "cus_m4b",
+            "status": "active", "cancel_at_period_end": False,
+            "current_period_start": now_ts,
+            "current_period_end": now_ts + 30 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "growth"},
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        self.fake_client.sub_states["sub_m4b"] = sub_state
         event = {
             "id": "evt_m4b", "type": "customer.subscription.created",
-            "data": {"object": {
-                "id": "sub_m4b", "customer": "cus_m4b",
-                "status": "active", "cancel_at_period_end": False,
-                "current_period_start": now_ts,
-                "current_period_end": now_ts + 30 * 86400,
-                "metadata": {"orgId": org_id, "planKey": "growth"},
-                "items": {"data": [{"price": {"id": "price_growth"}}]},
-            }},
+            "data": {"object": sub_state},
         }
         raw = json.dumps(event).encode("utf-8")
         asyncio.run(
@@ -1364,20 +1372,23 @@ class B2_StateReconciliationNotWatermark(_AuditBase):
         self.assertTrue(bool(after_ck.get("pendingSubscriptionConfirmation")))
 
         # Now the OLDER subscription.created arrives. Watermark would
-        # discard it; reconciliation applies it.
+        # discard it; reconciliation (Stripe retrieve returns the
+        # same trialing-growth state) applies it.
         now_ts = int(time.time())
+        sub_state = {
+            "id": "sub_b2a_new", "customer": "cus_b2a", "status": "trialing",
+            "cancel_at_period_end": False,
+            "current_period_start": now_ts,
+            "current_period_end": now_ts + 30 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "growth"},
+            "trial_end": now_ts + 7 * 86400,
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        self.fake_client.sub_states["sub_b2a_new"] = sub_state
         sub_evt = {
             "id": "evt_b2a_sub", "type": "customer.subscription.created",
             "created": created_ts,  # OLDER than the checkout_evt
-            "data": {"object": {
-                "id": "sub_b2a_new", "customer": "cus_b2a", "status": "trialing",
-                "cancel_at_period_end": False,
-                "current_period_start": now_ts,
-                "current_period_end": now_ts + 30 * 86400,
-                "metadata": {"orgId": org_id, "planKey": "growth"},
-                "trial_end": now_ts + 7 * 86400,
-                "items": {"data": [{"price": {"id": "price_growth"}}]},
-            }},
+            "data": {"object": sub_state},
         }
         raw_sub = json.dumps(sub_evt).encode("utf-8")
         asyncio.run(
@@ -1578,6 +1589,313 @@ class B7_ObsoleteSubscriptionDoesNotOverwriteCurrent(_AuditBase):
         self.assertEqual(final.get("planKey"), "growth")
 
 
+class B10_SubscriptionReconciliationAgainstCurrentStripeState(_AuditBase):
+    """Review-pass v6 fix (issue #1): on `customer.subscription.*` the
+    handler must reconcile against the CURRENT subscription state
+    (via Stripe retrieve), not merge the raw payload. Reviewer-named
+    scenarios:
+    - A: older subscription.updated reporting active after
+         subscription.deleted — must not restore access.
+    - B: older subscription.updated with Starter after a Growth
+         upgrade — must not revert the plan.
+    - C: payment_succeeded for an older invoice while sub remains
+         past_due for newer debt — must not set active.
+    """
+
+    def test_deleted_then_older_updated_active_does_not_restore(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b10a", slug="b10a-church", name="B10a Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b10a"
+        billing["stripeSubscriptionId"] = "sub_b10a"
+        billing["status"] = "canceled"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Current Stripe state: canceled (reconciliation returns this).
+        self.fake_client.sub_states["sub_b10a"] = {
+            "id": "sub_b10a", "customer": "cus_b10a", "status": "canceled",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 86400,
+            "metadata": {"orgId": org_id, "planKey": "starter"},
+            "items": {"data": [{"price": {"id": "price_starter"}}]},
+        }
+        # Payload falsely reports active (older event).
+        event = {
+            "id": "evt_b10a_stale", "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_b10a", "customer": "cus_b10a", "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": int(time.time()),
+                "current_period_end": int(time.time()) + 86400,
+                "metadata": {"orgId": org_id, "planKey": "starter"},
+                "items": {"data": [{"price": {"id": "price_starter"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("status"), "canceled",
+                         "stale subscription.updated active restored access")
+
+    def test_older_updated_with_starter_after_growth_upgrade_does_not_revert(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b10b", slug="b10b-church", name="B10b Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b10b"
+        billing["stripeSubscriptionId"] = "sub_b10b"
+        billing["status"] = "active"
+        billing["planKey"] = "growth"
+        billing["priceId"] = "price_growth"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Current Stripe state: Growth. Reconciliation returns this.
+        self.fake_client.sub_states["sub_b10b"] = {
+            "id": "sub_b10b", "customer": "cus_b10b", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 86400,
+            "metadata": {"orgId": org_id, "planKey": "growth"},
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        # Older payload falsely reports Starter price.
+        event = {
+            "id": "evt_b10b_stale", "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_b10b", "customer": "cus_b10b", "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": int(time.time()),
+                "current_period_end": int(time.time()) + 86400,
+                "metadata": {"orgId": org_id, "planKey": "starter"},
+                "items": {"data": [{"price": {"id": "price_starter"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("planKey"), "growth",
+                         "stale subscription.updated with Starter price reverted the Growth upgrade")
+        self.assertEqual((final.get("limits") or {}).get("maxServiceKeys"), 12)
+
+    def test_payment_succeeded_for_older_invoice_does_not_restore_active(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b10c", slug="b10c-church", name="B10c Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b10c"
+        billing["stripeSubscriptionId"] = "sub_b10c"
+        billing["status"] = "past_due"
+        billing["planKey"] = "starter"
+        billing["graceEndsAt"] = _utc_now() + timedelta(days=3)
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Stripe says: still past_due (newer debt not yet paid).
+        self.fake_client.sub_states["sub_b10c"] = {
+            "id": "sub_b10c", "customer": "cus_b10c", "status": "past_due",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 86400,
+            "items": {"data": [{"price": {"id": "price_starter"}}]},
+        }
+        # OLDER payment_succeeded invoice arrives.
+        event = {
+            "id": "evt_b10c_older_ok", "type": "invoice.payment_succeeded",
+            "data": {"object": {
+                "id": "in_older_ok", "customer": "cus_b10c",
+                "subscription": "sub_b10c",
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("status"), "past_due",
+                         "older payment_succeeded restored active while newer debt is outstanding")
+        self.assertIsNotNone(final.get("graceEndsAt"),
+                             "grace timer was cleared despite outstanding newer debt")
+
+
+class B11_TransientRetrievalErrorRemainsRetryable(_AuditBase):
+    """Review-pass v6 fix (issue #2): a transient `retrieve_subscription`
+    failure must raise so Stripe retries. The event must NOT be
+    marked completed; on retry (with Stripe recovered) the handler
+    completes.
+    """
+
+    def test_payment_failed_retry_converges_after_transient_retrieve_error(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b11", slug="b11-church", name="B11 Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b11"
+        billing["stripeSubscriptionId"] = "sub_b11"
+        billing["status"] = "active"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        event = {
+            "id": "evt_b11", "type": "invoice.payment_failed",
+            "data": {"object": {
+                "id": "in_b11", "customer": "cus_b11",
+                "subscription": "sub_b11",
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        sig = _sign_stripe_payload(raw, "whsec_audit")
+
+        # First delivery: Stripe retrieve fails transiently.
+        class _FlakyThenRecoveredClient(_FakeStripeClient):
+            calls = {"n": 0}
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                self_inner.calls["n"] += 1
+                if self_inner.calls["n"] == 1:
+                    raise StripeClientError("stripe_http_503:service_unavailable")
+                # Recovered: Stripe reports past_due.
+                return {
+                    "id": subscription_id, "customer": "cus_b11",
+                    "status": "past_due",
+                    "cancel_at_period_end": False,
+                    "current_period_start": int(time.time()),
+                    "current_period_end": int(time.time()) + 86400,
+                    "items": {"data": [{"price": {"id": "price_starter"}}]},
+                }
+
+        flaky = _FlakyThenRecoveredClient()
+        with patch.object(billing_routes, "_stripe_client", lambda: flaky):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    billing_routes.stripe_webhook(
+                        request=_DummyRequest(raw), stripe_signature=sig,
+                    )
+                )
+            self.assertEqual(ctx.exception.status_code, 502)
+            self.assertEqual(ctx.exception.detail, "stripe_reconcile_failed")
+            # Event is NOT completed.
+            rec = self.store._billing_events.get("evt_b11") or {}
+            self.assertNotEqual(rec.get("status"), "completed",
+                                "transient retrieve failure completed the event — not retryable")
+            # Age the lease so the retry's claim passes.
+            rec["claimedAt"] = _utc_now() - timedelta(seconds=999)
+            # Stripe retries.
+            result = asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw), stripe_signature=sig,
+                )
+            )
+            self.assertNotIn("deduped", result)
+            self.assertEqual(result.get("eventId"), "evt_b11")
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("status"), "past_due",
+                         "retry did not reconcile to the recovered subscription state")
+
+
+class B12_CreateMissingStripeCustomerBumpsCAS(_AuditBase):
+    """Review-pass v6 fix (issue #3): `set_org_billing_profile` now
+    always bumps `billing.updatedAt`. The `_create_missing_stripe_customer`
+    helper (called from the checkout route) persists via
+    `set_org_billing_profile`, so a concurrent webhook's CAS catches
+    the customer-reference change.
+    """
+
+    def test_create_missing_customer_bumps_billing_updated_at(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b12", slug="b12-church", name="B12 Church")
+        billing_before = self.store.get_org_billing_profile(org_id=org_id)
+        before_updated_at = billing_before.get("updatedAt")
+        time.sleep(0.001)
+        # Capture a dict that preserves the OLD updatedAt (as the
+        # route would after reading billing) — the key assertion is
+        # that `set_org_billing_profile` overrides it, no matter what
+        # the caller passes.
+        snapshot = dict(billing_before)
+        snapshot["stripeCustomerId"] = "cus_newly_created"
+        snapshot["updatedAt"] = before_updated_at  # explicitly stale
+        self.store.set_org_billing_profile(org_id=org_id, billing=snapshot)
+        after = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertNotEqual(after.get("updatedAt"), before_updated_at,
+                            "set_org_billing_profile preserved the stale updatedAt — CAS can't catch concurrent writers")
+        self.assertEqual(after.get("stripeCustomerId"), "cus_newly_created")
+
+    def test_webhook_cas_catches_concurrent_customer_create(self) -> None:
+        """Barrier-driven interleaving: webhook paused after its
+        billing read, `_create_missing_stripe_customer` (actual
+        helper) runs with a mocked client, webhook resumes → CAS
+        catches the change via the bumped updatedAt. The
+        newly-saved stripeCustomerId is NOT overwritten.
+        """
+        org_id = self._bootstrap_owner(uid="owner-b12c", slug="b12c-church", name="B12c Church")
+        billing_before = self.store.get_org_billing_profile(org_id=org_id)
+        billing_before["stripeSubscriptionId"] = "sub_b12c"
+        billing_before["status"] = "canceled"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing_before)
+
+        # Current Stripe state (reconciliation).
+        self.fake_client.sub_states["sub_b12c"] = {
+            "id": "sub_b12c", "customer": "cus_newly_created",
+            "status": "canceled",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 86400,
+            "items": {"data": [{"price": {"id": "price_starter"}}]},
+        }
+        event = {
+            "id": "evt_b12c", "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_b12c", "customer": "cus_newly_created",
+                "status": "canceled", "cancel_at_period_end": False,
+                "current_period_start": int(time.time()),
+                "current_period_end": int(time.time()) + 86400,
+                "metadata": {"orgId": org_id},
+                "items": {"data": [{"price": {"id": "price_starter"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+
+        # In between the webhook's billing read and its apply, invoke
+        # the actual `_create_missing_stripe_customer` helper (which
+        # persists via `set_org_billing_profile`).
+        original_apply = self.store.apply_webhook_event_atomic
+        did_interleave = {"n": 0}
+        user = self._user("owner-b12c")
+
+        def _interleaving_apply(**kwargs: Any) -> Dict[str, Any]:
+            if did_interleave["n"] == 0:
+                did_interleave["n"] = 1
+
+                class _CustClient:
+                    def create_customer(self_inner, *, email, name, metadata=None,
+                                        idempotency_key=None):
+                        return {"id": "cus_newly_created", "email": email, "name": name,
+                                "metadata": metadata or {}}
+
+                billing_at_interleave = self.store.get_org_billing_profile(org_id=org_id)
+                billing_routes._create_missing_stripe_customer(
+                    client=_CustClient(),
+                    org_id=org_id,
+                    billing=billing_at_interleave,
+                    user=user,
+                )
+            return original_apply(**kwargs)
+
+        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=_interleaving_apply):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    billing_routes.stripe_webhook(
+                        request=_DummyRequest(raw),
+                        stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                    )
+                )
+        self.assertEqual(ctx.exception.status_code, 409)
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("stripeCustomerId"), "cus_newly_created",
+                         "stale webhook overwrote the newly-saved customer reference")
+
+
 class B9_CheckoutMutationsBumpBillingUpdatedAt(_AuditBase):
     """Review-pass v5 fix for issue #2: `claim_checkout_attempt` and
     `record_checkout_attempt_session` both now bump
@@ -1770,17 +2088,19 @@ class B8_AtomicApplyPreservesSoftCapResetBehavior(_AuditBase):
 
         # Simulate an upgrade event to Growth (monthly_minutes=1800).
         now_ts = int(time.time())
+        sub_state = {
+            "id": "sub_b8", "customer": "cus_b8", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": now_ts,
+            "current_period_end": now_ts + 30 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "growth"},
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        self.fake_client.sub_states["sub_b8"] = sub_state
         event = {
             "id": "evt_b8_upgrade", "type": "customer.subscription.updated",
             "created": now_ts,
-            "data": {"object": {
-                "id": "sub_b8", "customer": "cus_b8", "status": "active",
-                "cancel_at_period_end": False,
-                "current_period_start": now_ts,
-                "current_period_end": now_ts + 30 * 86400,
-                "metadata": {"orgId": org_id, "planKey": "growth"},
-                "items": {"data": [{"price": {"id": "price_growth"}}]},
-            }},
+            "data": {"object": sub_state},
         }
         raw = json.dumps(event).encode("utf-8")
         asyncio.run(
