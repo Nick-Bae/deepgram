@@ -7,6 +7,29 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage eighth pass (2026-10-29, after 53373836)
+
+Reviewer flagged two remaining gaps.
+
+### Gap 1 — Targeted field updates for all production billing writers
+- **Problem**: `_hydrate_billing_from_stripe` is CAS-protected, but every other full-snapshot writer (`_create_missing_stripe_customer`, `_clear_stale_stripe_refs`, `_normalize_billing_refs` persisters in checkout/portal/change-plan, `change_plan` pending-plan writes, `cancel_pending_downgrade` clears) still read the OLD billing, mutated a few fields, and wrote the whole dict back — overwriting unrelated newer fields a concurrent webhook had committed. The setter's "legacy callers must not race" comment was aspirational, not enforced.
+- **Fix**: new `patch_org_billing_fields(org_id, updates)` on BOTH stores. Reads current billing, applies a `{field: value}` dict update (None clears), merges nested `limits` key-by-key, bumps `billing.updatedAt`, writes — all atomic under `_lock` (in-memory) or `@gcf_firestore.transactional` (Firestore). No full-snapshot write occurs; unrelated fields from a concurrent writer survive. All affected billing writers in `routes/billing.py` migrated:
+  - `_create_missing_stripe_customer` → patches only `stripeCustomerId`.
+  - `_clear_stale_stripe_refs` → patches only the stale ref fields (set to None).
+  - `_normalize_billing_refs` persisters (`billing_status`, `create_checkout_session`, `create_portal_session`, `change_plan`) → new `_persist_normalized_refs` helper patches only the three normalized ref fields.
+  - `change_plan` pending-plan writer → patches only `{pendingPlanKey, pendingPlanDate, pendingScheduleId}`.
+  - `cancel_pending_downgrade` → patches those three fields back to None.
+
+  `_hydrate_billing_from_stripe` keeps CAS'd `set_org_billing_profile` — it still writes a reconciled full snapshot from Stripe retrieval (that's the whole point of hydrate), and the CAS token prevents stale overwrite there.
+- **Regressions**:
+  - `B15_CustomerCreateReverseRaceGuard::test_stale_customer_create_does_not_erase_committed_subscription` — real threads + `threading.Event` barrier: helper paused inside `create_customer`, webhook commits Growth subscription, helper released. After helper completes, stored billing retains Growth's planKey/sub id/priceId/status and gains `stripeCustomerId`.
+  - Firestore emulator: `PatchOrgBillingFieldsFirestoreTests::test_patch_preserves_concurrent_webhook_fields` and `::test_patch_merges_limits_key_by_key`.
+
+### Gap 2 — Checkout completion must persist the reconciled priceId
+- **Problem**: v7's delayed-checkout reconciliation resolved `requested_plan` from the live subscription's `price_id` but did not write that `price_id` to `next_billing["priceId"]`. Result: planKey=growth, maxServiceKeys=12, priceId=price_starter (inconsistent).
+- **Fix**: capture `reconciled_price_id` in the reconciliation branch; after the plan/limits merge, when a reconciled price id is present, persist it: `next_billing["priceId"] = reconciled_price_id`.
+- **Regression**: `B13_DelayedCheckoutCompletionDoesNotRevertUpgrade::test_checkout_completion_reconciles_stale_priceId_too` — starting state planKey=starter, priceId=price_starter; live Stripe=Growth; delivered checkout.session.completed with metadata.planKey=starter. All three (planKey, limits.maxServiceKeys, priceId) must land Growth.
+
 ## Boundary-coverage seventh pass (2026-10-29, after 8b9d656b)
 
 Reviewer flagged two remaining gaps. Both addressed.

@@ -470,6 +470,87 @@ class SetOrgBillingProfileCASFirestoreTests(unittest.TestCase):
         self.assertEqual(final.get("planKey"), "growth")
 
 
+class PatchOrgBillingFieldsFirestoreTests(unittest.TestCase):
+    """Review-pass v8 fix (gap #1): `patch_org_billing_fields` on
+    Firestore preserves unrelated newer fields from a concurrent
+    writer. Models the customer-create ↔ webhook reverse race
+    without full-snapshot overwrite.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.store = FirestoreMultiChurchStore()
+
+    def _seed_org(self) -> str:
+        db = _db()
+        org_id = f"org_{uuid.uuid4().hex[:8]}"
+        now = _utc_now()
+        db.collection("organizations").document(org_id).set({
+            "orgId": org_id, "name": f"B15fs {org_id}",
+            "plan": "trial", "status": "trial",
+            "billing": {
+                "planKey": "trial", "status": "trialing",
+                "stripeCustomerId": None, "stripeSubscriptionId": None,
+                "priceId": None, "updatedAt": now,
+            },
+        })
+        return org_id
+
+    def test_patch_preserves_concurrent_webhook_fields(self) -> None:
+        db = _db()
+        org_id = self._seed_org()
+        # Simulate the webhook's commit: Growth + sub + price + active.
+        self.store.set_org_billing_profile(
+            org_id=org_id,
+            billing={
+                "planKey": "growth", "status": "active",
+                "stripeCustomerId": None,  # customer-create hasn't landed yet
+                "stripeSubscriptionId": "sub_b15fs",
+                "priceId": "price_growth",
+            },
+        )
+        after_webhook = (db.collection("organizations").document(org_id).get().to_dict()
+                         or {}).get("billing") or {}
+        self.assertEqual(after_webhook.get("planKey"), "growth")
+
+        # Now the (stale) customer-create helper patches ONLY stripeCustomerId.
+        # The old full-snapshot path would have reverted planKey/sub/price;
+        # the targeted-field patch must preserve them.
+        self.store.patch_org_billing_fields(
+            org_id=org_id,
+            updates={"stripeCustomerId": "cus_b15fs"},
+        )
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual(final.get("stripeCustomerId"), "cus_b15fs")
+        self.assertEqual(final.get("planKey"), "growth")
+        self.assertEqual(final.get("stripeSubscriptionId"), "sub_b15fs")
+        self.assertEqual(final.get("priceId"), "price_growth")
+        self.assertEqual(str(final.get("status") or "").lower(), "active")
+
+    def test_patch_merges_limits_key_by_key(self) -> None:
+        db = _db()
+        org_id = self._seed_org()
+        self.store.set_org_billing_profile(
+            org_id=org_id,
+            billing={
+                "planKey": "growth", "status": "active",
+                "limits": {"maxServiceKeys": 12, "customFlag": True},
+            },
+        )
+        self.store.patch_org_billing_fields(
+            org_id=org_id,
+            updates={"limits": {"maxServiceKeys": 20}},
+        )
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual((final.get("limits") or {}).get("maxServiceKeys"), 20)
+        self.assertEqual(
+            (final.get("limits") or {}).get("customFlag"), True,
+            "nested limits merge dropped a sibling key",
+        )
+
+
 class CheckoutAttemptFirestoreTests(unittest.TestCase):
     """Transactional validation of the checkout-attempt claim,
     including stable-request-parameter guard and parallel claims."""

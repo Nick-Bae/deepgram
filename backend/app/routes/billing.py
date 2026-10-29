@@ -252,17 +252,30 @@ def _normalize_billing_refs(*, billing: Dict[str, Any]) -> tuple[Dict[str, Any],
     return next_billing, changed
 
 
+def _persist_normalized_refs(*, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+    """Review-pass v8 gap #1: callers that just finished
+    `_normalize_billing_refs` write only the three normalized ref
+    fields via `patch_org_billing_fields`, so a concurrent webhook
+    writer's newer non-ref fields survive."""
+    ref_patch: Dict[str, Any] = {}
+    for key in ("stripeCustomerId", "stripeSubscriptionId", "priceId"):
+        ref_patch[key] = billing.get(key)
+    return multichurch_store.patch_org_billing_fields(
+        org_id=org_id, updates=ref_patch,
+    )
+
+
 def _clear_stale_stripe_refs(*, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
-    next_billing = dict(billing or {})
-    changed = False
+    """Review-pass v8 gap #1: switch to targeted field patch so a
+    concurrent webhook commit of e.g. planKey/status is not
+    overwritten by this cleanup's old snapshot."""
+    cleared: Dict[str, Any] = {}
     for key in ("stripeCustomerId", "stripeSubscriptionId", "priceId", "currentPeriodStart", "currentPeriodEnd"):
-        if next_billing.get(key) not in (None, ""):
-            next_billing[key] = None
-            changed = True
-    if not changed:
+        if (billing or {}).get(key) not in (None, ""):
+            cleared[key] = None
+    if not cleared:
         return billing
-    next_billing["updatedAt"] = _utcnow()
-    return multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
+    return multichurch_store.patch_org_billing_fields(org_id=org_id, updates=cleared)
 
 
 def _create_missing_stripe_customer(
@@ -273,6 +286,11 @@ def _create_missing_stripe_customer(
     user: AuthenticatedUser,
     idempotency_suffix: str = "",
 ) -> tuple[str, Dict[str, Any]]:
+    """Review-pass v8 gap #1: patch only `stripeCustomerId` via
+    `patch_org_billing_fields`. The previous full-snapshot write
+    could stamp an old snapshot over a concurrent webhook commit
+    (e.g. subscription.created landing while this call awaited
+    Stripe's customer-create response)."""
     customer = client.create_customer(
         email=user.email,
         name=user.displayName,
@@ -282,9 +300,10 @@ def _create_missing_stripe_customer(
     customer_id = _clean_customer_id((customer or {}).get("id"))
     if not customer_id:
         raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
-    next_billing = dict(billing or {})
-    next_billing["stripeCustomerId"] = customer_id
-    saved = multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
+    saved = multichurch_store.patch_org_billing_fields(
+        org_id=org_id,
+        updates={"stripeCustomerId": customer_id},
+    )
     return customer_id, saved
 
 
@@ -583,7 +602,7 @@ def billing_status(
         raise HTTPException(status_code=400, detail=detail or "billing_status_fetch_failed") from exc
     billing, refs_changed = _normalize_billing_refs(billing=billing)
     if refs_changed:
-        billing = multichurch_store.set_org_billing_profile(org_id=org_id, billing=billing)
+        billing = _persist_normalized_refs(org_id=org_id, billing=billing)
 
     try:
         billing = _hydrate_billing_from_stripe(
@@ -687,7 +706,7 @@ def create_checkout_session(
 
     billing, refs_changed = _normalize_billing_refs(billing=billing)
     if refs_changed:
-        billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+        billing = _persist_normalized_refs(org_id=body.orgId, billing=billing)
 
     client = _stripe_client()
     customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
@@ -775,7 +794,7 @@ def create_portal_session(
 
     billing, refs_changed = _normalize_billing_refs(billing=billing)
     if refs_changed:
-        billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+        billing = _persist_normalized_refs(org_id=body.orgId, billing=billing)
 
     try:
         billing = _hydrate_billing_from_stripe(
@@ -856,7 +875,7 @@ def change_plan(
 
     billing, refs_changed = _normalize_billing_refs(billing=billing)
     if refs_changed:
-        billing = multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=billing)
+        billing = _persist_normalized_refs(org_id=body.orgId, billing=billing)
 
     current_status = _clean(billing.get("status")).lower()
     if current_status not in {"active", "past_due"}:
@@ -917,13 +936,16 @@ def change_plan(
         raise HTTPException(status_code=502, detail="stripe_schedule_failed") from exc
 
     schedule_id = _clean((schedule or {}).get("id"))
-    next_billing = dict(billing)
-    next_billing["pendingPlanKey"] = target_plan.key
-    next_billing["pendingPlanDate"] = period_end_dt
-    next_billing["pendingScheduleId"] = schedule_id
-    next_billing["updatedAt"] = _utcnow()
+    # Review-pass v8 gap #1: patch only the pending-plan fields.
     try:
-        multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=next_billing)
+        multichurch_store.patch_org_billing_fields(
+            org_id=body.orgId,
+            updates={
+                "pendingPlanKey": target_plan.key,
+                "pendingPlanDate": period_end_dt,
+                "pendingScheduleId": schedule_id,
+            },
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
 
@@ -964,13 +986,16 @@ def cancel_pending_downgrade(
         logger.warning("cancel_downgrade_failed org=%s: %s", body.orgId, exc)
         raise HTTPException(status_code=502, detail="stripe_cancel_schedule_failed") from exc
 
-    next_billing = dict(billing)
-    next_billing["pendingPlanKey"] = None
-    next_billing["pendingPlanDate"] = None
-    next_billing["pendingScheduleId"] = None
-    next_billing["updatedAt"] = _utcnow()
+    # Review-pass v8 gap #1: patch only the pending-plan fields.
     try:
-        multichurch_store.set_org_billing_profile(org_id=body.orgId, billing=next_billing)
+        multichurch_store.patch_org_billing_fields(
+            org_id=body.orgId,
+            updates={
+                "pendingPlanKey": None,
+                "pendingPlanDate": None,
+                "pendingScheduleId": None,
+            },
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
 
@@ -1076,6 +1101,7 @@ async def stripe_webhook(
         # trust the checkout metadata — that's the authoritative plan
         # the user just purchased.
         current_sub_id_pre = _clean(next_billing.get("stripeSubscriptionId"))
+        reconciled_price_id: Optional[str] = None
         if subscription_id and current_sub_id_pre and current_sub_id_pre == subscription_id:
             try:
                 sub_live = _stripe_client().retrieve_subscription(
@@ -1096,6 +1122,7 @@ async def stripe_webhook(
                     fallback_plan_key=str(next_billing.get("planKey") or metadata.get("planKey") or "trial"),
                 )
                 requested_plan = plan_spec(resolved_plan_key)
+                reconciled_price_id = price_id_live
             else:
                 requested_plan = plan_spec(
                     metadata.get("planKey") or next_billing.get("planKey") or "trial"
@@ -1166,6 +1193,12 @@ async def stripe_webhook(
         if subscription_id:
             next_billing["stripeSubscriptionId"] = subscription_id
         next_billing["planKey"] = requested_plan.key
+        # Fix review item #2 (v8): when the delayed-checkout
+        # reconciliation determined a current price_id from the live
+        # subscription, persist it alongside planKey/limits so the
+        # stored priceId is never stale against the resolved plan.
+        if reconciled_price_id:
+            next_billing["priceId"] = reconciled_price_id
         next_billing.setdefault("limits", {})
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
         # Fix issue #2 (prior pass): represent "awaiting subscription

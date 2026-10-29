@@ -1553,6 +1553,64 @@ class InMemoryMultiChurchStore:
             org["updatedAt"] = now
             return dict(merged)
 
+    def patch_org_billing_fields(
+        self,
+        *,
+        org_id: str,
+        updates: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Targeted-field update of `billing` without a full snapshot.
+
+        Fix review-pass v8 gap #1: full-snapshot writers (customer
+        creation, reference cleanup, pending-plan writes) read an old
+        snapshot, mutate a few fields, then write the whole thing
+        back — overwriting unrelated newer fields a concurrent writer
+        (webhook) persisted in the meantime.
+
+        This method reads+mutates+writes inside the store lock so
+        OTHER fields from a concurrent commit survive. `updates` is
+        a mapping of field names → new values (None clears a field).
+        Nested `limits` is merged key-by-key, not replaced. Always
+        bumps `billing.updatedAt`.
+
+        Returns the full updated billing dict.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            current = _normalize_billing_state(
+                org.get("billing") or {},
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            next_billing = dict(current)
+            for key, value in (updates or {}).items():
+                if key == "limits" and isinstance(value, dict):
+                    merged_limits = dict(current.get("limits") or {})
+                    for lk, lv in value.items():
+                        if lv is None:
+                            merged_limits.pop(lk, None)
+                        else:
+                            merged_limits[lk] = lv
+                    next_billing["limits"] = merged_limits
+                else:
+                    next_billing[key] = value
+            next_billing["updatedAt"] = now
+            org["billing"] = next_billing
+            if "planKey" in (updates or {}):
+                org["plan"] = str(next_billing.get("planKey") or org.get("plan") or "trial")
+            if "status" in (updates or {}):
+                org["status"] = "trial" if str(next_billing.get("status") or "").strip().lower() == "trialing" else str(
+                    next_billing.get("status") or org.get("status") or "active"
+                )
+            org["updatedAt"] = now
+            return dict(next_billing)
+
     def get_org_effective_trial_seconds_remaining(self, *, org_id: str) -> Optional[int]:
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
@@ -4811,6 +4869,64 @@ class FirestoreMultiChurchStore:
             timeout=_FS_TIMEOUT,
         )
         return dict(merged)
+
+    def patch_org_billing_fields(
+        self,
+        *,
+        org_id: str,
+        updates: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """See InMemoryMultiChurchStore.patch_org_billing_fields.
+
+        Fix review-pass v8 gap #1: targeted-field update of
+        `billing` inside a Firestore transaction, so unrelated
+        newer fields from a concurrent commit are preserved.
+        Nested `limits` merges key-by-key. Always bumps
+        `billing.updatedAt`.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+
+        @gcf_firestore.transactional
+        def _apply(tx: Any) -> Dict[str, Any]:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org_tx = snap.to_dict() or {}
+            billing_payload, _ = _billing_payload_from_org_row(org_tx)
+            current = _normalize_billing_state(
+                billing_payload or {},
+                plan_key=str(org_tx.get("plan") or "trial"),
+                now=now,
+            )
+            next_billing = dict(current)
+            for key, value in (updates or {}).items():
+                if key == "limits" and isinstance(value, dict):
+                    merged_limits = dict(current.get("limits") or {})
+                    for lk, lv in value.items():
+                        if lv is None:
+                            merged_limits.pop(lk, None)
+                        else:
+                            merged_limits[lk] = lv
+                    next_billing["limits"] = merged_limits
+                else:
+                    next_billing[key] = value
+            next_billing["updatedAt"] = now
+            normalized_status = str(next_billing.get("status") or "").strip().lower()
+            tx.update(org_ref, {
+                "billing": next_billing,
+                "plan": str(next_billing.get("planKey") or org_tx.get("plan") or "trial"),
+                "status": "trial" if normalized_status == "trialing" else str(
+                    next_billing.get("status") or org_tx.get("status") or "active"
+                ),
+                "updatedAt": now,
+            })
+            return dict(next_billing)
+
+        return _apply(self._db.transaction())
 
     def get_org_effective_trial_seconds_remaining(self, *, org_id: str) -> Optional[int]:
         clean_org_id = _clean_token(org_id)

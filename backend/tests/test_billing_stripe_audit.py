@@ -1642,6 +1642,56 @@ class B13_DelayedCheckoutCompletionDoesNotRevertUpgrade(_AuditBase):
                          "org-level monthly-minute limit reverted to Starter")
         self.assertEqual(final.get("priceId"), "price_growth")
 
+    def test_checkout_completion_reconciles_stale_priceId_too(self) -> None:
+        """Review-pass v8 fix (gap #2): the checkout.session.completed
+        handler must persist the reconciled `priceId` alongside the
+        reconciled plan/limits. The B13 initial state already had
+        `priceId=price_growth`, so a stale priceId bug was invisible
+        there. Here we store the OPPOSITE: planKey/priceId=starter,
+        then let the webhook retrieve current Growth state and apply
+        the completion. All three (planKey, limits.maxServiceKeys,
+        priceId) must land Growth."""
+        org_id = self._bootstrap_owner(
+            uid="owner-b13b", slug="b13b-church", name="B13b Church",
+        )
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b13b"
+        billing["stripeSubscriptionId"] = "sub_b13b"
+        billing["status"] = "active"
+        billing["planKey"] = "starter"
+        billing["priceId"] = "price_starter"
+        billing.setdefault("limits", {})["maxServiceKeys"] = 5
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Live subscription is Growth now (an unobserved subscription.updated).
+        self.fake_client.sub_states["sub_b13b"] = {
+            "id": "sub_b13b", "customer": "cus_b13b", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 30 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "growth"},
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        event = {
+            "id": "evt_b13b_ck", "type": "checkout.session.completed",
+            "data": {"object": {
+                "id": "cs_b13b", "customer": "cus_b13b",
+                "subscription": "sub_b13b",
+                "metadata": {"orgId": org_id, "planKey": "starter", "interval": "month"},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("planKey"), "growth")
+        self.assertEqual((final.get("limits") or {}).get("maxServiceKeys"), 12)
+        self.assertEqual(final.get("priceId"), "price_growth",
+                         "stored priceId still reflected the old plan")
+
 
 class B14_HydrateReverseRaceCASGuard(_AuditBase):
     """Review-pass v7 fix (gap #2): a `_hydrate_billing_from_stripe`
@@ -1768,6 +1818,135 @@ class B14_HydrateReverseRaceCASGuard(_AuditBase):
             (hydrate_result.get("returned") or {}).get("planKey"), "growth",
             "stale hydrate returned its own stale snapshot instead of current state",
         )
+
+
+class B15_CustomerCreateReverseRaceGuard(_AuditBase):
+    """Review-pass v8 fix (gap #1): `_create_missing_stripe_customer`
+    previously read the OLD billing snapshot, awaited Stripe's
+    create_customer response (potentially slow), then wrote the full
+    snapshot back. A `customer.subscription.created` webhook landing
+    during that gap would be erased when the helper's write
+    overwrote the whole billing dict with its stale Trial snapshot.
+
+    This test uses real threads + a `threading.Event` barrier. The
+    helper is paused inside `create_customer`, the webhook commits a
+    Growth subscription (new sub id, status=active, priceId), then
+    the helper resumes. After the helper completes, the stored
+    billing must still carry the Growth fields; the only field the
+    helper is allowed to add is `stripeCustomerId`.
+    """
+
+    def test_stale_customer_create_does_not_erase_committed_subscription(self) -> None:
+        import threading
+        org_id = self._bootstrap_owner(
+            uid="owner-b15", slug="b15-church", name="B15 Church",
+        )
+        # Starting state: Trial with NO Stripe customer and no subscription.
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["planKey"] = "trial"
+        billing["status"] = "trialing"
+        billing["stripeCustomerId"] = None
+        billing["stripeSubscriptionId"] = None
+        billing["priceId"] = None
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        pause_create = threading.Event()
+        release_create = threading.Event()
+        trace: list = []
+
+        # Shared fake client (self.fake_client), already patched by setUp.
+        orig_create = self.fake_client.create_customer
+
+        def _slow_create_customer(**kwargs: Any) -> Dict[str, Any]:
+            trace.append(("create_customer enter", kwargs.get("email")))
+            pause_create.set()
+            release_create.wait(timeout=5.0)
+            trace.append(("create_customer exit",))
+            return {
+                "id": "cus_b15",
+                "email": kwargs.get("email"),
+                "name": kwargs.get("name"),
+            }
+
+        self.fake_client.create_customer = _slow_create_customer  # type: ignore
+
+        helper_result: Dict[str, Any] = {}
+
+        def _helper_thread() -> None:
+            try:
+                stripe_customer_id, saved = billing_routes._create_missing_stripe_customer(
+                    client=self.fake_client,
+                    org_id=org_id,
+                    billing=self.store.get_org_billing_profile(org_id=org_id),
+                    user=AuthenticatedUser(
+                        uid="owner-b15", email="o@x.com", displayName="O",
+                    ),
+                )
+                helper_result["returned"] = (stripe_customer_id, saved)
+            except Exception as exc:
+                helper_result["error"] = repr(exc)
+
+        try:
+            t = threading.Thread(target=_helper_thread)
+            t.start()
+            self.assertTrue(
+                pause_create.wait(timeout=5.0),
+                f"helper did not reach create_customer; trace={trace}",
+            )
+
+            # Webhook commits Growth while helper is paused.
+            growth_sub = {
+                "id": "sub_b15",
+                "customer": "cus_b15",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": int(time.time()),
+                "current_period_end": int(time.time()) + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "growth"},
+                "items": {"data": [{"price": {"id": "price_growth"}}]},
+            }
+            self.fake_client.sub_states["sub_b15"] = growth_sub
+            webhook_event = {
+                "id": "evt_b15",
+                "type": "customer.subscription.created",
+                "data": {"object": growth_sub},
+            }
+            raw = json.dumps(webhook_event).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw),
+                    stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                )
+            )
+            after_webhook = self.store.get_org_billing_profile(org_id=org_id)
+            self.assertEqual(
+                after_webhook.get("planKey"), "growth",
+                f"webhook did not commit Growth before helper release; trace={trace}",
+            )
+            self.assertEqual(after_webhook.get("stripeSubscriptionId"), "sub_b15")
+
+            # Release the helper. It writes stripeCustomerId.
+            release_create.set()
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive(), "helper thread hung")
+            self.assertNotIn("error", helper_result, helper_result.get("error", ""))
+
+            final = self.store.get_org_billing_profile(org_id=org_id)
+            # The helper's addition.
+            self.assertEqual(final.get("stripeCustomerId"), "cus_b15")
+            # The webhook's commit MUST survive.
+            self.assertEqual(final.get("planKey"), "growth",
+                             f"customer-create overwrote Growth; trace={trace}")
+            self.assertEqual(final.get("stripeSubscriptionId"), "sub_b15",
+                             "customer-create erased stripeSubscriptionId")
+            self.assertEqual(final.get("priceId"), "price_growth",
+                             "customer-create erased priceId")
+            self.assertEqual(
+                str(final.get("status") or "").strip().lower(), "active",
+                "customer-create reverted status to trialing",
+            )
+        finally:
+            self.fake_client.create_customer = orig_create  # type: ignore
 
 
 class B10_SubscriptionReconciliationAgainstCurrentStripeState(_AuditBase):
