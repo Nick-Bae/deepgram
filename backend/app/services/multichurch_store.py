@@ -154,6 +154,18 @@ DEFAULT_INVITE_EXPIRY_HOURS = _env_int("INVITE_DEFAULT_EXPIRY_HOURS", 24 * 3, mi
 MAX_ACTIVE_INVITES_PER_ORG = _env_int("INVITE_MAX_ACTIVE_PER_ORG", 20, min_value=1, max_value=500)
 INVITE_RETENTION_DAYS = _env_int("INVITE_RETENTION_DAYS", 30, min_value=1, max_value=365)
 BILLING_LIMITS_ENABLED = not _env_bool("DISABLE_BILLING_LIMITS", False)
+# Lease window for in-flight webhook claims. A claim older than this
+# is considered abandoned (the original handler either crashed or
+# never completed) and is reclaimed on next delivery. Must be longer
+# than the longest expected handler path including Firestore writes.
+_BILLING_EVENT_LEASE_SEC = _env_int(
+    "BILLING_EVENT_LEASE_SEC", 60, min_value=15, max_value=600,
+)
+# TTL for the pending-checkout-attempt record (fix-batch-2). Matches
+# Stripe's default Checkout Session validity of 24 hours.
+_BILLING_CHECKOUT_ATTEMPT_TTL_SEC = _env_int(
+    "BILLING_CHECKOUT_ATTEMPT_TTL_SEC", 24 * 3600, min_value=60, max_value=48 * 3600,
+)
 SERMON_PREP_BUDGETS_ENABLED = not _env_bool("DISABLE_SERMON_PREP_BUDGETS", False)
 SERMON_PREP_DEFAULT_BUDGET_USD = _env_float(
     "SERMON_PREP_DEFAULT_BUDGET_USD",
@@ -1573,6 +1585,123 @@ class InMemoryMultiChurchStore:
                     return org_id
         return None
 
+    def claim_checkout_attempt(
+        self,
+        *,
+        org_id: str,
+        plan_key: str,
+        interval: str,
+    ) -> Dict[str, Any]:
+        """fix-batch-2: atomically decide the next action for a POST to
+        /billing/checkout-session.
+
+        Returns a dict with:
+          - "action" ∈ {"reuse", "create", "already_subscribed",
+                       "pending_different_plan"}
+          - For "reuse": attemptId, sessionId, sessionUrl.
+          - For "create": attemptId (a new value to pass to Stripe as the
+                         Idempotency-Key); caller MUST follow up with
+                         `record_checkout_attempt_session` after the
+                         Stripe call returns.
+          - For "already_subscribed" / "pending_different_plan": no
+                         additional fields; the route surfaces a 409.
+
+        Guarantees under concurrent callers on the same org: at most
+        one caller can see "create"; the rest see "reuse" (same
+        attemptId) or a refusal.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_plan = str(plan_key or "").strip().lower()
+        clean_interval = str(interval or "").strip().lower() or "month"
+        now = _utcnow()
+        ttl = timedelta(seconds=int(_BILLING_CHECKOUT_ATTEMPT_TTL_SEC))
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            billing = _normalize_billing_state(
+                org.get("billing"),
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            # Guard: existing subscription — route the user to the Portal.
+            existing_sub = str(billing.get("stripeSubscriptionId") or "").strip()
+            existing_status = str(billing.get("status") or "").strip().lower()
+            if existing_sub and existing_status in {"active", "past_due", "trialing"}:
+                return {"action": "already_subscribed"}
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            exp = pending.get("expiresAt") if isinstance(pending, dict) else None
+            pending_live = (
+                isinstance(pending, dict)
+                and isinstance(exp, datetime)
+                and now < exp
+                and bool(pending.get("attemptId"))
+            )
+            if pending_live:
+                if (
+                    str(pending.get("planKey") or "").lower() == clean_plan
+                    and str(pending.get("interval") or "").lower() == clean_interval
+                ):
+                    return {
+                        "action": "reuse",
+                        "attemptId": pending["attemptId"],
+                        "sessionId": pending.get("sessionId"),
+                        "sessionUrl": pending.get("sessionUrl"),
+                    }
+                return {"action": "pending_different_plan"}
+            # Create a new attempt. The attemptId is the stable logical
+            # idempotency key — retries after an uncertain network
+            # outcome use the same value.
+            attempt_id = f"chkatt_{uuid4().hex}"
+            billing["pendingCheckoutAttempt"] = {
+                "attemptId": attempt_id,
+                "planKey": clean_plan,
+                "interval": clean_interval,
+                "createdAt": now,
+                "expiresAt": now + ttl,
+                "sessionId": None,
+                "sessionUrl": None,
+            }
+            org["billing"] = billing
+            org["updatedAt"] = now
+            return {"action": "create", "attemptId": attempt_id}
+
+    def record_checkout_attempt_session(
+        self,
+        *,
+        org_id: str,
+        attempt_id: str,
+        session_id: str,
+        session_url: str,
+    ) -> None:
+        """Persist the Stripe-returned session info on the pending
+        attempt. Called by the route AFTER
+        `client.create_checkout_session` succeeds. If the attempt no
+        longer matches (e.g. was cleared by `checkout.session.completed`
+        or replaced by a newer request), this is a silent no-op — the
+        latest state wins."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            billing = dict(org.get("billing") or {})
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            if not isinstance(pending, dict):
+                return
+            if str(pending.get("attemptId") or "") != str(attempt_id or ""):
+                return
+            pending = dict(pending)
+            pending["sessionId"] = str(session_id or "")
+            pending["sessionUrl"] = str(session_url or "")
+            billing["pendingCheckoutAttempt"] = pending
+            org["billing"] = billing
+            org["updatedAt"] = _utcnow()
+
     def try_mark_billing_event(
         self,
         *,
@@ -1580,19 +1709,92 @@ class InMemoryMultiChurchStore:
         event_type: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        """Legacy mark-at-start dedup. Preserved as a thin wrapper over
+        the claim/complete pair so callers that have NOT been migrated
+        continue to work: TRUE preserves the old "fresh" meaning while
+        completing the event immediately (prior semantics). New code
+        should use `try_claim_billing_event` + `complete_billing_event`.
+        """
+        status = self.try_claim_billing_event(
+            event_id=event_id, event_type=event_type, payload=payload,
+        )
+        if status == "fresh":
+            self.complete_billing_event(event_id=event_id)
+            return True
+        return False
+
+    def try_claim_billing_event(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Claim-and-complete dedup. Returns:
+          - "fresh"      — caller holds the lease; MUST call
+                           `complete_billing_event(event_id)` after
+                           successful billing persistence. If the caller
+                           raises before completing, the lease stays
+                           PENDING until it ages past
+                           `BILLING_EVENT_LEASE_SEC`, at which point a
+                           future claim can reclaim it.
+          - "deduped"    — a prior delivery already marked this event
+                           COMPLETED; the caller can short-circuit.
+          - "concurrent" — a prior delivery holds an active (non-aged)
+                           claim; the caller should refuse so Stripe can
+                           retry after back-off.
+        """
         clean_event_id = _clean_token(event_id)
         if not clean_event_id:
             raise ValueError("invalid_event_id")
+        now = _utcnow()
         with self._lock:
-            if clean_event_id in self._billing_events:
-                return False
-            self._billing_events[clean_event_id] = {
-                "eventId": clean_event_id,
-                "eventType": str(event_type or "").strip(),
-                "payload": dict(payload or {}),
-                "createdAt": _utcnow(),
-            }
-            return True
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
+                self._billing_events[clean_event_id] = {
+                    "eventId": clean_event_id,
+                    "eventType": str(event_type or "").strip(),
+                    "payload": dict(payload or {}),
+                    "status": "pending",
+                    "claimedAt": now,
+                    "createdAt": now,
+                }
+                return "fresh"
+            if str(rec.get("status") or "").lower() == "completed":
+                return "deduped"
+            claimed_at = rec.get("claimedAt")
+            if isinstance(claimed_at, datetime):
+                age = (now - claimed_at).total_seconds()
+                if age < _BILLING_EVENT_LEASE_SEC:
+                    return "concurrent"
+            # Lease aged out — reclaim.
+            rec["status"] = "pending"
+            rec["claimedAt"] = now
+            return "fresh"
+
+    def complete_billing_event(self, *, event_id: str) -> None:
+        """Mark the claim COMPLETED. Idempotent: a redundant call on an
+        already-completed event is a no-op."""
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        now = _utcnow()
+        with self._lock:
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
+                # No claim to complete — write a defensive terminal record.
+                self._billing_events[clean_event_id] = {
+                    "eventId": clean_event_id,
+                    "eventType": "",
+                    "payload": {},
+                    "status": "completed",
+                    "claimedAt": now,
+                    "completedAt": now,
+                    "createdAt": now,
+                }
+                return
+            rec["status"] = "completed"
+            rec["completedAt"] = now
 
     def get_org_billing_limits(
         self,
@@ -4403,6 +4605,114 @@ class FirestoreMultiChurchStore:
                 return snap.id
         return None
 
+    def claim_checkout_attempt(
+        self,
+        *,
+        org_id: str,
+        plan_key: str,
+        interval: str,
+    ) -> Dict[str, Any]:
+        """fix-batch-2: Firestore implementation. See
+        InMemoryMultiChurchStore.claim_checkout_attempt for the contract.
+        Transactional read-decide-write so concurrent callers see the
+        serialized result."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_plan = str(plan_key or "").strip().lower()
+        clean_interval = str(interval or "").strip().lower() or "month"
+        now = _utcnow()
+        ttl = timedelta(seconds=int(_BILLING_CHECKOUT_ATTEMPT_TTL_SEC))
+        org_ref = self._org_ref(clean_org_id)
+
+        @gcf_firestore.transactional
+        def _claim(tx: Any) -> Dict[str, Any]:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org = snap.to_dict() or {}
+            billing = _normalize_billing_state(
+                org.get("billing"),
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            existing_sub = str(billing.get("stripeSubscriptionId") or "").strip()
+            existing_status = str(billing.get("status") or "").strip().lower()
+            if existing_sub and existing_status in {"active", "past_due", "trialing"}:
+                return {"action": "already_subscribed"}
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            exp = pending.get("expiresAt") if isinstance(pending, dict) else None
+            pending_live = (
+                isinstance(pending, dict)
+                and isinstance(exp, datetime)
+                and now < exp
+                and bool(pending.get("attemptId"))
+            )
+            if pending_live:
+                if (
+                    str(pending.get("planKey") or "").lower() == clean_plan
+                    and str(pending.get("interval") or "").lower() == clean_interval
+                ):
+                    return {
+                        "action": "reuse",
+                        "attemptId": pending["attemptId"],
+                        "sessionId": pending.get("sessionId"),
+                        "sessionUrl": pending.get("sessionUrl"),
+                    }
+                return {"action": "pending_different_plan"}
+            attempt_id = f"chkatt_{uuid4().hex}"
+            billing["pendingCheckoutAttempt"] = {
+                "attemptId": attempt_id,
+                "planKey": clean_plan,
+                "interval": clean_interval,
+                "createdAt": now,
+                "expiresAt": now + ttl,
+                "sessionId": None,
+                "sessionUrl": None,
+            }
+            tx.update(org_ref, {"billing": billing, "updatedAt": now})
+            return {"action": "create", "attemptId": attempt_id}
+
+        return _claim(self._db.transaction())
+
+    def record_checkout_attempt_session(
+        self,
+        *,
+        org_id: str,
+        attempt_id: str,
+        session_id: str,
+        session_url: str,
+    ) -> None:
+        """Firestore counterpart to the in-memory record. Transactional
+        so a late-arriving record doesn't overwrite a newer attempt."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not attempt_id:
+            return
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+
+        @gcf_firestore.transactional
+        def _record(tx: Any) -> None:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org = snap.to_dict() or {}
+            billing = dict(org.get("billing") or {})
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            if not isinstance(pending, dict):
+                return
+            if str(pending.get("attemptId") or "") != str(attempt_id or ""):
+                return
+            pending = dict(pending)
+            pending["sessionId"] = str(session_id or "")
+            pending["sessionUrl"] = str(session_url or "")
+            billing["pendingCheckoutAttempt"] = pending
+            tx.update(org_ref, {"billing": billing, "updatedAt": now})
+
+        _record(self._db.transaction())
+
     def try_mark_billing_event(
         self,
         *,
@@ -4410,23 +4720,92 @@ class FirestoreMultiChurchStore:
         event_type: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        """Legacy wrapper. See InMemoryMultiChurchStore.try_mark_billing_event."""
+        status = self.try_claim_billing_event(
+            event_id=event_id, event_type=event_type, payload=payload,
+        )
+        if status == "fresh":
+            self.complete_billing_event(event_id=event_id)
+            return True
+        return False
+
+    def try_claim_billing_event(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Claim-and-complete webhook dedup. See
+        InMemoryMultiChurchStore.try_claim_billing_event for the
+        contract. Runs the three-way decision inside a single
+        Firestore transaction so concurrent deliveries cannot both
+        receive 'fresh'."""
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        ref = self._billing_event_ref(clean_event_id)
+        now = _utcnow()
+        lease_sec = float(_BILLING_EVENT_LEASE_SEC)
+
+        @gcf_firestore.transactional
+        def _claim(tx: Any) -> str:
+            snap = ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                tx.create(
+                    ref,
+                    {
+                        "eventId": clean_event_id,
+                        "eventType": str(event_type or "").strip(),
+                        "payload": dict(payload or {}),
+                        "status": "pending",
+                        "claimedAt": now,
+                        "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                    },
+                )
+                return "fresh"
+            rec = snap.to_dict() or {}
+            if str(rec.get("status") or "").lower() == "completed":
+                return "deduped"
+            claimed_at = rec.get("claimedAt")
+            if isinstance(claimed_at, datetime):
+                age = (now - claimed_at).total_seconds()
+                if age < lease_sec:
+                    return "concurrent"
+            # Lease aged out — reclaim.
+            tx.update(
+                ref,
+                {
+                    "status": "pending",
+                    "claimedAt": now,
+                    "eventType": str(event_type or "").strip() or rec.get("eventType") or "",
+                    "payload": dict(payload or rec.get("payload") or {}),
+                },
+            )
+            return "fresh"
+
+        return _claim(self._db.transaction())
+
+    def complete_billing_event(self, *, event_id: str) -> None:
         clean_event_id = _clean_token(event_id)
         if not clean_event_id:
             raise ValueError("invalid_event_id")
         ref = self._billing_event_ref(clean_event_id)
         try:
-            ref.create(
+            ref.set(
                 {
-                    "eventId": clean_event_id,
-                    "eventType": str(event_type or "").strip(),
-                    "payload": dict(payload or {}),
-                    "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "status": "completed",
+                    "completedAt": gcf_firestore.SERVER_TIMESTAMP,
                 },
+                merge=True,
                 timeout=_FS_TIMEOUT,
             )
-        except gcf_api_exceptions.AlreadyExists:
-            return False
-        return True
+        except Exception:
+            # Completion is best-effort; the next delivery will still
+            # see this event as pending (within lease) or dedupe once
+            # it writes successfully elsewhere. Do not fail the
+            # webhook on this write.
+            raise
 
     def get_org_billing_limits(
         self,

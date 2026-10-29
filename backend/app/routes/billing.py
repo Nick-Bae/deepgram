@@ -146,10 +146,20 @@ def _stripe_client() -> StripeBillingClient:
 
 
 def _resolve_plan_from_price_id(price_id: str, *, fallback_plan_key: str) -> str:
+    """Resolve a Stripe `price_...` id to a plan key by consulting BOTH
+    the monthly and annual price-id mappings. A customer who upgrades or
+    downgrades across intervals via the Customer Portal receives a
+    `customer.subscription.updated` carrying the NEW interval's price id;
+    without the annual-map lookup the resolver would fall back to the
+    stale caller-provided plan key.
+    """
     clean = _clean_price_id(price_id)
     if not clean:
         return plan_spec(fallback_plan_key).key
     for plan_key, configured_price in BILLING_CONFIG.stripe_price_ids.items():
+        if _clean_price_id(configured_price) and _clean_price_id(configured_price) == clean:
+            return plan_key
+    for plan_key, configured_price in BILLING_CONFIG.stripe_price_ids_annual.items():
         if _clean_price_id(configured_price) and _clean_price_id(configured_price) == clean:
             return plan_key
     return plan_spec(fallback_plan_key).key
@@ -598,6 +608,45 @@ def create_checkout_session(
     if not _clean(BILLING_CONFIG.stripe_secret_key):
         raise HTTPException(status_code=503, detail="billing_not_configured")
 
+    # fix-batch-2: duplicate-subscription prevention + stable idempotency.
+    # `claim_checkout_attempt` is a single transactional read-decide-write
+    # that serializes concurrent callers on the same org and returns one
+    # of four actions.
+    try:
+        claim = multichurch_store.claim_checkout_attempt(
+            org_id=body.orgId,
+            plan_key=target_plan.key,
+            interval=body.interval,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "org_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
+
+    if claim.get("action") == "already_subscribed":
+        # Existing subscribers manage plan via `change_plan` or the Portal,
+        # not a second checkout — prevents H1.
+        raise HTTPException(status_code=409, detail="subscription_already_active")
+    if claim.get("action") == "pending_different_plan":
+        # A pending non-expired attempt exists for a DIFFERENT plan or
+        # interval. Protects against accidental mid-attempt plan switches
+        # creating a second Stripe session on the same customer.
+        raise HTTPException(status_code=409, detail="pending_checkout_different_plan")
+    if claim.get("action") == "reuse":
+        reused_url = _clean(claim.get("sessionUrl"))
+        reused_id = _clean(claim.get("sessionId"))
+        if reused_url and reused_id:
+            return {"url": reused_url, "sessionId": reused_id, "reused": True}
+        # If a prior attempt existed but we never persisted the Stripe
+        # session (e.g. the earlier POST crashed between claim and record),
+        # the attemptId is still valid: fall through and let Stripe return
+        # the already-cached session via the Idempotency-Key.
+    attempt_id = _clean(claim.get("attemptId"))
+    if not attempt_id:
+        # Defensive: should not happen for action in {"create","reuse"}.
+        raise HTTPException(status_code=500, detail="billing_profile_fetch_failed")
+
     try:
         billing = multichurch_store.get_org_billing_profile(org_id=body.orgId)
     except ValueError as exc:
@@ -629,6 +678,7 @@ def create_checkout_session(
             trial_days=0,
             allow_no_payment_method=False,
             metadata={"orgId": body.orgId, "planKey": target_plan.key, "interval": body.interval, "requestedByUid": user.uid},
+            idempotency_key=attempt_id,
         )
     except StripeClientError as exc:
         # If the stored Stripe customer belongs to a different account/mode, recreate and retry once.
@@ -649,6 +699,7 @@ def create_checkout_session(
                     trial_days=0,
                     allow_no_payment_method=False,
                     metadata={"orgId": body.orgId, "planKey": target_plan.key, "interval": body.interval, "requestedByUid": user.uid},
+                    idempotency_key=attempt_id,
                 )
             except StripeClientError as retry_exc:
                 logger.warning("stripe_checkout_failed (retry) org=%s: %s", body.orgId, retry_exc)
@@ -661,6 +712,17 @@ def create_checkout_session(
     session_id = _clean((session or {}).get("id"))
     if not checkout_url or not session_id:
         raise HTTPException(status_code=502, detail="stripe_checkout_session_failed")
+    # Persist the Stripe-returned session so future retries with the same
+    # logical attempt (same user, same plan/interval, within TTL) reuse it.
+    try:
+        multichurch_store.record_checkout_attempt_session(
+            org_id=body.orgId,
+            attempt_id=attempt_id,
+            session_id=session_id,
+            session_url=checkout_url,
+        )
+    except Exception:
+        logger.exception("record_checkout_attempt_session_failed org=%s attempt=%s", body.orgId, attempt_id)
     return {"url": checkout_url, "sessionId": session_id}
 
 
@@ -906,8 +968,14 @@ async def stripe_webhook(
     if not isinstance(payload_obj, dict):
         payload_obj = {}
 
+    # fix-batch-1: claim-and-complete replaces mark-at-start dedup.
+    #   - "fresh"      → we hold the lease; process + complete at end.
+    #   - "deduped"    → prior delivery already COMPLETED. Safe to return.
+    #   - "concurrent" → prior delivery holds an active lease. Return 409
+    #                    so Stripe retries after its back-off (prevents
+    #                    double-persistence under racing deliveries).
     try:
-        fresh = multichurch_store.try_mark_billing_event(
+        claim = multichurch_store.try_claim_billing_event(
             event_id=event_id,
             event_type=event_type,
             payload={"type": event_type},
@@ -917,8 +985,12 @@ async def stripe_webhook(
         if detail in {"invalid_event_id", "invalid_event_type"}:
             raise HTTPException(status_code=400, detail=detail) from exc
         raise HTTPException(status_code=400, detail="invalid_webhook_event") from exc
-    if not fresh:
+    if claim == "deduped":
         return {"ok": True, "eventId": event_id, "deduped": True}
+    if claim == "concurrent":
+        # 409 is a non-2xx that Stripe retries. The in-flight sibling
+        # delivery completes first; the retry then finds "deduped".
+        raise HTTPException(status_code=409, detail="webhook_concurrent_delivery")
 
     org_id = _resolve_org_id_from_event(event_type, payload_obj)
     if not org_id:
@@ -939,6 +1011,11 @@ async def stripe_webhook(
     metadata = payload_obj.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
 
+    # Notifications are collected here and dispatched AFTER successful
+    # billing persistence (see fix-batch-1 — webhook retry safety). Each
+    # entry is passed verbatim to `_send_billing_email`.
+    pending_emails: list[dict[str, Any]] = []
+
     if event_type == "checkout.session.completed":
         customer_id = _clean(payload_obj.get("customer"))
         subscription_id = _clean(payload_obj.get("subscription"))
@@ -950,8 +1027,27 @@ async def stripe_webhook(
         next_billing["planKey"] = requested_plan.key
         next_billing.setdefault("limits", {})
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
+        # Clear the pending-checkout-attempt record now that the session
+        # completed. Preserves the attempt-reuse behavior in
+        # `create_checkout_session` without leaking stale state.
+        if next_billing.get("pendingCheckoutAttempt"):
+            next_billing["pendingCheckoutAttempt"] = None
+        # fix-batch-3 (M3): monthly-minute limit was previously only
+        # synced in the customer.subscription.* branch, leaving a window
+        # where plan key + service-key cap advanced but the minute cap
+        # stayed on the trial default. Sync here too.
+        try:
+            multichurch_store.set_org_monthly_minutes_limit(
+                org_id=org_id,
+                monthly_minutes=requested_plan.monthly_minutes,
+            )
+        except Exception:
+            logger.exception(
+                "set_org_monthly_minutes_limit_failed org=%s plan=%s event=checkout.session.completed",
+                org_id, requested_plan.key,
+            )
         if requested_plan.key != "trial":
-            _send_billing_email("subscription_started", org_id=org_id, plan_key=requested_plan.key)
+            pending_emails.append({"event": "subscription_started", "plan_key": requested_plan.key})
 
     elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
         next_billing = _merge_subscription_snapshot(
@@ -960,8 +1056,16 @@ async def stripe_webhook(
             now=now,
         )
         stripe_status = _clean(next_billing.get("status")).lower()
-        requested_plan = plan_spec(str(metadata.get("planKey") or next_billing.get("planKey") or "trial"))
-        next_billing["planKey"] = requested_plan.key
+        # fix-batch-3 (H3): the previous override — `metadata.get("planKey")
+        # or next_billing.get("planKey")` — allowed a STALE
+        # `subscription.metadata.planKey` (set at the original checkout and
+        # never updated by the Customer Portal) to overwrite the
+        # price-id-resolved plan key just set by
+        # `_merge_subscription_snapshot`. Trust the price-id-resolved
+        # value; `_resolve_plan_from_price_id` now consults both monthly
+        # and annual mappings and falls back to the stored planKey only
+        # when the price_id is unrecognised.
+        requested_plan = plan_spec(str(next_billing.get("planKey") or "trial"))
         next_billing.setdefault("limits", {})
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
 
@@ -985,13 +1089,13 @@ async def stripe_webhook(
             next_billing["status"] = "canceled"
             next_billing["trialEndsAt"] = None
             stripe_status = "canceled"
-            _send_billing_email("subscription_canceled", org_id=org_id)
+            pending_emails.append({"event": "subscription_canceled"})
         elif event_type == "customer.subscription.updated":
             # Send cancellation email immediately when user sets cancel_at_period_end=true
             # (e.g. via Customer Portal). The subscription.deleted event fires much later.
             just_set_cancel = bool(payload_obj.get("cancel_at_period_end")) and not bool(billing.get("cancelAtPeriodEnd"))
             if just_set_cancel:
-                _send_billing_email("subscription_canceled", org_id=org_id)
+                pending_emails.append({"event": "subscription_canceled"})
         if stripe_status == "past_due":
             if not next_billing.get("graceEndsAt"):
                 next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
@@ -1005,7 +1109,7 @@ async def stripe_webhook(
         if current_status in {"past_due", "incomplete", "unpaid"}:
             next_billing["status"] = "active"
             next_billing["graceEndsAt"] = None
-            _send_billing_email("payment_recovered", org_id=org_id)
+            pending_emails.append({"event": "payment_recovered"})
 
     elif event_type == "invoice.payment_failed":
         # Only act on subscription invoices; ignore setup intents and one-time charges.
@@ -1014,7 +1118,7 @@ async def stripe_webhook(
             # Only set graceEndsAt on the first failure; don't reset on each Stripe retry.
             if not next_billing.get("graceEndsAt"):
                 next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
-                _send_billing_email("payment_failed", org_id=org_id)
+                pending_emails.append({"event": "payment_failed"})
 
     next_billing.setdefault("entitlements", {})
     next_billing["entitlements"]["canStartService"] = _can_start_from_status(
@@ -1023,8 +1127,19 @@ async def stripe_webhook(
         now=now,
     )
 
+    # Persist first; if this raises, the event is NOT completed and a
+    # future Stripe retry can rerun the handler (fix-batch-1).
     try:
         multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
+
+    # Mark the event completed only after successful persistence.
+    multichurch_store.complete_billing_event(event_id=event_id)
+
+    # Notifications fire ONLY after the write succeeded, so a failed
+    # persistence followed by a Stripe retry doesn't double-email.
+    for item in pending_emails:
+        _send_billing_email(org_id=org_id, **item)
+
     return {"ok": True, "eventId": event_id}

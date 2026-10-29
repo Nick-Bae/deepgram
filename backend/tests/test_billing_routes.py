@@ -55,6 +55,7 @@ class _FakeStripeClient:
         trial_days: int,
         allow_no_payment_method: bool = True,
         metadata: dict | None = None,
+        idempotency_key: str | None = None,
     ) -> dict:
         return {
             "id": "cs_test_123",
@@ -66,6 +67,7 @@ class _FakeStripeClient:
             "cancel_url": cancel_url,
             "allow_no_payment_method": allow_no_payment_method,
             "metadata": metadata or {},
+            "idempotency_key": idempotency_key,
         }
 
     def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> dict:
@@ -310,6 +312,7 @@ class BillingRouteTests(unittest.TestCase):
                 trial_days: int,
                 allow_no_payment_method: bool = True,
                 metadata: dict | None = None,
+                idempotency_key: str | None = None,
             ) -> dict:
                 if customer_id == "cus_old_live_mode":
                     raise StripeClientError("stripe_http_400:No such customer: 'cus_old_live_mode'")
@@ -321,6 +324,7 @@ class BillingRouteTests(unittest.TestCase):
                     trial_days=trial_days,
                     allow_no_payment_method=allow_no_payment_method,
                     metadata=metadata,
+                    idempotency_key=idempotency_key,
                 )
 
         org_id = self._bootstrap_owner(uid="owner-billing-2b", slug="billing-route-b2", name="Billing Route B2")

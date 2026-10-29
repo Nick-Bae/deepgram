@@ -5,33 +5,53 @@
 **Scope**: Stripe integration — correctness of checkout, subscription lifecycle, plan changes, cancellation, webhook delivery, authorization, enforcement, and billing-state consistency.
 **Isolation**: in-memory `InMemoryMultiChurchStore`, `_FakeStripeClient` for all Stripe calls, `BillingConfig` test-fixture (empty `STRIPE_SECRET_KEY` at import, patched to `"sk_test_audit"` per-test). Resend bail: `email_service` short-circuits on missing `RESEND_API_KEY` (logs `email_skipped` warning; no HTTP). No `backend/.env` loading in the tests. No live Stripe credentials, no production Firestore/Redis, no outbound email.
 
-Stripe API version pinned to **`2023-10-16`** (`backend/app/billing/stripe_client.py:20`). Custom thin HTTP client over `httpx`, not the official SDK.
+Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
+
+## Fix batch 1 — applied on this branch (local only; nothing pushed)
+
+Three fix sub-batches landed in commit `prep/stripe-billing-audit` on top of `fc147a07` (the audit-tests + review-doc commit). Nothing is pushed, merged, deployed, or configured.
+
+### Sub-batch (A) — Webhook retry safety (addresses the newly-added **H5** finding)
+- `backend/app/services/multichurch_store.py` — new `try_claim_billing_event(event_id, event_type, payload) → {"fresh","deduped","concurrent"}` + `complete_billing_event(event_id)` on BOTH stores (in-memory + Firestore). Firestore impl runs inside `@gcf_firestore.transactional`. `BILLING_EVENT_LEASE_SEC` env-tunable (default 60 s). Legacy `try_mark_billing_event` preserved as a claim-then-complete wrapper.
+- `backend/app/routes/billing.py::stripe_webhook` — reorganised so (1) claim happens up front and may return `409 webhook_concurrent_delivery` for parallel sibling deliveries, (2) emails are collected in a `pending_emails` list and dispatched ONLY after `set_org_billing_profile` succeeds, (3) `complete_billing_event` is the LAST step. If persistence raises, the handler returns 400 and the lease stays pending; after `BILLING_EVENT_LEASE_SEC`, Stripe's retry reclaims and runs to completion.
+
+### Sub-batch (B) — Duplicate-subscription prevention + stable idempotency (addresses **H1** + **H2** together)
+- `backend/app/services/multichurch_store.py` — new `claim_checkout_attempt(org_id, plan_key, interval)` returning one of `{"already_subscribed","pending_different_plan","reuse","create"}` and persisting a `pendingCheckoutAttempt` field on the org's billing. Transactional on both stores. `BILLING_CHECKOUT_ATTEMPT_TTL_SEC` env-tunable (default 24 h to match Stripe's Checkout Session default). Companion `record_checkout_attempt_session(org_id, attempt_id, session_id, session_url)` persists the Stripe-returned URL on the attempt record only if it matches the current attempt id.
+- `backend/app/routes/billing.py::create_checkout_session` — refuses with 409 if a current subscription is active-shaped; refuses with 409 if a pending attempt for a different plan is in flight; reuses the prior session URL/ID when the same plan is re-requested within TTL; otherwise generates a stable `chkatt_<uuid>` and passes it to Stripe as the `Idempotency-Key`. Retries after an uncertain network outcome use the SAME attempt id. A new logical attempt (e.g. after TTL expiry or after `checkout.session.completed` clears the pending record) gets a new id.
+- `backend/app/billing/stripe_client.py::create_checkout_session` — accepts `idempotency_key: Optional[str]` and threads it to the HTTP layer.
+
+### Sub-batch (C) — Plan consistency (addresses **H3** + **M3**)
+- `backend/app/routes/billing.py::_resolve_plan_from_price_id` — now consults BOTH `stripe_price_ids` AND `stripe_price_ids_annual` so a Portal-driven monthly↔annual change resolves correctly.
+- `backend/app/routes/billing.py::stripe_webhook` (`customer.subscription.*` branch) — the stale `metadata.get("planKey")` override removed. The plan key resolved from the price_id by `_merge_subscription_snapshot` is now authoritative. Prevents H3's internal-inconsistency (`priceId=new, planKey=stale`).
+- `backend/app/routes/billing.py::stripe_webhook` (`checkout.session.completed` branch) — adds `multichurch_store.set_org_monthly_minutes_limit` and clears any now-superseded `pendingCheckoutAttempt`. Prevents M3's "service-key cap advanced, monthly-minutes cap stale".
+
+Note on scope: `change_plan` STILL reads only `BILLING_CONFIG.stripe_price_ids`, not the annual map (S7 below). Explicitly left pending per operator directive — annual plan-change policy and Stripe-side existing-schedule behaviour are deferred.
 
 ## Test commands and results
 
-Baseline (existing suites):
+Combined (baseline + regression) on the fix branch:
 
 ```
 cd backend
-backend/venv/bin/python -m pytest tests/test_billing_routes.py tests/test_billing_entitlements.py -q
-28 passed in 1.19s
-```
-
-Audit reproductions (added `tests/test_billing_stripe_audit.py`):
-
-```
-backend/venv/bin/python -m pytest tests/test_billing_stripe_audit.py -v
-8 passed in 0.60s
-```
-
-Combined (baseline + audit, same session):
-
-```
 backend/venv/bin/python -m pytest tests/test_billing_routes.py tests/test_billing_entitlements.py tests/test_billing_stripe_audit.py -q
-36 passed in 0.85s
+41 passed in 0.74s
 ```
 
-Every assertion in `test_billing_stripe_audit.py` is a positive reproduction of the behavior described below. No tests were weakened or skipped.
+Fix-branch breakdown:
+- `tests/test_billing_routes.py` — 13 pre-existing (unchanged in substance; the test-local `_FakeStripeClient` accepts the new `idempotency_key` kwarg).
+- `tests/test_billing_entitlements.py` — 15 pre-existing (unchanged).
+- `tests/test_billing_stripe_audit.py` — 13 regression tests (rewritten to assert INTENDED post-fix behavior).
+
+Base-commit validation (`ac32110c`, fresh worktree, same regression file):
+
+```
+backend/venv/bin/python -m pytest tests/test_billing_stripe_audit.py -q --tb=no
+9 failed, 4 passed in 1.03s
+```
+
+The 9 failures on base map 1:1 to the HIGH / MEDIUM findings: H1, H2 (2 tests), H2b, H3 (2 tests), M3, H5, H5b-concurrent. The 4 passes on base are tests that document behaviour unchanged by this fix (`H5b::test_completed_event_is_deduped` — pre-existing idempotency works; `M1_RepeatedChangePlanAttempts` — only probes local no-release behaviour which is unchanged; `M4` + `M4b` edge/positive cases — correctly handled on base too). Each regression test is a specific assertion of intended behavior; none are weakened or skipped on the fix branch, and none pass trivially on base.
+
+Firestore atomicity: `backend/tests/test_billing_webhook_claim_firestore.py` (added below) exercises `try_claim_billing_event` through the Firestore transactional path. The module skips on any environment without `FIRESTORE_EMULATOR_HOST` set — the CI `firestore-emulator-tests` job runs it; local runs without Java-based emulator skip (operator note: Firestore emulator requires a Java 8+ JRE on PATH; not available in this audit session).
 
 ---
 
@@ -121,13 +141,13 @@ Every assertion in `test_billing_stripe_audit.py` is a positive reproduction of 
 
 ## 2. Confirmed medium-severity risks
 
-### M1 — `change_plan` does not cancel a prior pending schedule before creating a new one
+### M1 (CORRECTED) — `change_plan` does not RELEASE a prior pending schedule before attempting to create a new one
 
-**Impact**: MEDIUM — repeated downgrade attempts create orphan subscription schedules on Stripe. The local billing profile only tracks the most recent `pendingScheduleId`; prior schedules remain active on Stripe and can fire unexpected plan transitions.
+**Impact (corrected)**: MEDIUM. The local behaviour is unambiguous: `change_plan` does not call `cancel_subscription_schedule` on an existing `pendingScheduleId` before invoking `/subscription_schedules?from_subscription=<sub>`. **What Stripe does with the second create call is a Stripe-side question**: Stripe refuses to create a second subscription schedule on a subscription that already has a non-released schedule attached, so the second call may fail with an HTTP 400 and this backend surfaces `stripe_schedule_failed` to the user. The earlier audit text "two schedules created on Stripe" was overstated — only ONE schedule-create ATTEMPT per request is modelled; the Stripe-side outcome depends on sandbox verification.
 
 - **File / line**: `backend/app/routes/billing.py:815-836` (`change_plan`, downgrade branch).
-- **Reproduction**: `test_billing_stripe_audit.py::M1_ChangePlanDoesNotCancelPendingSchedule` — two calls to `change_plan` create schedules `sched_1` and `sched_2`; no `cancel_subscription_schedule` call is made.
-- **Proposed fix** (not applied): at the top of the downgrade branch, if `billing.get("pendingScheduleId")` is set, call `client.cancel_subscription_schedule(schedule_id=<prior>)` first, then proceed.
+- **Reproduction**: `test_billing_stripe_audit.py::M1_RepeatedChangePlanAttempts` — asserts the LOCAL fact that no release call is made before a second create attempt. The Stripe response (whether the second create succeeds or 400s) is NOT asserted by this test and is deferred to the sandbox scenarios below.
+- **Proposed fix** (NOT applied in fix batch 1 per operator scope): at the top of the downgrade branch, if `billing.get("pendingScheduleId")` is set, call `client.cancel_subscription_schedule(schedule_id=<prior>)` first (idempotent on an already-released schedule), then proceed. This also prevents the user-facing `stripe_schedule_failed` noise when a customer rapidly re-submits the same downgrade.
 
 ### M3 — `checkout.session.completed` sets `maxServiceKeys` but does NOT sync `maxMinutesPerMonth`
 
@@ -137,26 +157,42 @@ Every assertion in `test_billing_stripe_audit.py` is a positive reproduction of 
 - **Reproduction**: `test_billing_stripe_audit.py::M3_CheckoutCompletedDoesNotSyncMonthlyMinutes` — after `checkout.session.completed` for Growth, `maxServiceKeys=12` (correct) but `org.maxMinutesPerMonth` remains at the bootstrap default (500) rather than `1800` (Growth plan).
 - **Proposed fix** (not applied): add a `set_org_monthly_minutes_limit(org_id=org_id, monthly_minutes=requested_plan.monthly_minutes)` call in the `checkout.session.completed` branch, matching the `customer.subscription.*` branch at line 977.
 
-### M4 — Out-of-order webhook: `customer.subscription.created` before `checkout.session.completed` is silently lost
+### H5 — Premature webhook deduplication: failed billing writes become permanently lost
 
-**Impact**: MEDIUM — Stripe does not guarantee webhook ordering. If `customer.subscription.created` arrives before `checkout.session.completed`, `_resolve_org_id_from_event` cannot match (no `orgId` metadata on bare subscription objects; no `stripeCustomerId` stored on any org yet), so the handler returns `{"unmatched": true, "ok": true}`. The webhook idempotency store (`try_mark_billing_event`) has already marked the event as processed, so Stripe's retry (if any) is deduped. The subscription snapshot (`currentPeriodStart/End`, status, `cancelAtPeriodEnd`) is lost until a FUTURE `customer.subscription.updated` or `invoice.payment_succeeded` arrives.
+**Impact**: HIGH — the webhook handler calls `try_mark_billing_event(event_id, ...)` BEFORE attempting the billing write. If the write fails (e.g. Firestore throws, the normalisation raises, the org doc has been reset mid-flight), the handler raises `HTTPException(400)` and returns a non-2xx to Stripe. Stripe retries. The dedup store already recorded the event, so the retry sees `fresh=False` and returns `deduped=True` — the retry never runs the billing update. The intended change (status transition, grace timer, plan key, etc.) is lost permanently; nothing emits a signal that anything is wrong.
 
-- **File / line**: `backend/app/routes/billing.py:909-925` (webhook idempotency ⨯ org-resolution ordering). The `try_mark_billing_event` call at line 910 fires BEFORE the org-resolution attempt at line 923, so a successful dedup write happens even if the org can't be found.
-- **Reproduction**: `test_billing_stripe_audit.py::M4_OutOfOrderSubscriptionBeforeCheckout` — delivers `customer.subscription.created` first, confirms `unmatched=true`, then confirms a redelivery of the same event is `deduped=true` (not retried for real), then confirms the subsequent `checkout.session.completed` sets `stripeCustomerId`/`stripeSubscriptionId` but leaves `currentPeriodStart/End` as `None`.
-- **Proposed fix** (not applied, two options):
-  - Option A (preferred): defer `try_mark_billing_event` until AFTER org resolution succeeds — move it below the `_resolve_org_id_from_event` call. Unmatched events return `unmatched=true` as today but are NOT recorded as processed, so Stripe's retry can succeed later once state has caught up.
-  - Option B: on a later `checkout.session.completed` or `invoice.payment_succeeded`, call `_hydrate_billing_from_stripe(force_refresh=True)` as part of the handler so the subscription snapshot is backfilled from the Stripe API.
+- **File / line**: `backend/app/routes/billing.py:909-925` on base — `try_mark_billing_event` is called immediately after signature verification and payload decode; the handler then does `_resolve_org_id_from_event` + `multichurch_store.set_org_billing_profile(...)` at the end. Any raise between the dedup mark and the final set loses the update on retry.
+- **Reproduction**: `test_billing_stripe_audit.py::H5_FailedWriteRetryIsNotDeduped` — forces `set_org_billing_profile` to raise on the first delivery, then confirms a second delivery of the same event (after lease aging) succeeds and persists the intended state.
+- **Expected**: the event must NOT be marked completed until billing persistence succeeds. Concurrent duplicate deliveries must be serialized so two parallel handlers don't both attempt a write.
+- **Fix (APPLIED on this branch — fix batch 1)**: split dedup into **claim-and-complete**. New store methods:
+  - `try_claim_billing_event(event_id, event_type, payload)` → returns `"fresh"` | `"deduped"` | `"concurrent"`.
+    - `"fresh"`: caller holds a lease (default 60 s); caller MUST call `complete_billing_event` after successful persistence.
+    - `"deduped"`: a prior delivery completed; return 200.
+    - `"concurrent"`: a prior delivery still holds a non-expired lease; return 409 so Stripe retries after its back-off. Prevents parallel double-write.
+  - `complete_billing_event(event_id)` — flips the record to `completed` with a server timestamp; idempotent.
+  - A stale lease (older than `BILLING_EVENT_LEASE_SEC`, default 60 s, env-tunable in `[15, 600]`) is reclaimed on the next delivery so a crashed handler doesn't permanently lock an event.
+  - Webhook handler reorganised: notifications collected during processing but DISPATCHED ONLY AFTER `set_org_billing_profile(...)` succeeds; `complete_billing_event(...)` is the LAST step. The legacy `try_mark_billing_event` is preserved as a wrapper (claim + immediate complete) so unmigrated callers are unaffected.
+- **Regression tests added**: `H5_FailedWriteRetryIsNotDeduped`, `H5b_ConcurrentDeliveryGetsConflict::test_second_concurrent_delivery_returns_409`, `H5b_ConcurrentDeliveryGetsConflict::test_completed_event_is_deduped` (positive-dedup still works).
+- **Firestore atomicity**: the claim-decide-write runs inside a `@gcf_firestore.transactional` function in `FirestoreMultiChurchStore.try_claim_billing_event`. In-memory success alone does not prove Firestore atomicity; the Firestore-emulator CI job (`.github/workflows/ci.yml::firestore-emulator-tests`) is the authoritative check. Local Firestore-emulator tests under `backend/tests/test_billing_webhook_claim_firestore.py` are added below the main suite with a module-level skip when `FIRESTORE_EMULATOR_HOST` is unset.
+
+### M4 (CORRECTED) — Webhook ordering: edge case only, not the normal checkout flow
+
+**Impact (corrected)**: the earlier audit characterised this as a normal-flow risk. That premise is wrong. The deployed code SETS `stripeCustomerId` on the org inside `_create_missing_stripe_customer` BEFORE calling `create_checkout_session` (`backend/app/routes/billing.py:258-278`), and the Stripe client stamps `subscription_data[metadata][orgId]` on the SUBSCRIPTION itself (`backend/app/billing/stripe_client.py:111-112`). So a `customer.subscription.created` arriving before `checkout.session.completed` resolves via EITHER the subscription-metadata `orgId` OR a lookup by `stripeCustomerId` — the handler does not drop the event. The claim covered the sentence "the subscription's `trialing/active` + `cancelAtPeriodEnd` + `currentPeriodEnd` wouldn't be set until a subsequent `subscription.updated` arrives", which was based on the wrong premise.
+
+- **Remaining EDGE case**: a subscription created OUTSIDE the standard Checkout flow (e.g. in the Stripe dashboard directly, with no `orgId` metadata, for a customer the org doesn't yet own) still returns `{"unmatched": true}`. This is the correct behaviour — the system has no way to attribute the event. Operator-reset or manually-created subscriptions must be hand-reconciled.
+- **Regression tests (positive + edge)**: `M4_WebhookEdgeCase_SubscriptionWithoutOrgIdOrKnownCustomer::test_unknown_customer_and_missing_metadata_returns_unmatched` (asserts `unmatched=true` with no state mutation), and `M4b_SubscriptionWithOrgIdMetadataMatches::test_subscription_metadata_orgid_resolves` (positive — subscription metadata lets the handler resolve the org without a prior `checkout.session.completed`).
 
 ---
 
 ## 3. Suspected risks (not individually asserted but worth operator review)
 
-- **S1 — `_lookup_customer_subscription` picks "best" subscription when multiple exist**: `backend/app/routes/billing.py:388-394` lists up to 10 subscriptions and sorts by `_subscription_sort_key` (status rank, then `-current_period_end`, then `-created_at`). If H1 or H2 above let two concurrent active subscriptions exist, the "best" pick is arbitrary. Not a defect in isolation; downstream of H1/H2.
-- **S2 — `_subscription_sort_key` tie-break**: for two `active` subscriptions with identical periods, `-created_at` picks the OLDER one. Depending on intent this may want to be the newer one. Confirm with operator.
-- **S3 — Payment-recovered email only fires on `invoice.payment_succeeded` → `active` transition** (`routes/billing.py:1003-1008`). If recovery is reflected via a `customer.subscription.updated` with `status=active` directly (e.g. operator manually fixes in Stripe dashboard), no recovery email is sent.
+- **S1 — `_lookup_customer_subscription` picks "best" subscription when multiple exist**: `backend/app/routes/billing.py:388-394` lists up to 10 subscriptions and sorts by `_subscription_sort_key` (status rank, then `-current_period_end`, then `-created_at`). Fix batch 2 prevents H1 from creating two active subscriptions, which was the primary concern.
+- **S2 — WITHDRAWN (incorrect in prior audit)**: `_pick_customer_subscription` uses Python `min(..., key=_subscription_sort_key)` with the tuple `(status_rank, -current_period_end, -created_at)`. `min` returns the SMALLEST tuple; for ties on `(status_rank, -current_period_end)`, the smallest `-created_at` is the LARGEST `created_at`, i.e. the NEWEST subscription. The earlier text claiming "picks the OLDER one" was wrong — no change needed.
+- **S3 — Payment-recovered email only fires on `invoice.payment_succeeded` → `active` transition** (`routes/billing.py:1003-1008`). If recovery is reflected via a `customer.subscription.updated` with `status=active` directly (e.g. operator manually fixes in Stripe dashboard), no recovery email is sent. Not changed in fix batch 1.
 - **S4 — Webhook signature tolerance window**: default 60 s, configurable 30–300 (`routes/billing.py:81-83`). Cloud Run cold-starts under load have been observed in the 5–15 s range; well within tolerance. No action.
 - **S5 — Trial is local-only, not Stripe-managed**: `create_checkout_session` always passes `trial_days=0` (`routes/billing.py:629,649`); the 30-day local trial lives in `multichurch_store` + `BILLING_CONFIG.trial_days`. Stripe treats the paid subscription as immediate. Design decision; documented in code; not a defect.
 - **S6 — Changing plans from `past_due` is allowed** by `change_plan` (`routes/billing.py:770`: `if current_status not in {"active", "past_due"}: raise ...`). This matches typical Stripe UX (upgrade to settle the balance), but confirm business policy.
+- **S7 — Annual plan-change path still uses only `stripe_price_ids` map in `change_plan`** (`routes/billing.py:751`). A monthly→annual change via `change_plan` would silently route to the monthly price. Fix batch 3 added annual-mapping support ONLY to the price-id→plan RESOLVER (webhook direction). The `change_plan` DIRECTION (plan→price-id) still ignores `stripe_price_ids_annual`. Explicitly left PENDING per operator directive — annual plan-change policy and the Stripe-side existing-schedule interaction are deferred.
 
 ## 4. Missing coverage
 

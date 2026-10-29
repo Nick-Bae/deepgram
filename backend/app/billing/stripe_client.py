@@ -93,6 +93,7 @@ class StripeBillingClient:
         trial_days: int,
         allow_no_payment_method: bool = True,
         metadata: Optional[Dict[str, str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "mode": "subscription",
@@ -110,7 +111,7 @@ class StripeBillingClient:
         for key, value in (metadata or {}).items():
             payload[f"metadata[{key}]"] = str(value)
             payload[f"subscription_data[metadata][{key}]"] = str(value)
-        return self._request("POST", "/checkout/sessions", data=payload)
+        return self._request("POST", "/checkout/sessions", data=payload, idempotency_key=idempotency_key)
 
     def create_billing_portal_session(self, *, customer_id: str, return_url: str) -> Dict[str, Any]:
         payload = {
