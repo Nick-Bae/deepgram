@@ -166,6 +166,14 @@ _BILLING_EVENT_LEASE_SEC = _env_int(
 _BILLING_CHECKOUT_ATTEMPT_TTL_SEC = _env_int(
     "BILLING_CHECKOUT_ATTEMPT_TTL_SEC", 24 * 3600, min_value=60, max_value=48 * 3600,
 )
+
+
+def _claim_token_for(now: datetime) -> str:
+    """Opaque token identifying a specific claim. Derived from the
+    claim's monotonic ISO timestamp; stable within a claim, differs
+    across reclaims because the reclaimer stamps a new `claimedAt`.
+    """
+    return now.isoformat().replace("+00:00", "Z")
 SERMON_PREP_BUDGETS_ENABLED = not _env_bool("DISABLE_SERMON_PREP_BUDGETS", False)
 SERMON_PREP_DEFAULT_BUDGET_USD = _env_float(
     "SERMON_PREP_DEFAULT_BUDGET_USD",
@@ -1715,11 +1723,13 @@ class InMemoryMultiChurchStore:
         completing the event immediately (prior semantics). New code
         should use `try_claim_billing_event` + `complete_billing_event`.
         """
-        status = self.try_claim_billing_event(
+        result = self.try_claim_billing_event(
             event_id=event_id, event_type=event_type, payload=payload,
         )
-        if status == "fresh":
-            self.complete_billing_event(event_id=event_id)
+        if result.get("status") == "fresh":
+            self.complete_billing_event(
+                event_id=event_id, claim_token=result.get("claimToken"),
+            )
             return True
         return False
 
@@ -1729,15 +1739,26 @@ class InMemoryMultiChurchStore:
         event_id: str,
         event_type: str,
         payload: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """Claim-and-complete dedup. Returns:
+    ) -> Dict[str, Any]:
+        """Claim-and-complete dedup. Returns a dict with:
+          - status: "fresh" | "deduped" | "concurrent"
+          - claimToken: the current claim's token (only meaningful on
+                        "fresh"; opaque to the caller — pass it back
+                        verbatim to `complete_billing_event` and
+                        `check_claim_still_held`).
+            On "fresh", claimToken is the server-side timestamp of the
+            claim (`claimedAt` ISO-8601 string). On "deduped"/
+            "concurrent" it may be None or the current holder's token;
+            callers must ignore it in those branches.
+
+        Semantics:
           - "fresh"      — caller holds the lease; MUST call
-                           `complete_billing_event(event_id)` after
-                           successful billing persistence. If the caller
-                           raises before completing, the lease stays
-                           PENDING until it ages past
-                           `BILLING_EVENT_LEASE_SEC`, at which point a
-                           future claim can reclaim it.
+                           `complete_billing_event(event_id, claim_token)`
+                           after successful billing persistence. Before
+                           persisting, callers SHOULD call
+                           `check_claim_still_held(event_id, claim_token)`
+                           to detect expired leases where another
+                           delivery has already taken over.
           - "deduped"    — a prior delivery already marked this event
                            COMPLETED; the caller can short-circuit.
           - "concurrent" — a prior delivery holds an active (non-aged)
@@ -1751,30 +1772,64 @@ class InMemoryMultiChurchStore:
         with self._lock:
             rec = self._billing_events.get(clean_event_id)
             if rec is None:
+                token = _claim_token_for(now)
                 self._billing_events[clean_event_id] = {
                     "eventId": clean_event_id,
                     "eventType": str(event_type or "").strip(),
                     "payload": dict(payload or {}),
                     "status": "pending",
                     "claimedAt": now,
+                    "claimToken": token,
                     "createdAt": now,
                 }
-                return "fresh"
+                return {"status": "fresh", "claimToken": token}
             if str(rec.get("status") or "").lower() == "completed":
-                return "deduped"
+                return {"status": "deduped", "claimToken": None}
             claimed_at = rec.get("claimedAt")
             if isinstance(claimed_at, datetime):
                 age = (now - claimed_at).total_seconds()
                 if age < _BILLING_EVENT_LEASE_SEC:
-                    return "concurrent"
+                    return {"status": "concurrent", "claimToken": None}
             # Lease aged out — reclaim.
+            token = _claim_token_for(now)
             rec["status"] = "pending"
             rec["claimedAt"] = now
-            return "fresh"
+            rec["claimToken"] = token
+            return {"status": "fresh", "claimToken": token}
 
-    def complete_billing_event(self, *, event_id: str) -> None:
-        """Mark the claim COMPLETED. Idempotent: a redundant call on an
-        already-completed event is a no-op."""
+    def check_claim_still_held(self, *, event_id: str, claim_token: str) -> bool:
+        """Boundary 1 (lease ownership): verify the passed-in token
+        still identifies the current claim. Slow workers whose lease
+        has aged out and been reclaimed by a sibling delivery MUST
+        detect this via this check BEFORE calling `set_org_billing_profile`
+        or `complete_billing_event`, otherwise their stale write
+        would overwrite the newer claim's work.
+        """
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            return False
+        with self._lock:
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
+                return False
+            if str(rec.get("status") or "").lower() == "completed":
+                return False
+            return str(rec.get("claimToken") or "") == str(claim_token or "")
+
+    def complete_billing_event(
+        self,
+        *,
+        event_id: str,
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        """Mark the claim COMPLETED. Returns True when the completion
+        was recorded as THIS claim; returns False when `claim_token` is
+        provided but does not match the current claim (a newer
+        delivery has taken over — don't overwrite its state).
+
+        Idempotent on token-less calls (the legacy wrapper from
+        `try_mark_billing_event` uses that path).
+        """
         clean_event_id = _clean_token(event_id)
         if not clean_event_id:
             raise ValueError("invalid_event_id")
@@ -1792,9 +1847,16 @@ class InMemoryMultiChurchStore:
                     "completedAt": now,
                     "createdAt": now,
                 }
-                return
+                return True
+            if claim_token is not None:
+                current_token = str(rec.get("claimToken") or "")
+                if current_token and current_token != str(claim_token):
+                    # Our lease was reclaimed. Do NOT overwrite the
+                    # newer claim's state.
+                    return False
             rec["status"] = "completed"
             rec["completedAt"] = now
+            return True
 
     def get_org_billing_limits(
         self,
@@ -4721,11 +4783,13 @@ class FirestoreMultiChurchStore:
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Legacy wrapper. See InMemoryMultiChurchStore.try_mark_billing_event."""
-        status = self.try_claim_billing_event(
+        result = self.try_claim_billing_event(
             event_id=event_id, event_type=event_type, payload=payload,
         )
-        if status == "fresh":
-            self.complete_billing_event(event_id=event_id)
+        if result.get("status") == "fresh":
+            self.complete_billing_event(
+                event_id=event_id, claim_token=result.get("claimToken"),
+            )
             return True
         return False
 
@@ -4735,7 +4799,7 @@ class FirestoreMultiChurchStore:
         event_id: str,
         event_type: str,
         payload: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> Dict[str, Any]:
         """Claim-and-complete webhook dedup. See
         InMemoryMultiChurchStore.try_claim_billing_event for the
         contract. Runs the three-way decision inside a single
@@ -4746,10 +4810,11 @@ class FirestoreMultiChurchStore:
             raise ValueError("invalid_event_id")
         ref = self._billing_event_ref(clean_event_id)
         now = _utcnow()
+        token = _claim_token_for(now)
         lease_sec = float(_BILLING_EVENT_LEASE_SEC)
 
         @gcf_firestore.transactional
-        def _claim(tx: Any) -> str:
+        def _claim(tx: Any) -> Dict[str, Any]:
             snap = ref.get(transaction=tx, timeout=_FS_TIMEOUT)
             if not snap.exists:
                 tx.create(
@@ -4760,52 +4825,93 @@ class FirestoreMultiChurchStore:
                         "payload": dict(payload or {}),
                         "status": "pending",
                         "claimedAt": now,
+                        "claimToken": token,
                         "createdAt": gcf_firestore.SERVER_TIMESTAMP,
                     },
                 )
-                return "fresh"
+                return {"status": "fresh", "claimToken": token}
             rec = snap.to_dict() or {}
             if str(rec.get("status") or "").lower() == "completed":
-                return "deduped"
+                return {"status": "deduped", "claimToken": None}
             claimed_at = rec.get("claimedAt")
             if isinstance(claimed_at, datetime):
                 age = (now - claimed_at).total_seconds()
                 if age < lease_sec:
-                    return "concurrent"
+                    return {"status": "concurrent", "claimToken": None}
             # Lease aged out — reclaim.
             tx.update(
                 ref,
                 {
                     "status": "pending",
                     "claimedAt": now,
+                    "claimToken": token,
                     "eventType": str(event_type or "").strip() or rec.get("eventType") or "",
                     "payload": dict(payload or rec.get("payload") or {}),
                 },
             )
-            return "fresh"
+            return {"status": "fresh", "claimToken": token}
 
         return _claim(self._db.transaction())
 
-    def complete_billing_event(self, *, event_id: str) -> None:
+    def check_claim_still_held(self, *, event_id: str, claim_token: str) -> bool:
+        """Boundary 1 (lease ownership): verify the current claim's
+        token matches `claim_token`. Transactional read on Firestore
+        (via `.get()` with consistent read via tx is not strictly
+        required since we only compare and do not write — a snapshot
+        read is sufficient)."""
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            return False
+        ref = self._billing_event_ref(clean_event_id)
+        try:
+            snap = ref.get(timeout=_FS_TIMEOUT)
+        except Exception:
+            return False
+        if not snap.exists:
+            return False
+        rec = snap.to_dict() or {}
+        if str(rec.get("status") or "").lower() == "completed":
+            return False
+        return str(rec.get("claimToken") or "") == str(claim_token or "")
+
+    def complete_billing_event(
+        self,
+        *,
+        event_id: str,
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        """Mark completed only if `claim_token` matches the current
+        claim (or if no token is provided, unconditional for the
+        legacy wrapper). Transactional on Firestore so a slow worker
+        cannot overwrite a newer claim's state."""
         clean_event_id = _clean_token(event_id)
         if not clean_event_id:
             raise ValueError("invalid_event_id")
         ref = self._billing_event_ref(clean_event_id)
-        try:
-            ref.set(
-                {
+
+        @gcf_firestore.transactional
+        def _complete(tx: Any) -> bool:
+            snap = ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                tx.set(ref, {
+                    "eventId": clean_event_id,
                     "status": "completed",
                     "completedAt": gcf_firestore.SERVER_TIMESTAMP,
-                },
-                merge=True,
-                timeout=_FS_TIMEOUT,
-            )
-        except Exception:
-            # Completion is best-effort; the next delivery will still
-            # see this event as pending (within lease) or dedupe once
-            # it writes successfully elsewhere. Do not fail the
-            # webhook on this write.
-            raise
+                    "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                })
+                return True
+            rec = snap.to_dict() or {}
+            if claim_token is not None:
+                current_token = str(rec.get("claimToken") or "")
+                if current_token and current_token != str(claim_token):
+                    return False
+            tx.update(ref, {
+                "status": "completed",
+                "completedAt": gcf_firestore.SERVER_TIMESTAMP,
+            })
+            return True
+
+        return _complete(self._db.transaction())
 
     def get_org_billing_limits(
         self,

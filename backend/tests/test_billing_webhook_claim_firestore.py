@@ -51,69 +51,73 @@ class WebhookClaimFirestoreTests(unittest.TestCase):
 
     def test_fresh_then_complete(self) -> None:
         eid = _unique()
-        self.assertEqual(
-            self.store.try_claim_billing_event(
-                event_id=eid, event_type="customer.subscription.updated",
-                payload={"type": "customer.subscription.updated"},
-            ),
-            "fresh",
+        a = self.store.try_claim_billing_event(
+            event_id=eid, event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
         )
-        self.store.complete_billing_event(event_id=eid)
-        self.assertEqual(
-            self.store.try_claim_billing_event(
-                event_id=eid, event_type="customer.subscription.updated",
-                payload={"type": "customer.subscription.updated"},
-            ),
-            "deduped",
+        self.assertEqual(a.get("status"), "fresh")
+        self.assertTrue(bool(a.get("claimToken")))
+        self.assertTrue(self.store.check_claim_still_held(
+            event_id=eid, claim_token=a.get("claimToken"),
+        ))
+        self.assertTrue(self.store.complete_billing_event(
+            event_id=eid, claim_token=a.get("claimToken"),
+        ))
+        b = self.store.try_claim_billing_event(
+            event_id=eid, event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
         )
+        self.assertEqual(b.get("status"), "deduped")
 
     def test_concurrent_within_lease(self) -> None:
         """Second claim within the lease window returns 'concurrent';
         proves the transaction serializes against parallel claims."""
         eid = _unique()
-        self.assertEqual(
-            self.store.try_claim_billing_event(
-                event_id=eid, event_type="invoice.payment_failed",
-                payload={"type": "invoice.payment_failed"},
-            ),
-            "fresh",
+        a = self.store.try_claim_billing_event(
+            event_id=eid, event_type="invoice.payment_failed",
+            payload={"type": "invoice.payment_failed"},
         )
-        self.assertEqual(
-            self.store.try_claim_billing_event(
-                event_id=eid, event_type="invoice.payment_failed",
-                payload={"type": "invoice.payment_failed"},
-            ),
-            "concurrent",
+        self.assertEqual(a.get("status"), "fresh")
+        b = self.store.try_claim_billing_event(
+            event_id=eid, event_type="invoice.payment_failed",
+            payload={"type": "invoice.payment_failed"},
         )
+        self.assertEqual(b.get("status"), "concurrent")
 
-    def test_stale_lease_is_reclaimed(self) -> None:
-        """A lease older than BILLING_EVENT_LEASE_SEC is reclaimed. We
-        can't easily back-date a server timestamp, so this test is
-        skipped unless the emulator allows a direct doc write of
-        `claimedAt`.
+    def test_stale_lease_is_reclaimed_and_slow_worker_rejected(self) -> None:
+        """A lease older than BILLING_EVENT_LEASE_SEC is reclaimed by
+        a sibling delivery. The slow worker's late `complete` with
+        its original token must be refused (returns False) so it
+        doesn't overwrite the newer claim's state in the event doc.
         """
         from google.cloud import firestore
         db = firestore.Client()
         eid = _unique()
-        self.assertEqual(
-            self.store.try_claim_billing_event(
-                event_id=eid, event_type="invoice.payment_failed",
-                payload={"type": "invoice.payment_failed"},
-            ),
-            "fresh",
+        a = self.store.try_claim_billing_event(
+            event_id=eid, event_type="invoice.payment_failed",
+            payload={"type": "invoice.payment_failed"},
         )
+        self.assertEqual(a.get("status"), "fresh")
+        token_a = a.get("claimToken")
         # Force the lease into the past.
         ref = db.collection("billing_events").document(eid)
         ref.update({"claimedAt": _utc_now() - timedelta(hours=1)})
-        self.assertEqual(
-            self.store.try_claim_billing_event(
-                event_id=eid, event_type="invoice.payment_failed",
-                payload={"type": "invoice.payment_failed"},
-            ),
-            "fresh",
+        b = self.store.try_claim_billing_event(
+            event_id=eid, event_type="invoice.payment_failed",
+            payload={"type": "invoice.payment_failed"},
         )
-        # Now completing works.
-        self.store.complete_billing_event(event_id=eid)
+        self.assertEqual(b.get("status"), "fresh")
+        self.assertNotEqual(token_a, b.get("claimToken"))
+        # B completes under its own token.
+        self.assertTrue(self.store.complete_billing_event(
+            event_id=eid, claim_token=b.get("claimToken"),
+        ))
+        # Slow worker A's late complete MUST be rejected.
+        self.assertFalse(self.store.complete_billing_event(
+            event_id=eid, claim_token=token_a,
+        ))
+        # Final event-doc status is still completed (not re-written
+        # by A's stale call).
         snap = ref.get()
         self.assertEqual((snap.to_dict() or {}).get("status"), "completed")
 

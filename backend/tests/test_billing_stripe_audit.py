@@ -499,7 +499,8 @@ class H5b_ConcurrentDeliveryGetsConflict(_AuditBase):
             event_id="evt_h5b", event_type="customer.subscription.updated",
             payload={"type": "customer.subscription.updated"},
         )
-        self.assertEqual(claim, "fresh")
+        self.assertEqual(claim.get("status"), "fresh")
+        self.assertTrue(bool(claim.get("claimToken")))
 
         with self.assertRaises(HTTPException) as ctx:
             asyncio.run(
@@ -704,6 +705,337 @@ class M4b_SubscriptionWithOrgIdMetadataMatches(_AuditBase):
 # No code change proposed in this fix batch per operator directive.
 # The policy question is captured in `docs/03-analysis/stripe-billing-audit.md`.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Boundary-coverage regressions (second pass, 2026-10-29).
+# Each test maps 1:1 to an operator-named boundary.
+# ---------------------------------------------------------------------------
+
+
+class B1_SlowWorkerAfterLeaseReclaim(_AuditBase):
+    """Boundary 1 — lease ownership. A slow worker whose claim has been
+    reclaimed by a sibling delivery (because its lease aged out) must
+    NOT be allowed to complete or overwrite the newer claim's state.
+
+    Pre-fix: `complete_billing_event` always wrote `status=completed`
+    unconditionally; the slow worker's late write stomped on the newer
+    delivery's final state.
+
+    Post-fix: `check_claim_still_held` + `complete_billing_event(claim_token=…)`
+    reject the stale completion.
+    """
+
+    def test_stale_slow_worker_cannot_complete(self) -> None:
+        # Delivery A claims.
+        a = self.store.try_claim_billing_event(
+            event_id="evt_b1", event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
+        )
+        self.assertEqual(a.get("status"), "fresh")
+        token_a = a.get("claimToken")
+        # Age the lease.
+        rec = self.store._billing_events["evt_b1"]
+        rec["claimedAt"] = _utc_now() - timedelta(seconds=600)
+        # Delivery B reclaims.
+        b = self.store.try_claim_billing_event(
+            event_id="evt_b1", event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
+        )
+        self.assertEqual(b.get("status"), "fresh")
+        self.assertNotEqual(a.get("claimToken"), b.get("claimToken"))
+
+        # B completes successfully.
+        self.assertTrue(self.store.complete_billing_event(
+            event_id="evt_b1", claim_token=b.get("claimToken"),
+        ))
+
+        # A finally returns and attempts to complete with its STALE
+        # token. The completion must be rejected — the event is still
+        # terminal under B's completion, and A's attempt is ignored.
+        a_result = self.store.complete_billing_event(
+            event_id="evt_b1", claim_token=token_a,
+        )
+        self.assertFalse(a_result)
+
+    def test_webhook_rejects_write_when_claim_lost(self) -> None:
+        """A slow handler can still try to WRITE after its lease aged
+        out. The webhook's pre-write ownership check (via
+        `check_claim_still_held`) must detect the reclaim and refuse
+        the write with 409 so the handler bails before stomping on
+        the newer claim's state.
+        """
+        org_id = self._bootstrap_owner(uid="owner-b1w", slug="b1w-church", name="B1w Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b1w"
+        billing["stripeSubscriptionId"] = "sub_b1w"
+        billing["status"] = "active"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        now_ts = int(time.time())
+        event = {
+            "id": "evt_b1w", "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_b1w", "customer": "cus_b1w", "status": "past_due",
+                "cancel_at_period_end": False,
+                "current_period_start": now_ts,
+                "current_period_end": now_ts + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "starter"},
+                "items": {"data": [{"price": {"id": "price_starter"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        sig = _sign_stripe_payload(raw, "whsec_audit")
+
+        # Pre-claim the event (as a sibling delivery would).
+        self.store.try_claim_billing_event(
+            event_id="evt_b1w", event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
+        )
+        # Age it out so the SECOND delivery (the webhook under test)
+        # becomes the reclaimer. Then after that, re-age so the
+        # webhook's own lease is also expired, simulating a slow
+        # handler whose lease was reclaimed by yet another sibling.
+        rec = self.store._billing_events["evt_b1w"]
+        rec["claimedAt"] = _utc_now() - timedelta(seconds=600)
+
+        # The webhook will see "fresh" (reclaim) then do pre-write
+        # ownership check — but we tamper with the token mid-way to
+        # simulate a third delivery racing in after the webhook's
+        # claim but before its write.
+        original_check = self.store.check_claim_still_held
+        def _tampered_check(**kwargs: Any) -> bool:
+            return False  # pretend another delivery took over
+
+        with patch.object(self.store, "check_claim_still_held", side_effect=_tampered_check):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    billing_routes.stripe_webhook(
+                        request=_DummyRequest(raw), stripe_signature=sig,
+                    )
+                )
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail, "webhook_claim_lost")
+        # Billing was NOT overwritten by the aborted handler.
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("status"), "active")
+
+
+class B3_CheckoutLateResponseDoesNotOverwriteReplacement(_AuditBase):
+    """Boundary 3 — checkout ownership. A late Stripe response that
+    carries attempt A's session info must NOT overwrite the pending
+    record if attempt B has already replaced it.
+    """
+
+    def test_record_checkout_attempt_session_only_updates_matching_attempt(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b3", slug="b3-church", name="B3 Church")
+        # First attempt — Starter.
+        first = self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+        )
+        self.assertEqual(first["action"], "create")
+        attempt_a = first["attemptId"]
+        # Expire attempt A's record (simulate TTL expiry) so attempt B
+        # can be created for a different plan.
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["pendingCheckoutAttempt"]["expiresAt"] = _utc_now() - timedelta(seconds=1)
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Second attempt — Growth, replaces attempt A.
+        second = self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="growth", interval="month",
+        )
+        self.assertEqual(second["action"], "create")
+        attempt_b = second["attemptId"]
+        self.assertNotEqual(attempt_a, attempt_b)
+
+        # Simulate attempt A's Stripe response arriving LATE — it
+        # tries to record its session info. The guard must prevent
+        # it from overwriting attempt B's slot.
+        self.store.record_checkout_attempt_session(
+            org_id=org_id,
+            attempt_id=attempt_a,
+            session_id="cs_late_from_a",
+            session_url="https://late.a/",
+        )
+        pending = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt") or {}
+        self.assertEqual(
+            pending.get("attemptId"), attempt_b,
+            "attempt B still owns the slot",
+        )
+        self.assertIsNone(
+            pending.get("sessionId"),
+            "late response from A must not populate B's session fields",
+        )
+
+
+class B4_PostCompletionGapRefusesSecondCheckout(_AuditBase):
+    """Boundary 4 — checkout lifecycle. After `checkout.session.completed`
+    sets `stripeSubscriptionId` but BEFORE `customer.subscription.*`
+    syncs the status, a user who re-POSTs /billing/checkout-session
+    must be refused. Pre-fix: a prior-canceled customer could slip
+    through because the `(stripeSubscriptionId AND status∈{active,
+    past_due, trialing})` guard didn't fire with status=canceled.
+    Post-fix: `checkout.session.completed` sets status to `trialing`
+    as an intermediate marker if the current status is not already
+    one of the active-shaped values.
+    """
+
+    def test_rapid_second_checkout_after_completion_is_refused(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b4", slug="b4-church", name="B4 Church")
+        # Seed as a previously-canceled customer (dead subId remains).
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b4"
+        billing["stripeSubscriptionId"] = "sub_old_canceled"
+        billing["status"] = "canceled"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Sanity: canceled customer CAN start a new checkout.
+        first = billing_routes.create_checkout_session(
+            billing_routes.CheckoutSessionRequest(
+                orgId=org_id, planKey="growth",
+                successUrl="https://example.com/ok",
+                cancelUrl="https://example.com/cancel",
+                interval="month",
+            ),
+            user=self._user("owner-b4"),
+        )
+        self.assertIn("url", first)
+        # User completes the new checkout. Simulate `checkout.session.completed`:
+        event = {
+            "id": "evt_b4_checkout", "type": "checkout.session.completed",
+            "data": {"object": {
+                "id": "cs_b4", "customer": "cus_b4", "subscription": "sub_new",
+                "metadata": {"orgId": org_id, "planKey": "growth", "interval": "month"},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        # Immediately re-POST (user double-clicks "Subscribe"). The
+        # customer.subscription.* event hasn't landed yet. The guard
+        # must still refuse to create a SECOND Stripe subscription.
+        with self.assertRaises(HTTPException) as ctx:
+            billing_routes.create_checkout_session(
+                billing_routes.CheckoutSessionRequest(
+                    orgId=org_id, planKey="growth",
+                    successUrl="https://example.com/ok",
+                    cancelUrl="https://example.com/cancel",
+                    interval="month",
+                ),
+                user=self._user("owner-b4"),
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail, "subscription_already_active")
+
+
+class B5_SwallowedPlanLimitsFailureNowRecoverable(_AuditBase):
+    """Boundary 5 — required persistence. If
+    `set_org_monthly_minutes_limit` fails, the event must NOT be
+    marked completed — otherwise Stripe's retry would be deduped and
+    the plan-limits inconsistency would be permanent.
+
+    Pre-fix: a bare try/except Exception around the call swallowed
+    all failures and the webhook continued to persist billing + mark
+    the event completed.
+
+    Post-fix: non-`org_not_found` failures propagate as HTTP 500 so
+    Stripe retries.
+    """
+
+    def test_monthly_minutes_failure_is_not_swallowed_followed_by_completion(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b5", slug="b5-church", name="B5 Church")
+
+        now_ts = int(time.time())
+        event = {
+            "id": "evt_b5_checkout", "type": "checkout.session.completed",
+            "data": {"object": {
+                "id": "cs_b5", "customer": "cus_b5", "subscription": "sub_b5",
+                "metadata": {"orgId": org_id, "planKey": "growth", "interval": "month"},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        sig = _sign_stripe_payload(raw, "whsec_audit")
+
+        original = self.store.set_org_monthly_minutes_limit
+        def _flaky(**kwargs: Any) -> None:
+            raise RuntimeError("firestore_unavailable")
+
+        with patch.object(self.store, "set_org_monthly_minutes_limit", side_effect=_flaky):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    billing_routes.stripe_webhook(
+                        request=_DummyRequest(raw), stripe_signature=sig,
+                    )
+                )
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertEqual(ctx.exception.detail, "billing_plan_limits_sync_failed")
+
+        # The event is NOT completed — a retry (after lease aging) can
+        # run to completion when the dependency recovers.
+        rec = self.store._billing_events.get("evt_b5_checkout") or {}
+        self.assertNotEqual(rec.get("status"), "completed")
+
+
+class B2_ConcurrentDifferentEventsSameOrg_DocumentedGap(_AuditBase):
+    """Boundary 2 — per-event dedup does NOT prevent conflicting
+    billing updates when DIFFERENT events on the SAME org arrive
+    concurrently. The in-memory store serializes via the global
+    `_lock`, so this test documents the LOCAL serialization property.
+    Firestore does not serialize cross-event writes to the same org
+    doc; that remains a Stripe-sandbox / Firestore-emulator question
+    (new audit §3 Suspected risk S8). This test is intentionally
+    local-only — see `tests/test_billing_webhook_claim_firestore.py`
+    for the emulator-side parallel we would add once the emulator is
+    available locally.
+    """
+
+    def test_sequential_different_events_both_persist_last_write_wins(self) -> None:
+        """When two different events for the same org are processed
+        sequentially (as the in-memory store serializes them), the
+        LAST write wins. This is the correct per-event behaviour; the
+        documented gap is that concurrent Firestore writes do not
+        serialize automatically.
+        """
+        org_id = self._bootstrap_owner(uid="owner-b2", slug="b2-church", name="B2 Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b2"
+        billing["stripeSubscriptionId"] = "sub_b2"
+        billing["status"] = "active"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        now_ts = int(time.time())
+        payment_failed = {
+            "id": "evt_b2_fail", "type": "invoice.payment_failed",
+            "data": {"object": {
+                "id": "in_b2_fail", "customer": "cus_b2",
+                "subscription": "sub_b2",
+                "metadata": {"orgId": org_id},
+            }},
+        }
+        payment_succeeded = {
+            "id": "evt_b2_ok", "type": "invoice.payment_succeeded",
+            "data": {"object": {
+                "id": "in_b2_ok", "customer": "cus_b2",
+                "subscription": "sub_b2",
+                "metadata": {"orgId": org_id},
+            }},
+        }
+        for ev in (payment_failed, payment_succeeded):
+            raw = json.dumps(ev).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw),
+                    stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                )
+            )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("status"), "active")  # last write wins
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -7,6 +7,43 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage second pass (2026-10-29, after fc147a07 + 719fb775)
+
+Operator-named boundaries + where coverage lives + any additional defects reproduced + fixes applied.
+
+### Boundary 1 — lease ownership (slow worker must not overwrite newer claim)
+
+- **Existing coverage**: `H5_FailedWriteRetryIsNotDeduped` + `H5b_ConcurrentDeliveryGetsConflict` cover persistence-failure recovery and parallel-delivery serialization, but DO NOT cover the slow-worker-returns-after-lease-reclaim case.
+- **Added regression**: `B1_SlowWorkerAfterLeaseReclaim::test_stale_slow_worker_cannot_complete` + `test_webhook_rejects_write_when_claim_lost`. Fail on base; pass on fix.
+- **Defect reproduced**: `complete_billing_event` on base writes `status=completed` unconditionally; a slow worker (lease aged out, sibling delivery already took over and finished) stomps on the newer claim's `completedAt`. More severely, the slow worker's eventual `set_org_billing_profile` write (which pre-fix was gated only by the lease *at claim time*) can race against the newer claim's write.
+- **Fix applied**: claim/complete now carry an opaque `claimToken`. Return of `try_claim_billing_event` is now `{"status": …, "claimToken": …}`. New `check_claim_still_held(event_id, claim_token)` is called in the webhook before `set_org_billing_profile`; a 409 `webhook_claim_lost` aborts the write when the token no longer matches. `complete_billing_event(event_id, claim_token)` returns `False` on mismatch instead of overwriting state.
+
+### Boundary 2 — concurrent different events on the same org
+
+- **Existing coverage**: in-memory store serializes ALL writes via a single `_lock`; cross-event sequential processing is correct and `B2_ConcurrentDifferentEventsSameOrg_DocumentedGap::test_sequential_different_events_both_persist_last_write_wins` asserts that last-write-wins is deterministic in-memory.
+- **Defect not reproduced locally**: the Firestore impl uses `set_org_billing_profile → ref.get()+ref.set(merge=True)` with no transaction and no optimistic-concurrency precondition. Two concurrent `invoice.payment_*` events on the same org could race and the later-ordered write wins unpredictably. **Per operator directive**: "reproduce an actual defect before changing it." Local reproduction requires the Firestore emulator — not available in this audit session. Logged as Suspected risk S8 below for the Stripe sandbox / Firestore-emulator scenarios.
+- **No code change** in this pass. The fix would require either a transactional read-modify-write for `set_org_billing_profile` or an `updatedAt`-based optimistic-concurrency precondition. Operator-approved separately.
+
+### Boundary 3 — checkout ownership (late Stripe response must not overwrite a replacement attempt)
+
+- **Existing coverage**: `record_checkout_attempt_session` ONLY updates the pending record if the `attemptId` matches (guard in both stores). No test exercised this.
+- **Added regression**: `B3_CheckoutLateResponseDoesNotOverwriteReplacement::test_record_checkout_attempt_session_only_updates_matching_attempt`. Fails on base (the method doesn't exist); passes on fix.
+- **No additional defect**: the pre-existing guard in `claim_checkout_attempt`/`record_checkout_attempt_session` is sufficient. The test confirms it.
+
+### Boundary 4 — checkout lifecycle (post-completion gap must not reopen duplicate purchasing)
+
+- **Existing coverage**: `H1_SecondCheckoutRefusedWhenSubscriptionActive` covers the active-subscription case. `H2b_PendingDifferentPlanRefused` covers the pending-attempt case.
+- **Defect reproduced**: after `checkout.session.completed` clears `pendingCheckoutAttempt` and sets `stripeSubscriptionId` on a previously-canceled org, a rapid second POST could slip through the `(stripeSubscriptionId AND status∈{active,past_due,trialing})` guard because `status` was still `canceled` (the real status comes with the subsequent `customer.subscription.*` event). Second POST → new attempt → second Stripe subscription → H1's shape returns.
+- **Added regression**: `B4_PostCompletionGapRefusesSecondCheckout::test_rapid_second_checkout_after_completion_is_refused`. Fails on base; passes on fix.
+- **Fix applied**: in the `checkout.session.completed` branch, if the current `status` is NOT in `{"active","past_due","trialing"}`, promote to `"trialing"` as an intermediate marker. The real status overwrites on the subsequent `customer.subscription.*` event.
+
+### Boundary 5 — required persistence (failures must be recoverable, not swallowed)
+
+- **Existing coverage**: `H5_FailedWriteRetryIsNotDeduped` covers `set_org_billing_profile` failure recovery. It did NOT cover `set_org_monthly_minutes_limit` failure (the earlier code bare-caught + swallowed everything from that call).
+- **Defect reproduced**: `set_org_monthly_minutes_limit` was wrapped in `try/except Exception → logger.exception` on both webhook branches; a failure left the billing profile written with the new plan key, event marked completed, and the monthly-minutes cap stale forever (no retry possible). Operator-named contract violated.
+- **Added regression**: `B5_SwallowedPlanLimitsFailureNowRecoverable::test_monthly_minutes_failure_is_not_swallowed_followed_by_completion`. Fails on base; passes on fix.
+- **Fix applied**: both call sites now split exception handling: `ValueError("org_not_found")` logs a warning and continues (unrecoverable), anything else re-raises as `HTTPException(500, "billing_plan_limits_sync_failed")` so Stripe retries. Event is NOT completed; retry runs the handler again.
+
 ## Fix batch 1 — applied on this branch (local only; nothing pushed)
 
 Three fix sub-batches landed in commit `prep/stripe-billing-audit` on top of `fc147a07` (the audit-tests + review-doc commit). Nothing is pushed, merged, deployed, or configured.
@@ -29,29 +66,35 @@ Note on scope: `change_plan` STILL reads only `BILLING_CONFIG.stripe_price_ids`,
 
 ## Test commands and results
 
-Combined (baseline + regression) on the fix branch:
+Combined (baseline + regression + boundary) on the fix branch:
 
 ```
 cd backend
-backend/venv/bin/python -m pytest tests/test_billing_routes.py tests/test_billing_entitlements.py tests/test_billing_stripe_audit.py -q
-41 passed in 0.74s
+backend/venv/bin/python -m pytest tests/test_billing_routes.py tests/test_billing_entitlements.py \
+    tests/test_billing_stripe_audit.py tests/test_billing_webhook_claim_firestore.py -q
+47 passed, 1 skipped in 0.71s
 ```
 
 Fix-branch breakdown:
 - `tests/test_billing_routes.py` — 13 pre-existing (unchanged in substance; the test-local `_FakeStripeClient` accepts the new `idempotency_key` kwarg).
 - `tests/test_billing_entitlements.py` — 15 pre-existing (unchanged).
-- `tests/test_billing_stripe_audit.py` — 13 regression tests (rewritten to assert INTENDED post-fix behavior).
+- `tests/test_billing_stripe_audit.py` — 19 regression + boundary tests (asserting INTENDED post-fix behavior).
+- `tests/test_billing_webhook_claim_firestore.py` — 5 emulator tests; skipped locally (no Java), CI emulator job included.
 
-Base-commit validation (`ac32110c`, fresh worktree, same regression file):
+Base-commit validation (`ac32110c`, fresh worktree, same regression file + fixture patched for the new kwarg):
 
 ```
 backend/venv/bin/python -m pytest tests/test_billing_stripe_audit.py -q --tb=no
-9 failed, 4 passed in 1.03s
+14 failed, 5 passed in 0.83s
 ```
 
-The 9 failures on base map 1:1 to the HIGH / MEDIUM findings: H1, H2 (2 tests), H2b, H3 (2 tests), M3, H5, H5b-concurrent. The 4 passes on base are tests that document behaviour unchanged by this fix (`H5b::test_completed_event_is_deduped` — pre-existing idempotency works; `M1_RepeatedChangePlanAttempts` — only probes local no-release behaviour which is unchanged; `M4` + `M4b` edge/positive cases — correctly handled on base too). Each regression test is a specific assertion of intended behavior; none are weakened or skipped on the fix branch, and none pass trivially on base.
+The 14 failures on base map 1:1 to the HIGH/MEDIUM findings and the four boundary defects: H1, H2 (2), H2b, H3 (2), M3, H5, H5b-concurrent, **B1 (2), B3, B4, B5**. The 5 passes on base document behaviour unchanged by this fix (`H5b::test_completed_event_is_deduped`, `M1_RepeatedChangePlanAttempts`, `M4` edge, `M4b` positive, `B2` documented-gap in-memory serialization). Each regression test is a specific assertion of intended behavior; none are weakened or skipped on the fix branch, and none pass trivially on base.
 
-Firestore atomicity: `backend/tests/test_billing_webhook_claim_firestore.py` (added below) exercises `try_claim_billing_event` through the Firestore transactional path. The module skips on any environment without `FIRESTORE_EMULATOR_HOST` set — the CI `firestore-emulator-tests` job runs it; local runs without Java-based emulator skip (operator note: Firestore emulator requires a Java 8+ JRE on PATH; not available in this audit session).
+Firestore atomicity: `backend/tests/test_billing_webhook_claim_firestore.py` exercises `try_claim_billing_event`, `check_claim_still_held`, `complete_billing_event` with `claim_token`, and `claim_checkout_attempt` through the Firestore transactional path. The module skips on any environment without `FIRESTORE_EMULATOR_HOST` set.
+
+CI discovery wiring: the file is now included in the pytest invocation inside `.github/workflows/ci.yml::firestore-emulator-tests` (added `tests/test_billing_webhook_claim_firestore.py::WebhookClaimFirestoreTests` and `::CheckoutAttemptFirestoreTests` to the explicit test list). Prior fix batch 1 had set `FIRESTORE_EMULATOR_HOST` but failed to add the file to the discovery list — the operator correctly flagged this. The job's "Fail if emulator tests skipped or none ran" guard catches the mistake of leaving a file out going forward.
+
+**Unresolved local-verification gap**: the Firestore emulator requires Java (Firestore emulator ≥ v1.19 needs JRE 21 per the CI setup step). Java is not installed in this audit session and cannot be installed without `sudo` (apt-get prompted for a password). The transactional implementation is thus validated by code review + in-memory parity + the CI emulator job's upcoming run on push, **not** by local execution. **The transactional implementation is not characterized as validated locally; the authoritative check is CI.**
 
 ---
 
@@ -193,6 +236,7 @@ Firestore atomicity: `backend/tests/test_billing_webhook_claim_firestore.py` (ad
 - **S5 — Trial is local-only, not Stripe-managed**: `create_checkout_session` always passes `trial_days=0` (`routes/billing.py:629,649`); the 30-day local trial lives in `multichurch_store` + `BILLING_CONFIG.trial_days`. Stripe treats the paid subscription as immediate. Design decision; documented in code; not a defect.
 - **S6 — Changing plans from `past_due` is allowed** by `change_plan` (`routes/billing.py:770`: `if current_status not in {"active", "past_due"}: raise ...`). This matches typical Stripe UX (upgrade to settle the balance), but confirm business policy.
 - **S7 — Annual plan-change path still uses only `stripe_price_ids` map in `change_plan`** (`routes/billing.py:751`). A monthly→annual change via `change_plan` would silently route to the monthly price. Fix batch 3 added annual-mapping support ONLY to the price-id→plan RESOLVER (webhook direction). The `change_plan` DIRECTION (plan→price-id) still ignores `stripe_price_ids_annual`. Explicitly left PENDING per operator directive — annual plan-change policy and the Stripe-side existing-schedule interaction are deferred.
+- **S8 — Concurrent writes to the same org billing doc have no Firestore-level serialization**: `FirestoreMultiChurchStore.set_org_billing_profile` reads then writes with `merge=True`, no transaction, no `updatedAt` precondition. Two concurrent `invoice.payment_*` events on the same org can both read the old state, each modify, and race on write — last write wins unpredictably. In-memory serializes via `_lock`, so the gap is Firestore-only. **Local reproduction requires the Firestore emulator** (unavailable in this audit session; see verification gap below). Fix would be a transactional read-modify-write or an optimistic-concurrency precondition on `updatedAt`. **Operator-stated principle "reproduce an actual defect before changing it" applied**: no code change in this pass; documented for the Stripe-sandbox / emulator scenarios.
 
 ## 4. Missing coverage
 

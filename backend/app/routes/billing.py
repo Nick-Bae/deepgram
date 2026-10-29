@@ -985,9 +985,11 @@ async def stripe_webhook(
         if detail in {"invalid_event_id", "invalid_event_type"}:
             raise HTTPException(status_code=400, detail=detail) from exc
         raise HTTPException(status_code=400, detail="invalid_webhook_event") from exc
-    if claim == "deduped":
+    claim_status = (claim or {}).get("status")
+    claim_token = (claim or {}).get("claimToken")
+    if claim_status == "deduped":
         return {"ok": True, "eventId": event_id, "deduped": True}
-    if claim == "concurrent":
+    if claim_status == "concurrent":
         # 409 is a non-2xx that Stripe retries. The in-flight sibling
         # delivery completes first; the retry then finds "deduped".
         raise HTTPException(status_code=409, detail="webhook_concurrent_delivery")
@@ -1032,20 +1034,54 @@ async def stripe_webhook(
         # `create_checkout_session` without leaking stale state.
         if next_billing.get("pendingCheckoutAttempt"):
             next_billing["pendingCheckoutAttempt"] = None
+        # Fix batch 2 (post-completion gap, boundary 4): the status
+        # field is not updated by `checkout.session.completed` on its
+        # own (the `customer.subscription.*` event supplies the real
+        # status). Between completion and the subscription event
+        # arriving, a user who re-POSTs /billing/checkout-session could
+        # bypass the "already_subscribed" guard if their prior status
+        # was `canceled` or similar. Promote the status to `trialing`
+        # as an intermediate marker so the guard fires. The actual
+        # Stripe-reported status will overwrite this when the
+        # `customer.subscription.*` event arrives.
+        current_status = _clean(next_billing.get("status")).lower()
+        if subscription_id and current_status not in {"active", "past_due", "trialing"}:
+            next_billing["status"] = "trialing"
         # fix-batch-3 (M3): monthly-minute limit was previously only
         # synced in the customer.subscription.* branch, leaving a window
         # where plan key + service-key cap advanced but the minute cap
         # stayed on the trial default. Sync here too.
+        # Fix batch 2 (required persistence, boundary 5): the earlier
+        # try/except swallowed ALL failures and let event completion
+        # proceed with a stale plan-limit — operator stated this is a
+        # recoverability contract, so raise instead. Only `org_not_found`
+        # is treated as unrecoverable (same handling as earlier billing
+        # profile fetches above).
         try:
             multichurch_store.set_org_monthly_minutes_limit(
                 org_id=org_id,
                 monthly_minutes=requested_plan.monthly_minutes,
             )
-        except Exception:
+        except ValueError as exc:
+            if str(exc) == "org_not_found":
+                logger.warning(
+                    "set_org_monthly_minutes_limit skipped org_not_found org=%s", org_id,
+                )
+            else:
+                raise HTTPException(
+                    status_code=500, detail="billing_plan_limits_sync_failed",
+                ) from exc
+        except Exception as exc:
+            # Non-ValueError failures (transport, timeout, …) must not
+            # be swallowed: the event is NOT completed, so Stripe's
+            # retry after lease expiry can rerun this handler.
             logger.exception(
                 "set_org_monthly_minutes_limit_failed org=%s plan=%s event=checkout.session.completed",
                 org_id, requested_plan.key,
             )
+            raise HTTPException(
+                status_code=500, detail="billing_plan_limits_sync_failed",
+            ) from exc
         if requested_plan.key != "trial":
             pending_emails.append({"event": "subscription_started", "plan_key": requested_plan.key})
 
@@ -1076,14 +1112,32 @@ async def stripe_webhook(
             next_billing["pendingPlanDate"] = None
             next_billing["pendingScheduleId"] = None
 
-        # Sync org-level minute limit to match the new plan spec
+        # Sync org-level minute limit to match the new plan spec.
+        # Fix batch 2 (required persistence, boundary 5): raise instead
+        # of swallow so a failure here does NOT get followed by event
+        # completion. See the parallel block in the
+        # checkout.session.completed branch.
         try:
             multichurch_store.set_org_monthly_minutes_limit(
                 org_id=org_id,
                 monthly_minutes=requested_plan.monthly_minutes,
             )
-        except Exception:
-            logger.exception("set_org_monthly_minutes_limit_failed org=%s plan=%s", org_id, requested_plan.key)
+        except ValueError as exc:
+            if str(exc) == "org_not_found":
+                logger.warning(
+                    "set_org_monthly_minutes_limit skipped org_not_found org=%s", org_id,
+                )
+            else:
+                raise HTTPException(
+                    status_code=500, detail="billing_plan_limits_sync_failed",
+                ) from exc
+        except Exception as exc:
+            logger.exception(
+                "set_org_monthly_minutes_limit_failed org=%s plan=%s", org_id, requested_plan.key,
+            )
+            raise HTTPException(
+                status_code=500, detail="billing_plan_limits_sync_failed",
+            ) from exc
 
         if event_type == "customer.subscription.deleted":
             next_billing["status"] = "canceled"
@@ -1127,6 +1181,17 @@ async def stripe_webhook(
         now=now,
     )
 
+    # Boundary 1 (lease ownership): before writing, verify our lease
+    # is still ours. If a sibling delivery took over after our lease
+    # aged out, our next write would be a stale overwrite.
+    if not multichurch_store.check_claim_still_held(
+        event_id=event_id, claim_token=claim_token,
+    ):
+        # Another delivery is in charge now. Return 409 so Stripe
+        # retries with proper state later; the current owner is
+        # responsible for persistence.
+        raise HTTPException(status_code=409, detail="webhook_claim_lost")
+
     # Persist first; if this raises, the event is NOT completed and a
     # future Stripe retry can rerun the handler (fix-batch-1).
     try:
@@ -1134,8 +1199,12 @@ async def stripe_webhook(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
 
-    # Mark the event completed only after successful persistence.
-    multichurch_store.complete_billing_event(event_id=event_id)
+    # Mark completed under the claim-token check. If a sibling
+    # reclaimed between our write and completion, we won't overwrite
+    # its state in the event doc.
+    multichurch_store.complete_billing_event(
+        event_id=event_id, claim_token=claim_token,
+    )
 
     # Notifications fire ONLY after the write succeeded, so a failed
     # persistence followed by a Stripe retry doesn't double-email.
