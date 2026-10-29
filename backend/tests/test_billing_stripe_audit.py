@@ -786,8 +786,11 @@ class B1_SlowWorkerAfterLeaseReclaim(_AuditBase):
 
         # Patch the fenced apply to simulate "another delivery took
         # over after our claim" — the sibling fenced-token check
-        # inside the method returns False.
-        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=lambda **_: False):
+        # inside the method returns a 'claim_lost' refusal.
+        with patch.object(
+            self.store, "apply_webhook_event_atomic",
+            side_effect=lambda **_: {"applied": False, "reason": "claim_lost"},
+        ):
             with self.assertRaises(HTTPException) as ctx:
                 asyncio.run(
                     billing_routes.stripe_webhook(
@@ -1186,61 +1189,266 @@ class B4f_StripeIdempotencyContractEnforced(_AuditBase):
         self.assertEqual(ctx.exception.detail, "pending_checkout_params_mismatch")
 
 
-class B2_ConcurrentDifferentEventsSameOrg_DocumentedGap(_AuditBase):
-    """Boundary 2 — per-event dedup does NOT prevent conflicting
-    billing updates when DIFFERENT events on the SAME org arrive
-    concurrently. The in-memory store serializes via the global
-    `_lock`, so this test documents the LOCAL serialization property.
-    Firestore does not serialize cross-event writes to the same org
-    doc; that remains a Stripe-sandbox / Firestore-emulator question
-    (new audit §3 Suspected risk S8). This test is intentionally
-    local-only — see `tests/test_billing_webhook_claim_firestore.py`
-    for the emulator-side parallel we would add once the emulator is
-    available locally.
+class B2_InterleavedDifferentEventsRespectCASAndEventOrder(_AuditBase):
+    """Review-pass fix for issue #1: deterministic interleaving of
+    two different events on the same org. The B2 test previously made
+    a misleading "serialization" claim based on sequential processing
+    — the in-memory `_lock` does NOT serialize whole webhook handlers,
+    only individual store calls. This test exercises the actual
+    reviewer scenario: an older `invoice.payment_failed` handler
+    paused mid-flight (with a stale `billing` snapshot) and a later
+    `invoice.payment_succeeded` processed to completion in between.
+
+    Expectation (post-fix):
+      - CAS on `expected_billing_updated_at` makes the older
+        handler's apply return `stale_snapshot` on first attempt →
+        route raises 409 → Stripe retries.
+      - On the retry, the handler reads the newer billing state
+        (status=active) and the event-created-at check prevents the
+        older failed event from stomping on the newer paid state.
     """
 
-    def test_sequential_different_events_both_persist_last_write_wins(self) -> None:
-        """When two different events for the same org are processed
-        sequentially (as the in-memory store serializes them), the
-        LAST write wins. This is the correct per-event behaviour; the
-        documented gap is that concurrent Firestore writes do not
-        serialize automatically.
-        """
-        org_id = self._bootstrap_owner(uid="owner-b2", slug="b2-church", name="B2 Church")
+    def test_interleaved_pay_failed_then_succeeded_does_not_regress_to_past_due(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b2i", slug="b2i-church", name="B2i Church")
         billing = self.store.get_org_billing_profile(org_id=org_id)
-        billing["stripeCustomerId"] = "cus_b2"
-        billing["stripeSubscriptionId"] = "sub_b2"
+        billing["stripeCustomerId"] = "cus_b2i"
+        billing["stripeSubscriptionId"] = "sub_b2i"
         billing["status"] = "active"
         billing["planKey"] = "starter"
         self.store.set_org_billing_profile(org_id=org_id, billing=billing)
 
-        now_ts = int(time.time())
-        payment_failed = {
-            "id": "evt_b2_fail", "type": "invoice.payment_failed",
+        failed_ts = int(time.time()) - 60  # older event (earlier `created`)
+        succeeded_ts = failed_ts + 30       # newer event
+
+        payment_failed_event = {
+            "id": "evt_b2i_fail", "type": "invoice.payment_failed",
+            "created": failed_ts,
             "data": {"object": {
-                "id": "in_b2_fail", "customer": "cus_b2",
-                "subscription": "sub_b2",
+                "id": "in_b2i_fail", "customer": "cus_b2i",
+                "subscription": "sub_b2i",
                 "metadata": {"orgId": org_id},
             }},
         }
-        payment_succeeded = {
-            "id": "evt_b2_ok", "type": "invoice.payment_succeeded",
+        payment_succeeded_event = {
+            "id": "evt_b2i_ok", "type": "invoice.payment_succeeded",
+            "created": succeeded_ts,
             "data": {"object": {
-                "id": "in_b2_ok", "customer": "cus_b2",
-                "subscription": "sub_b2",
+                "id": "in_b2i_ok", "customer": "cus_b2i",
+                "subscription": "sub_b2i",
                 "metadata": {"orgId": org_id},
             }},
         }
-        for ev in (payment_failed, payment_succeeded):
-            raw = json.dumps(ev).encode("utf-8")
-            asyncio.run(
-                billing_routes.stripe_webhook(
-                    request=_DummyRequest(raw),
-                    stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+
+        # Simulate deterministic interleaving. We can't nest an
+        # asyncio event loop, so inside the `side_effect` we SIMULATE
+        # the state-change that the SUCCEEDED webhook would have
+        # produced: bump billing.updatedAt + set
+        # lastProcessedEventCreatedAt. The FAILED handler's apply
+        # then sees a stale snapshot and refuses.
+        original_apply = self.store.apply_webhook_event_atomic
+        interleaving_done = {"n": 0}
+
+        def _interleaving_apply(**kwargs: Any) -> Dict[str, Any]:
+            if interleaving_done["n"] == 0 and kwargs.get("event_id") == "evt_b2i_fail":
+                interleaving_done["n"] = 1
+                # SUCCEEDED webhook would:
+                #  - set lastProcessedEventCreatedAt = succeeded_ts (datetime)
+                #  - leave status=active (already is), bump updatedAt.
+                org = self.store._orgs[org_id]
+                merged = dict(org.get("billing") or {})
+                merged["updatedAt"] = _utc_now()  # bump — causes stale_snapshot on FAILED's CAS
+                org["billing"] = merged
+                org["lastProcessedEventCreatedAt"] = datetime.fromtimestamp(
+                    succeeded_ts, tz=timezone.utc,
                 )
+            return original_apply(**kwargs)
+
+        raw_fail = json.dumps(payment_failed_event).encode("utf-8")
+        sig_fail = _sign_stripe_payload(raw_fail, "whsec_audit")
+        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=_interleaving_apply):
+            # First delivery of FAILED should see stale_snapshot → 409.
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    billing_routes.stripe_webhook(
+                        request=_DummyRequest(raw_fail), stripe_signature=sig_fail,
+                    )
+                )
+            self.assertEqual(ctx.exception.status_code, 409)
+            self.assertEqual(ctx.exception.detail, "webhook_claim_lost")
+
+        # Stripe retries. Age the lease so the retry's claim passes.
+        rec = self.store._billing_events["evt_b2i_fail"]
+        rec["claimedAt"] = _utc_now() - timedelta(seconds=999)
+        result = asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw_fail), stripe_signature=sig_fail,
             )
+        )
+        # The retry sees `staleEvent` (older than last processed) —
+        # the handler completes event identity but does NOT mutate
+        # billing. Status must remain "active" (NOT regressed to past_due).
         final = self.store.get_org_billing_profile(org_id=org_id)
-        self.assertEqual(final.get("status"), "active")  # last write wins
+        self.assertEqual(
+            final.get("status"), "active",
+            f"older payment_failed retry regressed status: {final.get('status')}; "
+            f"webhook result: {result}",
+        )
+        self.assertTrue(result.get("staleEvent") or result.get("deduped"), result)
+
+
+class B6_LateCompletionDoesNotEraseReplacementBySessionId(_AuditBase):
+    """Review-pass fix for issue #2: identity-based match of pending
+    attempt. Two attempts for the same (plan, interval) with different
+    session ids — the late completion for session_A must NOT erase
+    session_B's pending record.
+    """
+
+    def test_late_completion_for_sibling_attempt_preserves_replacement(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b6", slug="b6-church", name="B6 Church")
+        # Attempt A — Starter.
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b6",
+        )
+        # Record a Stripe session for A.
+        pending_before = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt")
+        self.store.record_checkout_attempt_session(
+            org_id=org_id, attempt_id=pending_before["attemptId"],
+            session_id="cs_A", session_url="https://a/",
+        )
+        # Expire A so B can take its place for the same plan+interval.
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["pendingCheckoutAttempt"]["expiresAt"] = _utc_now() - timedelta(seconds=1)
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Attempt B — same Starter plan but a new logical attempt.
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b6",
+        )
+        pending_b = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt")
+        self.store.record_checkout_attempt_session(
+            org_id=org_id, attempt_id=pending_b["attemptId"],
+            session_id="cs_B", session_url="https://b/",
+        )
+
+        # Delayed completion for session cs_A (an obsolete / abandoned attempt).
+        event = {
+            "id": "evt_b6_late", "type": "checkout.session.completed",
+            "created": int(time.time()),
+            "data": {"object": {
+                "id": "cs_A", "customer": "cus_b6", "subscription": "sub_from_A",
+                "metadata": {"orgId": org_id, "planKey": "starter", "interval": "month"},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        after = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt")
+        self.assertIsNotNone(after,
+                             "replacement B was erased by late completion for session cs_A")
+        self.assertEqual(after.get("sessionId"), "cs_B")
+
+
+class B7_ObsoleteSubscriptionDoesNotOverwriteCurrent(_AuditBase):
+    """Review-pass fix for issue #2: terminal-arrival / obsolete
+    reconciliation must guard based on BOTH subscription id AND
+    identity. A delayed `customer.subscription.*` for an obsolete
+    subscription must not overwrite the current one.
+    """
+
+    def test_subscription_event_for_obsolete_sub_leaves_current_untouched(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b7", slug="b7-church", name="B7 Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b7"
+        billing["stripeSubscriptionId"] = "sub_current"
+        billing["status"] = "active"
+        billing["planKey"] = "growth"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        # Delayed subscription event for an OBSOLETE sub.
+        now_ts = int(time.time())
+        event = {
+            "id": "evt_b7_obs", "type": "customer.subscription.updated",
+            "created": now_ts,
+            "data": {"object": {
+                "id": "sub_obsolete", "customer": "cus_b7", "status": "past_due",
+                "cancel_at_period_end": False,
+                "current_period_start": now_ts,
+                "current_period_end": now_ts + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "starter"},
+                "items": {"data": [{"price": {"id": "price_starter"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        result = asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        self.assertTrue(result.get("obsoleteSubscription"), result)
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        # Current subscription id unchanged.
+        self.assertEqual(final.get("stripeSubscriptionId"), "sub_current")
+        self.assertEqual(final.get("status"), "active")
+        self.assertEqual(final.get("planKey"), "growth")
+
+
+class B8_AtomicApplyPreservesSoftCapResetBehavior(_AuditBase):
+    """Review-pass fix for issue #3: `set_org_monthly_minutes_limit`
+    previously reset `softCapReached=False` when the new limit was 0
+    or exceeded current usage. The atomic-apply must preserve that
+    behavior; without it, an upgrade from an exhausted Starter leaves
+    the softCap flag permanently True under Growth."""
+
+    def test_upgrade_resets_soft_cap_flag(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b8", slug="b8-church", name="B8 Church")
+        # Seed org on Starter with usage=500 and softCap on.
+        org = self.store._orgs[org_id]
+        org["currentMonthMinutes"] = 500
+        org["maxMinutesPerMonth"] = 600  # Starter limit
+        org["softCapReached"] = True
+        org["billing"] = {
+            **(org.get("billing") or {}),
+            "stripeCustomerId": "cus_b8",
+            "stripeSubscriptionId": "sub_b8",
+            "status": "active",
+            "planKey": "starter",
+            "updatedAt": _utc_now(),
+        }
+
+        # Simulate an upgrade event to Growth (monthly_minutes=1800).
+        now_ts = int(time.time())
+        event = {
+            "id": "evt_b8_upgrade", "type": "customer.subscription.updated",
+            "created": now_ts,
+            "data": {"object": {
+                "id": "sub_b8", "customer": "cus_b8", "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": now_ts,
+                "current_period_end": now_ts + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "growth"},
+                "items": {"data": [{"price": {"id": "price_growth"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        self.assertEqual(self.store._orgs[org_id].get("maxMinutesPerMonth"), 1800)
+        self.assertFalse(
+            self.store._orgs[org_id].get("softCapReached"),
+            "softCapReached must reset when new limit exceeds current usage",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

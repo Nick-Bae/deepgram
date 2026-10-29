@@ -226,12 +226,12 @@ class ApplyWebhookEventAtomicFirestoreTests(unittest.TestCase):
             "stripeCustomerId": "cus_x", "stripeSubscriptionId": "sub_x",
             "limits": {"maxServiceKeys": 12},
         }
-        ok = self.store.apply_webhook_event_atomic(
+        result = self.store.apply_webhook_event_atomic(
             org_id=org_id, billing=next_billing,
             monthly_minutes=1800,
             event_id=eid, claim_token=a.get("claimToken"),
         )
-        self.assertTrue(ok)
+        self.assertTrue(result.get("applied"))
         org = db.collection("organizations").document(org_id).get().to_dict() or {}
         self.assertEqual(org.get("maxMinutesPerMonth"), 1800)
         self.assertEqual((org.get("billing") or {}).get("planKey"), "growth")
@@ -250,15 +250,13 @@ class ApplyWebhookEventAtomicFirestoreTests(unittest.TestCase):
             payload={"type": "customer.subscription.updated"},
         )
         token_a = a.get("claimToken")
-        # Reclaim.
         ref = db.collection("billingEvents").document(eid)
         ref.update({"claimedAt": _utc_now() - timedelta(hours=1)})
         self.store.try_claim_billing_event(
             event_id=eid, event_type="customer.subscription.updated",
             payload={"type": "customer.subscription.updated"},
         )
-        # Slow worker A attempts fenced-apply with its STALE token.
-        ok = self.store.apply_webhook_event_atomic(
+        result = self.store.apply_webhook_event_atomic(
             org_id=org_id,
             billing={
                 "planKey": "growth", "status": "active",
@@ -267,13 +265,99 @@ class ApplyWebhookEventAtomicFirestoreTests(unittest.TestCase):
             monthly_minutes=1800,
             event_id=eid, claim_token=token_a,
         )
-        self.assertFalse(ok)
-        # Verify no partial writes.
+        self.assertFalse(result.get("applied"))
+        self.assertEqual(result.get("reason"), "claim_lost")
         org = db.collection("organizations").document(org_id).get().to_dict() or {}
         self.assertEqual(org.get("maxMinutesPerMonth"), 500)
         self.assertEqual((org.get("billing") or {}).get("planKey"), "trial")
         ev = ref.get().to_dict() or {}
         self.assertNotEqual(ev.get("status"), "completed")
+
+    def test_apply_refuses_on_stale_billing_snapshot(self) -> None:
+        """CAS protection: a pre-computed `billing` snapshot whose
+        `updatedAt` no longer matches the current org state (because
+        a sibling delivery updated the org in between) must be
+        rejected with reason=stale_snapshot."""
+        db = _db()
+        org_id = self._seed_org()
+        eid = _unique("apply-cas")
+        a = self.store.try_claim_billing_event(
+            event_id=eid, event_type="invoice.payment_failed",
+            payload={"type": "invoice.payment_failed"},
+        )
+        token = a.get("claimToken")
+        # Capture CURRENT billing.updatedAt (may be None since seeded
+        # without one). Simulate a sibling update that bumps it.
+        bogus_baseline_dt = _utc_now() - timedelta(hours=1)
+        result = self.store.apply_webhook_event_atomic(
+            org_id=org_id,
+            billing={"status": "past_due"},
+            monthly_minutes=None,
+            event_id=eid, claim_token=token,
+            expected_billing_updated_at=bogus_baseline_dt,
+        )
+        self.assertFalse(result.get("applied"))
+        self.assertEqual(result.get("reason"), "stale_snapshot")
+        ev = db.collection("billingEvents").document(eid).get().to_dict() or {}
+        self.assertNotEqual(ev.get("status"), "completed")
+
+    def test_apply_refuses_stale_event_timestamp(self) -> None:
+        """Event-ordering: an older event arriving after a newer one
+        is marked completed without billing mutation."""
+        db = _db()
+        org_id = self._seed_org()
+        newer_ts = _utc_now()
+        older_ts = newer_ts - timedelta(seconds=120)
+        # Seed `lastProcessedEventCreatedAt` as if a newer event ran.
+        db.collection("organizations").document(org_id).set(
+            {"lastProcessedEventCreatedAt": newer_ts}, merge=True,
+        )
+        eid = _unique("apply-stale-evt")
+        a = self.store.try_claim_billing_event(
+            event_id=eid, event_type="invoice.payment_failed",
+            payload={"type": "invoice.payment_failed"},
+        )
+        result = self.store.apply_webhook_event_atomic(
+            org_id=org_id,
+            billing={"status": "past_due"},
+            monthly_minutes=None,
+            event_id=eid, claim_token=a.get("claimToken"),
+            event_created_at=older_ts,
+        )
+        self.assertFalse(result.get("applied"))
+        self.assertEqual(result.get("reason"), "stale_event")
+        # Event marked completed (identity-level processing) but
+        # billing untouched.
+        ev = db.collection("billingEvents").document(eid).get().to_dict() or {}
+        self.assertEqual(ev.get("status"), "completed")
+        org = db.collection("organizations").document(org_id).get().to_dict() or {}
+        self.assertNotEqual((org.get("billing") or {}).get("status"), "past_due")
+
+    def test_apply_preserves_soft_cap_reset(self) -> None:
+        """softCapReached must reset when the new limit >= currentMonthMinutes."""
+        db = _db()
+        org_id = self._seed_org()
+        db.collection("organizations").document(org_id).set({
+            "currentMonthMinutes": 500,
+            "maxMinutesPerMonth": 600,
+            "softCapReached": True,
+        }, merge=True)
+        eid = _unique("apply-soft")
+        a = self.store.try_claim_billing_event(
+            event_id=eid, event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
+        )
+        result = self.store.apply_webhook_event_atomic(
+            org_id=org_id,
+            billing={"planKey": "growth", "status": "active",
+                     "stripeCustomerId": "cus_x", "stripeSubscriptionId": "sub_x"},
+            monthly_minutes=1800,
+            event_id=eid, claim_token=a.get("claimToken"),
+        )
+        self.assertTrue(result.get("applied"))
+        org = db.collection("organizations").document(org_id).get().to_dict() or {}
+        self.assertEqual(org.get("maxMinutesPerMonth"), 1800)
+        self.assertFalse(bool(org.get("softCapReached")))
 
 
 class CheckoutAttemptFirestoreTests(unittest.TestCase):

@@ -1014,6 +1014,20 @@ async def stripe_webhook(
             return {"ok": True, "eventId": event_id, "unmatched": True}
         raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
 
+    # CAS baseline (fix review item #1): capture the billing-profile
+    # version we read so the atomic apply can reject the write if a
+    # sibling delivery updated the org between our read and our write.
+    expected_billing_updated_at = billing.get("updatedAt") if isinstance(billing, dict) else None
+    # Event-ordering baseline (fix review item #1): Stripe events carry
+    # a top-level `created` unix timestamp. The atomic apply refuses
+    # writes whose event is strictly older than the last-processed
+    # event's timestamp for this org, so retries of an older event
+    # cannot stomp on newer state.
+    try:
+        event_created_at: Optional[datetime] = _to_datetime(event.get("created"))
+    except Exception:
+        event_created_at = None
+
     now = _utcnow()
     next_billing = dict(billing)
     next_billing["updatedAt"] = now
@@ -1034,17 +1048,18 @@ async def stripe_webhook(
     if event_type == "checkout.session.completed":
         customer_id = _clean(payload_obj.get("customer"))
         subscription_id = _clean(payload_obj.get("subscription"))
+        session_id = _clean(payload_obj.get("id"))
         requested_plan = plan_spec(metadata.get("planKey") or next_billing.get("planKey") or "trial")
 
-        # Fix issue #2: late-arrival protection. If this completion is
-        # for a subscription we already know is terminally closed, DO
-        # NOT resurrect access. The reviewer scenario:
-        #   subscription.deleted → status=canceled, stripeSubscriptionId=sub_1
-        #   delayed checkout.session.completed for sub_1 → previously
-        #     reinstated access via a fabricated status change.
-        # Now: no fabricated status change. If the referenced subscription
-        # matches a terminal state, we skip billing mutation and simply
-        # record event completion.
+        # Review-pass identity checks (fix #2):
+        #   - Terminal-arrival guard requires BOTH matching
+        #     subscription id AND matching session id — otherwise a
+        #     late completion for an obsolete subscription could
+        #     overwrite the current active one.
+        #   - Pending-attempt clearing is now gated on sessionId
+        #     match (if the attempt captured one) rather than
+        #     plan+interval, because distinct attempts can share plan
+        #     and interval.
         current_sub_id = str(next_billing.get("stripeSubscriptionId") or "").strip()
         current_status = _clean(next_billing.get("status")).lower()
         is_terminal_late_arrival = bool(
@@ -1053,32 +1068,46 @@ async def stripe_webhook(
             and current_status in {"canceled", "incomplete_expired", "unpaid"}
         )
         pending_attempt = next_billing.get("pendingCheckoutAttempt") or {}
-        pending_plan_matches = (
+        pending_session_matches = (
             isinstance(pending_attempt, dict)
-            and str(pending_attempt.get("planKey") or "").lower() == requested_plan.key
-            and str(pending_attempt.get("interval") or "").lower() == str(
-                metadata.get("interval") or pending_attempt.get("interval") or ""
-            ).lower()
+            and bool(pending_attempt.get("sessionId"))
+            and str(pending_attempt.get("sessionId") or "") == session_id
         )
 
-        if is_terminal_late_arrival:
-            # Mark the event completed WITHOUT any billing mutation.
-            # No plan-limit sync, no stripe id change, no pending-attempt
-            # clear (an unrelated replacement attempt must survive).
+        # Obsolete-subscription guard: an active subscription is on
+        # record (not terminal) and the incoming completion refers to
+        # a DIFFERENT subscription id. The event is for an obsolete
+        # or orphan subscription (manually created in dashboard, or a
+        # delayed older session); do not overwrite the current
+        # stripeSubscriptionId / planKey / limits. Treat the event as
+        # a late-arrival (mark completed; no mutation).
+        is_obsolete_subscription_arrival = bool(
+            subscription_id
+            and current_sub_id
+            and current_sub_id != subscription_id
+            and current_status in {"active", "past_due", "trialing"}
+        )
+
+        if is_terminal_late_arrival or is_obsolete_subscription_arrival:
             logger.warning(
-                "checkout.session.completed received for terminal subscription "
-                "org=%s sub=%s; event completed without mutation",
-                org_id, subscription_id,
+                "checkout.session.completed late/obsolete arrival "
+                "org=%s session=%s sub=%s current_sub=%s current_status=%s",
+                org_id, session_id, subscription_id, current_sub_id, current_status,
             )
-            # Short-circuit: use the fenced-apply path with no changes.
-            if not multichurch_store.apply_webhook_event_atomic(
+            result = multichurch_store.apply_webhook_event_atomic(
                 org_id=org_id,
-                billing=next_billing,
+                billing=None,  # NO billing snapshot — late arrival must not resurrect state.
                 monthly_minutes=None,
                 event_id=event_id,
                 claim_token=claim_token,
-            ):
-                raise HTTPException(status_code=409, detail="webhook_claim_lost")
+                expected_billing_updated_at=expected_billing_updated_at,
+                event_created_at=event_created_at,
+            )
+            if not result.get("applied"):
+                reason = result.get("reason") or "unknown"
+                if reason in {"stale_snapshot", "claim_lost"}:
+                    raise HTTPException(status_code=409, detail="webhook_claim_lost")
+                return {"ok": True, "eventId": event_id, "lateArrival": True, "noop": reason}
             return {"ok": True, "eventId": event_id, "lateArrival": True}
 
         if customer_id:
@@ -1088,25 +1117,58 @@ async def stripe_webhook(
         next_billing["planKey"] = requested_plan.key
         next_billing.setdefault("limits", {})
         next_billing["limits"]["maxServiceKeys"] = requested_plan.max_service_keys
-        # Fix issue #2: represent "awaiting subscription confirmation"
-        # as a dedicated field, NOT a fabricated entitlement status.
-        # `claim_checkout_attempt` reads this flag to refuse duplicate
-        # checkouts during the window between completion and the
-        # subsequent `customer.subscription.*` arrival; entitlement
-        # (`canStartService`) is driven exclusively by status + grace.
+        # Fix issue #2 (prior pass): represent "awaiting subscription
+        # confirmation" as a dedicated field, NOT a fabricated
+        # entitlement status.
         if subscription_id:
             next_billing["pendingSubscriptionConfirmation"] = True
-        # Clear pending-checkout-attempt ONLY if this completion matches
-        # the pending attempt's plan+interval. A delayed completion for
-        # a prior attempt must not erase a REPLACEMENT attempt that was
-        # created after a logical new intent.
-        if pending_plan_matches:
+        # Clear pending-checkout-attempt only when the completion
+        # SESSION-ID matches the recorded one (review-pass identity
+        # fix). A delayed completion for a sibling attempt that
+        # happens to share plan+interval MUST NOT erase a replacement.
+        if pending_session_matches:
             next_billing["pendingCheckoutAttempt"] = None
         monthly_minutes_for_apply = requested_plan.monthly_minutes
         if requested_plan.key != "trial":
             pending_emails.append({"event": "subscription_started", "plan_key": requested_plan.key})
 
     elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
+        # Obsolete-subscription reconciliation (fix review item #2):
+        # if the event's subscription id does NOT match the org's
+        # current stripeSubscriptionId AND the current subscription is
+        # in an active-shaped state, this event is for a stale/orphan
+        # subscription — do NOT overwrite the current one. Mark the
+        # event completed with no billing mutation.
+        incoming_sub_id = str(payload_obj.get("id") or "").strip()
+        current_sub_id = str(next_billing.get("stripeSubscriptionId") or "").strip()
+        current_status = _clean(next_billing.get("status")).lower()
+        if (
+            incoming_sub_id
+            and current_sub_id
+            and incoming_sub_id != current_sub_id
+            and current_status in {"active", "past_due", "trialing"}
+        ):
+            logger.warning(
+                "customer.subscription.* arrival for obsolete sub "
+                "org=%s incoming_sub=%s current_sub=%s current_status=%s",
+                org_id, incoming_sub_id, current_sub_id, current_status,
+            )
+            result = multichurch_store.apply_webhook_event_atomic(
+                org_id=org_id,
+                billing=None,
+                monthly_minutes=None,
+                event_id=event_id,
+                claim_token=claim_token,
+                expected_billing_updated_at=expected_billing_updated_at,
+                event_created_at=event_created_at,
+            )
+            if not result.get("applied"):
+                reason = result.get("reason") or "unknown"
+                if reason in {"stale_snapshot", "claim_lost"}:
+                    raise HTTPException(status_code=409, detail="webhook_claim_lost")
+                return {"ok": True, "eventId": event_id, "obsoleteSubscription": True, "noop": reason}
+            return {"ok": True, "eventId": event_id, "obsoleteSubscription": True}
+
         next_billing = _merge_subscription_snapshot(
             billing=next_billing,
             stripe_subscription=payload_obj,
@@ -1186,34 +1248,44 @@ async def stripe_webhook(
         now=now,
     )
 
-    # Fenced apply (fix: boundary 1). Billing-profile write,
-    # monthly-minute write, and event completion happen as a single
-    # critical section gated on `claim_token`. If a sibling delivery
-    # reclaimed between our claim and this apply, the method returns
-    # False with NO partial writes and we surface 409 so Stripe
-    # retries with current state.
+    # Fenced apply with CAS + event-timestamp ordering (fix review
+    # item #1). Billing-profile write, monthly-minute write, and
+    # event completion happen as a single critical section gated on
+    # `claim_token` AND `expected_billing_updated_at` AND
+    # `event_created_at`. Any mismatch leaves the critical section
+    # untouched; a `stale_snapshot` or `claim_lost` reason surfaces as
+    # 409 so Stripe retries with current state. A `stale_event`
+    # reason completes the event (we processed it in identity terms)
+    # WITHOUT mutating billing — prevents retries of an older event
+    # from stomping on a newer one even when timing is adversarial.
     try:
-        applied = multichurch_store.apply_webhook_event_atomic(
+        result = multichurch_store.apply_webhook_event_atomic(
             org_id=org_id,
             billing=next_billing,
             monthly_minutes=monthly_minutes_for_apply,
             event_id=event_id,
             claim_token=claim_token,
+            expected_billing_updated_at=expected_billing_updated_at,
+            event_created_at=event_created_at,
         )
     except ValueError as exc:
         detail = str(exc)
         if detail == "org_not_found":
-            # The org was removed between resolve and apply. Mark the
-            # event completed (nothing to apply) and move on.
             multichurch_store.complete_billing_event(
                 event_id=event_id, claim_token=claim_token,
             )
             return {"ok": True, "eventId": event_id, "unmatched": True}
         raise HTTPException(status_code=400, detail=detail or "billing_profile_update_failed") from exc
-    if not applied:
-        # Another delivery is in charge now, OR persistence refused
-        # (e.g. event already completed). Return 409 so Stripe retries.
-        raise HTTPException(status_code=409, detail="webhook_claim_lost")
+    if not result.get("applied"):
+        reason = result.get("reason") or "unknown"
+        if reason in {"stale_snapshot", "claim_lost"}:
+            raise HTTPException(status_code=409, detail="webhook_claim_lost")
+        if reason == "stale_event":
+            # Event already recorded completed with no billing
+            # mutation inside the atomic apply. No notifications fire.
+            return {"ok": True, "eventId": event_id, "staleEvent": True}
+        # already_completed / no_claim — treat as dedup.
+        return {"ok": True, "eventId": event_id, "deduped": True, "reason": reason}
 
     # Notifications fire ONLY after the atomic apply succeeded, so a
     # failed persistence followed by a Stripe retry doesn't double-email.

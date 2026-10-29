@@ -7,6 +7,40 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage fourth pass (2026-10-29, after 27b92941)
+
+Reviewer flagged four remaining issues against the 27b92941 bundle. All four are addressed in this pass.
+
+### Issue 1 — Stale organization snapshots (CAS + event ordering)
+- **Problem**: `apply_webhook_event_atomic` took a pre-computed `billing` dict. A sibling delivery could update the org between the handler's read and the handler's apply; the Firestore transaction then wrote the stale snapshot. The reviewer's reproduction: older `invoice.payment_failed` handler pauses, newer `invoice.payment_succeeded` runs to completion, older handler resumes — final status `past_due` even though both events "completed."
+- **Fix**: `apply_webhook_event_atomic` now accepts `expected_billing_updated_at` (CAS token) and `event_created_at` (Stripe event's `created` timestamp). Inside the transaction:
+  - If `expected_billing_updated_at` ≠ current `billing.updatedAt` → return `{"applied": False, "reason": "stale_snapshot"}`. The route surfaces 409 so Stripe retries; on retry the handler reads the current state.
+  - If `event_created_at` is strictly older than `lastProcessedEventCreatedAt` on the org → mark the event completed (identity-level processing recorded) WITHOUT any billing mutation. Prevents retries of an older event from stomping on newer state.
+  - On success, `lastProcessedEventCreatedAt` is bumped to the current event's timestamp.
+- **Late-arrival branches now pass `billing=None`**: the previous code passed its full stale snapshot into `apply_webhook_event_atomic`, which could overwrite a replacement attempt. `billing=None` is a NO-OP write — the atomic apply still verifies CAS + claim-token + event-order but writes nothing to the billing profile.
+- **Deterministic interleaving regression**: `B2_InterleavedDifferentEventsRespectCASAndEventOrder::test_interleaved_pay_failed_then_succeeded_does_not_regress_to_past_due`. Uses a `side_effect` patch on the atomic apply to simulate "SUCCEEDED completes while FAILED is paused mid-flight" by directly bumping `billing.updatedAt` + setting `lastProcessedEventCreatedAt`. FAILED's first apply returns `stale_snapshot` → 409. Retry sees `stale_event` → marks completed without billing mutation. Final status: `active` (not regressed to `past_due`).
+- **Emulator parallel**: `test_apply_refuses_on_stale_billing_snapshot` and `test_apply_refuses_stale_event_timestamp` exercise CAS + event-ordering inside real Firestore transactions.
+- **Removed misleading claim**: earlier audit text said in-memory `_lock` serializes "whole handlers." That is **not true** — the lock serializes individual store calls only. The B2 test used to assert sequential last-write-wins; it has been replaced by the deterministic interleaving regression above.
+
+### Issue 2 — Match checkout completion by identity (session_id + obsolete subscription)
+- **Problem**:
+  - `pending_plan_matches` compared only plan + interval. Distinct attempts can share both; a completion for session `cs_A` could erase pending session `cs_B`.
+  - Terminal-arrival guard only checked matching subscription IDs. A delayed completion for `sub_obsolete` could overwrite the current `sub_current`.
+- **Fix**:
+  - Completion-matching is now by `sessionId`: `pending_session_matches` requires `pendingCheckoutAttempt.sessionId == payload.id`. Clear the pending record only on this match.
+  - Added **obsolete-subscription reconciliation** on BOTH event families:
+    - `checkout.session.completed`: if the incoming subscription id ≠ the current one AND the current status is active-shaped, treat as late arrival (no mutation; complete event).
+    - `customer.subscription.*`: same check — if the incoming subscription id ≠ the current one AND current status is active-shaped, mark completed with no billing mutation.
+- **Regressions**: `B6_LateCompletionDoesNotEraseReplacementBySessionId::test_late_completion_for_sibling_attempt_preserves_replacement`, `B7_ObsoleteSubscriptionDoesNotOverwriteCurrent::test_subscription_event_for_obsolete_sub_leaves_current_untouched`.
+
+### Issue 3 — Preserve `softCapReached` reset in the atomic apply
+- **Problem**: the original `set_org_monthly_minutes_limit` reset `softCapReached=False` when the new limit was 0 or exceeded `currentMonthMinutes`. The atomic-apply dropped that behavior; an upgrade from an exhausted Starter left the softCap flag permanently True under Growth.
+- **Fix**: both stores' `apply_webhook_event_atomic` now reset `softCapReached=False` when `monthly_minutes` is provided AND (limit == 0 OR currentMonthMinutes < limit) — matching the setter's semantics inside the same critical section.
+- **Regressions**: `B8_AtomicApplyPreservesSoftCapResetBehavior` (in-memory) + `test_apply_preserves_soft_cap_reset` (Firestore emulator).
+
+### Issue 4 — CI emulator discovery for ApplyWebhookEventAtomicFirestoreTests
+- **Fix**: `.github/workflows/ci.yml` now selects the WHOLE module `tests/test_billing_webhook_claim_firestore.py` in the firestore-emulator-tests invocation. Any future test class added to that file is automatically discovered.
+
 ## Boundary-coverage third pass (2026-10-29, after 817635e8)
 
 Reviewer flagged six concrete issues in the previous bundle; this pass addresses each with code changes and regression tests. Head commit on `prep/stripe-billing-audit` is now `<new-sha>`.

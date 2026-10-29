@@ -1906,26 +1906,43 @@ class InMemoryMultiChurchStore:
         self,
         *,
         org_id: str,
-        billing: Dict[str, Any],
+        billing: Optional[Dict[str, Any]],
         monthly_minutes: Optional[int],
         event_id: str,
         claim_token: str,
-    ) -> bool:
-        """Fenced apply (fix: boundary 1 — genuine lease fencing).
+        expected_billing_updated_at: Optional[datetime] = None,
+        event_created_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Fenced apply with CAS + event-timestamp ordering.
 
-        Writes the billing profile, org-level monthly-minute limit,
-        and event completion as a single critical section under the
-        in-memory `_lock`. If `claim_token` does not match the
-        current claim at the moment of apply, NO writes occur and
-        this method returns False — the caller must surface this to
-        the webhook layer so Stripe retries with the current state.
+        Returns a dict with at minimum `{"applied": bool}`. On
+        rejection, the dict includes a `"reason"` field one of:
+          - "no_claim"           — event doc missing or legacy
+                                   (treated as already completed).
+          - "already_completed"  — event is terminal.
+          - "claim_lost"         — claim_token differs from current.
+          - "stale_snapshot"     — expected_billing_updated_at
+                                   does not match the current
+                                   org.billing.updatedAt. The caller
+                                   should return 409 so Stripe retries;
+                                   the retry's fresh read sees the
+                                   newer state and recomputes
+                                   next_billing from it.
+          - "stale_event"        — event_created_at is strictly older
+                                   than `lastProcessedEventCreatedAt`
+                                   on the org. Prevents an older
+                                   payment event from stomping on a
+                                   newer one even when retries
+                                   interleave.
 
-        The Firestore counterpart on `FirestoreMultiChurchStore` runs
-        the equivalent in a single `@gcf_firestore.transactional`
-        function, so a sibling delivery that reclaims mid-flight does
-        NOT race the stale writer's three separate operations.
+        On success, the dict is `{"applied": True}` and the write
+        committed the billing profile, the monthly-minute limit (with
+        softCapReached preservation), and event completion as a single
+        critical section.
 
-        Returns True when all three writes committed as THIS claim.
+        A `billing=None` input is a NO-OP write — used by the
+        late-arrival branch which must mark the event completed but
+        MUST NOT submit any stale snapshot of the billing profile.
         """
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
@@ -1937,42 +1954,59 @@ class InMemoryMultiChurchStore:
         with self._lock:
             rec = self._billing_events.get(clean_event_id)
             if rec is None:
-                # No claim exists — refuse the apply so the caller
-                # surfaces a 409 and Stripe retries.
-                return False
+                return {"applied": False, "reason": "no_claim"}
             if "status" not in rec:
-                return False
+                return {"applied": False, "reason": "no_claim"}
             if str(rec.get("status") or "").lower() == "completed":
-                # Someone else already completed; abandon our writes.
-                return False
+                return {"applied": False, "reason": "already_completed"}
             current_token = str(rec.get("claimToken") or "")
             if current_token and current_token != str(claim_token):
-                return False
+                return {"applied": False, "reason": "claim_lost"}
             org = self._orgs.get(clean_org_id)
             if not org:
                 raise ValueError("org_not_found")
-            # Billing profile write (same normalization as
-            # set_org_billing_profile).
-            merged = _normalize_billing_state(
-                billing or {},
-                plan_key=str(org.get("plan") or "trial"),
-                now=now,
-            )
-            org["billing"] = merged
-            org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
-            org["status"] = (
-                "trial" if str(merged.get("status") or "").strip().lower() == "trialing"
-                else str(merged.get("status") or org.get("status") or "active")
-            )
+            # CAS on org.billing.updatedAt — rejects a stale snapshot.
+            if expected_billing_updated_at is not None:
+                current_billing = org.get("billing") or {}
+                current_ua = current_billing.get("updatedAt")
+                if current_ua != expected_billing_updated_at:
+                    return {"applied": False, "reason": "stale_snapshot"}
+            # Event-timestamp ordering — ignore strictly older events.
+            if event_created_at is not None:
+                last_created = org.get("lastProcessedEventCreatedAt")
+                if isinstance(last_created, datetime) and event_created_at < last_created:
+                    # Still mark the event completed (we did process
+                    # it to completion in event-identity terms; its
+                    # effect on billing is simply suppressed).
+                    rec["status"] = "completed"
+                    rec["completedAt"] = now
+                    return {"applied": False, "reason": "stale_event"}
+            # Only write billing fields when the caller supplied them.
+            if billing is not None:
+                merged = _normalize_billing_state(
+                    billing,
+                    plan_key=str(org.get("plan") or "trial"),
+                    now=now,
+                )
+                org["billing"] = merged
+                org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
+                org["status"] = (
+                    "trial" if str(merged.get("status") or "").strip().lower() == "trialing"
+                    else str(merged.get("status") or org.get("status") or "active")
+                )
             org["updatedAt"] = now
-            # Monthly-minute limit (atomic with the billing write).
+            # Monthly-minute limit — preserve the softCapReached
+            # reset semantics from `set_org_monthly_minutes_limit`.
             if monthly_minutes is not None:
                 int_minutes = max(0, int(monthly_minutes))
                 org["maxMinutesPerMonth"] = int_minutes
-            # Event completion.
+                if int_minutes == 0 or int(org.get("currentMonthMinutes") or 0) < int_minutes:
+                    org["softCapReached"] = False
+            if event_created_at is not None:
+                org["lastProcessedEventCreatedAt"] = event_created_at
             rec["status"] = "completed"
             rec["completedAt"] = now
-            return True
+            return {"applied": True}
 
     def get_org_billing_limits(
         self,
@@ -5059,18 +5093,16 @@ class FirestoreMultiChurchStore:
         self,
         *,
         org_id: str,
-        billing: Dict[str, Any],
+        billing: Optional[Dict[str, Any]],
         monthly_minutes: Optional[int],
         event_id: str,
         claim_token: str,
-    ) -> bool:
-        """Fenced apply (fix: boundary 1). See
+        expected_billing_updated_at: Optional[datetime] = None,
+        event_created_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Fenced apply with CAS + event-timestamp ordering. See
         InMemoryMultiChurchStore.apply_webhook_event_atomic for the
-        contract. Runs event-claim verification + billing write +
-        monthly-minutes write + event completion inside ONE Firestore
-        transaction. The transaction aborts (returns False) when the
-        current claim no longer matches `claim_token` or when the
-        event is already completed. No partial writes."""
+        contract. Runs everything inside one Firestore transaction."""
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
@@ -5082,45 +5114,63 @@ class FirestoreMultiChurchStore:
         event_ref = self._billing_event_ref(clean_event_id)
 
         @gcf_firestore.transactional
-        def _apply(tx: Any) -> bool:
+        def _apply(tx: Any) -> Dict[str, Any]:
             event_snap = event_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
             if not event_snap.exists:
-                return False
+                return {"applied": False, "reason": "no_claim"}
             rec = event_snap.to_dict() or {}
             if "status" not in rec:
-                return False  # legacy record — treat as completed
+                return {"applied": False, "reason": "no_claim"}
             if str(rec.get("status") or "").lower() == "completed":
-                return False
+                return {"applied": False, "reason": "already_completed"}
             current_token = str(rec.get("claimToken") or "")
             if current_token and current_token != str(claim_token):
-                return False
+                return {"applied": False, "reason": "claim_lost"}
             org_snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
             if not org_snap.exists:
                 raise ValueError("org_not_found")
             org = org_snap.to_dict() or {}
-            merged = _normalize_billing_state(
-                billing or {},
-                plan_key=str(org.get("plan") or "trial"),
-                now=now,
-            )
-            normalized_status = str(merged.get("status") or "").strip().lower()
-            org_update: Dict[str, Any] = {
-                "billing": merged,
-                "plan": str(merged.get("planKey") or org.get("plan") or "trial"),
-                "status": (
-                    "trial" if normalized_status == "trialing"
-                    else str(merged.get("status") or org.get("status") or "active")
-                ),
-                "updatedAt": now,
-            }
+            if expected_billing_updated_at is not None:
+                current_billing = org.get("billing") or {}
+                if current_billing.get("updatedAt") != expected_billing_updated_at:
+                    return {"applied": False, "reason": "stale_snapshot"}
+            if event_created_at is not None:
+                last_created = org.get("lastProcessedEventCreatedAt")
+                if isinstance(last_created, datetime) and event_created_at < last_created:
+                    tx.update(event_ref, {
+                        "status": "completed",
+                        "completedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    })
+                    return {"applied": False, "reason": "stale_event"}
+            org_update: Dict[str, Any] = {"updatedAt": now}
+            if billing is not None:
+                merged = _normalize_billing_state(
+                    billing,
+                    plan_key=str(org.get("plan") or "trial"),
+                    now=now,
+                )
+                normalized_status = str(merged.get("status") or "").strip().lower()
+                org_update.update({
+                    "billing": merged,
+                    "plan": str(merged.get("planKey") or org.get("plan") or "trial"),
+                    "status": (
+                        "trial" if normalized_status == "trialing"
+                        else str(merged.get("status") or org.get("status") or "active")
+                    ),
+                })
             if monthly_minutes is not None:
-                org_update["maxMinutesPerMonth"] = max(0, int(monthly_minutes))
+                int_minutes = max(0, int(monthly_minutes))
+                org_update["maxMinutesPerMonth"] = int_minutes
+                if int_minutes == 0 or int(org.get("currentMonthMinutes") or 0) < int_minutes:
+                    org_update["softCapReached"] = False
+            if event_created_at is not None:
+                org_update["lastProcessedEventCreatedAt"] = event_created_at
             tx.update(org_ref, org_update)
             tx.update(event_ref, {
                 "status": "completed",
                 "completedAt": gcf_firestore.SERVER_TIMESTAMP,
             })
-            return True
+            return {"applied": True}
 
         return _apply(self._db.transaction())
 
