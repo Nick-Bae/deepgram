@@ -715,6 +715,72 @@ class CustomerCreateHelperFirestoreTests(unittest.TestCase):
                  or {}).get("billing") or {}
         self.assertEqual(final.get("stripeCustomerId"), "cus_helper_made")
 
+    def test_expected_matches_raw_stored_representation(self) -> None:
+        """Review-pass v11 narrow fix at the store boundary. The
+        atomic precondition compares `expected[k]` against the RAW
+        stored value, so a caller that cleaned the observed value
+        to `None` cannot match a stored `""` (or vice versa).
+
+        Covers absent-key / None / empty-string. Each ordinary
+        patch — no sibling writer — must land when `expected` is
+        set to the exact observed value.
+        """
+        from app.services.multichurch_store import StaleBillingPatchError
+        db = _db()
+
+        # Absent key (no stripeCustomerId at all).
+        org_id = f"org_{uuid.uuid4().hex[:8]}"
+        now = _utc_now()
+        db.collection("organizations").document(org_id).set({
+            "orgId": org_id, "name": f"B19fs {org_id}",
+            "plan": "trial", "status": "trial",
+            "billing": {"planKey": "trial", "status": "trialing",
+                        "updatedAt": now},
+        })
+        with self.assertRaises(StaleBillingPatchError):
+            self.store.patch_org_billing_fields(
+                org_id=org_id,
+                updates={"stripeCustomerId": "cus_X"},
+                expected={"stripeCustomerId": ""},
+            )
+        self.store.patch_org_billing_fields(
+            org_id=org_id,
+            updates={"stripeCustomerId": "cus_X"},
+            expected={"stripeCustomerId": None},
+        )
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual(final.get("stripeCustomerId"), "cus_X")
+
+        # Explicit None.
+        org_id2 = self._seed_org_with_customer(None)
+        self.store.patch_org_billing_fields(
+            org_id=org_id2,
+            updates={"stripeCustomerId": "cus_Y"},
+            expected={"stripeCustomerId": None},
+        )
+        final2 = (db.collection("organizations").document(org_id2).get().to_dict()
+                  or {}).get("billing") or {}
+        self.assertEqual(final2.get("stripeCustomerId"), "cus_Y")
+
+        # Explicit empty string. expected=None would mismatch; expected=""
+        # must match.
+        org_id3 = self._seed_org_with_customer("")
+        with self.assertRaises(StaleBillingPatchError):
+            self.store.patch_org_billing_fields(
+                org_id=org_id3,
+                updates={"stripeCustomerId": "cus_Z"},
+                expected={"stripeCustomerId": None},
+            )
+        self.store.patch_org_billing_fields(
+            org_id=org_id3,
+            updates={"stripeCustomerId": "cus_Z"},
+            expected={"stripeCustomerId": ""},
+        )
+        final3 = (db.collection("organizations").document(org_id3).get().to_dict()
+                  or {}).get("billing") or {}
+        self.assertEqual(final3.get("stripeCustomerId"), "cus_Z")
+
 
 class CheckoutAttemptFirestoreTests(unittest.TestCase):
     """Transactional validation of the checkout-attempt claim,

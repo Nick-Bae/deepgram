@@ -383,7 +383,18 @@ def _create_missing_stripe_customer(
     rejected and the helper REUSES that newer id — it does NOT
     overwrite with the one we just created locally.
     """
-    observed_customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId")) or None
+    # Review-pass v10 narrow fix: preserve the EXACT observed stored
+    # representation for the atomic precondition. A previous version
+    # ran the raw value through `_clean_customer_id(...) or None`,
+    # which collapsed both "" and None to None. The store's
+    # `patch_org_billing_fields` compares `expected` against the raw
+    # stored value, so expected=None against stored="" always raised
+    # StaleBillingPatchError — even with zero concurrent writers —
+    # and the handler returned 409 instead of recovering. The
+    # precondition is about identity-change, not formatting; the
+    # Stripe call doesn't care about leading whitespace in a value
+    # we observed and are about to replace, so we observe raw.
+    observed_customer_id = (billing or {}).get("stripeCustomerId")
     customer = client.create_customer(
         email=user.email,
         name=user.displayName,

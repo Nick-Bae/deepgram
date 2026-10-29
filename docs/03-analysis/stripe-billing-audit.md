@@ -7,6 +7,20 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage eleventh pass (2026-10-29, after aa5c1201)
+
+Narrow edge case in v10. The reviewer confirmed concurrency fixes passed; only one representation detail remained.
+
+### Gap — Helper's precondition observed a cleaned value against the store's raw comparison
+- **Problem**: `_create_missing_stripe_customer` captured `observed_customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId")) or None`. `patch_org_billing_fields(expected=…)` compares against the **raw** stored value. With NO concurrent writer, if the stored `stripeCustomerId` was `""` (not `None` and not absent), the helper's `expected={"stripeCustomerId": None}` always mismatched stored `""`, raising `StaleBillingPatchError` and routing to the no-usable-id branch — the handler returned `409 stripe_customer_write_conflict` even though nothing had actually changed concurrently.
+- **Fix**: capture the raw observed value: `observed_customer_id = (billing or {}).get("stripeCustomerId")`. The precondition is about identity-change, not formatting; a stored `""` with observation `""` matches, as does `None` with `None` and absent-key with `None`. The downstream reload branch still runs the reloaded value through `_clean_customer_id` for semantic validation ("is it a usable id?").
+- **Regressions**:
+  - `B19_HelperExpectedMatchesRawStoredRepresentation` — three ordinary-recovery cases through the full Portal handler: `stripeCustomerId` absent, `None`, and `""`. All three must produce `cus_fresh` without a conflict error. The empty-string case fails on `aa5c1201` (verified in-session by locally reverting the one-line fix and running) and passes on `v11`; absent and None pass on both.
+  - Firestore emulator: `CustomerCreateHelperFirestoreTests::test_expected_matches_raw_stored_representation` — exercises absent, None, and `""` at the store boundary. For each, `expected=` set to the mismatched representation (e.g. `None` vs stored `""`) must raise; `expected=` set to the raw stored value must land.
+
+### Scope limit
+No broader refactor: `_normalize_billing_refs`/`_persist_normalized_refs` and `_clear_stale_stripe_refs` already capture `raw_value` and already-cleaned caller-supplied identities respectively. Both compare against the same raw stored shape through the store, so the problem does not recur there.
+
 ## Boundary-coverage tenth pass (2026-10-29, after 41ef16cf)
 
 Reviewer flagged an integration defect in `create_portal_session`'s missing-customer recovery that survived the v9 guarded cleanup.

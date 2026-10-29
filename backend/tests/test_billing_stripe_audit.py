@@ -40,6 +40,9 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_SENTINEL_ABSENT = object()
+
+
 class _AuditBase(unittest.TestCase):
     """Shared setup; patches BILLING_CONFIG on BOTH importers so the
     entitlements_v2 flag and price-id mappings reach every call site.
@@ -2438,6 +2441,94 @@ class B18_PortalRecoveryReusesWebhookCommittedCustomer(_AuditBase):
             self.assertEqual(final.get("stripeCustomerId"), "cus_webhook_won")
         finally:
             self.fake_client.create_customer = orig_create  # type: ignore
+
+
+class B19_HelperExpectedMatchesRawStoredRepresentation(_AuditBase):
+    """Review-pass v11 narrow fix: `_create_missing_stripe_customer`
+    previously ran the pre-call stored value through
+    `_clean_customer_id(...) or None`, collapsing both `""` and
+    `None` to `None`. But the store compares `expected` against the
+    raw stored value, so expected=None against stored="" always
+    raised `StaleBillingPatchError` — even with NO concurrent
+    writers — and the handler returned a spurious 409.
+
+    This triplet covers absent / None / empty-string: all three
+    must land cus_fresh via the ordinary recovery path without a
+    conflict error.
+    """
+
+    def _run_portal_recovery(self, *, uid: str, slug: str, seed_customer: Any) -> Dict[str, Any]:
+        from app.routes import billing as billing_routes
+        from app.billing.stripe_client import StripeClientError
+        org_id = self._bootstrap_owner(uid=uid, slug=slug, name=f"{slug} Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        if seed_customer is _SENTINEL_ABSENT:
+            billing.pop("stripeCustomerId", None)
+        else:
+            billing["stripeCustomerId"] = seed_customer
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        orig_portal = self.fake_client.create_billing_portal_session
+        orig_create = self.fake_client.create_customer
+        orig_list = self.fake_client.list_subscriptions
+
+        def _portal(**kwargs: Any) -> Dict[str, Any]:
+            cid = kwargs.get("customer_id")
+            # Only cus_fresh resolves; any seeded garbage would be
+            # "No such customer" — but the handler shouldn't send
+            # the seed if it is empty/None since _clean strips it.
+            return {"id": "bps_ok", "url": f"https://stripe.example/portal/{cid}"}
+
+        def _create(**kwargs: Any) -> Dict[str, Any]:
+            return {"id": "cus_fresh"}
+
+        def _no_subs(**kwargs: Any) -> Dict[str, Any]:
+            return {"data": []}
+
+        self.fake_client.create_billing_portal_session = _portal  # type: ignore
+        self.fake_client.create_customer = _create  # type: ignore
+        self.fake_client.list_subscriptions = _no_subs  # type: ignore
+        try:
+            result = billing_routes.create_portal_session(
+                body=billing_routes.PortalSessionRequest(
+                    orgId=org_id, returnUrl="https://app.example/x",
+                ),
+                user=AuthenticatedUser(uid=uid, email="o@x.com", displayName="O"),
+            )
+            final = self.store.get_org_billing_profile(org_id=org_id)
+            return {"result": result, "final": final}
+        finally:
+            self.fake_client.create_billing_portal_session = orig_portal  # type: ignore
+            self.fake_client.create_customer = orig_create  # type: ignore
+            self.fake_client.list_subscriptions = orig_list  # type: ignore
+
+    def test_absent_stripeCustomerId_recovers(self) -> None:
+        out = self._run_portal_recovery(
+            uid="owner-b19a", slug="b19a", seed_customer=_SENTINEL_ABSENT,
+        )
+        self.assertEqual(out["result"].get("url"),
+                         "https://stripe.example/portal/cus_fresh")
+        self.assertEqual(out["final"].get("stripeCustomerId"), "cus_fresh")
+
+    def test_none_stripeCustomerId_recovers(self) -> None:
+        out = self._run_portal_recovery(
+            uid="owner-b19b", slug="b19b", seed_customer=None,
+        )
+        self.assertEqual(out["result"].get("url"),
+                         "https://stripe.example/portal/cus_fresh")
+        self.assertEqual(out["final"].get("stripeCustomerId"), "cus_fresh")
+
+    def test_empty_string_stripeCustomerId_recovers(self) -> None:
+        """Regression lock for the v10 edge case. Fails on aa5c1201
+        with HTTPException(409, 'stripe_customer_write_conflict')
+        because observed=None mismatches stored='' in the atomic
+        precondition. Passes after v11's narrow fix (raw observed)."""
+        out = self._run_portal_recovery(
+            uid="owner-b19c", slug="b19c", seed_customer="",
+        )
+        self.assertEqual(out["result"].get("url"),
+                         "https://stripe.example/portal/cus_fresh")
+        self.assertEqual(out["final"].get("stripeCustomerId"), "cus_fresh")
 
 
 class B10_SubscriptionReconciliationAgainstCurrentStripeState(_AuditBase):
