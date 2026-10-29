@@ -7,6 +7,22 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage tenth pass (2026-10-29, after 41ef16cf)
+
+Reviewer flagged an integration defect in `create_portal_session`'s missing-customer recovery that survived the v9 guarded cleanup.
+
+### Gap — Recovery blindly re-creates after guarded cleanup, and helper's final write isn't identity-matched
+- **Problem**: `_clear_stale_stripe_refs` correctly abandoned the clear when a concurrent webhook had replaced the obsolete customer with a new valid id (`cus_new`). The handler then IGNORED that preserved identity and called `_create_missing_stripe_customer` unconditionally, which patched `stripeCustomerId` to a brand-new `cus_recovery` and used it for the retry Portal call. The newer `cus_new` identity committed by the webhook was overwritten; the returned Portal session targeted `cus_recovery` instead.
+- **Fixes**:
+  - **`create_portal_session` recovery path**: after `_clear_stale_stripe_refs`, if the refreshed billing's `stripeCustomerId` differs from the one that failed, REUSE that id — do not create a replacement. Only call `_create_missing_stripe_customer` when the clear went through (identity still matched) or no refreshed id exists.
+  - **`create_checkout_session` recovery path**: same change applied (parallel pattern).
+  - **`_create_missing_stripe_customer` helper**: now records `observed_customer_id` BEFORE calling `client.create_customer` and makes its final `patch_org_billing_fields` conditional on `expected={"stripeCustomerId": observed_customer_id}`. On `StaleBillingPatchError`, the helper reloads the current billing and RETURNS the existing (webhook-committed) customer id, discarding the one it just created on Stripe. If no replacement exists in the store (defensive branch), raises `HTTPException(409, "stripe_customer_write_conflict")` as a retryable signal — never blindly overwrites.
+- **Regressions**:
+  - `B18_PortalRecoveryReusesWebhookCommittedCustomer::test_portal_recovery_reuses_concurrent_webhook_customer` — real threads + barrier through the full handler. Portal call paused with `cus_obsolete`; webhook commits `cus_new/sub_new/price_growth`; Portal error released. Asserts stored `stripeCustomerId=cus_new`, `stripeSubscriptionId=sub_new`, no `create_customer` was invoked, and the returned Portal URL targets `cus_new`.
+  - `B18::test_ordinary_missing_customer_recovery_still_works` — regression lock on the no-concurrent-writer path: with no sibling webhook, cleanup clears, `_create_missing_stripe_customer` runs, and the retry Portal call lands with the fresh `cus_fresh`.
+  - `B18::test_create_missing_customer_helper_reuses_webhook_committed_id` — isolated helper race: `create_customer` paused, sibling `patch_org_billing_fields` sets `cus_webhook_won`, helper released. Helper's final patch is rejected via `StaleBillingPatchError` and the helper returns `cus_webhook_won`.
+  - Firestore emulator: `CustomerCreateHelperFirestoreTests::test_helper_write_rejected_when_webhook_committed_different_id` and `::test_helper_write_lands_when_observation_still_matches`.
+
 ## Boundary-coverage ninth pass (2026-10-29, after 8cd39e74)
 
 Reviewer flagged a remaining issue in the reference-write contract. v8's targeted patches preserved unrelated fields, but still overwrote the patched fields themselves with potentially stale values derived from an old read.

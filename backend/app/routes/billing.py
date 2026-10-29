@@ -371,11 +371,19 @@ def _create_missing_stripe_customer(
     user: AuthenticatedUser,
     idempotency_suffix: str = "",
 ) -> tuple[str, Dict[str, Any]]:
-    """Review-pass v8 gap #1: patch only `stripeCustomerId` via
-    `patch_org_billing_fields`. The previous full-snapshot write
-    could stamp an old snapshot over a concurrent webhook commit
-    (e.g. subscription.created landing while this call awaited
-    Stripe's customer-create response)."""
+    """Create a Stripe customer and persist its id.
+
+    Review-pass v9 gap: the Stripe create_customer call is slow;
+    a concurrent webhook may land `customer.subscription.created`
+    with a brand-new customer id during the gap between our
+    pre-call read and our post-call write. The helper now
+    OBSERVES the customer id before the Stripe call and makes
+    the final patch conditional on that observed value. If a
+    webhook has since written a different id, the patch is
+    rejected and the helper REUSES that newer id — it does NOT
+    overwrite with the one we just created locally.
+    """
+    observed_customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId")) or None
     customer = client.create_customer(
         email=user.email,
         name=user.displayName,
@@ -385,11 +393,37 @@ def _create_missing_stripe_customer(
     customer_id = _clean_customer_id((customer or {}).get("id"))
     if not customer_id:
         raise HTTPException(status_code=502, detail="stripe_customer_create_failed")
-    saved = multichurch_store.patch_org_billing_fields(
-        org_id=org_id,
-        updates={"stripeCustomerId": customer_id},
-    )
-    return customer_id, saved
+    try:
+        saved = multichurch_store.patch_org_billing_fields(
+            org_id=org_id,
+            updates={"stripeCustomerId": customer_id},
+            expected={"stripeCustomerId": observed_customer_id},
+        )
+        return customer_id, saved
+    except StaleBillingPatchError as exc:
+        # A webhook (e.g. customer.subscription.created) committed a
+        # different stripeCustomerId while our create_customer call
+        # was in flight. Reload, and if the current stored id is a
+        # valid new id, REUSE it. Our locally-created Stripe
+        # customer becomes an orphan on Stripe's side — acceptable:
+        # the idempotency_key keeps it unique, and leaving it alone
+        # is safer than overwriting a Stripe-tied new identity.
+        logger.info(
+            "create_missing_customer_conflict_reuse org=%s observed=%s current=%s",
+            org_id,
+            observed_customer_id,
+            (exc.mismatches.get("stripeCustomerId") or (None, None))[1],
+        )
+        refreshed = multichurch_store.get_org_billing_profile(org_id=org_id)
+        existing_id = _clean_customer_id((refreshed or {}).get("stripeCustomerId")) or None
+        if existing_id:
+            return existing_id, refreshed
+        # No valid replacement in the store (should not happen if the
+        # mismatch was a real new id, but defensively): surface a
+        # retryable conflict rather than overwrite.
+        raise HTTPException(
+            status_code=409, detail="stripe_customer_write_conflict",
+        ) from exc
 
 
 def _first_subscription_item(subscription: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -839,13 +873,27 @@ def create_checkout_session(
         # If the stored Stripe customer belongs to a different account/mode, recreate and retry once.
         if customer_id and _is_missing_customer_error(exc):
             try:
-                customer_id, billing = _create_missing_stripe_customer(
-                    client=client,
+                # Review-pass v9 gap: identity-matched cleanup first;
+                # if a concurrent webhook has committed a new valid
+                # customer, reuse it instead of creating a replacement.
+                refreshed_billing = _clear_stale_stripe_refs(
                     org_id=body.orgId,
                     billing=billing,
-                    user=user,
-                    idempotency_suffix="-retry",
+                    failed_customer_id=customer_id or None,
                 )
+                refreshed_customer_id = _clean_customer_id(
+                    (refreshed_billing or {}).get("stripeCustomerId"),
+                )
+                if refreshed_customer_id and refreshed_customer_id != customer_id:
+                    customer_id, billing = refreshed_customer_id, refreshed_billing
+                else:
+                    customer_id, billing = _create_missing_stripe_customer(
+                        client=client,
+                        org_id=body.orgId,
+                        billing=refreshed_billing,
+                        user=user,
+                        idempotency_suffix="-retry",
+                    )
                 session = client.create_checkout_session(
                     customer_id=customer_id,
                     price_id=price_id,
@@ -938,13 +986,24 @@ def create_portal_session(
                     billing=billing,
                     failed_customer_id=customer_id or None,
                 )
-                customer_id, billing = _create_missing_stripe_customer(
-                    client=client,
-                    org_id=body.orgId,
-                    billing=refreshed_billing,
-                    user=user,
-                    idempotency_suffix="-retry",
+                # Review-pass v9 gap: if `_clear_stale_stripe_refs`
+                # abandoned the clear because a concurrent webhook
+                # replaced our obsolete customer with a new valid
+                # id, REUSE that new id instead of creating a
+                # replacement customer blindly.
+                refreshed_customer_id = _clean_customer_id(
+                    (refreshed_billing or {}).get("stripeCustomerId"),
                 )
+                if refreshed_customer_id and refreshed_customer_id != customer_id:
+                    customer_id, billing = refreshed_customer_id, refreshed_billing
+                else:
+                    customer_id, billing = _create_missing_stripe_customer(
+                        client=client,
+                        org_id=body.orgId,
+                        billing=refreshed_billing,
+                        user=user,
+                        idempotency_suffix="-retry",
+                    )
                 session = client.create_billing_portal_session(customer_id=customer_id, return_url=body.returnUrl)
             except StripeClientError as retry_exc:
                 logger.warning("stripe_portal_failed (retry) org=%s: %s", body.orgId, retry_exc)

@@ -26,7 +26,7 @@ import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 if not os.environ.get("FIRESTORE_EMULATOR_HOST"):
     raise unittest.SkipTest(
@@ -648,6 +648,72 @@ class PatchOrgBillingFieldsExpectedFirestoreTests(unittest.TestCase):
         self.assertEqual(final.get("stripeSubscriptionId"), "sub_new")
         self.assertEqual(final.get("priceId"), "price_growth")
         self.assertEqual(final.get("planKey"), "growth")
+
+
+class CustomerCreateHelperFirestoreTests(unittest.TestCase):
+    """Review-pass v10 fix: the final write in
+    `_create_missing_stripe_customer` must be rejected if the stored
+    `stripeCustomerId` changed while the Stripe `create_customer`
+    call was in flight. At the Firestore boundary, this reduces to
+    asserting `patch_org_billing_fields(expected={"stripeCustomerId":
+    observed_old}, updates={"stripeCustomerId": helper_made})` is
+    rejected when a sibling writer has already set a different id.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.store = FirestoreMultiChurchStore()
+
+    def _seed_org_with_customer(self, customer_id: Optional[str]) -> str:
+        db = _db()
+        org_id = f"org_{uuid.uuid4().hex[:8]}"
+        now = _utc_now()
+        db.collection("organizations").document(org_id).set({
+            "orgId": org_id, "name": f"B18fs {org_id}",
+            "plan": "trial", "status": "trial",
+            "billing": {
+                "planKey": "trial", "status": "trialing",
+                "stripeCustomerId": customer_id,
+                "updatedAt": now,
+            },
+        })
+        return org_id
+
+    def test_helper_write_rejected_when_webhook_committed_different_id(self) -> None:
+        from app.services.multichurch_store import StaleBillingPatchError
+        db = _db()
+        org_id = self._seed_org_with_customer(None)
+        # Model what the helper OBSERVED pre-Stripe-call: no customer.
+        observed_customer_id = None
+        # Sibling writer (webhook) committed cus_new in the meantime.
+        self.store.patch_org_billing_fields(
+            org_id=org_id, updates={"stripeCustomerId": "cus_new"},
+        )
+        # Helper's final write must be rejected.
+        with self.assertRaises(StaleBillingPatchError) as cm:
+            self.store.patch_org_billing_fields(
+                org_id=org_id,
+                updates={"stripeCustomerId": "cus_helper_made"},
+                expected={"stripeCustomerId": observed_customer_id},
+            )
+        self.assertIn("stripeCustomerId", cm.exception.mismatches)
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual(final.get("stripeCustomerId"), "cus_new",
+                         "sibling customer id was overwritten by the stale helper patch")
+
+    def test_helper_write_lands_when_observation_still_matches(self) -> None:
+        db = _db()
+        org_id = self._seed_org_with_customer(None)
+        # No sibling writer. Helper's final write should land.
+        self.store.patch_org_billing_fields(
+            org_id=org_id,
+            updates={"stripeCustomerId": "cus_helper_made"},
+            expected={"stripeCustomerId": None},
+        )
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual(final.get("stripeCustomerId"), "cus_helper_made")
 
 
 class CheckoutAttemptFirestoreTests(unittest.TestCase):

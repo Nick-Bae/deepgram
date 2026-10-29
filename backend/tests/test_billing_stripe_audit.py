@@ -2151,6 +2151,295 @@ class B17_ClearStaleRefsVerifiesIdentity(_AuditBase):
             self.fake_client.list_subscriptions = orig_list  # type: ignore
 
 
+class B18_PortalRecoveryReusesWebhookCommittedCustomer(_AuditBase):
+    """Review-pass v10 fix: `create_portal_session`'s missing-customer
+    recovery previously called `_create_missing_stripe_customer`
+    unconditionally after `_clear_stale_stripe_refs` abandoned the
+    clear. That overwrote the newer customer id the guarded cleanup
+    had just preserved. The recovery must:
+
+      1. Prefer the current stored customer id when it has changed
+         (a webhook replaced the obsolete one) — don't create a
+         replacement.
+      2. Even when a new customer DOES need to be created, protect
+         the final `stripeCustomerId` patch with an identity
+         precondition so an in-flight webhook that committed a
+         different id wins.
+    """
+
+    def test_portal_recovery_reuses_concurrent_webhook_customer(self) -> None:
+        import threading
+        from app.routes import billing as billing_routes
+        from app.billing.stripe_client import StripeClientError
+        org_id = self._bootstrap_owner(
+            uid="owner-b18a", slug="b18a-church", name="B18a Church",
+        )
+        # Initial state: obsolete customer, no subscription.
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_obsolete"
+        billing["stripeSubscriptionId"] = None
+        billing["priceId"] = None
+        billing["planKey"] = "trial"
+        billing["status"] = "trialing"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        pause_portal = threading.Event()
+        release_portal = threading.Event()
+        trace: list = []
+
+        orig_portal = self.fake_client.create_billing_portal_session
+        orig_create = self.fake_client.create_customer
+        orig_list = self.fake_client.list_subscriptions
+
+        def _slow_portal(**kwargs: Any) -> Dict[str, Any]:
+            cid = kwargs.get("customer_id")
+            trace.append(("portal enter", cid))
+            if cid == "cus_obsolete":
+                pause_portal.set()
+                release_portal.wait(timeout=5.0)
+                trace.append(("portal raise obsolete",))
+                raise StripeClientError("No such customer: cus_obsolete")
+            # Success path for the retry target.
+            trace.append(("portal ok", cid))
+            return {
+                "id": "bps_123",
+                "url": f"https://stripe.example/billing_portal/{cid}",
+            }
+
+        def _recovery_create_customer(**kwargs: Any) -> Dict[str, Any]:
+            trace.append(("create_customer called",))
+            return {
+                "id": "cus_recovery",
+                "email": kwargs.get("email"),
+                "name": kwargs.get("name"),
+            }
+
+        def _no_subs_for_obsolete(**kwargs: Any) -> Dict[str, Any]:
+            # The create_portal_session handler runs hydrate first.
+            # The default fake fabricates a subscription under
+            # `cus_test_123` for any customer_id, which would smuggle
+            # the stored cus_obsolete into cus_test_123 before our
+            # portal call. Return empty so hydrate is a no-op.
+            trace.append(("list_subs", kwargs.get("customer_id")))
+            return {"data": []}
+
+        self.fake_client.create_billing_portal_session = _slow_portal  # type: ignore
+        self.fake_client.create_customer = _recovery_create_customer  # type: ignore
+        self.fake_client.list_subscriptions = _no_subs_for_obsolete  # type: ignore
+
+        handler_result: Dict[str, Any] = {}
+
+        def _handler_thread() -> None:
+            try:
+                handler_result["returned"] = billing_routes.create_portal_session(
+                    body=billing_routes.PortalSessionRequest(
+                        orgId=org_id,
+                        returnUrl="https://app.example/account/billing",
+                    ),
+                    user=AuthenticatedUser(
+                        uid="owner-b18a", email="o@x.com", displayName="O",
+                    ),
+                )
+            except Exception as exc:
+                handler_result["error"] = repr(exc)
+
+        try:
+            t = threading.Thread(target=_handler_thread)
+            t.start()
+            self.assertTrue(
+                pause_portal.wait(timeout=5.0),
+                f"handler did not reach create_billing_portal_session; trace={trace}",
+            )
+
+            # Webhook commits new identity for the SAME org.
+            growth_sub = {
+                "id": "sub_new",
+                "customer": "cus_new",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": int(time.time()),
+                "current_period_end": int(time.time()) + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "growth"},
+                "items": {"data": [{"price": {"id": "price_growth"}}]},
+            }
+            self.fake_client.sub_states["sub_new"] = growth_sub
+            raw = json.dumps({
+                "id": "evt_b18a",
+                "type": "customer.subscription.created",
+                "data": {"object": growth_sub},
+            }).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw),
+                    stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                )
+            )
+            after_webhook = self.store.get_org_billing_profile(org_id=org_id)
+            self.assertEqual(after_webhook.get("stripeCustomerId"), "cus_new")
+            self.assertEqual(after_webhook.get("stripeSubscriptionId"), "sub_new")
+
+            # Release the handler. The portal error raises; recovery
+            # path must REUSE cus_new, not create a cus_recovery.
+            release_portal.set()
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive(), "handler thread hung")
+            self.assertNotIn(
+                "error", handler_result,
+                f"handler raised: {handler_result.get('error')}; trace={trace}",
+            )
+
+            # No stray customer creation.
+            self.assertNotIn(
+                ("create_customer called",), trace,
+                f"handler created a replacement customer; trace={trace}",
+            )
+
+            final = self.store.get_org_billing_profile(org_id=org_id)
+            self.assertEqual(
+                final.get("stripeCustomerId"), "cus_new",
+                f"handler overwrote newer customer id; trace={trace}",
+            )
+            self.assertEqual(final.get("stripeSubscriptionId"), "sub_new")
+            self.assertEqual(final.get("priceId"), "price_growth")
+
+            returned = handler_result.get("returned") or {}
+            self.assertEqual(
+                returned.get("url"),
+                "https://stripe.example/billing_portal/cus_new",
+                f"portal session not targeted at cus_new; trace={trace}",
+            )
+        finally:
+            self.fake_client.create_billing_portal_session = orig_portal  # type: ignore
+            self.fake_client.create_customer = orig_create  # type: ignore
+            self.fake_client.list_subscriptions = orig_list  # type: ignore
+
+    def test_ordinary_missing_customer_recovery_still_works(self) -> None:
+        """Preserve the normal path: when no concurrent webhook landed,
+        _create_missing_stripe_customer must still produce a new
+        customer id and the handler must retry with it."""
+        from app.routes import billing as billing_routes
+        from app.billing.stripe_client import StripeClientError
+        org_id = self._bootstrap_owner(
+            uid="owner-b18b", slug="b18b-church", name="B18b Church",
+        )
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_bad"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        calls: list = []
+        orig_portal = self.fake_client.create_billing_portal_session
+        orig_create = self.fake_client.create_customer
+        orig_list = self.fake_client.list_subscriptions
+
+        def _portal(**kwargs: Any) -> Dict[str, Any]:
+            calls.append(("portal", kwargs.get("customer_id")))
+            cid = kwargs.get("customer_id")
+            if cid == "cus_bad":
+                raise StripeClientError("No such customer: cus_bad")
+            return {"id": "bps_ok", "url": f"https://stripe.example/portal/{cid}"}
+
+        def _create(**kwargs: Any) -> Dict[str, Any]:
+            calls.append(("create_customer",))
+            return {"id": "cus_fresh"}
+
+        def _no_subs(**kwargs: Any) -> Dict[str, Any]:
+            return {"data": []}
+
+        self.fake_client.create_billing_portal_session = _portal  # type: ignore
+        self.fake_client.create_customer = _create  # type: ignore
+        self.fake_client.list_subscriptions = _no_subs  # type: ignore
+        try:
+            result = billing_routes.create_portal_session(
+                body=billing_routes.PortalSessionRequest(
+                    orgId=org_id, returnUrl="https://app.example/x",
+                ),
+                user=AuthenticatedUser(
+                    uid="owner-b18b", email="o@x.com", displayName="O",
+                ),
+            )
+            self.assertEqual(result.get("url"), "https://stripe.example/portal/cus_fresh")
+            self.assertEqual(
+                calls,
+                [("portal", "cus_bad"), ("create_customer",), ("portal", "cus_fresh")],
+                "ordinary recovery flow altered",
+            )
+            final = self.store.get_org_billing_profile(org_id=org_id)
+            self.assertEqual(final.get("stripeCustomerId"), "cus_fresh")
+        finally:
+            self.fake_client.create_billing_portal_session = orig_portal  # type: ignore
+            self.fake_client.create_customer = orig_create  # type: ignore
+            self.fake_client.list_subscriptions = orig_list  # type: ignore
+
+    def test_create_missing_customer_helper_reuses_webhook_committed_id(self) -> None:
+        """Protect the helper's final reference write: even if the
+        caller somehow invokes `_create_missing_stripe_customer`
+        after a webhook has committed a new id, the helper's
+        identity-matched final patch must reject and reuse the
+        newer id — never overwrite it with the one it just created.
+        """
+        import threading
+        from app.routes import billing as billing_routes
+        org_id = self._bootstrap_owner(
+            uid="owner-b18c", slug="b18c-church", name="B18c Church",
+        )
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = None
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        pause_create = threading.Event()
+        release_create = threading.Event()
+
+        orig_create = self.fake_client.create_customer
+
+        def _slow_create(**kwargs: Any) -> Dict[str, Any]:
+            pause_create.set()
+            release_create.wait(timeout=5.0)
+            return {"id": "cus_helper_made"}
+
+        self.fake_client.create_customer = _slow_create  # type: ignore
+        helper_result: Dict[str, Any] = {}
+
+        def _helper_thread() -> None:
+            try:
+                cid, saved = billing_routes._create_missing_stripe_customer(
+                    client=self.fake_client,
+                    org_id=org_id,
+                    billing=self.store.get_org_billing_profile(org_id=org_id),
+                    user=AuthenticatedUser(
+                        uid="owner-b18c", email="o@x.com", displayName="O",
+                    ),
+                )
+                helper_result["returned"] = (cid, saved)
+            except Exception as exc:
+                helper_result["error"] = repr(exc)
+
+        try:
+            t = threading.Thread(target=_helper_thread)
+            t.start()
+            self.assertTrue(pause_create.wait(timeout=5.0))
+
+            # Webhook commits a different customer id while
+            # create_customer is in flight.
+            self.store.patch_org_billing_fields(
+                org_id=org_id,
+                updates={"stripeCustomerId": "cus_webhook_won"},
+            )
+
+            release_create.set()
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive(), "helper hung")
+            self.assertNotIn("error", helper_result, helper_result.get("error", ""))
+
+            # Helper REUSED the webhook's id, not its own.
+            returned_cid, _ = helper_result["returned"]
+            self.assertEqual(returned_cid, "cus_webhook_won",
+                             "helper overwrote webhook's committed customer id")
+            final = self.store.get_org_billing_profile(org_id=org_id)
+            self.assertEqual(final.get("stripeCustomerId"), "cus_webhook_won")
+        finally:
+            self.fake_client.create_customer = orig_create  # type: ignore
+
+
 class B10_SubscriptionReconciliationAgainstCurrentStripeState(_AuditBase):
     """Review-pass v6 fix (issue #1): on `customer.subscription.*` the
     handler must reconcile against the CURRENT subscription state
