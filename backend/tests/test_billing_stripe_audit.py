@@ -421,16 +421,19 @@ class H5_FailedWriteRetryIsNotDeduped(_AuditBase):
         raw = json.dumps(event).encode("utf-8")
         sig = _sign_stripe_payload(raw, "whsec_audit")
 
-        # First delivery: force a persistence failure.
-        original_set = self.store.set_org_billing_profile
+        # First delivery: force apply_webhook_event_atomic to raise.
+        # The fenced apply is the single critical section; its failure
+        # must leave the event uncompleted so Stripe's retry can
+        # rerun the handler cleanly.
+        original_apply = self.store.apply_webhook_event_atomic
         calls = {"n": 0}
-        def _flaky_set(**kwargs: Any) -> Dict[str, Any]:
+        def _flaky_apply(**kwargs: Any) -> bool:
             calls["n"] += 1
-            if calls["n"] == 1 or (kwargs.get("billing") or {}).get("status") == "past_due":
+            if calls["n"] == 1:
                 raise ValueError("persistence_write_failed")
-            return original_set(**kwargs)
+            return original_apply(**kwargs)
 
-        with patch.object(self.store, "set_org_billing_profile", side_effect=_flaky_set):
+        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=_flaky_apply):
             with self.assertRaises(HTTPException):
                 asyncio.run(
                     billing_routes.stripe_webhook(
@@ -438,16 +441,10 @@ class H5_FailedWriteRetryIsNotDeduped(_AuditBase):
                         stripe_signature=sig,
                     )
                 )
-
-        # The event must NOT be deduped on retry (a lease is still OK,
-        # but after the lease ages out the retry must succeed). To make
-        # the test deterministic, age the lease by rewriting claimedAt.
         rec = self.store._billing_events["evt_h5"]
         self.assertNotEqual(rec.get("status"), "completed",
-                            "event marked completed despite failed persistence")
-        rec["claimedAt"] = _utc_now() - timedelta(seconds=999)  # force lease expiry
-
-        # Second delivery: Stripe retried; this time persistence succeeds.
+                            "event marked completed despite failed apply")
+        rec["claimedAt"] = _utc_now() - timedelta(seconds=999)
         result = asyncio.run(
             billing_routes.stripe_webhook(
                 request=_DummyRequest(raw),
@@ -758,12 +755,11 @@ class B1_SlowWorkerAfterLeaseReclaim(_AuditBase):
         )
         self.assertFalse(a_result)
 
-    def test_webhook_rejects_write_when_claim_lost(self) -> None:
-        """A slow handler can still try to WRITE after its lease aged
-        out. The webhook's pre-write ownership check (via
-        `check_claim_still_held`) must detect the reclaim and refuse
-        the write with 409 so the handler bails before stomping on
-        the newer claim's state.
+    def test_webhook_apply_refused_when_claim_lost(self) -> None:
+        """A slow handler whose lease was reclaimed mid-flight must
+        not stomp on the newer claim's work. The fenced apply method
+        is the single critical section; when it returns False the
+        route surfaces 409 and NO partial writes land.
         """
         org_id = self._bootstrap_owner(uid="owner-b1w", slug="b1w-church", name="B1w Church")
         billing = self.store.get_org_billing_profile(org_id=org_id)
@@ -788,27 +784,10 @@ class B1_SlowWorkerAfterLeaseReclaim(_AuditBase):
         raw = json.dumps(event).encode("utf-8")
         sig = _sign_stripe_payload(raw, "whsec_audit")
 
-        # Pre-claim the event (as a sibling delivery would).
-        self.store.try_claim_billing_event(
-            event_id="evt_b1w", event_type="customer.subscription.updated",
-            payload={"type": "customer.subscription.updated"},
-        )
-        # Age it out so the SECOND delivery (the webhook under test)
-        # becomes the reclaimer. Then after that, re-age so the
-        # webhook's own lease is also expired, simulating a slow
-        # handler whose lease was reclaimed by yet another sibling.
-        rec = self.store._billing_events["evt_b1w"]
-        rec["claimedAt"] = _utc_now() - timedelta(seconds=600)
-
-        # The webhook will see "fresh" (reclaim) then do pre-write
-        # ownership check — but we tamper with the token mid-way to
-        # simulate a third delivery racing in after the webhook's
-        # claim but before its write.
-        original_check = self.store.check_claim_still_held
-        def _tampered_check(**kwargs: Any) -> bool:
-            return False  # pretend another delivery took over
-
-        with patch.object(self.store, "check_claim_still_held", side_effect=_tampered_check):
+        # Patch the fenced apply to simulate "another delivery took
+        # over after our claim" — the sibling fenced-token check
+        # inside the method returns False.
+        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=lambda **_: False):
             with self.assertRaises(HTTPException) as ctx:
                 asyncio.run(
                     billing_routes.stripe_webhook(
@@ -947,7 +926,11 @@ class B5_SwallowedPlanLimitsFailureNowRecoverable(_AuditBase):
     Stripe retries.
     """
 
-    def test_monthly_minutes_failure_is_not_swallowed_followed_by_completion(self) -> None:
+    def test_apply_failure_is_not_swallowed_followed_by_completion(self) -> None:
+        """Any failure inside `apply_webhook_event_atomic` (billing
+        profile write OR plan-limit write) must propagate so the
+        event does NOT get completed. Stripe's retry (after lease
+        aging) reruns the handler cleanly."""
         org_id = self._bootstrap_owner(uid="owner-b5", slug="b5-church", name="B5 Church")
 
         now_ts = int(time.time())
@@ -961,24 +944,246 @@ class B5_SwallowedPlanLimitsFailureNowRecoverable(_AuditBase):
         raw = json.dumps(event).encode("utf-8")
         sig = _sign_stripe_payload(raw, "whsec_audit")
 
-        original = self.store.set_org_monthly_minutes_limit
-        def _flaky(**kwargs: Any) -> None:
+        def _flaky_apply(**kwargs: Any) -> bool:
             raise RuntimeError("firestore_unavailable")
 
-        with patch.object(self.store, "set_org_monthly_minutes_limit", side_effect=_flaky):
-            with self.assertRaises(HTTPException) as ctx:
+        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=_flaky_apply):
+            with self.assertRaises(Exception):
                 asyncio.run(
                     billing_routes.stripe_webhook(
                         request=_DummyRequest(raw), stripe_signature=sig,
                     )
                 )
-        self.assertEqual(ctx.exception.status_code, 500)
-        self.assertEqual(ctx.exception.detail, "billing_plan_limits_sync_failed")
-
-        # The event is NOT completed — a retry (after lease aging) can
-        # run to completion when the dependency recovers.
         rec = self.store._billing_events.get("evt_b5_checkout") or {}
-        self.assertNotEqual(rec.get("status"), "completed")
+        self.assertNotEqual(rec.get("status"), "completed",
+                            "event marked completed despite failed apply")
+
+
+class B4b_LateArrivalCheckoutDoesNotResurrectAccess(_AuditBase):
+    """Second-review correction (issue #2): a delayed
+    `checkout.session.completed` for a now-canceled subscription
+    must NOT fabricate `status=trialing` to block a second checkout;
+    doing so grants service-start to a canceled account. The fix
+    uses a separate `pendingSubscriptionConfirmation` flag and
+    short-circuits the handler for late terminal arrivals.
+    """
+
+    entitlements_v2_enabled = True  # exercise the real entitlement-start path
+
+    def test_late_arrival_does_not_grant_service_access(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b4b", slug="b4b-church", name="B4b Church")
+        # Seed: subscription was deleted — status=canceled, stripeSubId still on record.
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b4b"
+        billing["stripeSubscriptionId"] = "sub_b4b"
+        billing["status"] = "canceled"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        # Delayed checkout.session.completed for the SAME sub_b4b.
+        event = {
+            "id": "evt_b4b_late", "type": "checkout.session.completed",
+            "data": {"object": {
+                "id": "cs_b4b", "customer": "cus_b4b", "subscription": "sub_b4b",
+                "metadata": {"orgId": org_id, "planKey": "starter", "interval": "month"},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        result = asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        self.assertTrue(result.get("lateArrival"), result)
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        # NO status flip: canceled stays canceled.
+        self.assertEqual(final.get("status"), "canceled",
+                         "fabricated trial status would resurrect access")
+        self.assertFalse(bool(final.get("pendingSubscriptionConfirmation")))
+
+        # Try to start a service — must be denied (status is canceled).
+        self.store._services[(org_id, "sun-11am")] = {
+            "title": "Sunday 11am", "timezone": "America/Chicago",
+            "rrule": None, "defaultLanguagePair": {"source": "ko", "target": "en"},
+            "activeRoomId": None, "lastRoomId": None, "updatedAt": _utc_now(),
+        }
+        with self.assertRaises(PermissionError):
+            self.store.start_service(
+                org_id=org_id, service_key="sun-11am",
+                host_uid="owner-b4b", source="ko", target="en",
+            )
+
+
+class B4c_LateArrivalDoesNotEraseReplacementAttempt(_AuditBase):
+    """Second-review correction (issue #2): a delayed completion for
+    an OLD subscription must not erase a REPLACEMENT pending-checkout
+    attempt (plan/interval differ)."""
+
+    def test_late_completion_preserves_replacement_attempt(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b4c", slug="b4c-church", name="B4c Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b4c"
+        billing["stripeSubscriptionId"] = "sub_old"
+        billing["status"] = "canceled"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # The user is now attempting a NEW Growth subscription — a
+        # pending attempt exists for Growth.
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="growth", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b4c",
+        )
+        pending_before = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt")
+        self.assertEqual(pending_before.get("planKey"), "growth")
+
+        # Delayed checkout.session.completed for the OLD sub (Starter).
+        event = {
+            "id": "evt_b4c_late", "type": "checkout.session.completed",
+            "data": {"object": {
+                "id": "cs_b4c_old", "customer": "cus_b4c", "subscription": "sub_old",
+                "metadata": {"orgId": org_id, "planKey": "starter", "interval": "month"},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        pending_after = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt")
+        self.assertIsNotNone(pending_after,
+                             "replacement attempt was erased by late terminal arrival")
+        self.assertEqual(pending_after.get("planKey"), "growth")
+
+
+class B4d_LegacyEventRecordTreatedAsDeduped(_AuditBase):
+    """Second-review correction (issue #3): legacy billingEvents docs
+    that lack `status`/`claimedAt` fields must be treated as
+    completed to avoid implicit replay."""
+
+    def test_legacy_record_in_memory_is_deduped(self) -> None:
+        # Manually seed a legacy-shaped record (no `status`, no `claimedAt`).
+        self.store._billing_events["evt_legacy"] = {
+            "eventId": "evt_legacy",
+            "eventType": "customer.subscription.updated",
+            "payload": {"type": "customer.subscription.updated"},
+            "createdAt": _utc_now(),
+            # NB: no "status", no "claimedAt", no "claimToken"
+        }
+        r = self.store.try_claim_billing_event(
+            event_id="evt_legacy", event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
+        )
+        self.assertEqual(r.get("status"), "deduped")
+
+
+class B4e_CheckoutAttemptStableParams(_AuditBase):
+    """Second-review correction (issue #4): same (plan, interval) with
+    DIFFERENT success_url / cancel_url / requested_by_uid must NOT
+    reuse the stored Idempotency-Key (Stripe would reject). Refuse
+    with 409 pending_checkout_params_mismatch."""
+
+    def test_different_requested_by_uid_refuses_reuse(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b4e-a", slug="b4e-church", name="B4e Church")
+        # First admin creates an attempt.
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b4e-a",
+        )
+        # Second admin (different uid) attempts same plan+interval.
+        result = self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b4e-b",
+        )
+        self.assertEqual(result.get("action"), "pending_params_mismatch")
+
+    def test_different_success_url_refuses_reuse(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b4e2", slug="b4e2-church", name="B4e2 Church")
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b4e2",
+        )
+        result = self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://y/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b4e2",
+        )
+        self.assertEqual(result.get("action"), "pending_params_mismatch")
+
+
+class B4f_StripeIdempotencyContractEnforced(_AuditBase):
+    """Second-review correction (issue #4): add a realistic mock of
+    Stripe's Idempotency-Key semantics (same key + different params =
+    IdempotencyError). The route refuses the mismatched retry at the
+    claim step, so the Stripe mock never sees two differing requests
+    for the same key — duplicate-purchase protection stays intact.
+    """
+
+    def test_mismatched_retry_refused_before_reaching_stripe(self) -> None:
+        seen: Dict[str, Dict[str, Any]] = {}
+
+        class _IdempotentClient(_FakeStripeClient):
+            def create_checkout_session(self_inner, **kwargs: Any) -> Dict[str, Any]:
+                key = kwargs.get("idempotency_key") or ""
+                if key:
+                    prior = seen.get(key)
+                    if prior is None:
+                        resp = super().create_checkout_session(**kwargs)
+                        # Snapshot the request parameters that MUST
+                        # stay stable under this key.
+                        seen[key] = {
+                            "price_id": kwargs.get("price_id"),
+                            "success_url": kwargs.get("success_url"),
+                            "cancel_url": kwargs.get("cancel_url"),
+                            "customer_id": kwargs.get("customer_id"),
+                            "response": resp,
+                        }
+                        return resp
+                    for field in ("price_id", "success_url", "cancel_url", "customer_id"):
+                        if kwargs.get(field) != prior.get(field):
+                            # Realistic Stripe behaviour on key reuse
+                            # with changed body.
+                            raise StripeClientError(
+                                f"stripe_http_400:Idempotent request conflict on key={key} field={field}"
+                            )
+                    return prior["response"]
+                return super().create_checkout_session(**kwargs)
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _IdempotentClient()):
+            org_id = self._bootstrap_owner(uid="owner-b4f", slug="b4f-church", name="B4f Church")
+            first = billing_routes.create_checkout_session(
+                billing_routes.CheckoutSessionRequest(
+                    orgId=org_id, planKey="starter",
+                    successUrl="https://example.com/ok",
+                    cancelUrl="https://example.com/cancel",
+                    interval="month",
+                ),
+                user=self._user("owner-b4f"),
+            )
+            self.assertIn("url", first)
+            # Same user retries with DIFFERENT success/cancel URLs
+            # (e.g. the browser navigated to a different sub-page).
+            # The claim step refuses the mismatch so the mocked
+            # Stripe client never sees a key-reuse with changed
+            # parameters.
+            with self.assertRaises(HTTPException) as ctx:
+                billing_routes.create_checkout_session(
+                    billing_routes.CheckoutSessionRequest(
+                        orgId=org_id, planKey="starter",
+                        successUrl="https://example.com/ok-different",
+                        cancelUrl="https://example.com/cancel",
+                        interval="month",
+                    ),
+                    user=self._user("owner-b4f"),
+                )
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail, "pending_checkout_params_mismatch")
 
 
 class B2_ConcurrentDifferentEventsSameOrg_DocumentedGap(_AuditBase):

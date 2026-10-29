@@ -7,6 +7,38 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage third pass (2026-10-29, after 817635e8)
+
+Reviewer flagged six concrete issues in the previous bundle; this pass addresses each with code changes and regression tests. Head commit on `prep/stripe-billing-audit` is now `<new-sha>`.
+
+### Issue 1 — Fenced persistence (true transactional apply)
+- **Problem**: `check_claim_still_held` and `set_org_billing_profile` were separate operations with a race window; `set_org_monthly_minutes_limit` ran BEFORE the ownership check, so a rejected claimant could still mutate `maxMinutesPerMonth` to 1800 while the stored plan was Starter.
+- **Fix**: new `apply_webhook_event_atomic(org_id, billing, monthly_minutes, event_id, claim_token)` on BOTH stores. In-memory holds `_lock` for the whole critical section; Firestore uses `@gcf_firestore.transactional` with event-claim verification + org read + billing update + minute-limit update + event completion all in one transaction. The route no longer calls `check_claim_still_held` + `set_org_billing_profile` + `set_org_monthly_minutes_limit` + `complete_billing_event` separately. Any failure during the apply leaves the event uncompleted → Stripe retries.
+- **Regression**: `H5_FailedWriteRetryIsNotDeduped` (now patches the atomic apply), `B1_SlowWorkerAfterLeaseReclaim::test_webhook_apply_refused_when_claim_lost`, `B5_SwallowedPlanLimitsFailureNowRecoverable::test_apply_failure_is_not_swallowed_followed_by_completion`.
+
+### Issue 2 — Remove fabricated trial status
+- **Problem**: the previous `checkout.session.completed` branch set `status=trialing` to block second-checkout. This changed entitlement status: a delayed completion for a cancelled subscription resurrected service access.
+- **Fix**: no fabricated status change. A `pendingSubscriptionConfirmation` boolean is set on the billing profile when `subscription_id` arrives on `checkout.session.completed`; `claim_checkout_attempt` reads this flag to refuse duplicate checkouts. The real status flows in via `customer.subscription.*` which also clears the flag. A late-arrival completion for an already-terminal subscription short-circuits with `lateArrival=true` and NO billing mutation.
+- **Regression**: `B4b_LateArrivalCheckoutDoesNotResurrectAccess::test_late_arrival_does_not_grant_service_access` (asserts `start_service` still raises `PermissionError` after a late terminal completion); `B4c_LateArrivalDoesNotEraseReplacementAttempt` (asserts a REPLACEMENT attempt for a different plan is NOT cleared by a late terminal completion for the OLD subscription); `B4_PostCompletionGapRefusesSecondCheckout` adjusted to work with the new `pendingSubscriptionConfirmation` flag.
+
+### Issue 3 — Legacy event-record compatibility
+- **Problem**: original `billingEvents` docs had `{eventId, eventType, payload, createdAt}` with no `status`/`claimedAt`. The new claim treated them as fresh, which would implicitly replay historical events.
+- **Fix**: both stores now treat a record missing the `status` field as `completed` under the pre-existing "existence = processed" semantics.
+- **Regression**: `B4d_LegacyEventRecordTreatedAsDeduped::test_legacy_record_in_memory_is_deduped` + Firestore-emulator `WebhookClaimFirestoreTests::test_legacy_record_treated_as_deduped`.
+
+### Issue 4 — Stable checkout request parameters
+- **Problem**: on uncertain response, a different admin could POST with a different `requestedByUid`, `successUrl`, or `cancelUrl` but the SAME attemptId. The route rebuilt parameters from the new request → Stripe would see a key-reuse with changed body (Idempotency-Key contract violation).
+- **Fix**: `claim_checkout_attempt` persists all immutable params (`successUrl`, `cancelUrl`, `requestedByUid`) on the pending record. On reuse, it enforces that every parameter matches; mismatch returns `pending_params_mismatch` → the route surfaces 409 `pending_checkout_params_mismatch`. The claim refuses BEFORE invoking Stripe, so a realistic Idempotency-Key mock (which raises on same-key-different-body) never sees two differing requests.
+- **Regression**: `B4e_CheckoutAttemptStableParams` (two tests covering uid-change and successUrl-change); `B4f_StripeIdempotencyContractEnforced::test_mismatched_retry_refused_before_reaching_stripe` (realistic Stripe mock that would raise on key+param conflict; test asserts the refusal fires at the claim step so Stripe never sees the mismatch).
+
+### Issue 5 — Emulator fixtures
+- **Problem**: tests opened Firestore via `firestore.Client()` without `database="worship-translation"`, so they read/wrote a different database than the store. The lease test wrote to `billing_events`, store uses `billingEvents`.
+- **Fix**: test helpers now open the SAME database and reference the SAME collection name. Added REAL parallel-claim and parallel-checkout-attempt tests (4 threads converge on one attempt / one fresh claim).
+- **Firestore-emulator run**: portable Temurin 21 JRE downloaded to `/home/namju/.cache/jre21-stripe-audit`; `gcloud emulators firestore start` runs on 127.0.0.1:8085. The suite executes **11/11 passing** on the real emulator including the parallel-claim and parallel-checkout tests, the stale-lease / slow-worker ownership test, the fenced-apply with-and-without stale token, and the legacy-record dedup test.
+
+### Issue 6 — Clean the branch
+- `backend/app/services/__pycache__/__init__.cpython-312.pyc` was tracked (committed in `53e51d8470691ef1619d71b75bba079af4673b88` long ago; `.gitignore` includes it but the pre-existing track overrode the pattern). Removed via `git rm --cached` on the branch.
+
 ## Boundary-coverage second pass (2026-10-29, after fc147a07 + 719fb775)
 
 Operator-named boundaries + where coverage lives + any additional defects reproduced + fixes applied.

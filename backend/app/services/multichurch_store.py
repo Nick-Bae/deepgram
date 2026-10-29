@@ -1599,20 +1599,29 @@ class InMemoryMultiChurchStore:
         org_id: str,
         plan_key: str,
         interval: str,
+        success_url: str = "",
+        cancel_url: str = "",
+        requested_by_uid: str = "",
     ) -> Dict[str, Any]:
         """fix-batch-2: atomically decide the next action for a POST to
         /billing/checkout-session.
 
         Returns a dict with:
           - "action" ∈ {"reuse", "create", "already_subscribed",
-                       "pending_different_plan"}
+                        "pending_different_plan", "pending_params_mismatch"}
           - For "reuse": attemptId, sessionId, sessionUrl.
           - For "create": attemptId (a new value to pass to Stripe as the
                          Idempotency-Key); caller MUST follow up with
                          `record_checkout_attempt_session` after the
                          Stripe call returns.
-          - For "already_subscribed" / "pending_different_plan": no
-                         additional fields; the route surfaces a 409.
+          - For refusals: no additional fields; the route surfaces 409.
+
+        The record captures ALL immutable request parameters
+        (success_url, cancel_url, requested_by_uid) alongside plan/
+        interval. On reuse, EVERY parameter must match the stored
+        record; a mismatch means a different logical attempt and we
+        refuse rather than silently reuse a Stripe Idempotency-Key
+        with changed parameters (which the real Stripe would reject).
 
         Guarantees under concurrent callers on the same org: at most
         one caller can see "create"; the rest see "reuse" (same
@@ -1623,6 +1632,9 @@ class InMemoryMultiChurchStore:
             raise ValueError("org_not_found")
         clean_plan = str(plan_key or "").strip().lower()
         clean_interval = str(interval or "").strip().lower() or "month"
+        clean_success = str(success_url or "").strip()
+        clean_cancel = str(cancel_url or "").strip()
+        clean_uid = str(requested_by_uid or "").strip()
         now = _utcnow()
         ttl = timedelta(seconds=int(_BILLING_CHECKOUT_ATTEMPT_TTL_SEC))
         with self._lock:
@@ -1639,6 +1651,13 @@ class InMemoryMultiChurchStore:
             existing_status = str(billing.get("status") or "").strip().lower()
             if existing_sub and existing_status in {"active", "past_due", "trialing"}:
                 return {"action": "already_subscribed"}
+            # Fix issue #2: a subscription whose completion has fired
+            # but whose status event has not arrived yet is marked by
+            # `pendingSubscriptionConfirmation=True`. Block duplicate
+            # checkouts until the status arrives (entitlement separate
+            # from this signal).
+            if existing_sub and bool(billing.get("pendingSubscriptionConfirmation")):
+                return {"action": "already_subscribed"}
             pending = billing.get("pendingCheckoutAttempt") or {}
             exp = pending.get("expiresAt") if isinstance(pending, dict) else None
             pending_live = (
@@ -1652,6 +1671,21 @@ class InMemoryMultiChurchStore:
                     str(pending.get("planKey") or "").lower() == clean_plan
                     and str(pending.get("interval") or "").lower() == clean_interval
                 ):
+                    # Fix issue #4: stable request parameters.
+                    # Compare the IMMUTABLE request fields with the
+                    # stored record. If any differ, this is a
+                    # DIFFERENT logical attempt (different admin,
+                    # different return URL) and must not reuse the
+                    # existing Stripe Idempotency-Key.
+                    stored_success = str(pending.get("successUrl") or "")
+                    stored_cancel = str(pending.get("cancelUrl") or "")
+                    stored_uid = str(pending.get("requestedByUid") or "")
+                    if (
+                        (clean_success and stored_success and clean_success != stored_success)
+                        or (clean_cancel and stored_cancel and clean_cancel != stored_cancel)
+                        or (clean_uid and stored_uid and clean_uid != stored_uid)
+                    ):
+                        return {"action": "pending_params_mismatch"}
                     return {
                         "action": "reuse",
                         "attemptId": pending["attemptId"],
@@ -1667,6 +1701,9 @@ class InMemoryMultiChurchStore:
                 "attemptId": attempt_id,
                 "planKey": clean_plan,
                 "interval": clean_interval,
+                "successUrl": clean_success,
+                "cancelUrl": clean_cancel,
+                "requestedByUid": clean_uid,
                 "createdAt": now,
                 "expiresAt": now + ttl,
                 "sessionId": None,
@@ -1783,6 +1820,13 @@ class InMemoryMultiChurchStore:
                     "createdAt": now,
                 }
                 return {"status": "fresh", "claimToken": token}
+            # Legacy-record compatibility (fix issue #3): pre-claim/complete
+            # records had only {eventId, eventType, payload, createdAt}
+            # with NO `status` or `claimedAt`. The old semantics was
+            # "existence = processed," so treat the absence of `status`
+            # as COMPLETED to avoid implicit replay.
+            if "status" not in rec:
+                return {"status": "deduped", "claimToken": None}
             if str(rec.get("status") or "").lower() == "completed":
                 return {"status": "deduped", "claimToken": None}
             claimed_at = rec.get("claimedAt")
@@ -1854,6 +1898,78 @@ class InMemoryMultiChurchStore:
                     # Our lease was reclaimed. Do NOT overwrite the
                     # newer claim's state.
                     return False
+            rec["status"] = "completed"
+            rec["completedAt"] = now
+            return True
+
+    def apply_webhook_event_atomic(
+        self,
+        *,
+        org_id: str,
+        billing: Dict[str, Any],
+        monthly_minutes: Optional[int],
+        event_id: str,
+        claim_token: str,
+    ) -> bool:
+        """Fenced apply (fix: boundary 1 — genuine lease fencing).
+
+        Writes the billing profile, org-level monthly-minute limit,
+        and event completion as a single critical section under the
+        in-memory `_lock`. If `claim_token` does not match the
+        current claim at the moment of apply, NO writes occur and
+        this method returns False — the caller must surface this to
+        the webhook layer so Stripe retries with the current state.
+
+        The Firestore counterpart on `FirestoreMultiChurchStore` runs
+        the equivalent in a single `@gcf_firestore.transactional`
+        function, so a sibling delivery that reclaims mid-flight does
+        NOT race the stale writer's three separate operations.
+
+        Returns True when all three writes committed as THIS claim.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        now = _utcnow()
+        with self._lock:
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
+                # No claim exists — refuse the apply so the caller
+                # surfaces a 409 and Stripe retries.
+                return False
+            if "status" not in rec:
+                return False
+            if str(rec.get("status") or "").lower() == "completed":
+                # Someone else already completed; abandon our writes.
+                return False
+            current_token = str(rec.get("claimToken") or "")
+            if current_token and current_token != str(claim_token):
+                return False
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            # Billing profile write (same normalization as
+            # set_org_billing_profile).
+            merged = _normalize_billing_state(
+                billing or {},
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            org["billing"] = merged
+            org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
+            org["status"] = (
+                "trial" if str(merged.get("status") or "").strip().lower() == "trialing"
+                else str(merged.get("status") or org.get("status") or "active")
+            )
+            org["updatedAt"] = now
+            # Monthly-minute limit (atomic with the billing write).
+            if monthly_minutes is not None:
+                int_minutes = max(0, int(monthly_minutes))
+                org["maxMinutesPerMonth"] = int_minutes
+            # Event completion.
             rec["status"] = "completed"
             rec["completedAt"] = now
             return True
@@ -4673,6 +4789,9 @@ class FirestoreMultiChurchStore:
         org_id: str,
         plan_key: str,
         interval: str,
+        success_url: str = "",
+        cancel_url: str = "",
+        requested_by_uid: str = "",
     ) -> Dict[str, Any]:
         """fix-batch-2: Firestore implementation. See
         InMemoryMultiChurchStore.claim_checkout_attempt for the contract.
@@ -4683,6 +4802,9 @@ class FirestoreMultiChurchStore:
             raise ValueError("org_not_found")
         clean_plan = str(plan_key or "").strip().lower()
         clean_interval = str(interval or "").strip().lower() or "month"
+        clean_success = str(success_url or "").strip()
+        clean_cancel = str(cancel_url or "").strip()
+        clean_uid = str(requested_by_uid or "").strip()
         now = _utcnow()
         ttl = timedelta(seconds=int(_BILLING_CHECKOUT_ATTEMPT_TTL_SEC))
         org_ref = self._org_ref(clean_org_id)
@@ -4702,6 +4824,8 @@ class FirestoreMultiChurchStore:
             existing_status = str(billing.get("status") or "").strip().lower()
             if existing_sub and existing_status in {"active", "past_due", "trialing"}:
                 return {"action": "already_subscribed"}
+            if existing_sub and bool(billing.get("pendingSubscriptionConfirmation")):
+                return {"action": "already_subscribed"}
             pending = billing.get("pendingCheckoutAttempt") or {}
             exp = pending.get("expiresAt") if isinstance(pending, dict) else None
             pending_live = (
@@ -4715,6 +4839,15 @@ class FirestoreMultiChurchStore:
                     str(pending.get("planKey") or "").lower() == clean_plan
                     and str(pending.get("interval") or "").lower() == clean_interval
                 ):
+                    stored_success = str(pending.get("successUrl") or "")
+                    stored_cancel = str(pending.get("cancelUrl") or "")
+                    stored_uid = str(pending.get("requestedByUid") or "")
+                    if (
+                        (clean_success and stored_success and clean_success != stored_success)
+                        or (clean_cancel and stored_cancel and clean_cancel != stored_cancel)
+                        or (clean_uid and stored_uid and clean_uid != stored_uid)
+                    ):
+                        return {"action": "pending_params_mismatch"}
                     return {
                         "action": "reuse",
                         "attemptId": pending["attemptId"],
@@ -4727,6 +4860,9 @@ class FirestoreMultiChurchStore:
                 "attemptId": attempt_id,
                 "planKey": clean_plan,
                 "interval": clean_interval,
+                "successUrl": clean_success,
+                "cancelUrl": clean_cancel,
+                "requestedByUid": clean_uid,
                 "createdAt": now,
                 "expiresAt": now + ttl,
                 "sessionId": None,
@@ -4831,6 +4967,12 @@ class FirestoreMultiChurchStore:
                 )
                 return {"status": "fresh", "claimToken": token}
             rec = snap.to_dict() or {}
+            # Legacy-record compatibility (fix issue #3): pre-claim/complete
+            # records had only {eventId, eventType, payload, createdAt}.
+            # Treat absence of `status` as COMPLETED under the old
+            # "existence = processed" semantics.
+            if "status" not in rec:
+                return {"status": "deduped", "claimToken": None}
             if str(rec.get("status") or "").lower() == "completed":
                 return {"status": "deduped", "claimToken": None}
             claimed_at = rec.get("claimedAt")
@@ -4912,6 +5054,75 @@ class FirestoreMultiChurchStore:
             return True
 
         return _complete(self._db.transaction())
+
+    def apply_webhook_event_atomic(
+        self,
+        *,
+        org_id: str,
+        billing: Dict[str, Any],
+        monthly_minutes: Optional[int],
+        event_id: str,
+        claim_token: str,
+    ) -> bool:
+        """Fenced apply (fix: boundary 1). See
+        InMemoryMultiChurchStore.apply_webhook_event_atomic for the
+        contract. Runs event-claim verification + billing write +
+        monthly-minutes write + event completion inside ONE Firestore
+        transaction. The transaction aborts (returns False) when the
+        current claim no longer matches `claim_token` or when the
+        event is already completed. No partial writes."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+        event_ref = self._billing_event_ref(clean_event_id)
+
+        @gcf_firestore.transactional
+        def _apply(tx: Any) -> bool:
+            event_snap = event_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not event_snap.exists:
+                return False
+            rec = event_snap.to_dict() or {}
+            if "status" not in rec:
+                return False  # legacy record — treat as completed
+            if str(rec.get("status") or "").lower() == "completed":
+                return False
+            current_token = str(rec.get("claimToken") or "")
+            if current_token and current_token != str(claim_token):
+                return False
+            org_snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not org_snap.exists:
+                raise ValueError("org_not_found")
+            org = org_snap.to_dict() or {}
+            merged = _normalize_billing_state(
+                billing or {},
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            normalized_status = str(merged.get("status") or "").strip().lower()
+            org_update: Dict[str, Any] = {
+                "billing": merged,
+                "plan": str(merged.get("planKey") or org.get("plan") or "trial"),
+                "status": (
+                    "trial" if normalized_status == "trialing"
+                    else str(merged.get("status") or org.get("status") or "active")
+                ),
+                "updatedAt": now,
+            }
+            if monthly_minutes is not None:
+                org_update["maxMinutesPerMonth"] = max(0, int(monthly_minutes))
+            tx.update(org_ref, org_update)
+            tx.update(event_ref, {
+                "status": "completed",
+                "completedAt": gcf_firestore.SERVER_TIMESTAMP,
+            })
+            return True
+
+        return _apply(self._db.transaction())
 
     def get_org_billing_limits(
         self,
