@@ -47,14 +47,17 @@ jobs:
           #     instances/worshiptranslate-redis, Basic tier 1 GB, AUTH
           #     enabled, host wired via REDIS_HOST and REDIS_PASSWORD
           #     mounted from Secret Manager at the service level) is
-          #     provisioned and reachable from the Cloud Run service's
-          #     direct VPC egress on the `default` subnetwork. This flag
-          #     turns the Redis Pub/Sub broadcast path on at the SINGLE
-          #     INSTANCE serving (`--max-instances=1` below is unchanged;
-          #     Redis is being exercised, not scaled yet). Scaling to two
-          #     instances is a separate step gated on seven days of green
-          #     Redis-enabled operation at single-instance + the Gate 2
-          #     rerun with Redis on + the A4 recovery-rate baseline (see
+          #     provisioned with configured connectivity (direct VPC
+          #     egress on the `default` subnetwork); operation is
+          #     verified after deployment by observing the structured
+          #     operational events emitted by redis_pubsub.py from the
+          #     new revision. This flag turns the Redis Pub/Sub broadcast
+          #     path on at the SINGLE INSTANCE serving (`--max-instances=1`
+          #     below is unchanged; Redis is being exercised, not scaled
+          #     yet). Scaling to two instances is a separate step gated
+          #     on seven days of green Redis-enabled operation at single-
+          #     instance + the Gate 2 rerun with Redis on + the A4
+          #     recovery-rate baseline (see
           #     docs/03-analysis/redis-pubsub-cloudrun-runbook.md §7 and
           #     docs/03-analysis/track-1-rollout-observation.md). To
           #     disable: set this to 0 — redis_pubsub.py short-circuits to
