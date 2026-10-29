@@ -1949,6 +1949,208 @@ class B15_CustomerCreateReverseRaceGuard(_AuditBase):
             self.fake_client.create_customer = orig_create  # type: ignore
 
 
+class B16_NormalizedRefsPatchIsPerFieldAndConditional(_AuditBase):
+    """Review-pass v9 fix (gap #1): `_normalize_billing_refs` /
+    `_persist_normalized_refs` previously patched ALL three ref
+    fields unconditionally from the (possibly old) snapshot. If
+    only one field needed formatting cleanup and another (e.g.
+    priceId) had already been updated by a concurrent webhook, the
+    unchanged old value was still submitted and reverted the
+    webhook's write.
+
+    The persister now submits ONLY the fields that actually needed
+    correction, AND each is `expected=` the pre-correction stored
+    value — so if a concurrent writer has since changed even the
+    corrected field, the patch is abandoned.
+    """
+
+    def test_only_corrected_fields_are_submitted(self) -> None:
+        org_id = self._bootstrap_owner(
+            uid="owner-b16a", slug="b16a-church", name="B16a Church",
+        )
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "  cus_b16a  "  # formatting cleanup
+        billing["stripeSubscriptionId"] = "sub_b16a"
+        billing["priceId"] = "price_starter"
+        billing["planKey"] = "starter"
+        billing["status"] = "active"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        # Meanwhile the webhook commits a Growth update, including
+        # a new priceId. Simulate that commit via the SAME helper
+        # the real webhook would use.
+        self.store.patch_org_billing_fields(
+            org_id=org_id,
+            updates={
+                "planKey": "growth", "priceId": "price_growth",
+                "limits": {"maxServiceKeys": 12},
+            },
+        )
+
+        # Now the "stale" normalizer runs on the OLD read.
+        from app.routes import billing as billing_routes
+        _, corrections, observed = billing_routes._normalize_billing_refs(billing=billing)
+        self.assertEqual(set(corrections.keys()), {"stripeCustomerId"},
+                         "normalizer should only correct the whitespace customer id")
+        self.assertEqual(corrections["stripeCustomerId"], "cus_b16a")
+        self.assertEqual(observed["stripeCustomerId"], "  cus_b16a  ")
+
+        billing_routes._persist_normalized_refs(
+            org_id=org_id, corrections=corrections, observed=observed,
+        )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        # The customer id correction landed:
+        self.assertEqual(final.get("stripeCustomerId"), "cus_b16a")
+        # The webhook's Growth priceId SURVIVED (previously regressed to price_starter):
+        self.assertEqual(final.get("priceId"), "price_growth",
+                         "normalize reverted priceId to the stale pre-webhook value")
+        self.assertEqual(final.get("planKey"), "growth")
+        self.assertEqual((final.get("limits") or {}).get("maxServiceKeys"), 12)
+
+    def test_patch_abandoned_when_corrected_field_itself_changed(self) -> None:
+        """If even the field being corrected has since been overwritten
+        by another writer, the normalize patch must NOT win."""
+        org_id = self._bootstrap_owner(
+            uid="owner-b16b", slug="b16b-church", name="B16b Church",
+        )
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "  cus_b16b_old  "
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        # Meanwhile the webhook replaces stripeCustomerId with a new id.
+        self.store.patch_org_billing_fields(
+            org_id=org_id, updates={"stripeCustomerId": "cus_b16b_new"},
+        )
+        from app.routes import billing as billing_routes
+        _, corrections, observed = billing_routes._normalize_billing_refs(billing=billing)
+        self.assertEqual(corrections.get("stripeCustomerId"), "cus_b16b_old")
+
+        # Persister should bail (expected=  cus_b16b_old   current=cus_b16b_new).
+        billing_routes._persist_normalized_refs(
+            org_id=org_id, corrections=corrections, observed=observed,
+        )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("stripeCustomerId"), "cus_b16b_new",
+                         "stale normalize overwrote the webhook's newer customer id")
+
+
+class B17_ClearStaleRefsVerifiesIdentity(_AuditBase):
+    """Review-pass v9 fix (gap #2): `_clear_stale_stripe_refs` is
+    invoked when a specific Stripe lookup returns "No such customer:
+    cus_X". It must only clear the stored refs when the current
+    stripeCustomerId STILL equals cus_X. If a concurrent webhook has
+    already replaced the obsolete customer with a new valid one,
+    clearing would erase valid state.
+
+    Uses the real hydrate helper on a background thread + a
+    `threading.Event` barrier for the interleaving.
+    """
+
+    def test_concurrent_webhook_new_customer_survives_cleanup(self) -> None:
+        import threading
+        from app.routes import billing as billing_routes
+        org_id = self._bootstrap_owner(
+            uid="owner-b17", slug="b17-church", name="B17 Church",
+        )
+        # Start with the OBSOLETE customer stored.
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_obsolete"
+        billing["stripeSubscriptionId"] = None
+        billing["priceId"] = None
+        billing["planKey"] = "trial"
+        billing["status"] = "trialing"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        pause_lookup = threading.Event()
+        release_lookup = threading.Event()
+        trace: list = []
+
+        from app.billing.stripe_client import StripeClientError
+        orig_list = self.fake_client.list_subscriptions
+
+        def _slow_list_subs(**kwargs: Any) -> Dict[str, Any]:
+            trace.append(("list_subs enter", kwargs.get("customer_id")))
+            pause_lookup.set()
+            release_lookup.wait(timeout=5.0)
+            # After release, fail as "No such customer: cus_obsolete".
+            trace.append(("list_subs raise",))
+            raise StripeClientError("No such customer: cus_obsolete")
+
+        self.fake_client.list_subscriptions = _slow_list_subs  # type: ignore
+
+        hydrate_result: Dict[str, Any] = {}
+
+        def _hydrate_thread() -> None:
+            try:
+                read_billing = self.store.get_org_billing_profile(org_id=org_id)
+                hydrate_result["returned"] = billing_routes._hydrate_billing_from_stripe(
+                    org_id=org_id, billing=read_billing, force_refresh=True,
+                )
+            except Exception as exc:
+                hydrate_result["error"] = repr(exc)
+
+        try:
+            t = threading.Thread(target=_hydrate_thread)
+            t.start()
+            self.assertTrue(
+                pause_lookup.wait(timeout=5.0),
+                f"hydrate did not reach list_subscriptions; trace={trace}",
+            )
+
+            # Webhook commits a NEW customer + subscription + price:
+            # Growth + active.
+            growth_sub = {
+                "id": "sub_new",
+                "customer": "cus_new",
+                "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": int(time.time()),
+                "current_period_end": int(time.time()) + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "growth"},
+                "items": {"data": [{"price": {"id": "price_growth"}}]},
+            }
+            self.fake_client.sub_states["sub_new"] = growth_sub
+            webhook_event = {
+                "id": "evt_b17",
+                "type": "customer.subscription.created",
+                "data": {"object": growth_sub},
+            }
+            raw = json.dumps(webhook_event).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw),
+                    stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                )
+            )
+            after_webhook = self.store.get_org_billing_profile(org_id=org_id)
+            self.assertEqual(
+                after_webhook.get("stripeCustomerId"), "cus_new",
+                f"webhook did not commit new customer; trace={trace}",
+            )
+            self.assertEqual(after_webhook.get("planKey"), "growth")
+
+            # Release the hydrate: its list_subscriptions raises
+            # "No such customer: cus_obsolete". `_clear_stale_stripe_refs`
+            # must see cus_obsolete != cus_new and NOT clear.
+            release_lookup.set()
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive(), "hydrate thread hung")
+            self.assertNotIn("error", hydrate_result, hydrate_result.get("error", ""))
+
+            final = self.store.get_org_billing_profile(org_id=org_id)
+            # The NEW identity must survive cleanup.
+            self.assertEqual(final.get("stripeCustomerId"), "cus_new",
+                             f"cleanup erased new customer; trace={trace}")
+            self.assertEqual(final.get("stripeSubscriptionId"), "sub_new",
+                             "cleanup erased new subscription")
+            self.assertEqual(final.get("priceId"), "price_growth",
+                             "cleanup erased new priceId")
+            self.assertEqual(final.get("planKey"), "growth")
+            self.assertEqual(str(final.get("status") or "").lower(), "active")
+        finally:
+            self.fake_client.list_subscriptions = orig_list  # type: ignore
+
+
 class B10_SubscriptionReconciliationAgainstCurrentStripeState(_AuditBase):
     """Review-pass v6 fix (issue #1): on `customer.subscription.*` the
     handler must reconcile against the CURRENT subscription state

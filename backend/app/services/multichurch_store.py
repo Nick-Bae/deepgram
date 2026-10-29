@@ -176,6 +176,22 @@ class StaleBillingProfileError(RuntimeError):
     """
 
 
+class StaleBillingPatchError(RuntimeError):
+    """Raised when `patch_org_billing_fields(expected=…)` is called
+    and one or more of the expected field values no longer matches
+    the current stored value. Callers that pass `expected` are opting
+    into reject-on-identity-mismatch (review-pass v9 gap #1/#2).
+
+    The exception carries `.mismatches: dict` → each key is a field
+    whose current stored value diverges from the expected value;
+    each value is a `(expected, actual)` tuple.
+    """
+
+    def __init__(self, message: str, *, mismatches: Dict[str, Any]):
+        super().__init__(message)
+        self.mismatches: Dict[str, Any] = dict(mismatches)
+
+
 def _claim_token_for(now: datetime) -> str:
     """Opaque token identifying a specific claim. Derived from the
     claim's monotonic ISO timestamp; stable within a claim, differs
@@ -1558,6 +1574,7 @@ class InMemoryMultiChurchStore:
         *,
         org_id: str,
         updates: Dict[str, Any],
+        expected: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Targeted-field update of `billing` without a full snapshot.
 
@@ -1567,11 +1584,21 @@ class InMemoryMultiChurchStore:
         back — overwriting unrelated newer fields a concurrent writer
         (webhook) persisted in the meantime.
 
-        This method reads+mutates+writes inside the store lock so
-        OTHER fields from a concurrent commit survive. `updates` is
-        a mapping of field names → new values (None clears a field).
-        Nested `limits` is merged key-by-key, not replaced. Always
-        bumps `billing.updatedAt`.
+        Fix review-pass v9 gaps #1/#2: `expected` lets the caller
+        pin the identity it believes about each field it is
+        changing. Before applying `updates`, the current stored
+        value of every key in `expected` is compared to the given
+        expected value. On ANY mismatch, raises
+        `StaleBillingPatchError` and NO fields are written. The
+        comparison and the write happen atomically under `_lock`.
+        Compared with a plain CAS on `billing.updatedAt`, this is
+        narrower: an unrelated writer bumping updatedAt does not
+        trip it, but a concurrent writer changing one of the
+        caller's fields does.
+
+        `updates` is a mapping of field names → new values (None
+        clears a field). Nested `limits` is merged key-by-key, not
+        replaced. Always bumps `billing.updatedAt`.
 
         Returns the full updated billing dict.
         """
@@ -1588,6 +1615,18 @@ class InMemoryMultiChurchStore:
                 plan_key=str(org.get("plan") or "trial"),
                 now=now,
             )
+            if expected is not None:
+                mismatches: Dict[str, Any] = {}
+                for key, want in expected.items():
+                    got = current.get(key)
+                    if got != want:
+                        mismatches[key] = (want, got)
+                if mismatches:
+                    raise StaleBillingPatchError(
+                        "patch_org_billing_fields: expected field mismatch "
+                        f"(mismatches={mismatches!r})",
+                        mismatches=mismatches,
+                    )
             next_billing = dict(current)
             for key, value in (updates or {}).items():
                 if key == "limits" and isinstance(value, dict):
@@ -4875,14 +4914,16 @@ class FirestoreMultiChurchStore:
         *,
         org_id: str,
         updates: Dict[str, Any],
+        expected: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """See InMemoryMultiChurchStore.patch_org_billing_fields.
 
-        Fix review-pass v8 gap #1: targeted-field update of
-        `billing` inside a Firestore transaction, so unrelated
-        newer fields from a concurrent commit are preserved.
-        Nested `limits` merges key-by-key. Always bumps
-        `billing.updatedAt`.
+        Fix review-pass v9 gaps #1/#2: when `expected` is provided,
+        the read, per-field identity check, and write all run inside
+        the Firestore transaction. On any mismatch, raises
+        `StaleBillingPatchError` and nothing is written. Even on a
+        Firestore transaction retry, the final committed state is
+        guaranteed to have observed `expected` matching current.
         """
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
@@ -4902,6 +4943,18 @@ class FirestoreMultiChurchStore:
                 plan_key=str(org_tx.get("plan") or "trial"),
                 now=now,
             )
+            if expected is not None:
+                mismatches: Dict[str, Any] = {}
+                for key, want in expected.items():
+                    got = current.get(key)
+                    if got != want:
+                        mismatches[key] = (want, got)
+                if mismatches:
+                    raise StaleBillingPatchError(
+                        "patch_org_billing_fields: expected field mismatch "
+                        f"(mismatches={mismatches!r})",
+                        mismatches=mismatches,
+                    )
             next_billing = dict(current)
             for key, value in (updates or {}).items():
                 if key == "limits" and isinstance(value, dict):

@@ -7,6 +7,29 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage ninth pass (2026-10-29, after 8cd39e74)
+
+Reviewer flagged a remaining issue in the reference-write contract. v8's targeted patches preserved unrelated fields, but still overwrote the patched fields themselves with potentially stale values derived from an old read.
+
+### Gap 1 — Reference normalization writes only truly-corrected fields, conditionally
+- **Problem**: `_normalize_billing_refs` returned a `(next_billing, changed)` tuple; `_persist_normalized_refs` then patched ALL three ref fields unconditionally from the (possibly old) snapshot. If only one field (e.g. whitespace in `stripeCustomerId`) needed cleanup and another (`priceId`) had been updated by a concurrent webhook in the meantime, the unchanged old `priceId` was still submitted — reverting the webhook's write.
+- **Fix**: `_normalize_billing_refs` now returns `(next_billing, corrections, observed)` where `corrections` is only the fields that actually needed correction and `observed` is the pre-correction stored value for each. `_persist_normalized_refs` calls `patch_org_billing_fields(updates=corrections, expected=observed)`; on `StaleBillingPatchError`, logs and returns the current stored billing without re-trying.
+- **Regressions**:
+  - `B16_NormalizedRefsPatchIsPerFieldAndConditional::test_only_corrected_fields_are_submitted` — formatting-cleanup on `stripeCustomerId`; webhook commits Growth + `price_growth` in between; final must retain Growth priceId.
+  - `B16::test_patch_abandoned_when_corrected_field_itself_changed` — the corrected field itself is overwritten by another writer; stale normalize must bail.
+  - Firestore emulator: `PatchOrgBillingFieldsExpectedFirestoreTests::test_expected_mismatch_raises_and_writes_nothing`, `::test_expected_match_allows_write`.
+
+### Gap 2 — Stale-reference cleanup verifies the identity whose lookup failed
+- **Problem**: `_clear_stale_stripe_refs` fired when a Stripe customer lookup returned "No such customer: cus_X". It cleared the five stored ref fields unconditionally — but if a concurrent `customer.subscription.created` webhook had already replaced the obsolete customer with a new valid one, cleanup erased that newer valid identity.
+- **Fix**: `_clear_stale_stripe_refs` takes new `failed_customer_id` / `failed_subscription_id` parameters (identity the lookup actually targeted). It patches via `patch_org_billing_fields(expected={"stripeCustomerId": failed_customer_id, ...})`. On mismatch, logs and abandons the clear. Both callers (`_lookup_by_customer` inside `_hydrate_billing_from_stripe`; `create_portal_session` retry path) now pass the attempted customer id.
+- **Regressions**:
+  - `B17_ClearStaleRefsVerifiesIdentity::test_concurrent_webhook_new_customer_survives_cleanup` — real threads + `threading.Event` barrier: hydrate paused inside `list_subscriptions`, webhook commits `cus_new`/`sub_new`/`price_growth`, hydrate released with "No such customer: cus_obsolete". Final state: all new identities + Growth survive.
+  - Firestore emulator: `PatchOrgBillingFieldsExpectedFirestoreTests::test_clear_stale_refs_abandons_when_identity_differs`.
+
+### Store contract additions
+- New `StaleBillingPatchError` exception (carries `.mismatches: {field: (expected, actual)}`).
+- `patch_org_billing_fields` on both stores accepts optional `expected: Dict[str, Any]`. When present, the per-field identity check and the write run inside the SAME lock (in-memory) or Firestore transaction. Any mismatch raises `StaleBillingPatchError` and nothing is written. This is narrower than the full-profile CAS: an unrelated writer bumping `billing.updatedAt` does NOT trip it.
+
 ## Boundary-coverage eighth pass (2026-10-29, after 53373836)
 
 Reviewer flagged two remaining gaps.

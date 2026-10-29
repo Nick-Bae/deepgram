@@ -34,7 +34,11 @@ from app.auth.guards import require_org_role
 from app.billing.config import BILLING_CONFIG
 from app.billing.models import plan_spec
 from app.billing.stripe_client import StripeBillingClient, StripeClientError
-from app.services.multichurch_store import multichurch_store, StaleBillingProfileError
+from app.services.multichurch_store import (
+    multichurch_store,
+    StaleBillingProfileError,
+    StaleBillingPatchError,
+)
 from app.services import email_service
 
 router = APIRouter(tags=["billing"])
@@ -232,9 +236,24 @@ def _price_id_from_subscription(subscription: Dict[str, Any]) -> str:
     return ""
 
 
-def _normalize_billing_refs(*, billing: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+def _normalize_billing_refs(
+    *, billing: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Normalize the three Stripe reference fields (whitespace / case
+    cleanup → None for empty-after-clean). Returns:
+      - `next_billing`: a local snapshot with the normalized values.
+      - `corrections`: ONLY the fields that needed correction, as
+        `{field: new_normalized_value}`. Empty when nothing changed.
+      - `observed`: for each corrected field, the pre-correction
+        stored value — the identity the caller OBSERVED when it
+        decided to correct that field. The persister uses this as
+        the `expected=` precondition on the targeted patch so a
+        concurrent writer who has since changed that field is not
+        overwritten with stale normalized data.
+    """
     next_billing = dict(billing or {})
-    changed = False
+    corrections: Dict[str, Any] = {}
+    observed: Dict[str, Any] = {}
     for key, cleaner in (
         ("stripeCustomerId", _clean_customer_id),
         ("stripeSubscriptionId", _clean_subscription_id),
@@ -245,37 +264,103 @@ def _normalize_billing_refs(*, billing: Dict[str, Any]) -> tuple[Dict[str, Any],
         if normalized:
             if normalized != raw_value:
                 next_billing[key] = normalized
-                changed = True
+                corrections[key] = normalized
+                observed[key] = raw_value
         elif raw_value not in (None, ""):
             next_billing[key] = None
-            changed = True
-    return next_billing, changed
+            corrections[key] = None
+            observed[key] = raw_value
+    return next_billing, corrections, observed
 
 
-def _persist_normalized_refs(*, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
-    """Review-pass v8 gap #1: callers that just finished
-    `_normalize_billing_refs` write only the three normalized ref
-    fields via `patch_org_billing_fields`, so a concurrent webhook
-    writer's newer non-ref fields survive."""
-    ref_patch: Dict[str, Any] = {}
-    for key in ("stripeCustomerId", "stripeSubscriptionId", "priceId"):
-        ref_patch[key] = billing.get(key)
-    return multichurch_store.patch_org_billing_fields(
-        org_id=org_id, updates=ref_patch,
-    )
+def _persist_normalized_refs(
+    *, org_id: str, corrections: Dict[str, Any], observed: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Review-pass v9 gap #1: send ONLY the fields the normalization
+    actually corrected, and send them conditionally — the current
+    stored value of each must still equal `observed` or the patch
+    is rejected. On rejection, log and abandon the stale correction;
+    the field has already been written to a newer value by someone
+    else (a webhook, another normalize path), so our stale normalized
+    value would downgrade it.
+    """
+    if not corrections:
+        return None
+    try:
+        return multichurch_store.patch_org_billing_fields(
+            org_id=org_id,
+            updates=corrections,
+            expected=observed,
+        )
+    except StaleBillingPatchError as exc:
+        logger.info(
+            "normalize_refs_abandoned_stale_patch org=%s mismatches=%s",
+            org_id, list(exc.mismatches.keys()),
+        )
+        try:
+            return multichurch_store.get_org_billing_profile(org_id=org_id)
+        except Exception:
+            return None
 
 
-def _clear_stale_stripe_refs(*, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
-    """Review-pass v8 gap #1: switch to targeted field patch so a
-    concurrent webhook commit of e.g. planKey/status is not
-    overwritten by this cleanup's old snapshot."""
+def _clear_stale_stripe_refs(
+    *,
+    org_id: str,
+    billing: Dict[str, Any],
+    failed_customer_id: Optional[str] = None,
+    failed_subscription_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Review-pass v9 gap #2: cleanup is called when a specific
+    Stripe lookup failed ("No such customer: cus_X" / "No such
+    subscription: sub_Y"). Only clear the stored refs when they
+    STILL match the identity whose lookup failed — otherwise a
+    concurrent webhook has already replaced the obsolete references
+    with new, valid ones, and clearing would erase valid state.
+    """
+    stripe_customer_id = (billing or {}).get("stripeCustomerId") or None
+    stripe_subscription_id = (billing or {}).get("stripeSubscriptionId") or None
+    stripe_price_id = (billing or {}).get("priceId") or None
+    current_period_start = (billing or {}).get("currentPeriodStart") or None
+    current_period_end = (billing or {}).get("currentPeriodEnd") or None
     cleared: Dict[str, Any] = {}
-    for key in ("stripeCustomerId", "stripeSubscriptionId", "priceId", "currentPeriodStart", "currentPeriodEnd"):
-        if (billing or {}).get(key) not in (None, ""):
-            cleared[key] = None
+    if stripe_customer_id is not None:
+        cleared["stripeCustomerId"] = None
+    if stripe_subscription_id is not None:
+        cleared["stripeSubscriptionId"] = None
+    if stripe_price_id is not None:
+        cleared["priceId"] = None
+    if current_period_start is not None:
+        cleared["currentPeriodStart"] = None
+    if current_period_end is not None:
+        cleared["currentPeriodEnd"] = None
     if not cleared:
         return billing
-    return multichurch_store.patch_org_billing_fields(org_id=org_id, updates=cleared)
+    # Build the identity-match precondition from the caller's intent.
+    expected: Dict[str, Any] = {}
+    if failed_customer_id is not None:
+        expected["stripeCustomerId"] = failed_customer_id
+    if failed_subscription_id is not None:
+        expected["stripeSubscriptionId"] = failed_subscription_id
+    # If no caller-supplied identity was given, fall back to the
+    # observed billing's own refs — still better than no check.
+    if not expected:
+        if stripe_customer_id is not None:
+            expected["stripeCustomerId"] = stripe_customer_id
+        if stripe_subscription_id is not None:
+            expected["stripeSubscriptionId"] = stripe_subscription_id
+    try:
+        return multichurch_store.patch_org_billing_fields(
+            org_id=org_id, updates=cleared, expected=expected or None,
+        )
+    except StaleBillingPatchError as exc:
+        logger.info(
+            "clear_stale_refs_abandoned org=%s mismatches=%s",
+            org_id, list(exc.mismatches.keys()),
+        )
+        try:
+            return multichurch_store.get_org_billing_profile(org_id=org_id)
+        except Exception:
+            return billing
 
 
 def _create_missing_stripe_customer(
@@ -456,11 +541,22 @@ def _hydrate_billing_from_stripe(
 
     def _lookup_by_customer() -> Optional[Dict[str, Any]]:
         nonlocal billing, customer_refs_invalid, customer_id, subscription_id
+        attempted_customer_id = customer_id
         try:
             return _lookup_customer_subscription(client, customer_id=customer_id)
         except StripeClientError as exc:
             if _is_missing_customer_error(exc):
-                billing = _clear_stale_stripe_refs(org_id=org_id, billing=billing)
+                # Fix review-pass v9 gap #2: pass the identity whose
+                # lookup failed so cleanup verifies the current stored
+                # stripeCustomerId still matches it before clearing
+                # anything. If a concurrent webhook has already
+                # replaced the obsolete customer with a new valid one,
+                # the clear is abandoned and the new refs survive.
+                billing = _clear_stale_stripe_refs(
+                    org_id=org_id,
+                    billing=billing,
+                    failed_customer_id=attempted_customer_id or None,
+                )
                 customer_refs_invalid = True
                 customer_id = ""
                 subscription_id = ""
@@ -600,9 +696,14 @@ def billing_status(
         if detail == "org_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_status_fetch_failed") from exc
-    billing, refs_changed = _normalize_billing_refs(billing=billing)
-    if refs_changed:
-        billing = _persist_normalized_refs(org_id=org_id, billing=billing)
+    billing_local, corrections, observed = _normalize_billing_refs(billing=billing)
+    if corrections:
+        refreshed = _persist_normalized_refs(
+            org_id=org_id, corrections=corrections, observed=observed,
+        )
+        billing = refreshed if refreshed is not None else billing_local
+    else:
+        billing = billing_local
 
     try:
         billing = _hydrate_billing_from_stripe(
@@ -704,9 +805,14 @@ def create_checkout_session(
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
 
-    billing, refs_changed = _normalize_billing_refs(billing=billing)
-    if refs_changed:
-        billing = _persist_normalized_refs(org_id=body.orgId, billing=billing)
+    billing_local, corrections, observed = _normalize_billing_refs(billing=billing)
+    if corrections:
+        refreshed = _persist_normalized_refs(
+            org_id=body.orgId, corrections=corrections, observed=observed,
+        )
+        billing = refreshed if refreshed is not None else billing_local
+    else:
+        billing = billing_local
 
     client = _stripe_client()
     customer_id = _clean_customer_id((billing or {}).get("stripeCustomerId"))
@@ -792,9 +898,14 @@ def create_portal_session(
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
 
-    billing, refs_changed = _normalize_billing_refs(billing=billing)
-    if refs_changed:
-        billing = _persist_normalized_refs(org_id=body.orgId, billing=billing)
+    billing_local, corrections, observed = _normalize_billing_refs(billing=billing)
+    if corrections:
+        refreshed = _persist_normalized_refs(
+            org_id=body.orgId, corrections=corrections, observed=observed,
+        )
+        billing = refreshed if refreshed is not None else billing_local
+    else:
+        billing = billing_local
 
     try:
         billing = _hydrate_billing_from_stripe(
@@ -822,7 +933,11 @@ def create_portal_session(
     except StripeClientError as exc:
         if _is_missing_customer_error(exc):
             try:
-                refreshed_billing = _clear_stale_stripe_refs(org_id=body.orgId, billing=billing)
+                refreshed_billing = _clear_stale_stripe_refs(
+                    org_id=body.orgId,
+                    billing=billing,
+                    failed_customer_id=customer_id or None,
+                )
                 customer_id, billing = _create_missing_stripe_customer(
                     client=client,
                     org_id=body.orgId,
@@ -873,9 +988,14 @@ def change_plan(
             raise HTTPException(status_code=404, detail=detail) from exc
         raise HTTPException(status_code=400, detail=detail or "billing_profile_fetch_failed") from exc
 
-    billing, refs_changed = _normalize_billing_refs(billing=billing)
-    if refs_changed:
-        billing = _persist_normalized_refs(org_id=body.orgId, billing=billing)
+    billing_local, corrections, observed = _normalize_billing_refs(billing=billing)
+    if corrections:
+        refreshed = _persist_normalized_refs(
+            org_id=body.orgId, corrections=corrections, observed=observed,
+        )
+        billing = refreshed if refreshed is not None else billing_local
+    else:
+        billing = billing_local
 
     current_status = _clean(billing.get("status")).lower()
     if current_status not in {"active", "past_due"}:

@@ -551,6 +551,105 @@ class PatchOrgBillingFieldsFirestoreTests(unittest.TestCase):
         )
 
 
+class PatchOrgBillingFieldsExpectedFirestoreTests(unittest.TestCase):
+    """Review-pass v9 fix (gaps #1/#2): the `expected` parameter on
+    `patch_org_billing_fields` must enforce per-field identity
+    match atomically inside the Firestore transaction. When any
+    `expected` key no longer matches current, raises
+    `StaleBillingPatchError` and nothing is written.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.store = FirestoreMultiChurchStore()
+
+    def _seed_org(self, planKey: str = "starter") -> str:
+        db = _db()
+        org_id = f"org_{uuid.uuid4().hex[:8]}"
+        now = _utc_now()
+        db.collection("organizations").document(org_id).set({
+            "orgId": org_id, "name": f"B16fs {org_id}",
+            "plan": planKey, "status": "active",
+            "billing": {
+                "planKey": planKey, "status": "active",
+                "stripeCustomerId": "cus_old",
+                "stripeSubscriptionId": "sub_old",
+                "priceId": "price_starter",
+                "updatedAt": now,
+            },
+        })
+        return org_id
+
+    def test_expected_mismatch_raises_and_writes_nothing(self) -> None:
+        from app.services.multichurch_store import StaleBillingPatchError
+        db = _db()
+        org_id = self._seed_org()
+        # Simulate the webhook replacing stripeCustomerId with a new id.
+        self.store.patch_org_billing_fields(
+            org_id=org_id, updates={"stripeCustomerId": "cus_new"},
+        )
+        # A stale normalizer tries to correct stripeCustomerId → cus_old_norm
+        # with expected=cus_old. Must be rejected.
+        with self.assertRaises(StaleBillingPatchError) as cm:
+            self.store.patch_org_billing_fields(
+                org_id=org_id,
+                updates={"stripeCustomerId": "cus_old_norm"},
+                expected={"stripeCustomerId": "cus_old"},
+            )
+        self.assertIn("stripeCustomerId", cm.exception.mismatches)
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual(final.get("stripeCustomerId"), "cus_new",
+                         "rejected stale patch still wrote to Firestore")
+
+    def test_expected_match_allows_write(self) -> None:
+        db = _db()
+        org_id = self._seed_org()
+        # Patch with expected matching current — must succeed.
+        self.store.patch_org_billing_fields(
+            org_id=org_id,
+            updates={"stripeCustomerId": "cus_new"},
+            expected={"stripeCustomerId": "cus_old"},
+        )
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual(final.get("stripeCustomerId"), "cus_new")
+
+    def test_clear_stale_refs_abandons_when_identity_differs(self) -> None:
+        """Models gap #2 at the Firestore boundary: calling
+        patch_org_billing_fields with expected={"stripeCustomerId":
+        "cus_obsolete"} + updates clearing all refs is rejected when
+        the current customer id is "cus_new"."""
+        from app.services.multichurch_store import StaleBillingPatchError
+        db = _db()
+        org_id = self._seed_org()
+        # Webhook commits new identity.
+        self.store.patch_org_billing_fields(
+            org_id=org_id, updates={
+                "stripeCustomerId": "cus_new",
+                "stripeSubscriptionId": "sub_new",
+                "priceId": "price_growth",
+                "planKey": "growth",
+            },
+        )
+        with self.assertRaises(StaleBillingPatchError):
+            self.store.patch_org_billing_fields(
+                org_id=org_id,
+                updates={
+                    "stripeCustomerId": None,
+                    "stripeSubscriptionId": None,
+                    "priceId": None,
+                },
+                expected={"stripeCustomerId": "cus_obsolete"},
+            )
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing") or {}
+        self.assertEqual(final.get("stripeCustomerId"), "cus_new")
+        self.assertEqual(final.get("stripeSubscriptionId"), "sub_new")
+        self.assertEqual(final.get("priceId"), "price_growth")
+        self.assertEqual(final.get("planKey"), "growth")
+
+
 class CheckoutAttemptFirestoreTests(unittest.TestCase):
     """Transactional validation of the checkout-attempt claim,
     including stable-request-parameter guard and parallel claims."""
