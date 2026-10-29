@@ -42,13 +42,27 @@ jobs:
           # Explicit env-var overrides make production configuration
           # reproducible instead of relying on whatever the service template
           # happens to hold:
-          #   * REDIS_ENABLED=0 — the Memorystore Redis instance this project
-          #     claims to use does not currently exist. Prod is safe only
-          #     because it runs single-instance (--max-instances=1) and the
-          #     code falls back to local delivery when Redis is unreachable.
-          #     Keep this at 0 until Memorystore is provisioned AND the
-          #     two-instance cross-instance test has passed on a tagged
-          #     revision. Do not flip to 1 without that verification.
+          #   * REDIS_ENABLED=1 — Memorystore Redis
+          #     (projects/${{ secrets.GCP_PROJECT_ID }}/locations/us-central1/
+          #     instances/worshiptranslate-redis, Basic tier 1 GB, AUTH
+          #     enabled, host wired via REDIS_HOST and REDIS_PASSWORD
+          #     mounted from Secret Manager at the service level) is
+          #     provisioned with configured connectivity (direct VPC
+          #     egress on the `default` subnetwork); operation is
+          #     verified after deployment by observing the structured
+          #     operational events emitted by redis_pubsub.py from the
+          #     new revision. This flag turns the Redis Pub/Sub broadcast
+          #     path on at the SINGLE INSTANCE serving (`--max-instances=1`
+          #     below is unchanged; Redis is being exercised, not scaled
+          #     yet). Scaling to two instances is a separate step gated
+          #     on seven days of green Redis-enabled operation at single-
+          #     instance + the Gate 2 rerun with Redis on + the A4
+          #     recovery-rate baseline (see
+          #     docs/03-analysis/redis-pubsub-cloudrun-runbook.md §7 and
+          #     docs/03-analysis/track-1-rollout-observation.md). To
+          #     disable: set this to 0 — redis_pubsub.py short-circuits to
+          #     local-only broadcast when enabled is False; the broadcast
+          #     callsites and reconciler are Redis-independent.
           #   * ROOM_RECONCILER_ENABLED=1 — enabled after PR-T1-E's monitoring
           #     stack completed its 24-hour silent observation gate. The first
           #     successful production tick starts the A1 freshness clock. Keep
@@ -70,7 +84,7 @@ jobs:
             --memory=1Gi \
             --timeout=3600 \
             --cpu-boost \
-            --update-env-vars="^|^REDIS_ENABLED=0|ROOM_RECONCILER_ENABLED=1|CORS_ALLOW_ORIGINS=https://www.worshiptranslate.com,https://worshiptranslate.com,https://www.worshiptranslation.com,https://worshiptranslation.com" \
+            --update-env-vars="^|^REDIS_ENABLED=1|ROOM_RECONCILER_ENABLED=1|CORS_ALLOW_ORIGINS=https://www.worshiptranslate.com,https://worshiptranslate.com,https://www.worshiptranslation.com,https://worshiptranslation.com" \
             --quiet
 
       - name: Route 100% traffic to the newly deployed revision
