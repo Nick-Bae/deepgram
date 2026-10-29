@@ -1017,16 +1017,11 @@ async def stripe_webhook(
     # CAS baseline (fix review item #1): capture the billing-profile
     # version we read so the atomic apply can reject the write if a
     # sibling delivery updated the org between our read and our write.
+    # Every writer that mutates billing fields (checkout attempt claim,
+    # session record, webhook apply) bumps `billing.updatedAt`, so a
+    # race between a webhook handler and a concurrent /checkout-session
+    # or Stripe-session record is caught here.
     expected_billing_updated_at = billing.get("updatedAt") if isinstance(billing, dict) else None
-    # Event-ordering baseline (fix review item #1): Stripe events carry
-    # a top-level `created` unix timestamp. The atomic apply refuses
-    # writes whose event is strictly older than the last-processed
-    # event's timestamp for this org, so retries of an older event
-    # cannot stomp on newer state.
-    try:
-        event_created_at: Optional[datetime] = _to_datetime(event.get("created"))
-    except Exception:
-        event_created_at = None
 
     now = _utcnow()
     next_billing = dict(billing)
@@ -1101,7 +1096,6 @@ async def stripe_webhook(
                 event_id=event_id,
                 claim_token=claim_token,
                 expected_billing_updated_at=expected_billing_updated_at,
-                event_created_at=event_created_at,
             )
             if not result.get("applied"):
                 reason = result.get("reason") or "unknown"
@@ -1160,7 +1154,6 @@ async def stripe_webhook(
                 event_id=event_id,
                 claim_token=claim_token,
                 expected_billing_updated_at=expected_billing_updated_at,
-                event_created_at=event_created_at,
             )
             if not result.get("applied"):
                 reason = result.get("reason") or "unknown"
@@ -1226,20 +1219,55 @@ async def stripe_webhook(
             next_billing["graceEndsAt"] = next_billing.get("graceEndsAt")
 
     elif event_type == "invoice.payment_succeeded":
+        # Reconcile against the invoice's subscription: only act when
+        # the invoice refers to the CURRENT subscription id (obsolete-
+        # subscription invoices are no-ops) AND the current stored
+        # state is a payment-not-yet-recovered status. This prevents a
+        # delayed `payment_succeeded` from toggling status on an
+        # unrelated subscription.
+        invoice_sub_id = _clean(payload_obj.get("subscription"))
+        current_sub_id = _clean(next_billing.get("stripeSubscriptionId"))
         current_status = _clean(next_billing.get("status")).lower()
-        if current_status in {"past_due", "incomplete", "unpaid"}:
-            next_billing["status"] = "active"
-            next_billing["graceEndsAt"] = None
-            pending_emails.append({"event": "payment_recovered"})
+        if invoice_sub_id and current_sub_id and invoice_sub_id == current_sub_id:
+            if current_status in {"past_due", "incomplete", "unpaid"}:
+                next_billing["status"] = "active"
+                next_billing["graceEndsAt"] = None
+                pending_emails.append({"event": "payment_recovered"})
 
     elif event_type == "invoice.payment_failed":
-        # Only act on subscription invoices; ignore setup intents and one-time charges.
-        if _clean(payload_obj.get("subscription")):
-            next_billing["status"] = "past_due"
-            # Only set graceEndsAt on the first failure; don't reset on each Stripe retry.
-            if not next_billing.get("graceEndsAt"):
-                next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
-                pending_emails.append({"event": "payment_failed"})
+        # Reconcile against the invoice's subscription id and the
+        # subscription's CURRENT state (fix review item #1 v5): an
+        # older `payment_failed` retry arriving after Stripe has
+        # already recovered the subscription must NOT overwrite the
+        # recovered state. We retrieve the subscription's current
+        # status (mocked locally; real Stripe in prod) and only apply
+        # when Stripe itself still reports a payment-not-recovered
+        # status. Obsolete-subscription invoices are no-ops.
+        invoice_sub_id = _clean(payload_obj.get("subscription"))
+        current_sub_id = _clean(next_billing.get("stripeSubscriptionId"))
+        if invoice_sub_id and current_sub_id and invoice_sub_id == current_sub_id:
+            try:
+                sub_live = _stripe_client().retrieve_subscription(
+                    subscription_id=invoice_sub_id,
+                )
+                stripe_status = _status_from_stripe(
+                    str((sub_live or {}).get("status") or ""),
+                    fallback_status=_clean(next_billing.get("status")).lower(),
+                )
+            except StripeClientError as exc:
+                logger.warning(
+                    "payment_failed_reconcile_retrieve_sub_failed org=%s sub=%s: %s",
+                    org_id, invoice_sub_id, exc,
+                )
+                # Conservative fallback: do nothing. A follow-up
+                # customer.subscription.updated event will carry the
+                # authoritative status.
+                stripe_status = "active"
+            if stripe_status in {"past_due", "unpaid", "incomplete"}:
+                next_billing["status"] = "past_due"
+                if not next_billing.get("graceEndsAt"):
+                    next_billing["graceEndsAt"] = now + timedelta(days=int(BILLING_CONFIG.grace_days))
+                    pending_emails.append({"event": "payment_failed"})
 
     next_billing.setdefault("entitlements", {})
     next_billing["entitlements"]["canStartService"] = _can_start_from_status(
@@ -1248,16 +1276,13 @@ async def stripe_webhook(
         now=now,
     )
 
-    # Fenced apply with CAS + event-timestamp ordering (fix review
-    # item #1). Billing-profile write, monthly-minute write, and
-    # event completion happen as a single critical section gated on
-    # `claim_token` AND `expected_billing_updated_at` AND
-    # `event_created_at`. Any mismatch leaves the critical section
-    # untouched; a `stale_snapshot` or `claim_lost` reason surfaces as
-    # 409 so Stripe retries with current state. A `stale_event`
-    # reason completes the event (we processed it in identity terms)
-    # WITHOUT mutating billing — prevents retries of an older event
-    # from stomping on a newer one even when timing is adversarial.
+    # Fenced apply with CAS (fix review item #1 v5: no event-timestamp
+    # watermark; Stripe explicitly documents that `created` MUST NOT
+    # determine event ordering). Billing-profile write, monthly-minute
+    # write, and event completion happen as a single critical section
+    # gated on `claim_token` AND `expected_billing_updated_at`.
+    # - `claim_lost` or `stale_snapshot` → 409 so Stripe retries.
+    # - `already_completed` or `no_claim` → dedup.
     try:
         result = multichurch_store.apply_webhook_event_atomic(
             org_id=org_id,
@@ -1266,7 +1291,6 @@ async def stripe_webhook(
             event_id=event_id,
             claim_token=claim_token,
             expected_billing_updated_at=expected_billing_updated_at,
-            event_created_at=event_created_at,
         )
     except ValueError as exc:
         detail = str(exc)
@@ -1280,10 +1304,6 @@ async def stripe_webhook(
         reason = result.get("reason") or "unknown"
         if reason in {"stale_snapshot", "claim_lost"}:
             raise HTTPException(status_code=409, detail="webhook_claim_lost")
-        if reason == "stale_event":
-            # Event already recorded completed with no billing
-            # mutation inside the atomic apply. No notifications fire.
-            return {"ok": True, "eventId": event_id, "staleEvent": True}
         # already_completed / no_claim — treat as dedup.
         return {"ok": True, "eventId": event_id, "deduped": True, "reason": reason}
 

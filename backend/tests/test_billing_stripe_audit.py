@@ -1189,26 +1189,20 @@ class B4f_StripeIdempotencyContractEnforced(_AuditBase):
         self.assertEqual(ctx.exception.detail, "pending_checkout_params_mismatch")
 
 
-class B2_InterleavedDifferentEventsRespectCASAndEventOrder(_AuditBase):
-    """Review-pass fix for issue #1: deterministic interleaving of
-    two different events on the same org. The B2 test previously made
-    a misleading "serialization" claim based on sequential processing
-    — the in-memory `_lock` does NOT serialize whole webhook handlers,
-    only individual store calls. This test exercises the actual
-    reviewer scenario: an older `invoice.payment_failed` handler
-    paused mid-flight (with a stale `billing` snapshot) and a later
-    `invoice.payment_succeeded` processed to completion in between.
+class B2_StateReconciliationNotWatermark(_AuditBase):
+    """Review-pass v5 fix for issue #1 (reviewer scenario B):
+    old-payment-failed retry does NOT regress a recovered
+    subscription, because the handler reconciles against the
+    SUBSCRIPTION's current state (Stripe retrieve, locally mocked)
+    rather than any global event-created watermark.
 
-    Expectation (post-fix):
-      - CAS on `expected_billing_updated_at` makes the older
-        handler's apply return `stale_snapshot` on first attempt →
-        route raises 409 → Stripe retries.
-      - On the retry, the handler reads the newer billing state
-        (status=active) and the event-created-at check prevents the
-        older failed event from stomping on the newer paid state.
+    Scenario: a `payment_failed` for `sub_b2i` arrives after an
+    `invoice.payment_succeeded` already restored the subscription to
+    active. The failed handler retrieves the subscription, sees
+    `status=active`, and no-ops. Status stays active.
     """
 
-    def test_interleaved_pay_failed_then_succeeded_does_not_regress_to_past_due(self) -> None:
+    def test_payment_failed_after_recovery_does_not_regress(self) -> None:
         org_id = self._bootstrap_owner(uid="owner-b2i", slug="b2i-church", name="B2i Church")
         billing = self.store.get_org_billing_profile(org_id=org_id)
         billing["stripeCustomerId"] = "cus_b2i"
@@ -1217,83 +1211,267 @@ class B2_InterleavedDifferentEventsRespectCASAndEventOrder(_AuditBase):
         billing["planKey"] = "starter"
         self.store.set_org_billing_profile(org_id=org_id, billing=billing)
 
-        failed_ts = int(time.time()) - 60  # older event (earlier `created`)
-        succeeded_ts = failed_ts + 30       # newer event
+        # Stripe retrieve returns active — the subscription IS
+        # recovered. Older payment_failed retry must not override.
+        class _ActiveSubClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_b2i",
+                    "status": "active",
+                    "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_x", "price": {"id": "price_starter"}}]},
+                }
 
-        payment_failed_event = {
-            "id": "evt_b2i_fail", "type": "invoice.payment_failed",
-            "created": failed_ts,
+        with patch.object(billing_routes, "_stripe_client", lambda: _ActiveSubClient()):
+            event = {
+                "id": "evt_b2i_fail", "type": "invoice.payment_failed",
+                "data": {"object": {
+                    "id": "in_b2i_fail", "customer": "cus_b2i",
+                    "subscription": "sub_b2i",
+                    "metadata": {"orgId": org_id},
+                }},
+            }
+            raw = json.dumps(event).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw),
+                    stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                )
+            )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("status"), "active",
+                         "payment_failed retry regressed subscription that Stripe reports as active")
+        self.assertIsNone(final.get("graceEndsAt"))
+
+    def test_equal_timestamp_success_then_failure_no_global_discard(self) -> None:
+        """Reviewer scenario B: successful payment and failed payment
+        share the same `created` second. Deliver success, then the
+        older failure. With a watermark, the older failure would
+        either (a) be discarded with `<` or (b) with `<=` discard
+        legitimate same-second updates. The v5 fix is state
+        reconciliation: the failure retrieves the subscription,
+        sees active, and no-ops. Status stays active.
+        """
+        org_id = self._bootstrap_owner(uid="owner-b2eq", slug="b2eq-church", name="B2eq Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b2eq"
+        billing["stripeSubscriptionId"] = "sub_b2eq"
+        billing["status"] = "past_due"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        same_ts = int(time.time())
+
+        class _ActiveSubClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                return {
+                    "id": subscription_id, "customer": "cus_b2eq",
+                    "status": "active",
+                    "cancel_at_period_end": False,
+                    "current_period_start": same_ts,
+                    "current_period_end": same_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_x", "price": {"id": "price_starter"}}]},
+                }
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _ActiveSubClient()):
+            # Success first.
+            ok_evt = {
+                "id": "evt_b2eq_ok", "type": "invoice.payment_succeeded",
+                "created": same_ts,
+                "data": {"object": {
+                    "id": "in_ok", "customer": "cus_b2eq",
+                    "subscription": "sub_b2eq",
+                    "metadata": {"orgId": org_id},
+                }},
+            }
+            raw_ok = json.dumps(ok_evt).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw_ok),
+                    stripe_signature=_sign_stripe_payload(raw_ok, "whsec_audit"),
+                )
+            )
+            self.assertEqual(
+                self.store.get_org_billing_profile(org_id=org_id).get("status"),
+                "active",
+            )
+            # Then the older failure, SAME timestamp.
+            fail_evt = {
+                "id": "evt_b2eq_fail", "type": "invoice.payment_failed",
+                "created": same_ts,
+                "data": {"object": {
+                    "id": "in_fail", "customer": "cus_b2eq",
+                    "subscription": "sub_b2eq",
+                    "metadata": {"orgId": org_id},
+                }},
+            }
+            raw_fail = json.dumps(fail_evt).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw_fail),
+                    stripe_signature=_sign_stripe_payload(raw_fail, "whsec_audit"),
+                )
+            )
+        self.assertEqual(
+            self.store.get_org_billing_profile(org_id=org_id).get("status"),
+            "active",
+            "same-second payment_failed stomped on recovered state",
+        )
+
+    def test_subscription_created_before_checkout_completion_is_not_discarded(self) -> None:
+        """Reviewer scenario A: subscription.created at T=100,
+        checkout.session.completed at T=110 delivered FIRST, then
+        subscription.created arrives. With a watermark, the older
+        subscription.created would be discarded. With state
+        reconciliation, both events apply correctly."""
+        org_id = self._bootstrap_owner(uid="owner-b2a", slug="b2a-church", name="B2a Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b2a"
+        billing["stripeSubscriptionId"] = "sub_b2a_old"
+        billing["status"] = "canceled"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        # First deliver checkout.session.completed for the new sub.
+        completed_ts = int(time.time()) + 10
+        created_ts = completed_ts - 10
+        checkout_evt = {
+            "id": "evt_b2a_ck", "type": "checkout.session.completed",
+            "created": completed_ts,
             "data": {"object": {
-                "id": "in_b2i_fail", "customer": "cus_b2i",
-                "subscription": "sub_b2i",
-                "metadata": {"orgId": org_id},
+                "id": "cs_b2a", "customer": "cus_b2a", "subscription": "sub_b2a_new",
+                "metadata": {"orgId": org_id, "planKey": "growth", "interval": "month"},
             }},
         }
-        payment_succeeded_event = {
-            "id": "evt_b2i_ok", "type": "invoice.payment_succeeded",
-            "created": succeeded_ts,
-            "data": {"object": {
-                "id": "in_b2i_ok", "customer": "cus_b2i",
-                "subscription": "sub_b2i",
-                "metadata": {"orgId": org_id},
-            }},
-        }
-
-        # Simulate deterministic interleaving. We can't nest an
-        # asyncio event loop, so inside the `side_effect` we SIMULATE
-        # the state-change that the SUCCEEDED webhook would have
-        # produced: bump billing.updatedAt + set
-        # lastProcessedEventCreatedAt. The FAILED handler's apply
-        # then sees a stale snapshot and refuses.
-        original_apply = self.store.apply_webhook_event_atomic
-        interleaving_done = {"n": 0}
-
-        def _interleaving_apply(**kwargs: Any) -> Dict[str, Any]:
-            if interleaving_done["n"] == 0 and kwargs.get("event_id") == "evt_b2i_fail":
-                interleaving_done["n"] = 1
-                # SUCCEEDED webhook would:
-                #  - set lastProcessedEventCreatedAt = succeeded_ts (datetime)
-                #  - leave status=active (already is), bump updatedAt.
-                org = self.store._orgs[org_id]
-                merged = dict(org.get("billing") or {})
-                merged["updatedAt"] = _utc_now()  # bump — causes stale_snapshot on FAILED's CAS
-                org["billing"] = merged
-                org["lastProcessedEventCreatedAt"] = datetime.fromtimestamp(
-                    succeeded_ts, tz=timezone.utc,
-                )
-            return original_apply(**kwargs)
-
-        raw_fail = json.dumps(payment_failed_event).encode("utf-8")
-        sig_fail = _sign_stripe_payload(raw_fail, "whsec_audit")
-        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=_interleaving_apply):
-            # First delivery of FAILED should see stale_snapshot → 409.
-            with self.assertRaises(HTTPException) as ctx:
-                asyncio.run(
-                    billing_routes.stripe_webhook(
-                        request=_DummyRequest(raw_fail), stripe_signature=sig_fail,
-                    )
-                )
-            self.assertEqual(ctx.exception.status_code, 409)
-            self.assertEqual(ctx.exception.detail, "webhook_claim_lost")
-
-        # Stripe retries. Age the lease so the retry's claim passes.
-        rec = self.store._billing_events["evt_b2i_fail"]
-        rec["claimedAt"] = _utc_now() - timedelta(seconds=999)
-        result = asyncio.run(
+        # Note: the "obsolete-subscription" guard in
+        # checkout.session.completed looks at stored_sub == incoming_sub +
+        # active-shaped-status; here stored is sub_b2a_old / canceled,
+        # incoming is sub_b2a_new → is_obsolete_subscription_arrival
+        # is False and is_terminal_late_arrival is False too (sub
+        # ids differ). The handler proceeds with the normal
+        # completion path.
+        raw_ck = json.dumps(checkout_evt).encode("utf-8")
+        asyncio.run(
             billing_routes.stripe_webhook(
-                request=_DummyRequest(raw_fail), stripe_signature=sig_fail,
+                request=_DummyRequest(raw_ck),
+                stripe_signature=_sign_stripe_payload(raw_ck, "whsec_audit"),
             )
         )
-        # The retry sees `staleEvent` (older than last processed) —
-        # the handler completes event identity but does NOT mutate
-        # billing. Status must remain "active" (NOT regressed to past_due).
-        final = self.store.get_org_billing_profile(org_id=org_id)
-        self.assertEqual(
-            final.get("status"), "active",
-            f"older payment_failed retry regressed status: {final.get('status')}; "
-            f"webhook result: {result}",
+        after_ck = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(after_ck.get("stripeSubscriptionId"), "sub_b2a_new")
+        self.assertTrue(bool(after_ck.get("pendingSubscriptionConfirmation")))
+
+        # Now the OLDER subscription.created arrives. Watermark would
+        # discard it; reconciliation applies it.
+        now_ts = int(time.time())
+        sub_evt = {
+            "id": "evt_b2a_sub", "type": "customer.subscription.created",
+            "created": created_ts,  # OLDER than the checkout_evt
+            "data": {"object": {
+                "id": "sub_b2a_new", "customer": "cus_b2a", "status": "trialing",
+                "cancel_at_period_end": False,
+                "current_period_start": now_ts,
+                "current_period_end": now_ts + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "growth"},
+                "trial_end": now_ts + 7 * 86400,
+                "items": {"data": [{"price": {"id": "price_growth"}}]},
+            }},
+        }
+        raw_sub = json.dumps(sub_evt).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw_sub),
+                stripe_signature=_sign_stripe_payload(raw_sub, "whsec_audit"),
+            )
         )
-        self.assertTrue(result.get("staleEvent") or result.get("deduped"), result)
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        # Subscription-created merged: trialing status set.
+        self.assertEqual(final.get("status"), "trialing")
+        # pendingSubscriptionConfirmation cleared by customer.subscription.*.
+        self.assertFalse(bool(final.get("pendingSubscriptionConfirmation")))
+
+    def test_obsolete_noop_does_not_discard_later_current_event(self) -> None:
+        """Reviewer scenario C: an obsolete-subscription event
+        correctly no-ops. With a watermark it would ALSO advance the
+        watermark and later discard a legitimate event with a
+        slightly older `created` time. With state reconciliation
+        (no watermark) the legitimate current-subscription event
+        applies normally.
+        """
+        org_id = self._bootstrap_owner(uid="owner-b2c", slug="b2c-church", name="B2c Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b2c"
+        billing["stripeSubscriptionId"] = "sub_current"
+        billing["status"] = "past_due"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        obs_ts = int(time.time()) + 60
+        current_ts = obs_ts - 30  # legitimate event with EARLIER created
+
+        # 1) Obsolete event — processed as no-op.
+        obs_evt = {
+            "id": "evt_b2c_obs", "type": "checkout.session.completed",
+            "created": obs_ts,
+            "data": {"object": {
+                "id": "cs_obsolete", "customer": "cus_b2c", "subscription": "sub_obsolete",
+                "metadata": {"orgId": org_id, "planKey": "starter", "interval": "month"},
+            }},
+        }
+        raw_obs = json.dumps(obs_evt).encode("utf-8")
+        # Need an active-shaped current status for the obsolete guard
+        # to fire — set status to "active" momentarily.
+        billing_a = self.store.get_org_billing_profile(org_id=org_id)
+        billing_a["status"] = "active"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing_a)
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw_obs),
+                stripe_signature=_sign_stripe_payload(raw_obs, "whsec_audit"),
+            )
+        )
+
+        # 2) Legitimate payment_succeeded for the CURRENT sub, with
+        # an EARLIER created timestamp. Must apply.
+        # Flip status back to past_due so the recovery path fires.
+        billing_b = self.store.get_org_billing_profile(org_id=org_id)
+        billing_b["status"] = "past_due"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing_b)
+
+        class _ActiveSubClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                return {
+                    "id": subscription_id, "customer": "cus_b2c",
+                    "status": "active",
+                    "cancel_at_period_end": False,
+                    "current_period_start": current_ts,
+                    "current_period_end": current_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_x", "price": {"id": "price_starter"}}]},
+                }
+
+        ok_evt = {
+            "id": "evt_b2c_ok", "type": "invoice.payment_succeeded",
+            "created": current_ts,  # earlier than obs_ts
+            "data": {"object": {
+                "id": "in_current", "customer": "cus_b2c",
+                "subscription": "sub_current",
+                "metadata": {"orgId": org_id},
+            }},
+        }
+        raw_ok = json.dumps(ok_evt).encode("utf-8")
+        with patch.object(billing_routes, "_stripe_client", lambda: _ActiveSubClient()):
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw_ok),
+                    stripe_signature=_sign_stripe_payload(raw_ok, "whsec_audit"),
+                )
+            )
+        self.assertEqual(
+            self.store.get_org_billing_profile(org_id=org_id).get("status"),
+            "active",
+            "legitimate recovery event with earlier `created` was discarded by a watermark",
+        )
 
 
 class B6_LateCompletionDoesNotEraseReplacementBySessionId(_AuditBase):
@@ -1398,6 +1576,173 @@ class B7_ObsoleteSubscriptionDoesNotOverwriteCurrent(_AuditBase):
         self.assertEqual(final.get("stripeSubscriptionId"), "sub_current")
         self.assertEqual(final.get("status"), "active")
         self.assertEqual(final.get("planKey"), "growth")
+
+
+class B9_CheckoutMutationsBumpBillingUpdatedAt(_AuditBase):
+    """Review-pass v5 fix for issue #2: `claim_checkout_attempt` and
+    `record_checkout_attempt_session` both now bump
+    `billing.updatedAt`, so a concurrent webhook handler's CAS check
+    on `expected_billing_updated_at` catches these mutations.
+    """
+
+    def test_claim_checkout_attempt_bumps_updated_at(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b9a", slug="b9a-church", name="B9a Church")
+        before = self.store.get_org_billing_profile(org_id=org_id).get("updatedAt")
+        time.sleep(0.001)  # ensure a different timestamp
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b9a",
+        )
+        after = self.store.get_org_billing_profile(org_id=org_id).get("updatedAt")
+        self.assertNotEqual(before, after,
+                            "claim_checkout_attempt did not bump billing.updatedAt")
+
+    def test_record_checkout_attempt_session_bumps_updated_at(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b9b", slug="b9b-church", name="B9b Church")
+        claim = self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b9b",
+        )
+        before = self.store.get_org_billing_profile(org_id=org_id).get("updatedAt")
+        time.sleep(0.001)
+        self.store.record_checkout_attempt_session(
+            org_id=org_id, attempt_id=claim["attemptId"],
+            session_id="cs_x", session_url="https://x/",
+        )
+        after = self.store.get_org_billing_profile(org_id=org_id).get("updatedAt")
+        self.assertNotEqual(before, after,
+                            "record_checkout_attempt_session did not bump billing.updatedAt")
+
+    def test_webhook_cas_catches_concurrent_claim_checkout_attempt(self) -> None:
+        """Pause a webhook after its billing read; create a checkout
+        attempt in between; resume the webhook. CAS must fail → 409.
+        Without the updatedAt bump the pre-v5 behaviour erased the
+        new attempt.
+
+        We seed a canceled-subscription state so `claim_checkout_attempt`
+        is allowed through (not blocked by the active-subscription
+        guard), exercising the write path that must bump
+        `billing.updatedAt`.
+        """
+        org_id = self._bootstrap_owner(uid="owner-b9c", slug="b9c-church", name="B9c Church")
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b9c"
+        billing["stripeSubscriptionId"] = "sub_b9c_old"
+        billing["status"] = "canceled"  # canceled → claim passes
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        now_ts = int(time.time())
+        # The webhook event references a DIFFERENT subscription id;
+        # the obsolete-subscription guard does NOT fire (current
+        # status is canceled, not active-shaped), so the handler
+        # proceeds to apply.
+        event = {
+            "id": "evt_b9c", "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_b9c_old", "customer": "cus_b9c", "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": now_ts,
+                "current_period_end": now_ts + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "starter"},
+                "items": {"data": [{"price": {"id": "price_starter"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+
+        # Create a checkout attempt inside the apply (simulating a
+        # concurrent /checkout-session call between the webhook's
+        # read and its atomic apply).
+        original_apply = self.store.apply_webhook_event_atomic
+        did_interleave = {"n": 0}
+
+        def _interleaving_apply(**kwargs: Any) -> Dict[str, Any]:
+            if did_interleave["n"] == 0:
+                did_interleave["n"] = 1
+                # Simulate a concurrent /checkout-session caller
+                # mutating billing. It must bump billing.updatedAt.
+                self.store.claim_checkout_attempt(
+                    org_id=org_id, plan_key="starter", interval="month",
+                    success_url="https://x/ok", cancel_url="https://x/cancel",
+                    requested_by_uid="owner-b9c",
+                )
+            return original_apply(**kwargs)
+
+        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=_interleaving_apply):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    billing_routes.stripe_webhook(
+                        request=_DummyRequest(raw),
+                        stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                    )
+                )
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail, "webhook_claim_lost")
+        # Checkout attempt survived.
+        pending_after = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt")
+        self.assertIsNotNone(pending_after, "attempt was erased by stale webhook write")
+
+    def test_webhook_cas_catches_concurrent_record_session(self) -> None:
+        """Pause a webhook after its billing read; record a Stripe
+        session in between; resume the webhook. CAS must fail → 409.
+        Without the updatedAt bump the pre-v5 behaviour restored
+        sessionId=None after record completed.
+        """
+        org_id = self._bootstrap_owner(uid="owner-b9d", slug="b9d-church", name="B9d Church")
+        # Seed an existing pending attempt.
+        claim = self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="owner-b9d",
+        )
+        # Advance billing so the webhook read gets a different `updatedAt`.
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b9d"
+        billing["stripeSubscriptionId"] = "sub_b9d"
+        billing["status"] = "active"
+        billing["planKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+        now_ts = int(time.time())
+        event = {
+            "id": "evt_b9d", "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_b9d", "customer": "cus_b9d", "status": "active",
+                "cancel_at_period_end": False,
+                "current_period_start": now_ts,
+                "current_period_end": now_ts + 30 * 86400,
+                "metadata": {"orgId": org_id, "planKey": "starter"},
+                "items": {"data": [{"price": {"id": "price_starter"}}]},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+
+        original_apply = self.store.apply_webhook_event_atomic
+        did_interleave = {"n": 0}
+
+        def _interleaving_apply(**kwargs: Any) -> Dict[str, Any]:
+            if did_interleave["n"] == 0:
+                did_interleave["n"] = 1
+                self.store.record_checkout_attempt_session(
+                    org_id=org_id, attempt_id=claim["attemptId"],
+                    session_id="cs_concurrent", session_url="https://conc/",
+                )
+            return original_apply(**kwargs)
+
+        with patch.object(self.store, "apply_webhook_event_atomic", side_effect=_interleaving_apply):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    billing_routes.stripe_webhook(
+                        request=_DummyRequest(raw),
+                        stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                    )
+                )
+        self.assertEqual(ctx.exception.status_code, 409)
+        pending_after = self.store.get_org_billing_profile(org_id=org_id).get("pendingCheckoutAttempt")
+        self.assertEqual(pending_after.get("sessionId"), "cs_concurrent",
+                         "sessionId was reset by stale webhook write")
 
 
 class B8_AtomicApplyPreservesSoftCapResetBehavior(_AuditBase):

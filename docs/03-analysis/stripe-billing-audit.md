@@ -7,6 +7,36 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage fifth pass (2026-10-29, after 02546a70)
+
+Reviewer flagged two remaining root problems. Both addressed here.
+
+### Issue 1 — Replaced the org-wide event-created watermark with state reconciliation
+- **Problem**: `lastProcessedEventCreatedAt` is an invalid ordering mechanism per Stripe's own documentation (`created` must not determine order). Reproductions:
+  - **A**. Older `customer.subscription.created` arriving after newer `checkout.session.completed` would be discarded as `staleEvent`; on a previously canceled account this left `pendingSubscriptionConfirmation=True` and status=canceled forever.
+  - **B**. Same-second success+fail — deliver success then older failure → failure passed the `<` watermark check and restored past_due.
+  - **C**. Obsolete-event no-op advanced the watermark; a legitimate current-sub event with earlier `created` was then discarded.
+- **Fix**: removed `event_created_at` parameter + `lastProcessedEventCreatedAt` field entirely. State reconciliation now drives decisions:
+  - `invoice.payment_failed`: retrieve the subscription from Stripe (`StripeBillingClient.retrieve_subscription`, mocked in tests); apply only when Stripe itself still reports `past_due`/`unpaid`/`incomplete`. Older failed-payment retries after Stripe has recovered the subscription are no-ops.
+  - `invoice.payment_succeeded`: already correctly gated on the current stored `status` AND now also on the invoice's subscription id matching the current subscription id (obsolete-invoice no-op).
+  - `customer.subscription.*` and `checkout.session.completed`: existing obsolete-subscription-id guards from pass v3 cover these.
+- **No global suppression** anywhere; event-ID dedup (claim/complete) remains separate from the state decision.
+- **Regressions** (`B2_StateReconciliationNotWatermark`):
+  - `test_payment_failed_after_recovery_does_not_regress`
+  - `test_equal_timestamp_success_then_failure_no_global_discard`
+  - `test_subscription_created_before_checkout_completion_is_not_discarded`
+  - `test_obsolete_noop_does_not_discard_later_current_event`
+
+### Issue 2 — CAS now covers checkout mutations
+- **Problem**: `claim_checkout_attempt` and `record_checkout_attempt_session` mutated billing fields but did NOT bump `billing.updatedAt`. A webhook that captured the pre-mutation `updatedAt` passed CAS and overwrote the checkout mutation.
+- **Fix**: both methods now set `billing["updatedAt"] = now` on write — in both the in-memory store and the Firestore transactional path.
+- **Regressions** (`B9_CheckoutMutationsBumpBillingUpdatedAt`):
+  - `test_claim_checkout_attempt_bumps_updated_at`
+  - `test_record_checkout_attempt_session_bumps_updated_at`
+  - `test_webhook_cas_catches_concurrent_claim_checkout_attempt` — webhook pauses after read; a concurrent claim bumps billing; webhook resumes → CAS mismatch → 409; the claim is NOT erased.
+  - `test_webhook_cas_catches_concurrent_record_session` — same shape for `record_checkout_attempt_session`; sessionId is NOT reset to None.
+- **Firestore emulator parallels**: `CheckoutMutationsBumpBillingUpdatedAtFirestoreTests` (3 tests) running against the real emulator.
+
 ## Boundary-coverage fourth pass (2026-10-29, after 27b92941)
 
 Reviewer flagged four remaining issues against the 27b92941 bundle. All four are addressed in this pass.

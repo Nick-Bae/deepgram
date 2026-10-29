@@ -301,38 +301,6 @@ class ApplyWebhookEventAtomicFirestoreTests(unittest.TestCase):
         ev = db.collection("billingEvents").document(eid).get().to_dict() or {}
         self.assertNotEqual(ev.get("status"), "completed")
 
-    def test_apply_refuses_stale_event_timestamp(self) -> None:
-        """Event-ordering: an older event arriving after a newer one
-        is marked completed without billing mutation."""
-        db = _db()
-        org_id = self._seed_org()
-        newer_ts = _utc_now()
-        older_ts = newer_ts - timedelta(seconds=120)
-        # Seed `lastProcessedEventCreatedAt` as if a newer event ran.
-        db.collection("organizations").document(org_id).set(
-            {"lastProcessedEventCreatedAt": newer_ts}, merge=True,
-        )
-        eid = _unique("apply-stale-evt")
-        a = self.store.try_claim_billing_event(
-            event_id=eid, event_type="invoice.payment_failed",
-            payload={"type": "invoice.payment_failed"},
-        )
-        result = self.store.apply_webhook_event_atomic(
-            org_id=org_id,
-            billing={"status": "past_due"},
-            monthly_minutes=None,
-            event_id=eid, claim_token=a.get("claimToken"),
-            event_created_at=older_ts,
-        )
-        self.assertFalse(result.get("applied"))
-        self.assertEqual(result.get("reason"), "stale_event")
-        # Event marked completed (identity-level processing) but
-        # billing untouched.
-        ev = db.collection("billingEvents").document(eid).get().to_dict() or {}
-        self.assertEqual(ev.get("status"), "completed")
-        org = db.collection("organizations").document(org_id).get().to_dict() or {}
-        self.assertNotEqual((org.get("billing") or {}).get("status"), "past_due")
-
     def test_apply_preserves_soft_cap_reset(self) -> None:
         """softCapReached must reset when the new limit >= currentMonthMinutes."""
         db = _db()
@@ -358,6 +326,99 @@ class ApplyWebhookEventAtomicFirestoreTests(unittest.TestCase):
         org = db.collection("organizations").document(org_id).get().to_dict() or {}
         self.assertEqual(org.get("maxMinutesPerMonth"), 1800)
         self.assertFalse(bool(org.get("softCapReached")))
+
+
+class CheckoutMutationsBumpBillingUpdatedAtFirestoreTests(unittest.TestCase):
+    """Review-pass v5 fix for issue #2 on Firestore: both
+    `claim_checkout_attempt` and `record_checkout_attempt_session`
+    bump `billing.updatedAt` so a concurrent webhook handler's CAS
+    check catches these mutations.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.store = FirestoreMultiChurchStore()
+
+    def _seed_org(self) -> str:
+        db = _db()
+        org_id = f"org_{uuid.uuid4().hex[:8]}"
+        db.collection("organizations").document(org_id).set({
+            "orgId": org_id, "name": f"B9 {org_id}",
+            "plan": "trial", "status": "active",
+            "billing": {"planKey": "trial", "status": "trialing"},
+        })
+        return org_id
+
+    def test_claim_bumps_billing_updated_at(self) -> None:
+        db = _db()
+        org_id = self._seed_org()
+        before = (db.collection("organizations").document(org_id).get().to_dict()
+                  or {}).get("billing", {}).get("updatedAt")
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="u1",
+        )
+        after = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing", {}).get("updatedAt")
+        self.assertNotEqual(before, after)
+
+    def test_record_session_bumps_billing_updated_at(self) -> None:
+        db = _db()
+        org_id = self._seed_org()
+        claim = self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="u1",
+        )
+        before = (db.collection("organizations").document(org_id).get().to_dict()
+                  or {}).get("billing", {}).get("updatedAt")
+        self.store.record_checkout_attempt_session(
+            org_id=org_id, attempt_id=claim["attemptId"],
+            session_id="cs_x", session_url="https://x/",
+        )
+        after = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing", {}).get("updatedAt")
+        self.assertNotEqual(before, after)
+
+    def test_apply_sees_cas_mismatch_after_concurrent_claim(self) -> None:
+        """Fenced apply must refuse (stale_snapshot) when a concurrent
+        `claim_checkout_attempt` bumped `billing.updatedAt` between the
+        caller's read and the atomic apply."""
+        db = _db()
+        org_id = self._seed_org()
+        # Seed an explicit baseline so the CAS compare has a non-None
+        # expected value.
+        baseline = _utc_now() - timedelta(seconds=5)
+        db.collection("organizations").document(org_id).update({
+            "billing.updatedAt": baseline,
+        })
+        # Interleaving claim bumps updatedAt.
+        self.store.claim_checkout_attempt(
+            org_id=org_id, plan_key="starter", interval="month",
+            success_url="https://x/ok", cancel_url="https://x/cancel",
+            requested_by_uid="u1",
+        )
+        # Now a webhook that captured `baseline` tries to apply.
+        eid = _unique("apply-cas-checkout")
+        a = self.store.try_claim_billing_event(
+            event_id=eid, event_type="customer.subscription.updated",
+            payload={"type": "customer.subscription.updated"},
+        )
+        result = self.store.apply_webhook_event_atomic(
+            org_id=org_id,
+            billing={"planKey": "growth", "status": "active"},
+            monthly_minutes=1800,
+            event_id=eid, claim_token=a.get("claimToken"),
+            expected_billing_updated_at=baseline,
+        )
+        self.assertFalse(result.get("applied"))
+        self.assertEqual(result.get("reason"), "stale_snapshot")
+        # The pending-checkout-attempt from the concurrent claim is
+        # NOT erased by the aborted webhook apply.
+        after = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing", {}).get("pendingCheckoutAttempt")
+        self.assertIsNotNone(after)
 
 
 class CheckoutAttemptFirestoreTests(unittest.TestCase):

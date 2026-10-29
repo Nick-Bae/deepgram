@@ -1709,6 +1709,10 @@ class InMemoryMultiChurchStore:
                 "sessionId": None,
                 "sessionUrl": None,
             }
+            # Fix review item #2: CAS token lives in billing.updatedAt;
+            # every writer that mutates billing fields MUST bump it so
+            # concurrent webhook handlers' CAS checks catch the change.
+            billing["updatedAt"] = now
             org["billing"] = billing
             org["updatedAt"] = now
             return {"action": "create", "attemptId": attempt_id}
@@ -1726,10 +1730,16 @@ class InMemoryMultiChurchStore:
         `client.create_checkout_session` succeeds. If the attempt no
         longer matches (e.g. was cleared by `checkout.session.completed`
         or replaced by a newer request), this is a silent no-op — the
-        latest state wins."""
+        latest state wins.
+
+        Fix review item #2: this writer bumps `billing.updatedAt` so a
+        concurrent webhook handler whose CAS captured the earlier
+        `updatedAt` will be refused.
+        """
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
+        now = _utcnow()
         with self._lock:
             org = self._orgs.get(clean_org_id)
             if not org:
@@ -1744,8 +1754,9 @@ class InMemoryMultiChurchStore:
             pending["sessionId"] = str(session_id or "")
             pending["sessionUrl"] = str(session_url or "")
             billing["pendingCheckoutAttempt"] = pending
+            billing["updatedAt"] = now
             org["billing"] = billing
-            org["updatedAt"] = _utcnow()
+            org["updatedAt"] = now
 
     def try_mark_billing_event(
         self,
@@ -1911,38 +1922,35 @@ class InMemoryMultiChurchStore:
         event_id: str,
         claim_token: str,
         expected_billing_updated_at: Optional[datetime] = None,
-        event_created_at: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """Fenced apply with CAS + event-timestamp ordering.
+        """Fenced apply with CAS.
 
         Returns a dict with at minimum `{"applied": bool}`. On
-        rejection, the dict includes a `"reason"` field one of:
+        rejection the dict includes a `"reason"` field one of:
           - "no_claim"           — event doc missing or legacy
                                    (treated as already completed).
           - "already_completed"  — event is terminal.
           - "claim_lost"         — claim_token differs from current.
-          - "stale_snapshot"     — expected_billing_updated_at
-                                   does not match the current
-                                   org.billing.updatedAt. The caller
-                                   should return 409 so Stripe retries;
-                                   the retry's fresh read sees the
-                                   newer state and recomputes
-                                   next_billing from it.
-          - "stale_event"        — event_created_at is strictly older
-                                   than `lastProcessedEventCreatedAt`
-                                   on the org. Prevents an older
-                                   payment event from stomping on a
-                                   newer one even when retries
-                                   interleave.
+          - "stale_snapshot"     — expected_billing_updated_at does
+                                   not match the current
+                                   `billing.updatedAt`. The caller
+                                   should return 409 so Stripe
+                                   retries; the retry reads the
+                                   current state and reconciles.
 
-        On success, the dict is `{"applied": True}` and the write
-        committed the billing profile, the monthly-minute limit (with
-        softCapReached preservation), and event completion as a single
-        critical section.
+        **No global event-created watermark.** Stripe explicitly
+        documents that `created` MUST NOT determine event order
+        (fix review item #1); any suppression based on an
+        org-wide watermark discards legitimate current-subscription
+        updates and allows obsolete events to advance it. Current-
+        state reconciliation is the caller's job (via Stripe
+        retrieval for invoice events; via obsolete-subscription
+        checks for subscription/checkout events).
 
         A `billing=None` input is a NO-OP write — used by the
-        late-arrival branch which must mark the event completed but
-        MUST NOT submit any stale snapshot of the billing profile.
+        late-arrival / obsolete-subscription branches which must
+        complete the event dedup but MUST NOT submit any snapshot
+        of the billing profile.
         """
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
@@ -1965,23 +1973,11 @@ class InMemoryMultiChurchStore:
             org = self._orgs.get(clean_org_id)
             if not org:
                 raise ValueError("org_not_found")
-            # CAS on org.billing.updatedAt — rejects a stale snapshot.
             if expected_billing_updated_at is not None:
                 current_billing = org.get("billing") or {}
                 current_ua = current_billing.get("updatedAt")
                 if current_ua != expected_billing_updated_at:
                     return {"applied": False, "reason": "stale_snapshot"}
-            # Event-timestamp ordering — ignore strictly older events.
-            if event_created_at is not None:
-                last_created = org.get("lastProcessedEventCreatedAt")
-                if isinstance(last_created, datetime) and event_created_at < last_created:
-                    # Still mark the event completed (we did process
-                    # it to completion in event-identity terms; its
-                    # effect on billing is simply suppressed).
-                    rec["status"] = "completed"
-                    rec["completedAt"] = now
-                    return {"applied": False, "reason": "stale_event"}
-            # Only write billing fields when the caller supplied them.
             if billing is not None:
                 merged = _normalize_billing_state(
                     billing,
@@ -1995,15 +1991,11 @@ class InMemoryMultiChurchStore:
                     else str(merged.get("status") or org.get("status") or "active")
                 )
             org["updatedAt"] = now
-            # Monthly-minute limit — preserve the softCapReached
-            # reset semantics from `set_org_monthly_minutes_limit`.
             if monthly_minutes is not None:
                 int_minutes = max(0, int(monthly_minutes))
                 org["maxMinutesPerMonth"] = int_minutes
                 if int_minutes == 0 or int(org.get("currentMonthMinutes") or 0) < int_minutes:
                     org["softCapReached"] = False
-            if event_created_at is not None:
-                org["lastProcessedEventCreatedAt"] = event_created_at
             rec["status"] = "completed"
             rec["completedAt"] = now
             return {"applied": True}
@@ -4902,6 +4894,9 @@ class FirestoreMultiChurchStore:
                 "sessionId": None,
                 "sessionUrl": None,
             }
+            # Fix review item #2: bump billing.updatedAt so a
+            # concurrent webhook's CAS catches this change.
+            billing["updatedAt"] = now
             tx.update(org_ref, {"billing": billing, "updatedAt": now})
             return {"action": "create", "attemptId": attempt_id}
 
@@ -4916,7 +4911,9 @@ class FirestoreMultiChurchStore:
         session_url: str,
     ) -> None:
         """Firestore counterpart to the in-memory record. Transactional
-        so a late-arriving record doesn't overwrite a newer attempt."""
+        so a late-arriving record doesn't overwrite a newer attempt.
+
+        Fix review item #2: bumps `billing.updatedAt`."""
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
@@ -4941,6 +4938,7 @@ class FirestoreMultiChurchStore:
             pending["sessionId"] = str(session_id or "")
             pending["sessionUrl"] = str(session_url or "")
             billing["pendingCheckoutAttempt"] = pending
+            billing["updatedAt"] = now
             tx.update(org_ref, {"billing": billing, "updatedAt": now})
 
         _record(self._db.transaction())
@@ -5098,11 +5096,13 @@ class FirestoreMultiChurchStore:
         event_id: str,
         claim_token: str,
         expected_billing_updated_at: Optional[datetime] = None,
-        event_created_at: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """Fenced apply with CAS + event-timestamp ordering. See
+        """Fenced apply with CAS. See
         InMemoryMultiChurchStore.apply_webhook_event_atomic for the
-        contract. Runs everything inside one Firestore transaction."""
+        contract. Runs everything inside one Firestore transaction.
+
+        No global event-created watermark (fix review item #1) —
+        caller does state reconciliation."""
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
@@ -5134,14 +5134,6 @@ class FirestoreMultiChurchStore:
                 current_billing = org.get("billing") or {}
                 if current_billing.get("updatedAt") != expected_billing_updated_at:
                     return {"applied": False, "reason": "stale_snapshot"}
-            if event_created_at is not None:
-                last_created = org.get("lastProcessedEventCreatedAt")
-                if isinstance(last_created, datetime) and event_created_at < last_created:
-                    tx.update(event_ref, {
-                        "status": "completed",
-                        "completedAt": gcf_firestore.SERVER_TIMESTAMP,
-                    })
-                    return {"applied": False, "reason": "stale_event"}
             org_update: Dict[str, Any] = {"updatedAt": now}
             if billing is not None:
                 merged = _normalize_billing_state(
@@ -5163,8 +5155,6 @@ class FirestoreMultiChurchStore:
                 org_update["maxMinutesPerMonth"] = int_minutes
                 if int_minutes == 0 or int(org.get("currentMonthMinutes") or 0) < int_minutes:
                     org_update["softCapReached"] = False
-            if event_created_at is not None:
-                org_update["lastProcessedEventCreatedAt"] = event_created_at
             tx.update(org_ref, org_update)
             tx.update(event_ref, {
                 "status": "completed",
