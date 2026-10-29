@@ -168,6 +168,14 @@ _BILLING_CHECKOUT_ATTEMPT_TTL_SEC = _env_int(
 )
 
 
+class StaleBillingProfileError(RuntimeError):
+    """Raised when `set_org_billing_profile(expected_billing_updated_at=…)`
+    is called with a CAS token that no longer matches the stored
+    `billing.updatedAt`. Callers that pass a CAS token are opting
+    into the reject-on-stale contract (fix review item #7).
+    """
+
+
 def _claim_token_for(now: datetime) -> str:
     """Opaque token identifying a specific claim. Derived from the
     claim's monotonic ISO timestamp; stable within a claim, differs
@@ -1494,7 +1502,27 @@ class InMemoryMultiChurchStore:
             org["updatedAt"] = now
             return dict(billing)
 
-    def set_org_billing_profile(self, *, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+    def set_org_billing_profile(
+        self,
+        *,
+        org_id: str,
+        billing: Dict[str, Any],
+        expected_billing_updated_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Write a billing snapshot.
+
+        Fix review item #7 (v7): optional CAS token.
+          - When `expected_billing_updated_at` is None (legacy
+            callers), writes unconditionally. These callers must
+            not race with the webhook/apply path.
+          - When provided, the call is CONDITIONAL on the current
+            billing.updatedAt matching the token. On mismatch the
+            method RAISES `StaleBillingProfileError`; the caller
+            re-reads and reconciles or abandons.
+
+        `billing.updatedAt` is always stamped `now` after the write
+        succeeds, so every writer uniformly participates in CAS.
+        """
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
@@ -1503,18 +1531,19 @@ class InMemoryMultiChurchStore:
             org = self._orgs.get(clean_org_id)
             if not org:
                 raise ValueError("org_not_found")
+            if expected_billing_updated_at is not None:
+                current_billing = org.get("billing") or {}
+                if current_billing.get("updatedAt") != expected_billing_updated_at:
+                    raise StaleBillingProfileError(
+                        "set_org_billing_profile: billing.updatedAt mismatch "
+                        f"(expected={expected_billing_updated_at!r}, "
+                        f"current={current_billing.get('updatedAt')!r})"
+                    )
             merged = _normalize_billing_state(
                 billing or {},
                 plan_key=str(org.get("plan") or "trial"),
                 now=now,
             )
-            # Fix review item #3 (v6): EVERY billing writer must bump
-            # `billing.updatedAt`. The CAS token lives in this field,
-            # so a writer that leaves it unchanged lets a stale
-            # concurrent webhook overwrite its work. Previously
-            # `_normalize_billing_state` preserved any input
-            # `updatedAt` — now `set_org_billing_profile` always
-            # stamps `now` after normalization.
             merged["updatedAt"] = now
             org["billing"] = merged
             org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
@@ -4707,12 +4736,57 @@ class FirestoreMultiChurchStore:
             )
         return dict(billing)
 
-    def set_org_billing_profile(self, *, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+    def set_org_billing_profile(
+        self,
+        *,
+        org_id: str,
+        billing: Dict[str, Any],
+        expected_billing_updated_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """See InMemoryMultiChurchStore.set_org_billing_profile.
+
+        Fix review item #7 (v7): when `expected_billing_updated_at`
+        is provided, the read+write runs inside a transaction and
+        raises `StaleBillingProfileError` on CAS mismatch. Legacy
+        (None) callers continue to write unconditionally."""
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
         now = _utcnow()
         org_ref = self._org_ref(clean_org_id)
+
+        if expected_billing_updated_at is not None:
+            @gcf_firestore.transactional
+            def _cas_set(tx: Any) -> Dict[str, Any]:
+                snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+                if not snap.exists:
+                    raise ValueError("org_not_found")
+                org_tx = snap.to_dict() or {}
+                current_billing = org_tx.get("billing") or {}
+                if current_billing.get("updatedAt") != expected_billing_updated_at:
+                    raise StaleBillingProfileError(
+                        "set_org_billing_profile: billing.updatedAt mismatch "
+                        f"(expected={expected_billing_updated_at!r}, "
+                        f"current={current_billing.get('updatedAt')!r})"
+                    )
+                merged = _normalize_billing_state(
+                    billing or {},
+                    plan_key=str(org_tx.get("plan") or "trial"),
+                    now=now,
+                )
+                merged["updatedAt"] = now
+                normalized_status = str(merged.get("status") or "").strip().lower()
+                tx.update(org_ref, {
+                    "billing": merged,
+                    "plan": str(merged.get("planKey") or org_tx.get("plan") or "trial"),
+                    "status": "trial" if normalized_status == "trialing" else str(
+                        merged.get("status") or org_tx.get("status") or "active"
+                    ),
+                    "updatedAt": now,
+                })
+                return dict(merged)
+            return _cas_set(self._db.transaction())
+
         org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")

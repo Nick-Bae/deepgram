@@ -1589,6 +1589,187 @@ class B7_ObsoleteSubscriptionDoesNotOverwriteCurrent(_AuditBase):
         self.assertEqual(final.get("planKey"), "growth")
 
 
+class B13_DelayedCheckoutCompletionDoesNotRevertUpgrade(_AuditBase):
+    """Review-pass v7 fix (gap #1): a delayed
+    `checkout.session.completed` for an already-active subscription
+    must NOT downgrade the plan based on its stale `metadata.planKey`.
+    The handler reconciles against the subscription's CURRENT state
+    (via Stripe retrieve) and uses that plan key.
+    """
+
+    def test_delayed_checkout_for_current_sub_does_not_revert_growth(self) -> None:
+        org_id = self._bootstrap_owner(uid="owner-b13", slug="b13-church", name="B13 Church")
+        # Current state: Growth subscription (via a prior subscription.updated).
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b13"
+        billing["stripeSubscriptionId"] = "sub_b13"
+        billing["status"] = "active"
+        billing["planKey"] = "growth"
+        billing["priceId"] = "price_growth"
+        billing.setdefault("limits", {})["maxServiceKeys"] = 12
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        # Stripe says: still Growth.
+        self.fake_client.sub_states["sub_b13"] = {
+            "id": "sub_b13", "customer": "cus_b13", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 86400,
+            "metadata": {"orgId": org_id, "planKey": "growth"},
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        # Delayed completion for the ORIGINAL (starter) checkout session.
+        event = {
+            "id": "evt_b13_late_ck", "type": "checkout.session.completed",
+            "data": {"object": {
+                "id": "cs_b13_original", "customer": "cus_b13",
+                "subscription": "sub_b13",
+                "metadata": {"orgId": org_id, "planKey": "starter", "interval": "month"},
+            }},
+        }
+        raw = json.dumps(event).encode("utf-8")
+        asyncio.run(
+            billing_routes.stripe_webhook(
+                request=_DummyRequest(raw),
+                stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+            )
+        )
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("planKey"), "growth",
+                         "stale checkout.session.completed reverted the Growth upgrade")
+        self.assertEqual((final.get("limits") or {}).get("maxServiceKeys"), 12,
+                         "limits.maxServiceKeys reverted to Starter cap")
+        self.assertEqual(self.store._orgs[org_id].get("maxMinutesPerMonth"), 1800,
+                         "org-level monthly-minute limit reverted to Starter")
+        self.assertEqual(final.get("priceId"), "price_growth")
+
+
+class B14_HydrateReverseRaceCASGuard(_AuditBase):
+    """Review-pass v7 fix (gap #2): a `_hydrate_billing_from_stripe`
+    call reads old billing + retrieves Starter from Stripe. A webhook
+    retrieves Growth and commits it. The hydrate finishes and tries
+    to write Starter back. With CAS, the hydrate write is rejected
+    (StaleBillingProfileError); hydrate returns the current (Growth)
+    state instead of overwriting.
+
+    This test uses real threads + a `threading.Event` barrier to
+    pause the hydrate inside its Stripe retrieve, run the webhook to
+    completion, then release the hydrate.
+    """
+
+    def test_stale_hydrate_cannot_overwrite_committed_webhook(self) -> None:
+        import threading
+        org_id = self._bootstrap_owner(uid="owner-b14", slug="b14-church", name="B14 Church")
+        # Current state before the race: Starter (old).
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_b14"
+        billing["stripeSubscriptionId"] = "sub_b14"
+        billing["status"] = "active"
+        billing["planKey"] = "starter"
+        billing["priceId"] = "price_starter"
+        billing["currentPeriodStart"] = _utc_now() - timedelta(days=1)
+        billing["currentPeriodEnd"] = _utc_now() + timedelta(days=29)
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+        baseline_updated_at = self.store.get_org_billing_profile(org_id=org_id).get("updatedAt")
+
+        pause_hydrate = threading.Event()
+        release_hydrate = threading.Event()
+        trace: list = []
+        starter_sub = {
+            "id": "sub_b14", "customer": "cus_b14", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()) - 86400,
+            "current_period_end": int(time.time()) + 29 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "starter"},
+            "items": {"data": [{"price": {"id": "price_starter"}}]},
+        }
+        growth_sub = {
+            "id": "sub_b14", "customer": "cus_b14", "status": "active",
+            "cancel_at_period_end": False,
+            "current_period_start": int(time.time()),
+            "current_period_end": int(time.time()) + 30 * 86400,
+            "metadata": {"orgId": org_id, "planKey": "growth"},
+            "items": {"data": [{"price": {"id": "price_growth"}}]},
+        }
+        # Both the hydrate helper and the webhook pull their Stripe
+        # client via `billing_routes._stripe_client()`, which setUp
+        # patches to a single shared `self.fake_client`. We can't
+        # safely swap that patch per-thread (patch.object is process-
+        # wide), so instead the fake's `retrieve_subscription` behaves
+        # DIFFERENTLY per call based on a call-count:
+        #   call 1 → hydrate: blocks on `release_hydrate`, returns Starter.
+        #   call 2 → webhook: returns Growth immediately.
+        call_count = {"n": 0}
+        orig_retrieve = self.fake_client.retrieve_subscription
+
+        def _staged_retrieve(*, subscription_id: str) -> Dict[str, Any]:
+            call_count["n"] += 1
+            n = call_count["n"]
+            trace.append(("retrieve", n, subscription_id))
+            if n == 1:
+                pause_hydrate.set()
+                release_hydrate.wait(timeout=5.0)
+                return dict(starter_sub)
+            return dict(growth_sub)
+
+        self.fake_client.retrieve_subscription = _staged_retrieve  # type: ignore
+        try:
+            hydrate_result: Dict[str, Any] = {}
+
+            def _hydrate_thread() -> None:
+                try:
+                    read_billing = self.store.get_org_billing_profile(org_id=org_id)
+                    hydrate_result["returned"] = billing_routes._hydrate_billing_from_stripe(
+                        org_id=org_id, billing=read_billing, force_refresh=True,
+                    )
+                except Exception as exc:
+                    hydrate_result["error"] = repr(exc)
+
+            t = threading.Thread(target=_hydrate_thread)
+            t.start()
+            self.assertTrue(pause_hydrate.wait(timeout=5.0),
+                            f"hydrate did not reach retrieve_subscription; trace={trace}")
+
+            # Webhook commits Growth while hydrate is paused.
+            webhook_event = {
+                "id": "evt_b14_webhook", "type": "customer.subscription.updated",
+                "data": {"object": growth_sub},
+            }
+            raw = json.dumps(webhook_event).encode("utf-8")
+            asyncio.run(
+                billing_routes.stripe_webhook(
+                    request=_DummyRequest(raw),
+                    stripe_signature=_sign_stripe_payload(raw, "whsec_audit"),
+                )
+            )
+            after_webhook = self.store.get_org_billing_profile(org_id=org_id)
+            self.assertEqual(
+                after_webhook.get("planKey"), "growth",
+                f"webhook commit did not land before hydrate release; trace={trace}",
+            )
+            new_updated_at = after_webhook.get("updatedAt")
+            self.assertNotEqual(new_updated_at, baseline_updated_at)
+
+            # Release the hydrate. It computes Starter and tries to write.
+            # CAS must reject.
+            release_hydrate.set()
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive(), "hydrate thread hung")
+            self.assertNotIn("error", hydrate_result, hydrate_result.get("error", ""))
+        finally:
+            self.fake_client.retrieve_subscription = orig_retrieve  # type: ignore
+
+        final = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(final.get("planKey"), "growth",
+                         "stale hydrate overwrote the committed Growth state")
+        self.assertEqual(final.get("priceId"), "price_growth")
+        # The hydrate's return value should reflect the CURRENT state
+        # (post-webhook) rather than its own stale Starter snapshot.
+        self.assertEqual(
+            (hydrate_result.get("returned") or {}).get("planKey"), "growth",
+            "stale hydrate returned its own stale snapshot instead of current state",
+        )
+
+
 class B10_SubscriptionReconciliationAgainstCurrentStripeState(_AuditBase):
     """Review-pass v6 fix (issue #1): on `customer.subscription.*` the
     handler must reconcile against the CURRENT subscription state
@@ -1822,11 +2003,16 @@ class B12_CreateMissingStripeCustomerBumpsCAS(_AuditBase):
         self.assertEqual(after.get("stripeCustomerId"), "cus_newly_created")
 
     def test_webhook_cas_catches_concurrent_customer_create(self) -> None:
-        """Barrier-driven interleaving: webhook paused after its
-        billing read, `_create_missing_stripe_customer` (actual
-        helper) runs with a mocked client, webhook resumes → CAS
-        catches the change via the bumped updatedAt. The
-        newly-saved stripeCustomerId is NOT overwritten.
+        """Deterministic side-effect interleaving (NOT real threads):
+        the atomic apply's `side_effect` runs the actual
+        `_create_missing_stripe_customer` helper with a mocked client
+        between the webhook's billing read and its apply. CAS catches
+        the change via the bumped updatedAt. The newly-saved
+        stripeCustomerId is NOT overwritten by the stale webhook.
+
+        For the real-thread + barrier-driven version of the reverse
+        race (hydrate ↔ webhook), see
+        `B14_HydrateReverseRaceCASGuard`.
         """
         org_id = self._bootstrap_owner(uid="owner-b12c", slug="b12c-church", name="B12c Church")
         billing_before = self.store.get_org_billing_profile(org_id=org_id)

@@ -421,6 +421,55 @@ class CheckoutMutationsBumpBillingUpdatedAtFirestoreTests(unittest.TestCase):
         self.assertIsNotNone(after)
 
 
+class SetOrgBillingProfileCASFirestoreTests(unittest.TestCase):
+    """Review-pass v7 fix (gap #2): `set_org_billing_profile` on
+    Firestore accepts an optional CAS token. When the token no
+    longer matches the stored `billing.updatedAt`, the method
+    raises StaleBillingProfileError inside the transaction with no
+    partial writes. Models the hydrate-vs-webhook reverse race.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.store = FirestoreMultiChurchStore()
+
+    def _seed_org(self) -> str:
+        db = _db()
+        org_id = f"org_{uuid.uuid4().hex[:8]}"
+        now = _utc_now()
+        db.collection("organizations").document(org_id).set({
+            "orgId": org_id, "name": f"B14 {org_id}",
+            "plan": "starter", "status": "active",
+            "billing": {"planKey": "starter", "status": "active", "updatedAt": now},
+        })
+        return org_id
+
+    def test_cas_mismatch_raises_stale_billing_profile_error(self) -> None:
+        from app.services.multichurch_store import StaleBillingProfileError
+        db = _db()
+        org_id = self._seed_org()
+        baseline = (db.collection("organizations").document(org_id).get().to_dict()
+                    or {}).get("billing", {}).get("updatedAt")
+        # Simulate a sibling writer that already updated billing.
+        self.store.set_org_billing_profile(
+            org_id=org_id,
+            billing={"planKey": "growth", "status": "active",
+                     "stripeCustomerId": "cus", "stripeSubscriptionId": "sub"},
+        )
+        # Stale CAS token (baseline) must now be rejected.
+        with self.assertRaises(StaleBillingProfileError):
+            self.store.set_org_billing_profile(
+                org_id=org_id,
+                billing={"planKey": "starter", "status": "active",
+                         "stripeCustomerId": "cus", "stripeSubscriptionId": "sub"},
+                expected_billing_updated_at=baseline,
+            )
+        # Stored state unchanged by the failed call.
+        final = (db.collection("organizations").document(org_id).get().to_dict()
+                 or {}).get("billing", {})
+        self.assertEqual(final.get("planKey"), "growth")
+
+
 class CheckoutAttemptFirestoreTests(unittest.TestCase):
     """Transactional validation of the checkout-attempt claim,
     including stable-request-parameter guard and parallel claims."""

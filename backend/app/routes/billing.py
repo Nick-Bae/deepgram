@@ -34,7 +34,7 @@ from app.auth.guards import require_org_role
 from app.billing.config import BILLING_CONFIG
 from app.billing.models import plan_spec
 from app.billing.stripe_client import StripeBillingClient, StripeClientError
-from app.services.multichurch_store import multichurch_store
+from app.services.multichurch_store import multichurch_store, StaleBillingProfileError
 from app.services import email_service
 
 router = APIRouter(tags=["billing"])
@@ -473,7 +473,29 @@ def _hydrate_billing_from_stripe(
         stripe_subscription=stripe_subscription,
         now=_utcnow(),
     )
-    return multichurch_store.set_org_billing_profile(org_id=org_id, billing=next_billing)
+    # Fix review item #7 (v7): the hydrate helper reads billing and
+    # retrieves subscription state from Stripe asynchronously; a
+    # webhook or another hydrate call may commit a newer billing
+    # profile in the gap between our read and our write. Pass CAS
+    # token so a stale hydrate call does NOT overwrite the newer
+    # state. On mismatch, abandon and return the current stored
+    # billing — the authoritative state was already committed by
+    # the other writer.
+    cas_token = billing.get("updatedAt") if isinstance(billing, dict) else None
+    try:
+        return multichurch_store.set_org_billing_profile(
+            org_id=org_id,
+            billing=next_billing,
+            expected_billing_updated_at=cas_token,
+        )
+    except StaleBillingProfileError:
+        logger.info(
+            "hydrate_cas_mismatch_abandoning_stale_refresh org=%s", org_id,
+        )
+        try:
+            return multichurch_store.get_org_billing_profile(org_id=org_id)
+        except Exception:
+            return billing
 
 
 def _can_start_from_status(*, status: str, grace_ends_at: Optional[datetime], now: datetime) -> bool:
@@ -1044,7 +1066,42 @@ async def stripe_webhook(
         customer_id = _clean(payload_obj.get("customer"))
         subscription_id = _clean(payload_obj.get("subscription"))
         session_id = _clean(payload_obj.get("id"))
-        requested_plan = plan_spec(metadata.get("planKey") or next_billing.get("planKey") or "trial")
+        # Fix review item #8 (v7): reconcile `requested_plan` against
+        # the subscription's CURRENT state (via Stripe retrieve) when
+        # the checkout.session.completed is DELAYED for an already-
+        # active subscription. Using the event's stale metadata.planKey
+        # would downgrade a Growth-upgraded sub back to Starter.
+        # For the initial-checkout case (no current subscription id or
+        # mismatched id handled by the obsolete/terminal guards below),
+        # trust the checkout metadata — that's the authoritative plan
+        # the user just purchased.
+        current_sub_id_pre = _clean(next_billing.get("stripeSubscriptionId"))
+        if subscription_id and current_sub_id_pre and current_sub_id_pre == subscription_id:
+            try:
+                sub_live = _stripe_client().retrieve_subscription(
+                    subscription_id=subscription_id,
+                )
+            except StripeClientError as exc:
+                logger.warning(
+                    "checkout_completed_reconcile_retrieve_failed org=%s sub=%s: %s",
+                    org_id, subscription_id, exc,
+                )
+                raise HTTPException(
+                    status_code=502, detail="stripe_reconcile_failed",
+                ) from exc
+            price_id_live = _clean_price_id(_price_id_from_subscription(sub_live or {}))
+            if price_id_live:
+                resolved_plan_key = _resolve_plan_from_price_id(
+                    price_id_live,
+                    fallback_plan_key=str(next_billing.get("planKey") or metadata.get("planKey") or "trial"),
+                )
+                requested_plan = plan_spec(resolved_plan_key)
+            else:
+                requested_plan = plan_spec(
+                    metadata.get("planKey") or next_billing.get("planKey") or "trial"
+                )
+        else:
+            requested_plan = plan_spec(metadata.get("planKey") or next_billing.get("planKey") or "trial")
 
         # Review-pass identity checks (fix #2):
         #   - Terminal-arrival guard requires BOTH matching
@@ -1123,7 +1180,12 @@ async def stripe_webhook(
         if pending_session_matches:
             next_billing["pendingCheckoutAttempt"] = None
         monthly_minutes_for_apply = requested_plan.monthly_minutes
-        if requested_plan.key != "trial":
+        # Only email "subscription_started" the FIRST time we see this
+        # subscription id — avoids double-emailing on a delayed
+        # checkout.session.completed for an already-active sub.
+        if requested_plan.key != "trial" and (
+            not current_sub_id_pre or current_sub_id_pre != subscription_id
+        ):
             pending_emails.append({"event": "subscription_started", "plan_key": requested_plan.key})
 
     elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:

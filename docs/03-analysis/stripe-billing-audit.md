@@ -7,6 +7,25 @@
 
 Stripe REQUEST version pinned to **`2023-10-16`** in the `Stripe-Version` header on each outbound call (`backend/app/billing/stripe_client.py:20,38`). This governs what Stripe's REST API returns to this backend. It does **not** independently establish the Stripe-API version used when Stripe DELIVERS webhook events — that version is set on the webhook endpoint configuration in the Stripe dashboard and is not visible from this codebase. Audit assumptions about webhook payload shapes (`current_period_start/end`, `items.data[0].price.id`, etc.) must be re-verified against the actually-configured delivery version in a Stripe sandbox.
 
+## Boundary-coverage seventh pass (2026-10-29, after 8b9d656b)
+
+Reviewer flagged two remaining gaps. Both addressed.
+
+### Gap 1 — Delayed Checkout completion reconciles against current subscription
+- **Problem**: `checkout.session.completed` arriving for an already-current subscription derived `requested_plan` from `metadata.planKey` without reconciling against the subscription's current price. A delayed completion for a Starter checkout session could downgrade a Growth-upgraded subscription back to Starter.
+- **Fix**: when `payload_obj.subscription == billing.stripeSubscriptionId` (same sub id), retrieve the subscription from Stripe and resolve `requested_plan` from the live `price_id` via `_resolve_plan_from_price_id`. Initial-checkout path (no current sub) continues to trust `metadata.planKey`. Also suppresses the duplicate `subscription_started` email on delayed completions for an already-recorded sub.
+- **Regression**: `B13_DelayedCheckoutCompletionDoesNotRevertUpgrade::test_delayed_checkout_for_current_sub_does_not_revert_growth`.
+
+### Gap 2 — CAS covers reverse writer direction (hydrate → set_org_billing_profile)
+- **Problem**: `set_org_billing_profile` wrote unconditionally with a bumped `updatedAt`. The hydrate path (`_hydrate_billing_from_stripe`) reads billing, retrieves Stripe (slow), then writes — a webhook completing in between is overwritten by the hydrate's stale snapshot.
+- **Fix**: `set_org_billing_profile` on both stores accepts an optional `expected_billing_updated_at`. When provided, the read+compare+write is transactional (Firestore) or inside the `_lock` (in-memory) and raises `StaleBillingProfileError` on mismatch. `_hydrate_billing_from_stripe` passes the CAS token from its initial read; on mismatch, abandons the stale snapshot and returns the current stored billing instead of overwriting.
+- **Regressions**:
+  - `B14_HydrateReverseRaceCASGuard::test_stale_hydrate_cannot_overwrite_committed_webhook` — real threads + `threading.Event` barrier: hydrate paused inside `retrieve_subscription`, webhook commits Growth, hydrate released with stale Starter snapshot → CAS rejects; stored state remains Growth; hydrate returns current state (not stale).
+  - Firestore emulator: `SetOrgBillingProfileCASFirestoreTests::test_cas_mismatch_raises_stale_billing_profile_error`.
+
+### B12c label correction
+The `B12::test_webhook_cas_catches_concurrent_customer_create` test was previously labeled "barrier-driven." It is a deterministic `side_effect` interleaving on the atomic apply — docstring corrected. The real-thread + barrier case lives in `B14`.
+
 ## Boundary-coverage sixth pass (2026-10-29, after aaaca878)
 
 Reviewer flagged three remaining blockers against aaaca878. All three addressed.
