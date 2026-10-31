@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
@@ -4807,31 +4808,95 @@ class FirestoreMultiChurchStore:
         return clean_org_id
 
     def get_org_billing_profile(self, *, org_id: str) -> Dict[str, Any]:
+        """Read billing with normalization. Any required writeback runs
+        inside a Firestore transaction so a concurrent CAS-protected
+        writer's commit is not clobbered.
+
+        Prior implementation used `org_ref.set({..., SERVER_TIMESTAMP},
+        merge=True)` with no CAS token: a reader-triggered writeback
+        could overwrite a concurrent `set_org_billing_profile` commit.
+        Offline reproduction confirmed this (see tmp/stripe-sandbox/
+        offline-reproduction/REPRODUCTION-RESULTS-V7.md, Case D).
+
+        Design:
+          - Firestore `@gcf_firestore.transactional` wraps read + the
+            optional writeback. Contention aborts the transaction;
+            retries resolve against a fresh snapshot. No manual CAS
+            token on the writeback path.
+          - Returned `billing.updatedAt` equals the stored `updatedAt`:
+            the writeback uses the transaction-attempt-scoped `now`
+            instead of SERVER_TIMESTAMP so returned == stored.
+          - Idempotent: writeback fires ONLY when the normalized
+            billing differs from the on-disk nested `billing` block.
+            A second read of a stable doc preserves the CAS token.
+            Legacy top-level `billing.*` dotted keys that are already
+            represented in nested state are left in place (no churn).
+            A dotted key that ADDS or CHANGES a value triggers one
+            migration write; subsequent reads converge.
+          - Monotonic `updatedAt`: the write timestamp is captured
+            INSIDE each transaction attempt. If the snapshot's
+            existing `updatedAt` is >= `_utcnow()` (clock skew, or a
+            concurrent writer that committed a larger token between
+            retries), the write timestamp advances to
+            `snapshot_token + 1us` so a slow retry cannot roll the
+            stored timestamp backward.
+          - `ValueError('org_not_found')` and any transaction failure
+            propagate unchanged — no exception masking.
+        """
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
-        now = _utcnow()
         org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
-        if not org_snap.exists:
-            raise ValueError("org_not_found")
-        org = org_snap.to_dict() or {}
-        billing_payload, lifted_legacy_fields = _billing_payload_from_org_row(org)
-        billing = _normalize_billing_state(
-            billing_payload,
-            plan_key=str(org.get("plan") or "trial"),
-            now=now,
-        )
-        if lifted_legacy_fields or billing != billing_payload:
-            org_ref.set(
-                {
-                    "billing": billing,
-                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
-                },
-                merge=True,
-                timeout=_FS_TIMEOUT,
+
+        @gcf_firestore.transactional
+        def _tx(tx: Any) -> Dict[str, Any]:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org_tx = snap.to_dict() or {}
+            # DEEP-COPY the persisted nested billing block BEFORE the
+            # legacy helper mutates `org_tx`. `_billing_payload_from_org_row`
+            # shallow-copies the nested dict and then overwrites nested
+            # containers (e.g. `limits`) in place; a reference to
+            # `org_tx['billing']` would share mutated sub-dicts with the
+            # payload, so the later `billing != raw_nested` comparison
+            # would miss the migration (reviewer-reproduced: nested
+            # alias `billing.limits.maxServiceKeys = 5` getter returned
+            # 5 but writeback was skipped and stored stayed None).
+            raw_nested_raw = org_tx.get("billing")
+            if isinstance(raw_nested_raw, dict):
+                raw_nested = copy.deepcopy(raw_nested_raw)
+            else:
+                raw_nested = {}
+            # Advance `now` over snapshot_token when necessary so a
+            # retry under concurrent commits cannot persist a stale
+            # timestamp. Captured per-attempt (NOT across retries).
+            now = _utcnow()
+            snapshot_token = raw_nested.get("updatedAt")
+            if snapshot_token is not None and snapshot_token >= now:
+                now = snapshot_token + timedelta(microseconds=1)
+            billing_payload, _lifted = _billing_payload_from_org_row(org_tx)
+            billing = _normalize_billing_state(
+                billing_payload,
+                plan_key=str(org_tx.get("plan") or "trial"),
+                now=now,
             )
-        return dict(billing)
+            # Idempotence: compare against the DEEP-COPIED persisted
+            # nested state. Any SUBSTANTIVE change (added/altered field,
+            # or dotted-key legacy value that genuinely differs from
+            # nested) triggers a single migration write. A stable doc
+            # produces no writeback and preserves its CAS token.
+            if billing != raw_nested:
+                billing = dict(billing)
+                billing["updatedAt"] = now
+                tx.set(
+                    org_ref,
+                    {"billing": billing, "updatedAt": now},
+                    merge=True,
+                )
+            return dict(billing)
+
+        return _tx(self._db.transaction())
 
     def set_org_billing_profile(
         self,
