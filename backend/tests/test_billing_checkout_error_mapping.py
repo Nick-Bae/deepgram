@@ -285,6 +285,89 @@ class CheckoutErrorMappingTests(unittest.TestCase):
         self.assertEqual(ctx.exception.detail, "invalid_plan_params")
         self.assertEqual(self.stripe_tracker.calls, 0)
 
+    # -----------------------------------------------------------------
+    # 7 — SDK-generated exhaustion (the shape the Firestore Python
+    #     client's @firestore.transactional decorator actually surfaces
+    #     after N failed ABORTED commits): a ValueError whose
+    #     __cause__ is the underlying Aborted. Must be mapped to 503,
+    #     BEFORE any Stripe operation.
+    #
+    #     Reviewer-reproduced path (2026-11-02): five stubbed ABORTED
+    #     commits → client wrapper exhausts and raises
+    #     ValueError("Failed to commit transaction in 5 attempts.")
+    #     with `__cause__` set to google.api_core.exceptions.Aborted.
+    # -----------------------------------------------------------------
+    def test_sdk_exhaustion_valueerror_caused_by_aborted_returns_503(self) -> None:
+        org_id = self._bootstrap_owner(
+            uid="owner-cem-7", slug="billing-cem-valueerror-aborted",
+            name="CEM ValueError-Caused-By-Aborted",
+        )
+        cause = gexc.Aborted("Transaction lock timeout.")
+        # Build the exact shape the SDK actually produces: a ValueError
+        # whose chained __cause__ is Aborted. The simplest way to
+        # construct that in Python is `raise ValueError(...) from cause`,
+        # which sets `__cause__` on the ValueError. We mimic that here
+        # with a side_effect callable so the chaining is preserved
+        # exactly as the SDK's own `raise ... from ...` would set it.
+        def _raise_valueerror_from_aborted(*_a, **_kw):
+            try:
+                raise cause
+            except gexc.Aborted as inner:
+                raise ValueError(
+                    "Failed to commit transaction in 5 attempts."
+                ) from inner
+
+        with patch.object(
+            self.store, "claim_checkout_attempt",
+            side_effect=_raise_valueerror_from_aborted,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                billing_routes.create_checkout_session(
+                    self._request(org_id), user=self._user("owner-cem-7"),
+                )
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "checkout_backend_unavailable")
+        self.assertEqual(
+            self.stripe_tracker.calls, 0,
+            "Stripe create_checkout_session MUST NOT be called when the "
+            "Firestore client's transactional wrapper has exhausted its "
+            "retries and surfaced the exhaustion as a cause-chained "
+            "ValueError.",
+        )
+
+    # -----------------------------------------------------------------
+    # 8 — Message-only negative control: a ValueError whose message
+    #     EXACTLY matches the SDK's exhaustion text but whose __cause__
+    #     is None (or any non-Aborted type) must RETAIN its existing
+    #     400 behavior. The discriminator is `__cause__`'s type, NOT
+    #     message substring.
+    # -----------------------------------------------------------------
+    def test_valueerror_matching_message_without_aborted_cause_stays_400(self) -> None:
+        org_id = self._bootstrap_owner(
+            uid="owner-cem-8", slug="billing-cem-message-only",
+            name="CEM Message-Only Negative Control",
+        )
+        # Plain ValueError (no `raise ... from ...`), so __cause__ is None.
+        # The message is the one the SDK uses on exhaustion.
+        with patch.object(
+            self.store, "claim_checkout_attempt",
+            side_effect=ValueError("Failed to commit transaction in 5 attempts."),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                billing_routes.create_checkout_session(
+                    self._request(org_id), user=self._user("owner-cem-8"),
+                )
+        # Must NOT be reclassified to 503 — the discriminator is
+        # __cause__'s TYPE, not the message text.
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(
+            ctx.exception.detail,
+            "Failed to commit transaction in 5 attempts.",
+            "Existing 400 behavior must be preserved for a ValueError "
+            "that merely has a matching message but no Aborted cause.",
+        )
+        self.assertEqual(self.stripe_tracker.calls, 0)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

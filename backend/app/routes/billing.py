@@ -845,6 +845,25 @@ def create_checkout_session(
             status_code=503, detail="checkout_backend_unavailable",
         ) from exc
     except ValueError as exc:
+        # Completion to the two except branches above: the Firestore
+        # Python client's `@firestore.transactional` decorator surfaces
+        # a retry-exhausted ABORTED to the caller as `ValueError("Failed
+        # to commit transaction in N attempts.")` with `__cause__` set
+        # to the underlying `google.api_core.exceptions.Aborted`. That
+        # path is NOT caught by the `_gexc.Aborted` or `_gexc.RetryError`
+        # branches above; it reaches this `ValueError` branch instead.
+        # Distinguish it from genuine validation errors by inspecting
+        # `__cause__` (an attribute, not a message substring) BEFORE
+        # the existing 404 / 400 mapping.
+        if isinstance(exc.__cause__, _gexc.Aborted):
+            logger.warning(
+                "checkout_claim_firestore_retry_exhausted_via_valueerror "
+                "org=%s cause=%s",
+                body.orgId, type(exc.__cause__).__name__,
+            )
+            raise HTTPException(
+                status_code=503, detail="checkout_backend_unavailable",
+            ) from exc
         detail = str(exc)
         if detail == "org_not_found":
             raise HTTPException(status_code=404, detail=detail) from exc
