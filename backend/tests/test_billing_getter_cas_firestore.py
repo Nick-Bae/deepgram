@@ -245,7 +245,18 @@ class TestGetterCASTransactional(unittest.TestCase):
                     )
                     B_result["committed"] = True
                     B_result["outcome"] = "commit"
-                except StaleBillingProfileError as exc:
+                # Catch via the CURRENT module reference, not the
+                # module-top captured name. `importlib.reload` of
+                # `app.services.multichurch_store` by other tests
+                # (e.g. test_sweeper_atomic.FirestoreAtomicIdleTerminationTests.setUp
+                # at test_sweeper_atomic.py:853) rebinds
+                # `mcs.StaleBillingProfileError` to a NEW class object
+                # whose module and qualname match the pre-reload class
+                # but whose id() differs. `except StaleBillingProfileError`
+                # (bound at test-module load, line 42) then fails to
+                # catch instances raised from the reloaded module.
+                # Reproducer in test_billing_cas_module_reload_isolation.py.
+                except mcs.StaleBillingProfileError as exc:
                     B_result["outcome"] = "stale_cas_expected"
                     B_result["exc"] = (type(exc).__name__, repr(exc))
                 except BaseException as exc:
