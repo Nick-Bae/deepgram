@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request
+from google.api_core import exceptions as _gexc
 from pydantic import BaseModel, Field, field_validator
 
 from app import validators
@@ -799,6 +800,20 @@ def create_checkout_session(
     # `claim_checkout_attempt` is a single transactional read-decide-write
     # that serializes concurrent callers on the same org and returns one
     # of four actions.
+    #
+    # Error-mapping (follow-up to the merge-readiness flake diagnosis):
+    # the transactional commit path can surface
+    # `google.api_core.exceptions.Aborted` (and, when the Firestore client
+    # library's own Retry wrapper exhausts, `google.api_core.exceptions.RetryError`
+    # with `.cause` set to an Aborted) under contention. Distinguish by
+    # exception TYPE — not by matching the English message string, since
+    # unrelated code paths may raise RuntimeError or similar with
+    # overlapping text — and map ONLY the Aborted/RetryError-wrapping-Aborted
+    # case to HTTP 503 with a stable public detail. Occurs BEFORE any Stripe
+    # operation is initiated, so a retry-exhausted store transaction does
+    # not leak into a half-created Stripe session. No application-level
+    # retry is added here; the Firestore client library owns its own retry
+    # policy, and the HTTP 503 lets the caller decide whether to retry.
     try:
         claim = multichurch_store.claim_checkout_attempt(
             org_id=body.orgId,
@@ -808,6 +823,27 @@ def create_checkout_session(
             cancel_url=body.cancelUrl,
             requested_by_uid=user.uid,
         )
+    except _gexc.RetryError as exc:
+        _cause = getattr(exc, "cause", None)
+        if isinstance(_cause, _gexc.Aborted):
+            logger.warning(
+                "checkout_claim_firestore_retry_exhausted org=%s cause=%s",
+                body.orgId, type(_cause).__name__,
+            )
+            raise HTTPException(
+                status_code=503, detail="checkout_backend_unavailable",
+            ) from exc
+        # RetryError with a non-Aborted cause is a different failure
+        # mode (e.g. DeadlineExceeded with no retryable child); preserve
+        # it rather than silently reclassifying.
+        raise
+    except _gexc.Aborted as exc:
+        logger.warning(
+            "checkout_claim_firestore_aborted org=%s", body.orgId,
+        )
+        raise HTTPException(
+            status_code=503, detail="checkout_backend_unavailable",
+        ) from exc
     except ValueError as exc:
         detail = str(exc)
         if detail == "org_not_found":
