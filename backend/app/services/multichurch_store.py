@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
@@ -154,6 +155,50 @@ DEFAULT_INVITE_EXPIRY_HOURS = _env_int("INVITE_DEFAULT_EXPIRY_HOURS", 24 * 3, mi
 MAX_ACTIVE_INVITES_PER_ORG = _env_int("INVITE_MAX_ACTIVE_PER_ORG", 20, min_value=1, max_value=500)
 INVITE_RETENTION_DAYS = _env_int("INVITE_RETENTION_DAYS", 30, min_value=1, max_value=365)
 BILLING_LIMITS_ENABLED = not _env_bool("DISABLE_BILLING_LIMITS", False)
+# Lease window for in-flight webhook claims. A claim older than this
+# is considered abandoned (the original handler either crashed or
+# never completed) and is reclaimed on next delivery. Must be longer
+# than the longest expected handler path including Firestore writes.
+_BILLING_EVENT_LEASE_SEC = _env_int(
+    "BILLING_EVENT_LEASE_SEC", 60, min_value=15, max_value=600,
+)
+# TTL for the pending-checkout-attempt record (fix-batch-2). Matches
+# Stripe's default Checkout Session validity of 24 hours.
+_BILLING_CHECKOUT_ATTEMPT_TTL_SEC = _env_int(
+    "BILLING_CHECKOUT_ATTEMPT_TTL_SEC", 24 * 3600, min_value=60, max_value=48 * 3600,
+)
+
+
+class StaleBillingProfileError(RuntimeError):
+    """Raised when `set_org_billing_profile(expected_billing_updated_at=…)`
+    is called with a CAS token that no longer matches the stored
+    `billing.updatedAt`. Callers that pass a CAS token are opting
+    into the reject-on-stale contract (fix review item #7).
+    """
+
+
+class StaleBillingPatchError(RuntimeError):
+    """Raised when `patch_org_billing_fields(expected=…)` is called
+    and one or more of the expected field values no longer matches
+    the current stored value. Callers that pass `expected` are opting
+    into reject-on-identity-mismatch (review-pass v9 gap #1/#2).
+
+    The exception carries `.mismatches: dict` → each key is a field
+    whose current stored value diverges from the expected value;
+    each value is a `(expected, actual)` tuple.
+    """
+
+    def __init__(self, message: str, *, mismatches: Dict[str, Any]):
+        super().__init__(message)
+        self.mismatches: Dict[str, Any] = dict(mismatches)
+
+
+def _claim_token_for(now: datetime) -> str:
+    """Opaque token identifying a specific claim. Derived from the
+    claim's monotonic ISO timestamp; stable within a claim, differs
+    across reclaims because the reclaimer stamps a new `claimedAt`.
+    """
+    return now.isoformat().replace("+00:00", "Z")
 SERMON_PREP_BUDGETS_ENABLED = not _env_bool("DISABLE_SERMON_PREP_BUDGETS", False)
 SERMON_PREP_DEFAULT_BUDGET_USD = _env_float(
     "SERMON_PREP_DEFAULT_BUDGET_USD",
@@ -1474,7 +1519,27 @@ class InMemoryMultiChurchStore:
             org["updatedAt"] = now
             return dict(billing)
 
-    def set_org_billing_profile(self, *, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+    def set_org_billing_profile(
+        self,
+        *,
+        org_id: str,
+        billing: Dict[str, Any],
+        expected_billing_updated_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Write a billing snapshot.
+
+        Fix review item #7 (v7): optional CAS token.
+          - When `expected_billing_updated_at` is None (legacy
+            callers), writes unconditionally. These callers must
+            not race with the webhook/apply path.
+          - When provided, the call is CONDITIONAL on the current
+            billing.updatedAt matching the token. On mismatch the
+            method RAISES `StaleBillingProfileError`; the caller
+            re-reads and reconciles or abandons.
+
+        `billing.updatedAt` is always stamped `now` after the write
+        succeeds, so every writer uniformly participates in CAS.
+        """
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
@@ -1483,11 +1548,20 @@ class InMemoryMultiChurchStore:
             org = self._orgs.get(clean_org_id)
             if not org:
                 raise ValueError("org_not_found")
+            if expected_billing_updated_at is not None:
+                current_billing = org.get("billing") or {}
+                if current_billing.get("updatedAt") != expected_billing_updated_at:
+                    raise StaleBillingProfileError(
+                        "set_org_billing_profile: billing.updatedAt mismatch "
+                        f"(expected={expected_billing_updated_at!r}, "
+                        f"current={current_billing.get('updatedAt')!r})"
+                    )
             merged = _normalize_billing_state(
                 billing or {},
                 plan_key=str(org.get("plan") or "trial"),
                 now=now,
             )
+            merged["updatedAt"] = now
             org["billing"] = merged
             org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
             org["status"] = "trial" if str(merged.get("status") or "").strip().lower() == "trialing" else str(
@@ -1495,6 +1569,87 @@ class InMemoryMultiChurchStore:
             )
             org["updatedAt"] = now
             return dict(merged)
+
+    def patch_org_billing_fields(
+        self,
+        *,
+        org_id: str,
+        updates: Dict[str, Any],
+        expected: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Targeted-field update of `billing` without a full snapshot.
+
+        Fix review-pass v8 gap #1: full-snapshot writers (customer
+        creation, reference cleanup, pending-plan writes) read an old
+        snapshot, mutate a few fields, then write the whole thing
+        back — overwriting unrelated newer fields a concurrent writer
+        (webhook) persisted in the meantime.
+
+        Fix review-pass v9 gaps #1/#2: `expected` lets the caller
+        pin the identity it believes about each field it is
+        changing. Before applying `updates`, the current stored
+        value of every key in `expected` is compared to the given
+        expected value. On ANY mismatch, raises
+        `StaleBillingPatchError` and NO fields are written. The
+        comparison and the write happen atomically under `_lock`.
+        Compared with a plain CAS on `billing.updatedAt`, this is
+        narrower: an unrelated writer bumping updatedAt does not
+        trip it, but a concurrent writer changing one of the
+        caller's fields does.
+
+        `updates` is a mapping of field names → new values (None
+        clears a field). Nested `limits` is merged key-by-key, not
+        replaced. Always bumps `billing.updatedAt`.
+
+        Returns the full updated billing dict.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            current = _normalize_billing_state(
+                org.get("billing") or {},
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            if expected is not None:
+                mismatches: Dict[str, Any] = {}
+                for key, want in expected.items():
+                    got = current.get(key)
+                    if got != want:
+                        mismatches[key] = (want, got)
+                if mismatches:
+                    raise StaleBillingPatchError(
+                        "patch_org_billing_fields: expected field mismatch "
+                        f"(mismatches={mismatches!r})",
+                        mismatches=mismatches,
+                    )
+            next_billing = dict(current)
+            for key, value in (updates or {}).items():
+                if key == "limits" and isinstance(value, dict):
+                    merged_limits = dict(current.get("limits") or {})
+                    for lk, lv in value.items():
+                        if lv is None:
+                            merged_limits.pop(lk, None)
+                        else:
+                            merged_limits[lk] = lv
+                    next_billing["limits"] = merged_limits
+                else:
+                    next_billing[key] = value
+            next_billing["updatedAt"] = now
+            org["billing"] = next_billing
+            if "planKey" in (updates or {}):
+                org["plan"] = str(next_billing.get("planKey") or org.get("plan") or "trial")
+            if "status" in (updates or {}):
+                org["status"] = "trial" if str(next_billing.get("status") or "").strip().lower() == "trialing" else str(
+                    next_billing.get("status") or org.get("status") or "active"
+                )
+            org["updatedAt"] = now
+            return dict(next_billing)
 
     def get_org_effective_trial_seconds_remaining(self, *, org_id: str) -> Optional[int]:
         clean_org_id = _clean_token(org_id)
@@ -1573,6 +1728,171 @@ class InMemoryMultiChurchStore:
                     return org_id
         return None
 
+    def claim_checkout_attempt(
+        self,
+        *,
+        org_id: str,
+        plan_key: str,
+        interval: str,
+        success_url: str = "",
+        cancel_url: str = "",
+        requested_by_uid: str = "",
+    ) -> Dict[str, Any]:
+        """fix-batch-2: atomically decide the next action for a POST to
+        /billing/checkout-session.
+
+        Returns a dict with:
+          - "action" ∈ {"reuse", "create", "already_subscribed",
+                        "pending_different_plan", "pending_params_mismatch"}
+          - For "reuse": attemptId, sessionId, sessionUrl.
+          - For "create": attemptId (a new value to pass to Stripe as the
+                         Idempotency-Key); caller MUST follow up with
+                         `record_checkout_attempt_session` after the
+                         Stripe call returns.
+          - For refusals: no additional fields; the route surfaces 409.
+
+        The record captures ALL immutable request parameters
+        (success_url, cancel_url, requested_by_uid) alongside plan/
+        interval. On reuse, EVERY parameter must match the stored
+        record; a mismatch means a different logical attempt and we
+        refuse rather than silently reuse a Stripe Idempotency-Key
+        with changed parameters (which the real Stripe would reject).
+
+        Guarantees under concurrent callers on the same org: at most
+        one caller can see "create"; the rest see "reuse" (same
+        attemptId) or a refusal.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_plan = str(plan_key or "").strip().lower()
+        clean_interval = str(interval or "").strip().lower() or "month"
+        clean_success = str(success_url or "").strip()
+        clean_cancel = str(cancel_url or "").strip()
+        clean_uid = str(requested_by_uid or "").strip()
+        now = _utcnow()
+        ttl = timedelta(seconds=int(_BILLING_CHECKOUT_ATTEMPT_TTL_SEC))
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            billing = _normalize_billing_state(
+                org.get("billing"),
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            # Guard: existing subscription — route the user to the Portal.
+            existing_sub = str(billing.get("stripeSubscriptionId") or "").strip()
+            existing_status = str(billing.get("status") or "").strip().lower()
+            if existing_sub and existing_status in {"active", "past_due", "trialing"}:
+                return {"action": "already_subscribed"}
+            # Fix issue #2: a subscription whose completion has fired
+            # but whose status event has not arrived yet is marked by
+            # `pendingSubscriptionConfirmation=True`. Block duplicate
+            # checkouts until the status arrives (entitlement separate
+            # from this signal).
+            if existing_sub and bool(billing.get("pendingSubscriptionConfirmation")):
+                return {"action": "already_subscribed"}
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            exp = pending.get("expiresAt") if isinstance(pending, dict) else None
+            pending_live = (
+                isinstance(pending, dict)
+                and isinstance(exp, datetime)
+                and now < exp
+                and bool(pending.get("attemptId"))
+            )
+            if pending_live:
+                if (
+                    str(pending.get("planKey") or "").lower() == clean_plan
+                    and str(pending.get("interval") or "").lower() == clean_interval
+                ):
+                    # Fix issue #4: stable request parameters.
+                    # Compare the IMMUTABLE request fields with the
+                    # stored record. If any differ, this is a
+                    # DIFFERENT logical attempt (different admin,
+                    # different return URL) and must not reuse the
+                    # existing Stripe Idempotency-Key.
+                    stored_success = str(pending.get("successUrl") or "")
+                    stored_cancel = str(pending.get("cancelUrl") or "")
+                    stored_uid = str(pending.get("requestedByUid") or "")
+                    if (
+                        (clean_success and stored_success and clean_success != stored_success)
+                        or (clean_cancel and stored_cancel and clean_cancel != stored_cancel)
+                        or (clean_uid and stored_uid and clean_uid != stored_uid)
+                    ):
+                        return {"action": "pending_params_mismatch"}
+                    return {
+                        "action": "reuse",
+                        "attemptId": pending["attemptId"],
+                        "sessionId": pending.get("sessionId"),
+                        "sessionUrl": pending.get("sessionUrl"),
+                    }
+                return {"action": "pending_different_plan"}
+            # Create a new attempt. The attemptId is the stable logical
+            # idempotency key — retries after an uncertain network
+            # outcome use the same value.
+            attempt_id = f"chkatt_{uuid4().hex}"
+            billing["pendingCheckoutAttempt"] = {
+                "attemptId": attempt_id,
+                "planKey": clean_plan,
+                "interval": clean_interval,
+                "successUrl": clean_success,
+                "cancelUrl": clean_cancel,
+                "requestedByUid": clean_uid,
+                "createdAt": now,
+                "expiresAt": now + ttl,
+                "sessionId": None,
+                "sessionUrl": None,
+            }
+            # Fix review item #2: CAS token lives in billing.updatedAt;
+            # every writer that mutates billing fields MUST bump it so
+            # concurrent webhook handlers' CAS checks catch the change.
+            billing["updatedAt"] = now
+            org["billing"] = billing
+            org["updatedAt"] = now
+            return {"action": "create", "attemptId": attempt_id}
+
+    def record_checkout_attempt_session(
+        self,
+        *,
+        org_id: str,
+        attempt_id: str,
+        session_id: str,
+        session_url: str,
+    ) -> None:
+        """Persist the Stripe-returned session info on the pending
+        attempt. Called by the route AFTER
+        `client.create_checkout_session` succeeds. If the attempt no
+        longer matches (e.g. was cleared by `checkout.session.completed`
+        or replaced by a newer request), this is a silent no-op — the
+        latest state wins.
+
+        Fix review item #2: this writer bumps `billing.updatedAt` so a
+        concurrent webhook handler whose CAS captured the earlier
+        `updatedAt` will be refused.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        with self._lock:
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            billing = dict(org.get("billing") or {})
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            if not isinstance(pending, dict):
+                return
+            if str(pending.get("attemptId") or "") != str(attempt_id or ""):
+                return
+            pending = dict(pending)
+            pending["sessionId"] = str(session_id or "")
+            pending["sessionUrl"] = str(session_url or "")
+            billing["pendingCheckoutAttempt"] = pending
+            billing["updatedAt"] = now
+            org["billing"] = billing
+            org["updatedAt"] = now
+
     def try_mark_billing_event(
         self,
         *,
@@ -1580,19 +1900,240 @@ class InMemoryMultiChurchStore:
         event_type: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        """Legacy mark-at-start dedup. Preserved as a thin wrapper over
+        the claim/complete pair so callers that have NOT been migrated
+        continue to work: TRUE preserves the old "fresh" meaning while
+        completing the event immediately (prior semantics). New code
+        should use `try_claim_billing_event` + `complete_billing_event`.
+        """
+        result = self.try_claim_billing_event(
+            event_id=event_id, event_type=event_type, payload=payload,
+        )
+        if result.get("status") == "fresh":
+            self.complete_billing_event(
+                event_id=event_id, claim_token=result.get("claimToken"),
+            )
+            return True
+        return False
+
+    def try_claim_billing_event(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Claim-and-complete dedup. Returns a dict with:
+          - status: "fresh" | "deduped" | "concurrent"
+          - claimToken: the current claim's token (only meaningful on
+                        "fresh"; opaque to the caller — pass it back
+                        verbatim to `complete_billing_event` and
+                        `check_claim_still_held`).
+            On "fresh", claimToken is the server-side timestamp of the
+            claim (`claimedAt` ISO-8601 string). On "deduped"/
+            "concurrent" it may be None or the current holder's token;
+            callers must ignore it in those branches.
+
+        Semantics:
+          - "fresh"      — caller holds the lease; MUST call
+                           `complete_billing_event(event_id, claim_token)`
+                           after successful billing persistence. Before
+                           persisting, callers SHOULD call
+                           `check_claim_still_held(event_id, claim_token)`
+                           to detect expired leases where another
+                           delivery has already taken over.
+          - "deduped"    — a prior delivery already marked this event
+                           COMPLETED; the caller can short-circuit.
+          - "concurrent" — a prior delivery holds an active (non-aged)
+                           claim; the caller should refuse so Stripe can
+                           retry after back-off.
+        """
         clean_event_id = _clean_token(event_id)
         if not clean_event_id:
             raise ValueError("invalid_event_id")
+        now = _utcnow()
         with self._lock:
-            if clean_event_id in self._billing_events:
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
+                token = _claim_token_for(now)
+                self._billing_events[clean_event_id] = {
+                    "eventId": clean_event_id,
+                    "eventType": str(event_type or "").strip(),
+                    "payload": dict(payload or {}),
+                    "status": "pending",
+                    "claimedAt": now,
+                    "claimToken": token,
+                    "createdAt": now,
+                }
+                return {"status": "fresh", "claimToken": token}
+            # Legacy-record compatibility (fix issue #3): pre-claim/complete
+            # records had only {eventId, eventType, payload, createdAt}
+            # with NO `status` or `claimedAt`. The old semantics was
+            # "existence = processed," so treat the absence of `status`
+            # as COMPLETED to avoid implicit replay.
+            if "status" not in rec:
+                return {"status": "deduped", "claimToken": None}
+            if str(rec.get("status") or "").lower() == "completed":
+                return {"status": "deduped", "claimToken": None}
+            claimed_at = rec.get("claimedAt")
+            if isinstance(claimed_at, datetime):
+                age = (now - claimed_at).total_seconds()
+                if age < _BILLING_EVENT_LEASE_SEC:
+                    return {"status": "concurrent", "claimToken": None}
+            # Lease aged out — reclaim.
+            token = _claim_token_for(now)
+            rec["status"] = "pending"
+            rec["claimedAt"] = now
+            rec["claimToken"] = token
+            return {"status": "fresh", "claimToken": token}
+
+    def check_claim_still_held(self, *, event_id: str, claim_token: str) -> bool:
+        """Boundary 1 (lease ownership): verify the passed-in token
+        still identifies the current claim. Slow workers whose lease
+        has aged out and been reclaimed by a sibling delivery MUST
+        detect this via this check BEFORE calling `set_org_billing_profile`
+        or `complete_billing_event`, otherwise their stale write
+        would overwrite the newer claim's work.
+        """
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            return False
+        with self._lock:
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
                 return False
-            self._billing_events[clean_event_id] = {
-                "eventId": clean_event_id,
-                "eventType": str(event_type or "").strip(),
-                "payload": dict(payload or {}),
-                "createdAt": _utcnow(),
-            }
+            if str(rec.get("status") or "").lower() == "completed":
+                return False
+            return str(rec.get("claimToken") or "") == str(claim_token or "")
+
+    def complete_billing_event(
+        self,
+        *,
+        event_id: str,
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        """Mark the claim COMPLETED. Returns True when the completion
+        was recorded as THIS claim; returns False when `claim_token` is
+        provided but does not match the current claim (a newer
+        delivery has taken over — don't overwrite its state).
+
+        Idempotent on token-less calls (the legacy wrapper from
+        `try_mark_billing_event` uses that path).
+        """
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        now = _utcnow()
+        with self._lock:
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
+                # No claim to complete — write a defensive terminal record.
+                self._billing_events[clean_event_id] = {
+                    "eventId": clean_event_id,
+                    "eventType": "",
+                    "payload": {},
+                    "status": "completed",
+                    "claimedAt": now,
+                    "completedAt": now,
+                    "createdAt": now,
+                }
+                return True
+            if claim_token is not None:
+                current_token = str(rec.get("claimToken") or "")
+                if current_token and current_token != str(claim_token):
+                    # Our lease was reclaimed. Do NOT overwrite the
+                    # newer claim's state.
+                    return False
+            rec["status"] = "completed"
+            rec["completedAt"] = now
             return True
+
+    def apply_webhook_event_atomic(
+        self,
+        *,
+        org_id: str,
+        billing: Optional[Dict[str, Any]],
+        monthly_minutes: Optional[int],
+        event_id: str,
+        claim_token: str,
+        expected_billing_updated_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Fenced apply with CAS.
+
+        Returns a dict with at minimum `{"applied": bool}`. On
+        rejection the dict includes a `"reason"` field one of:
+          - "no_claim"           — event doc missing or legacy
+                                   (treated as already completed).
+          - "already_completed"  — event is terminal.
+          - "claim_lost"         — claim_token differs from current.
+          - "stale_snapshot"     — expected_billing_updated_at does
+                                   not match the current
+                                   `billing.updatedAt`. The caller
+                                   should return 409 so Stripe
+                                   retries; the retry reads the
+                                   current state and reconciles.
+
+        **No global event-created watermark.** Stripe explicitly
+        documents that `created` MUST NOT determine event order
+        (fix review item #1); any suppression based on an
+        org-wide watermark discards legitimate current-subscription
+        updates and allows obsolete events to advance it. Current-
+        state reconciliation is the caller's job (via Stripe
+        retrieval for invoice events; via obsolete-subscription
+        checks for subscription/checkout events).
+
+        A `billing=None` input is a NO-OP write — used by the
+        late-arrival / obsolete-subscription branches which must
+        complete the event dedup but MUST NOT submit any snapshot
+        of the billing profile.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        now = _utcnow()
+        with self._lock:
+            rec = self._billing_events.get(clean_event_id)
+            if rec is None:
+                return {"applied": False, "reason": "no_claim"}
+            if "status" not in rec:
+                return {"applied": False, "reason": "no_claim"}
+            if str(rec.get("status") or "").lower() == "completed":
+                return {"applied": False, "reason": "already_completed"}
+            current_token = str(rec.get("claimToken") or "")
+            if current_token and current_token != str(claim_token):
+                return {"applied": False, "reason": "claim_lost"}
+            org = self._orgs.get(clean_org_id)
+            if not org:
+                raise ValueError("org_not_found")
+            if expected_billing_updated_at is not None:
+                current_billing = org.get("billing") or {}
+                current_ua = current_billing.get("updatedAt")
+                if current_ua != expected_billing_updated_at:
+                    return {"applied": False, "reason": "stale_snapshot"}
+            if billing is not None:
+                merged = _normalize_billing_state(
+                    billing,
+                    plan_key=str(org.get("plan") or "trial"),
+                    now=now,
+                )
+                org["billing"] = merged
+                org["plan"] = str(merged.get("planKey") or org.get("plan") or "trial")
+                org["status"] = (
+                    "trial" if str(merged.get("status") or "").strip().lower() == "trialing"
+                    else str(merged.get("status") or org.get("status") or "active")
+                )
+            org["updatedAt"] = now
+            if monthly_minutes is not None:
+                int_minutes = max(0, int(monthly_minutes))
+                org["maxMinutesPerMonth"] = int_minutes
+                if int_minutes == 0 or int(org.get("currentMonthMinutes") or 0) < int_minutes:
+                    org["softCapReached"] = False
+            rec["status"] = "completed"
+            rec["completedAt"] = now
+            return {"applied": True}
 
     def get_org_billing_limits(
         self,
@@ -4267,38 +4808,147 @@ class FirestoreMultiChurchStore:
         return clean_org_id
 
     def get_org_billing_profile(self, *, org_id: str) -> Dict[str, Any]:
-        clean_org_id = _clean_token(org_id)
-        if not clean_org_id:
-            raise ValueError("org_not_found")
-        now = _utcnow()
-        org_ref = self._org_ref(clean_org_id)
-        org_snap = org_ref.get(timeout=_FS_TIMEOUT)
-        if not org_snap.exists:
-            raise ValueError("org_not_found")
-        org = org_snap.to_dict() or {}
-        billing_payload, lifted_legacy_fields = _billing_payload_from_org_row(org)
-        billing = _normalize_billing_state(
-            billing_payload,
-            plan_key=str(org.get("plan") or "trial"),
-            now=now,
-        )
-        if lifted_legacy_fields or billing != billing_payload:
-            org_ref.set(
-                {
-                    "billing": billing,
-                    "updatedAt": gcf_firestore.SERVER_TIMESTAMP,
-                },
-                merge=True,
-                timeout=_FS_TIMEOUT,
-            )
-        return dict(billing)
+        """Read billing with normalization. Any required writeback runs
+        inside a Firestore transaction so a concurrent CAS-protected
+        writer's commit is not clobbered.
 
-    def set_org_billing_profile(self, *, org_id: str, billing: Dict[str, Any]) -> Dict[str, Any]:
+        Prior implementation used `org_ref.set({..., SERVER_TIMESTAMP},
+        merge=True)` with no CAS token: a reader-triggered writeback
+        could overwrite a concurrent `set_org_billing_profile` commit.
+        Offline reproduction confirmed this (see tmp/stripe-sandbox/
+        offline-reproduction/REPRODUCTION-RESULTS-V7.md, Case D).
+
+        Design:
+          - Firestore `@gcf_firestore.transactional` wraps read + the
+            optional writeback. Contention aborts the transaction;
+            retries resolve against a fresh snapshot. No manual CAS
+            token on the writeback path.
+          - Returned `billing.updatedAt` equals the stored `updatedAt`:
+            the writeback uses the transaction-attempt-scoped `now`
+            instead of SERVER_TIMESTAMP so returned == stored.
+          - Idempotent: writeback fires ONLY when the normalized
+            billing differs from the on-disk nested `billing` block.
+            A second read of a stable doc preserves the CAS token.
+            Legacy top-level `billing.*` dotted keys that are already
+            represented in nested state are left in place (no churn).
+            A dotted key that ADDS or CHANGES a value triggers one
+            migration write; subsequent reads converge.
+          - Monotonic `updatedAt`: the write timestamp is captured
+            INSIDE each transaction attempt. If the snapshot's
+            existing `updatedAt` is >= `_utcnow()` (clock skew, or a
+            concurrent writer that committed a larger token between
+            retries), the write timestamp advances to
+            `snapshot_token + 1us` so a slow retry cannot roll the
+            stored timestamp backward.
+          - `ValueError('org_not_found')` and any transaction failure
+            propagate unchanged — no exception masking.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        org_ref = self._org_ref(clean_org_id)
+
+        @gcf_firestore.transactional
+        def _tx(tx: Any) -> Dict[str, Any]:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org_tx = snap.to_dict() or {}
+            # DEEP-COPY the persisted nested billing block BEFORE the
+            # legacy helper mutates `org_tx`. `_billing_payload_from_org_row`
+            # shallow-copies the nested dict and then overwrites nested
+            # containers (e.g. `limits`) in place; a reference to
+            # `org_tx['billing']` would share mutated sub-dicts with the
+            # payload, so the later `billing != raw_nested` comparison
+            # would miss the migration (reviewer-reproduced: nested
+            # alias `billing.limits.maxServiceKeys = 5` getter returned
+            # 5 but writeback was skipped and stored stayed None).
+            raw_nested_raw = org_tx.get("billing")
+            if isinstance(raw_nested_raw, dict):
+                raw_nested = copy.deepcopy(raw_nested_raw)
+            else:
+                raw_nested = {}
+            # Advance `now` over snapshot_token when necessary so a
+            # retry under concurrent commits cannot persist a stale
+            # timestamp. Captured per-attempt (NOT across retries).
+            now = _utcnow()
+            snapshot_token = raw_nested.get("updatedAt")
+            if snapshot_token is not None and snapshot_token >= now:
+                now = snapshot_token + timedelta(microseconds=1)
+            billing_payload, _lifted = _billing_payload_from_org_row(org_tx)
+            billing = _normalize_billing_state(
+                billing_payload,
+                plan_key=str(org_tx.get("plan") or "trial"),
+                now=now,
+            )
+            # Idempotence: compare against the DEEP-COPIED persisted
+            # nested state. Any SUBSTANTIVE change (added/altered field,
+            # or dotted-key legacy value that genuinely differs from
+            # nested) triggers a single migration write. A stable doc
+            # produces no writeback and preserves its CAS token.
+            if billing != raw_nested:
+                billing = dict(billing)
+                billing["updatedAt"] = now
+                tx.set(
+                    org_ref,
+                    {"billing": billing, "updatedAt": now},
+                    merge=True,
+                )
+            return dict(billing)
+
+        return _tx(self._db.transaction())
+
+    def set_org_billing_profile(
+        self,
+        *,
+        org_id: str,
+        billing: Dict[str, Any],
+        expected_billing_updated_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """See InMemoryMultiChurchStore.set_org_billing_profile.
+
+        Fix review item #7 (v7): when `expected_billing_updated_at`
+        is provided, the read+write runs inside a transaction and
+        raises `StaleBillingProfileError` on CAS mismatch. Legacy
+        (None) callers continue to write unconditionally."""
         clean_org_id = _clean_token(org_id)
         if not clean_org_id:
             raise ValueError("org_not_found")
         now = _utcnow()
         org_ref = self._org_ref(clean_org_id)
+
+        if expected_billing_updated_at is not None:
+            @gcf_firestore.transactional
+            def _cas_set(tx: Any) -> Dict[str, Any]:
+                snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+                if not snap.exists:
+                    raise ValueError("org_not_found")
+                org_tx = snap.to_dict() or {}
+                current_billing = org_tx.get("billing") or {}
+                if current_billing.get("updatedAt") != expected_billing_updated_at:
+                    raise StaleBillingProfileError(
+                        "set_org_billing_profile: billing.updatedAt mismatch "
+                        f"(expected={expected_billing_updated_at!r}, "
+                        f"current={current_billing.get('updatedAt')!r})"
+                    )
+                merged = _normalize_billing_state(
+                    billing or {},
+                    plan_key=str(org_tx.get("plan") or "trial"),
+                    now=now,
+                )
+                merged["updatedAt"] = now
+                normalized_status = str(merged.get("status") or "").strip().lower()
+                tx.update(org_ref, {
+                    "billing": merged,
+                    "plan": str(merged.get("planKey") or org_tx.get("plan") or "trial"),
+                    "status": "trial" if normalized_status == "trialing" else str(
+                        merged.get("status") or org_tx.get("status") or "active"
+                    ),
+                    "updatedAt": now,
+                })
+                return dict(merged)
+            return _cas_set(self._db.transaction())
+
         org_snap = org_ref.get(timeout=_FS_TIMEOUT)
         if not org_snap.exists:
             raise ValueError("org_not_found")
@@ -4308,6 +4958,9 @@ class FirestoreMultiChurchStore:
             plan_key=str(org.get("plan") or "trial"),
             now=now,
         )
+        # Fix review item #3 (v6): every billing writer must bump
+        # billing.updatedAt. See InMemoryMultiChurchStore counterpart.
+        merged["updatedAt"] = now
         normalized_status = str(merged.get("status") or "").strip().lower()
         org_ref.set(
             {
@@ -4320,6 +4973,78 @@ class FirestoreMultiChurchStore:
             timeout=_FS_TIMEOUT,
         )
         return dict(merged)
+
+    def patch_org_billing_fields(
+        self,
+        *,
+        org_id: str,
+        updates: Dict[str, Any],
+        expected: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """See InMemoryMultiChurchStore.patch_org_billing_fields.
+
+        Fix review-pass v9 gaps #1/#2: when `expected` is provided,
+        the read, per-field identity check, and write all run inside
+        the Firestore transaction. On any mismatch, raises
+        `StaleBillingPatchError` and nothing is written. Even on a
+        Firestore transaction retry, the final committed state is
+        guaranteed to have observed `expected` matching current.
+        """
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+
+        @gcf_firestore.transactional
+        def _apply(tx: Any) -> Dict[str, Any]:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org_tx = snap.to_dict() or {}
+            billing_payload, _ = _billing_payload_from_org_row(org_tx)
+            current = _normalize_billing_state(
+                billing_payload or {},
+                plan_key=str(org_tx.get("plan") or "trial"),
+                now=now,
+            )
+            if expected is not None:
+                mismatches: Dict[str, Any] = {}
+                for key, want in expected.items():
+                    got = current.get(key)
+                    if got != want:
+                        mismatches[key] = (want, got)
+                if mismatches:
+                    raise StaleBillingPatchError(
+                        "patch_org_billing_fields: expected field mismatch "
+                        f"(mismatches={mismatches!r})",
+                        mismatches=mismatches,
+                    )
+            next_billing = dict(current)
+            for key, value in (updates or {}).items():
+                if key == "limits" and isinstance(value, dict):
+                    merged_limits = dict(current.get("limits") or {})
+                    for lk, lv in value.items():
+                        if lv is None:
+                            merged_limits.pop(lk, None)
+                        else:
+                            merged_limits[lk] = lv
+                    next_billing["limits"] = merged_limits
+                else:
+                    next_billing[key] = value
+            next_billing["updatedAt"] = now
+            normalized_status = str(next_billing.get("status") or "").strip().lower()
+            tx.update(org_ref, {
+                "billing": next_billing,
+                "plan": str(next_billing.get("planKey") or org_tx.get("plan") or "trial"),
+                "status": "trial" if normalized_status == "trialing" else str(
+                    next_billing.get("status") or org_tx.get("status") or "active"
+                ),
+                "updatedAt": now,
+            })
+            return dict(next_billing)
+
+        return _apply(self._db.transaction())
 
     def get_org_effective_trial_seconds_remaining(self, *, org_id: str) -> Optional[int]:
         clean_org_id = _clean_token(org_id)
@@ -4403,6 +5128,140 @@ class FirestoreMultiChurchStore:
                 return snap.id
         return None
 
+    def claim_checkout_attempt(
+        self,
+        *,
+        org_id: str,
+        plan_key: str,
+        interval: str,
+        success_url: str = "",
+        cancel_url: str = "",
+        requested_by_uid: str = "",
+    ) -> Dict[str, Any]:
+        """fix-batch-2: Firestore implementation. See
+        InMemoryMultiChurchStore.claim_checkout_attempt for the contract.
+        Transactional read-decide-write so concurrent callers see the
+        serialized result."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_plan = str(plan_key or "").strip().lower()
+        clean_interval = str(interval or "").strip().lower() or "month"
+        clean_success = str(success_url or "").strip()
+        clean_cancel = str(cancel_url or "").strip()
+        clean_uid = str(requested_by_uid or "").strip()
+        now = _utcnow()
+        ttl = timedelta(seconds=int(_BILLING_CHECKOUT_ATTEMPT_TTL_SEC))
+        org_ref = self._org_ref(clean_org_id)
+
+        @gcf_firestore.transactional
+        def _claim(tx: Any) -> Dict[str, Any]:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org = snap.to_dict() or {}
+            billing = _normalize_billing_state(
+                org.get("billing"),
+                plan_key=str(org.get("plan") or "trial"),
+                now=now,
+            )
+            existing_sub = str(billing.get("stripeSubscriptionId") or "").strip()
+            existing_status = str(billing.get("status") or "").strip().lower()
+            if existing_sub and existing_status in {"active", "past_due", "trialing"}:
+                return {"action": "already_subscribed"}
+            if existing_sub and bool(billing.get("pendingSubscriptionConfirmation")):
+                return {"action": "already_subscribed"}
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            exp = pending.get("expiresAt") if isinstance(pending, dict) else None
+            pending_live = (
+                isinstance(pending, dict)
+                and isinstance(exp, datetime)
+                and now < exp
+                and bool(pending.get("attemptId"))
+            )
+            if pending_live:
+                if (
+                    str(pending.get("planKey") or "").lower() == clean_plan
+                    and str(pending.get("interval") or "").lower() == clean_interval
+                ):
+                    stored_success = str(pending.get("successUrl") or "")
+                    stored_cancel = str(pending.get("cancelUrl") or "")
+                    stored_uid = str(pending.get("requestedByUid") or "")
+                    if (
+                        (clean_success and stored_success and clean_success != stored_success)
+                        or (clean_cancel and stored_cancel and clean_cancel != stored_cancel)
+                        or (clean_uid and stored_uid and clean_uid != stored_uid)
+                    ):
+                        return {"action": "pending_params_mismatch"}
+                    return {
+                        "action": "reuse",
+                        "attemptId": pending["attemptId"],
+                        "sessionId": pending.get("sessionId"),
+                        "sessionUrl": pending.get("sessionUrl"),
+                    }
+                return {"action": "pending_different_plan"}
+            attempt_id = f"chkatt_{uuid4().hex}"
+            billing["pendingCheckoutAttempt"] = {
+                "attemptId": attempt_id,
+                "planKey": clean_plan,
+                "interval": clean_interval,
+                "successUrl": clean_success,
+                "cancelUrl": clean_cancel,
+                "requestedByUid": clean_uid,
+                "createdAt": now,
+                "expiresAt": now + ttl,
+                "sessionId": None,
+                "sessionUrl": None,
+            }
+            # Fix review item #2: bump billing.updatedAt so a
+            # concurrent webhook's CAS catches this change.
+            billing["updatedAt"] = now
+            tx.update(org_ref, {"billing": billing, "updatedAt": now})
+            return {"action": "create", "attemptId": attempt_id}
+
+        return _claim(self._db.transaction())
+
+    def record_checkout_attempt_session(
+        self,
+        *,
+        org_id: str,
+        attempt_id: str,
+        session_id: str,
+        session_url: str,
+    ) -> None:
+        """Firestore counterpart to the in-memory record. Transactional
+        so a late-arriving record doesn't overwrite a newer attempt.
+
+        Fix review item #2: bumps `billing.updatedAt`."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        if not attempt_id:
+            return
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+
+        @gcf_firestore.transactional
+        def _record(tx: Any) -> None:
+            snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                raise ValueError("org_not_found")
+            org = snap.to_dict() or {}
+            billing = dict(org.get("billing") or {})
+            pending = billing.get("pendingCheckoutAttempt") or {}
+            if not isinstance(pending, dict):
+                return
+            if str(pending.get("attemptId") or "") != str(attempt_id or ""):
+                return
+            pending = dict(pending)
+            pending["sessionId"] = str(session_id or "")
+            pending["sessionUrl"] = str(session_url or "")
+            billing["pendingCheckoutAttempt"] = pending
+            billing["updatedAt"] = now
+            tx.update(org_ref, {"billing": billing, "updatedAt": now})
+
+        _record(self._db.transaction())
+
     def try_mark_billing_event(
         self,
         *,
@@ -4410,23 +5269,219 @@ class FirestoreMultiChurchStore:
         event_type: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        """Legacy wrapper. See InMemoryMultiChurchStore.try_mark_billing_event."""
+        result = self.try_claim_billing_event(
+            event_id=event_id, event_type=event_type, payload=payload,
+        )
+        if result.get("status") == "fresh":
+            self.complete_billing_event(
+                event_id=event_id, claim_token=result.get("claimToken"),
+            )
+            return True
+        return False
+
+    def try_claim_billing_event(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Claim-and-complete webhook dedup. See
+        InMemoryMultiChurchStore.try_claim_billing_event for the
+        contract. Runs the three-way decision inside a single
+        Firestore transaction so concurrent deliveries cannot both
+        receive 'fresh'."""
         clean_event_id = _clean_token(event_id)
         if not clean_event_id:
             raise ValueError("invalid_event_id")
         ref = self._billing_event_ref(clean_event_id)
-        try:
-            ref.create(
+        now = _utcnow()
+        token = _claim_token_for(now)
+        lease_sec = float(_BILLING_EVENT_LEASE_SEC)
+
+        @gcf_firestore.transactional
+        def _claim(tx: Any) -> Dict[str, Any]:
+            snap = ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                tx.create(
+                    ref,
+                    {
+                        "eventId": clean_event_id,
+                        "eventType": str(event_type or "").strip(),
+                        "payload": dict(payload or {}),
+                        "status": "pending",
+                        "claimedAt": now,
+                        "claimToken": token,
+                        "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                    },
+                )
+                return {"status": "fresh", "claimToken": token}
+            rec = snap.to_dict() or {}
+            # Legacy-record compatibility (fix issue #3): pre-claim/complete
+            # records had only {eventId, eventType, payload, createdAt}.
+            # Treat absence of `status` as COMPLETED under the old
+            # "existence = processed" semantics.
+            if "status" not in rec:
+                return {"status": "deduped", "claimToken": None}
+            if str(rec.get("status") or "").lower() == "completed":
+                return {"status": "deduped", "claimToken": None}
+            claimed_at = rec.get("claimedAt")
+            if isinstance(claimed_at, datetime):
+                age = (now - claimed_at).total_seconds()
+                if age < lease_sec:
+                    return {"status": "concurrent", "claimToken": None}
+            # Lease aged out — reclaim.
+            tx.update(
+                ref,
                 {
-                    "eventId": clean_event_id,
-                    "eventType": str(event_type or "").strip(),
-                    "payload": dict(payload or {}),
-                    "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "status": "pending",
+                    "claimedAt": now,
+                    "claimToken": token,
+                    "eventType": str(event_type or "").strip() or rec.get("eventType") or "",
+                    "payload": dict(payload or rec.get("payload") or {}),
                 },
-                timeout=_FS_TIMEOUT,
             )
-        except gcf_api_exceptions.AlreadyExists:
+            return {"status": "fresh", "claimToken": token}
+
+        return _claim(self._db.transaction())
+
+    def check_claim_still_held(self, *, event_id: str, claim_token: str) -> bool:
+        """Boundary 1 (lease ownership): verify the current claim's
+        token matches `claim_token`. Transactional read on Firestore
+        (via `.get()` with consistent read via tx is not strictly
+        required since we only compare and do not write — a snapshot
+        read is sufficient)."""
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
             return False
-        return True
+        ref = self._billing_event_ref(clean_event_id)
+        try:
+            snap = ref.get(timeout=_FS_TIMEOUT)
+        except Exception:
+            return False
+        if not snap.exists:
+            return False
+        rec = snap.to_dict() or {}
+        if str(rec.get("status") or "").lower() == "completed":
+            return False
+        return str(rec.get("claimToken") or "") == str(claim_token or "")
+
+    def complete_billing_event(
+        self,
+        *,
+        event_id: str,
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        """Mark completed only if `claim_token` matches the current
+        claim (or if no token is provided, unconditional for the
+        legacy wrapper). Transactional on Firestore so a slow worker
+        cannot overwrite a newer claim's state."""
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        ref = self._billing_event_ref(clean_event_id)
+
+        @gcf_firestore.transactional
+        def _complete(tx: Any) -> bool:
+            snap = ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not snap.exists:
+                tx.set(ref, {
+                    "eventId": clean_event_id,
+                    "status": "completed",
+                    "completedAt": gcf_firestore.SERVER_TIMESTAMP,
+                    "createdAt": gcf_firestore.SERVER_TIMESTAMP,
+                })
+                return True
+            rec = snap.to_dict() or {}
+            if claim_token is not None:
+                current_token = str(rec.get("claimToken") or "")
+                if current_token and current_token != str(claim_token):
+                    return False
+            tx.update(ref, {
+                "status": "completed",
+                "completedAt": gcf_firestore.SERVER_TIMESTAMP,
+            })
+            return True
+
+        return _complete(self._db.transaction())
+
+    def apply_webhook_event_atomic(
+        self,
+        *,
+        org_id: str,
+        billing: Optional[Dict[str, Any]],
+        monthly_minutes: Optional[int],
+        event_id: str,
+        claim_token: str,
+        expected_billing_updated_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Fenced apply with CAS. See
+        InMemoryMultiChurchStore.apply_webhook_event_atomic for the
+        contract. Runs everything inside one Firestore transaction.
+
+        No global event-created watermark (fix review item #1) —
+        caller does state reconciliation."""
+        clean_org_id = _clean_token(org_id)
+        if not clean_org_id:
+            raise ValueError("org_not_found")
+        clean_event_id = _clean_token(event_id)
+        if not clean_event_id:
+            raise ValueError("invalid_event_id")
+        now = _utcnow()
+        org_ref = self._org_ref(clean_org_id)
+        event_ref = self._billing_event_ref(clean_event_id)
+
+        @gcf_firestore.transactional
+        def _apply(tx: Any) -> Dict[str, Any]:
+            event_snap = event_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not event_snap.exists:
+                return {"applied": False, "reason": "no_claim"}
+            rec = event_snap.to_dict() or {}
+            if "status" not in rec:
+                return {"applied": False, "reason": "no_claim"}
+            if str(rec.get("status") or "").lower() == "completed":
+                return {"applied": False, "reason": "already_completed"}
+            current_token = str(rec.get("claimToken") or "")
+            if current_token and current_token != str(claim_token):
+                return {"applied": False, "reason": "claim_lost"}
+            org_snap = org_ref.get(transaction=tx, timeout=_FS_TIMEOUT)
+            if not org_snap.exists:
+                raise ValueError("org_not_found")
+            org = org_snap.to_dict() or {}
+            if expected_billing_updated_at is not None:
+                current_billing = org.get("billing") or {}
+                if current_billing.get("updatedAt") != expected_billing_updated_at:
+                    return {"applied": False, "reason": "stale_snapshot"}
+            org_update: Dict[str, Any] = {"updatedAt": now}
+            if billing is not None:
+                merged = _normalize_billing_state(
+                    billing,
+                    plan_key=str(org.get("plan") or "trial"),
+                    now=now,
+                )
+                normalized_status = str(merged.get("status") or "").strip().lower()
+                org_update.update({
+                    "billing": merged,
+                    "plan": str(merged.get("planKey") or org.get("plan") or "trial"),
+                    "status": (
+                        "trial" if normalized_status == "trialing"
+                        else str(merged.get("status") or org.get("status") or "active")
+                    ),
+                })
+            if monthly_minutes is not None:
+                int_minutes = max(0, int(monthly_minutes))
+                org_update["maxMinutesPerMonth"] = int_minutes
+                if int_minutes == 0 or int(org.get("currentMonthMinutes") or 0) < int_minutes:
+                    org_update["softCapReached"] = False
+            tx.update(org_ref, org_update)
+            tx.update(event_ref, {
+                "status": "completed",
+                "completedAt": gcf_firestore.SERVER_TIMESTAMP,
+            })
+            return {"applied": True}
+
+        return _apply(self._db.transaction())
 
     def get_org_billing_limits(
         self,
