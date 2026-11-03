@@ -103,11 +103,27 @@ async def _lag_loop(
             # - elapsed comes from monotonic deltas (immune to clock jumps).
             # - UTC boundaries come from wall-clock stamps; they are informative
             #   for log correlation and MUST NOT be used for duration arithmetic.
+            # - wall_clock_drift_seconds is the net disagreement between wall
+            #   and monotonic elapsed over the same window:
+            #     drift = (end_wall − start_wall) − observed_window_elapsed_seconds
+            #   Semantics (contract):
+            #     • Pure fact; the sampler asserts no tolerance of its own.
+            #     • Zero does NOT prove UTC accuracy — compensating clock
+            #       adjustments inside the window can cancel to zero.
+            #     • Negative does NOT by itself prove the clock reversed —
+            #       wall time may have simply advanced less than monotonic.
+            #     • Positive indicates wall advanced more than monotonic.
+            #     • Consumers that correlate on UTC must apply their own
+            #       explicit policy; this field is an input, not a verdict.
             first_start_mono = samples[0][1]
             last_end_mono = samples[-1][2]
             first_start_wall = samples[0][3]
             last_end_wall = samples[-1][4]
             observed_window_elapsed_seconds = max(0.0, last_end_mono - first_start_mono)
+            wall_clock_drift_seconds = (
+                (last_end_wall - first_start_wall)
+                - observed_window_elapsed_seconds
+            )
             p50 = _percentile(vals, 50)
             p95 = _percentile(vals, 95)
             p99 = _percentile(vals, 99)
@@ -127,6 +143,7 @@ async def _lag_loop(
                 observed_window_elapsed_seconds=round(
                     observed_window_elapsed_seconds, 6
                 ),
+                wall_clock_drift_seconds=round(wall_clock_drift_seconds, 6),
             )
 
 

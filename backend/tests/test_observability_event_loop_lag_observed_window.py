@@ -1,32 +1,51 @@
-"""Observed-window-boundary fields on the event-loop-lag sampler.
+"""Observed-window-boundary + wall-clock-drift fields on the sampler.
 
-Scope: assert the sampler emits observation-boundary fields
+Scope: assert the sampler emits six observation-related fields
 (`observed_window_start_utc`, `observed_window_end_utc`,
-`observed_window_elapsed_seconds`) that span the oldest retained
-sample's START through the newest sample's END, and verify three
-invariants against the exact values produced by an injected clock:
+`observed_window_elapsed_seconds`, `wall_clock_drift_seconds`,
+preserved `samples`, preserved nominal `window_seconds`) and verify
+their contract against the exact values produced by an injected
+clock:
 
   1. Single-sample case — observed elapsed equals that sample's full
-     measurement interval, NOT zero. (This directly discriminates the
-     corrected `last_end − first_start` formula from the earlier
-     `last_end − first_end` which would yield zero.)
-  2. Buffer rollover — once samples evict, the observed start UTC
-     advances specifically to the NEXT RETAINED interval's start wall
-     clock. The test verifies the exact predicted start string, not a
-     "forward" relation.
-  3. Clock handling — a backward wall-clock jump keeps
-     `observed_window_elapsed_seconds` strictly non-negative and equal
-     to the real monotonic span; the emitted UTC boundaries become
-     unreliable, which the test ASSERTS BY observing that
-     `end_utc < start_utc` under reversed wall clock. Consumers that
-     correlate on UTC must therefore not treat ordering as a guarantee.
+     measurement interval, NOT zero. Drift-free injected clocks yield
+     `wall_clock_drift_seconds == 0.0`.
+  2. Multi-sample case — observed elapsed equals newest-end minus
+     oldest-start. Drift-free injected clocks yield drift zero.
+  3. Buffer rollover — once samples evict, the observed start UTC
+     advances specifically to the NEXT RETAINED interval's start.
+  4. Reversed wall clock — monotonic duration preserved; drift is a
+     specific large negative value matching the reversal magnitude;
+     UTC endpoints are inverted (secondary signal of the pathology).
+  5. FORWARD wall adjustment — wall advances MORE than monotonic
+     during the window (e.g., clock jumped forward mid-sample). Drift
+     is positive by a specific value. UTC endpoints remain correctly
+     ordered (end > start). Monotonic duration is unchanged.
+  6. BACKWARD wall adjustment with endpoints ordered — wall advances
+     LESS than monotonic (clock dialed back some amount mid-sample)
+     but net wall delta is still positive. Drift is negative by a
+     specific value. UTC endpoints remain correctly ordered. This is
+     the case the UTC-order check alone would MISS; the drift field
+     exposes it.
+
+Contract of `wall_clock_drift_seconds` (as emitted by the sampler):
+
+    wall_clock_drift_seconds =
+        (last_end_wall − first_start_wall)
+        − observed_window_elapsed_seconds
+
+Pure fact; the sampler asserts no tolerance of its own. Zero does
+NOT prove UTC accuracy (compensating adjustments can cancel inside
+the window). Negative does NOT by itself prove reversal (wall may
+simply have advanced less than monotonic). Consumers must apply
+their own explicit policy before correlating on UTC.
 
 Clock injection uses the module-level aliases `_now_mono` /
-`_now_wall` added for this purpose; it does NOT patch the global
-`time` module, so `asyncio.sleep` is untouched. Existing lag
-calculations, severity thresholds, cadence, nominal `window_seconds`,
-and other preserved field meanings are asserted inline so a
-regression on them is also caught here.
+`_now_wall`; it does NOT patch the global `time` module, so
+`asyncio.sleep` is untouched. Existing lag calculations, severity
+thresholds, cadence, nominal `window_seconds`, and other preserved
+field meanings are asserted inline so a regression on them is also
+caught here.
 """
 from __future__ import annotations
 
@@ -105,6 +124,7 @@ async def _run_until_first_emit_or_timeout(
 
 
 # ----- 1. Single-sample span equals the measurement interval -----------
+#        (drift-free clocks → drift == 0.0)
 
 
 def test_single_sample_span_equals_measurement_interval(capsys, monkeypatch):
@@ -112,9 +132,8 @@ def test_single_sample_span_equals_measurement_interval(capsys, monkeypatch):
     `observed_window_elapsed_seconds` must equal that sample's full
     measurement interval (`end_mono − start_mono`), NOT zero.
 
-    Discriminator: the earlier `last_end − first_end` formula would
-    yield 0 for a one-sample buffer; the corrected `last_end −
-    first_start` yields the sample's own interval.
+    Clocks are drift-free (wall delta == monotonic delta) so
+    `wall_clock_drift_seconds == 0.0`.
     """
     from app.observability import event_loop_lag as _ell  # noqa: PLC0415
 
@@ -127,6 +146,7 @@ def test_single_sample_span_equals_measurement_interval(capsys, monkeypatch):
         _ell, "_now_mono",
         _chain_then_repeat([0.0, 10.0, 10.75, 10.75], tail=11.0).__next__,
     )
+    # Wall delta = 0.75, matches monotonic delta — drift-free.
     monkeypatch.setattr(
         _ell, "_now_wall",
         _chain_then_repeat([1_000_000.0, 1_000_000.75], tail=1_000_000.75).__next__,
@@ -145,12 +165,13 @@ def test_single_sample_span_equals_measurement_interval(capsys, monkeypatch):
 
     first = events[0]
     assert first["samples"] == 1, f"expected samples==1, got {first['samples']}"
-    # The exact span: end_mono − start_mono = 10.75 − 10.0 = 0.75
-    assert first["observed_window_elapsed_seconds"] == pytest.approx(0.75, abs=1e-9), (
-        f"single-sample span wrong: expected 0.75, got "
-        f"{first['observed_window_elapsed_seconds']}"
+    # Exact span: end_mono − start_mono = 10.75 − 10.0 = 0.75
+    assert first["observed_window_elapsed_seconds"] == pytest.approx(0.75, abs=1e-9)
+    # Drift-free: wall delta (0.75) − mono elapsed (0.75) = 0.0
+    assert first["wall_clock_drift_seconds"] == pytest.approx(0.0, abs=1e-9), (
+        f"drift-free clocks must emit drift==0.0; got {first['wall_clock_drift_seconds']}"
     )
-    # Preserved: nominal window_seconds unchanged
+    # Preserved: nominal window_seconds
     assert first["window_seconds"] == pytest.approx(0.001, abs=1e-9)
     # UTC boundaries match the injected wall clock
     assert first["observed_window_start_utc"] == _iso_utc(1_000_000.0)
@@ -162,10 +183,12 @@ def test_single_sample_span_equals_measurement_interval(capsys, monkeypatch):
 
 
 # ----- 2. Exact multi-sample span (first-start → last-end) -------------
+#        (drift-free clocks → drift == 0.0)
 
 
 def test_exact_multi_sample_span_with_injected_clock(capsys, monkeypatch):
     """Multi-sample emission: span equals newest-end − oldest-start.
+    Wall delta per-sample matches monotonic delta, so drift == 0.0.
 
     Scenario (clock units are arbitrary; sampler calls `_now_mono`
     three times per iteration — start, end, now-emit-check):
@@ -175,8 +198,8 @@ def test_exact_multi_sample_span_with_injected_clock(capsys, monkeypatch):
       sample 2      : start=3,  end=4,  now=4    (no emit)
       sample 3      : start=5,  end=8,  now=8    (emit — 8-0 >= 5)
 
-    Expected span = sample 3's end (8) − sample 1's start (1) = 7.
-    The earlier `last_end − first_end` would give 8 − 2 = 6.
+    Expected monotonic span = 8 − 1 = 7. Wall values chosen so wall
+    delta per sample equals mono delta per sample, hence drift = 0.
     """
     from app.observability import event_loop_lag as _ell  # noqa: PLC0415
 
@@ -190,13 +213,15 @@ def test_exact_multi_sample_span_with_injected_clock(capsys, monkeypatch):
             tail=8.0,
         ).__next__,
     )
+    # Wall deltas per sample: 1, 1, 3 — identical to mono deltas.
+    # First-start → last-end wall delta = 1_000_007 − 1_000_000 = 7.
     monkeypatch.setattr(
         _ell, "_now_wall",
         _chain_then_repeat(
-            [1_000_000.0, 1_000_000.5,   # sample 1 start/end
-             1_000_001.0, 1_000_001.5,   # sample 2 start/end
-             1_000_002.0, 1_000_005.0],  # sample 3 start/end
-            tail=1_000_005.0,
+            [1_000_000.0, 1_000_001.0,   # sample 1 (mono delta 1 == wall delta 1)
+             1_000_002.0, 1_000_003.0,   # sample 2 (mono delta 1 == wall delta 1)
+             1_000_004.0, 1_000_007.0],  # sample 3 (mono delta 3 == wall delta 3)
+            tail=1_000_007.0,
         ).__next__,
     )
 
@@ -213,18 +238,17 @@ def test_exact_multi_sample_span_with_injected_clock(capsys, monkeypatch):
 
     first = events[0]
     assert first["samples"] == 3
-    # Expected: 8 (last end) − 1 (first start) = 7
-    assert first["observed_window_elapsed_seconds"] == pytest.approx(7.0, abs=1e-9), (
-        f"multi-sample span wrong (should include oldest sample's measurement "
-        f"interval): expected 7.0, got {first['observed_window_elapsed_seconds']}"
-    )
+    assert first["observed_window_elapsed_seconds"] == pytest.approx(7.0, abs=1e-9)
+    # Drift-free across all three samples: wall_delta (7) − mono_elapsed (7) = 0
+    assert first["wall_clock_drift_seconds"] == pytest.approx(0.0, abs=1e-9)
     assert first["observed_window_start_utc"] == _iso_utc(1_000_000.0)
-    assert first["observed_window_end_utc"] == _iso_utc(1_000_005.0)
+    assert first["observed_window_end_utc"] == _iso_utc(1_000_007.0)
     # Nominal window_seconds is preserved — nominal, not measured
     assert first["window_seconds"] == pytest.approx(0.001 * 3, abs=1e-9)
 
 
 # ----- 3. Buffer rollover advances to next-retained-interval start -----
+#        (clocks are not drift-free in this scenario; drift value asserted)
 
 
 def test_rollover_advances_to_next_retained_interval_start(capsys, monkeypatch):
@@ -241,10 +265,10 @@ def test_rollover_advances_to_next_retained_interval_start(capsys, monkeypatch):
       sample 4 (S4) : start=7,  end=10, now=10   (10 − 0 ≥ 7, emit;
                                                    buffer=[S3,S4] — S2 evicted)
 
-    Expected:
-      - observed_window_start_utc == iso(S3.start_wall)   (S3 oldest-retained)
-      - observed_window_end_utc   == iso(S4.end_wall)     (S4 newest)
-      - observed_window_elapsed_seconds = S4.end − S3.start = 10 − 5 = 5.0
+    Monotonic elapsed = S4.end (10) − S3.start (5) = 5.
+    Wall delta = S4.end_wall (1_000_006.0) − S3.start_wall (1_000_002.0) = 4.
+    Drift = 4 − 5 = −1 (wall advanced less than monotonic over the
+    retained window; a specific, non-zero drift value — asserted exactly).
     """
     from app.observability import event_loop_lag as _ell  # noqa: PLC0415
 
@@ -259,8 +283,6 @@ def test_rollover_advances_to_next_retained_interval_start(capsys, monkeypatch):
             tail=10.0,
         ).__next__,
     )
-    # Deliberately spaced wall clocks per sample so retained vs
-    # evicted boundaries are visually unambiguous.
     S1_SW, S1_EW = 1_000_000.0, 1_000_000.5
     S2_SW, S2_EW = 1_000_001.0, 1_000_001.5
     S3_SW, S3_EW = 1_000_002.0, 1_000_002.5
@@ -278,9 +300,9 @@ def test_rollover_advances_to_next_retained_interval_start(capsys, monkeypatch):
 
     asyncio.run(
         _run_until_first_emit_or_timeout(
-            emit_interval_s=7.0,  # see docstring: emit only after sample 4
+            emit_interval_s=7.0,
             sample_interval_s=0.001,
-            window_samples=2,  # ring size: oldest-2 evicted
+            window_samples=2,
             real_timeout_s=0.10,
         )
     )
@@ -288,51 +310,41 @@ def test_rollover_advances_to_next_retained_interval_start(capsys, monkeypatch):
     assert events
 
     first = events[0]
-    assert first["samples"] == 2, (
-        f"ring buffer should hold 2 samples; got {first['samples']}"
-    )
-    # The retained oldest is S3 (S1, S2 evicted).
-    assert first["observed_window_start_utc"] == _iso_utc(S3_SW), (
-        f"observed_window_start_utc must equal next-retained-interval start "
-        f"{_iso_utc(S3_SW)}; got {first['observed_window_start_utc']}"
-    )
+    assert first["samples"] == 2
+    # Oldest-retained is S3 (S1, S2 evicted).
+    assert first["observed_window_start_utc"] == _iso_utc(S3_SW)
     assert first["observed_window_start_utc"] != _iso_utc(S1_SW), (
         "regression: start_utc stuck on evicted S1"
     )
     assert first["observed_window_start_utc"] != _iso_utc(S2_SW), (
         "regression: start_utc stuck on evicted S2"
     )
-    # End remains S4's end wall clock.
     assert first["observed_window_end_utc"] == _iso_utc(S4_EW)
-    # Elapsed = S4.end_mono − S3.start_mono = 10 − 5 = 5
     assert first["observed_window_elapsed_seconds"] == pytest.approx(5.0, abs=1e-9)
+    # Exact drift: (S4_EW − S3_SW) − 5.0 = 4.0 − 5.0 = −1.0
+    assert first["wall_clock_drift_seconds"] == pytest.approx(-1.0, abs=1e-9)
 
 
-# ----- 4. Backward wall-clock jump: monotonic preserved, UTC unreliable -
+# ----- 4. Reversed wall clock: monotonic preserved, drift large negative -
 
 
-def test_wall_clock_backward_jump_preserves_monotonic_and_flags_utc_unreliability(
+def test_reversed_wall_clock_preserves_monotonic_and_emits_large_negative_drift(
     capsys, monkeypatch
 ):
-    """A reversed wall clock must NOT corrupt
-    `observed_window_elapsed_seconds` (which is monotonic-only).
-    Under the same reversed clock the emitted UTC boundaries become
-    UNRELIABLE for log correlation: specifically `end_utc < start_utc`.
-    The test asserts BOTH:
-      - monotonic span is correct and non-negative, AND
-      - the end_utc precedes start_utc, documenting that UTC ordering
-        is NOT a guarantee of this emission's temporal semantics under
-        pathological clock behavior.
+    """A fully reversed wall clock must NOT corrupt the monotonic
+    duration. The drift field reports the specific disagreement; the
+    UTC endpoints are inverted as a secondary signal of the pathology.
+
+    Monotonic elapsed = 3 − 1 = 2 (unchanged by wall reversal).
+    Wall delta = END_WALL − START_WALL = 1_000_000 − 2_000_000 = −1_000_000.
+    Drift = −1_000_000 − 2 = −1_000_002 (exact, large negative).
     """
     from app.observability import event_loop_lag as _ell  # noqa: PLC0415
 
-    # Monotonic clock advances normally (as it must by definition):
-    #   init=0; sample 1 start=1, end=3, now=3  (emit — 3-0 >= 2)
     monkeypatch.setattr(
         _ell, "_now_mono",
         _chain_then_repeat([0.0, 1.0, 3.0, 3.0], tail=4.0).__next__,
     )
-    # Wall clock runs BACKWARD between the start and end stamps.
     START_WALL = 2_000_000.0   # chronologically "later"
     END_WALL = 1_000_000.0     # chronologically "earlier" — backward jump
     monkeypatch.setattr(
@@ -353,21 +365,131 @@ def test_wall_clock_backward_jump_preserves_monotonic_and_flags_utc_unreliabilit
 
     first = events[0]
     assert first["samples"] == 1
-    # Monotonic span: 3 − 1 = 2. The reversed wall clock cannot touch it.
-    assert first["observed_window_elapsed_seconds"] == pytest.approx(2.0, abs=1e-9), (
-        f"wall-clock reversal leaked into monotonic arithmetic: "
-        f"elapsed={first['observed_window_elapsed_seconds']}"
-    )
+    # Monotonic span unaffected by wall reversal.
+    assert first["observed_window_elapsed_seconds"] == pytest.approx(2.0, abs=1e-9)
     assert first["observed_window_elapsed_seconds"] >= 0.0
-    # UTC boundaries reflect the reversed wall clock. The emission
-    # faithfully reports what the clock said; downstream correlation
-    # consumers must know this ordering is NOT a guarantee.
+    # Exact drift value — large negative.
+    assert first["wall_clock_drift_seconds"] == pytest.approx(-1_000_002.0, abs=1e-9)
+    # UTC endpoints reflect the reversed wall clock (secondary signal).
     assert first["observed_window_start_utc"] == _iso_utc(START_WALL)
     assert first["observed_window_end_utc"] == _iso_utc(END_WALL)
-    # Explicit unreliability signal: end precedes start lexically
-    # (both strings share the same ISO format so lexical order follows
-    # UTC order at microsecond precision).
-    assert first["observed_window_end_utc"] < first["observed_window_start_utc"], (
-        "under reversed wall clock, end_utc must precede start_utc; this "
-        "emission intentionally exposes that condition rather than masking it"
+    assert first["observed_window_end_utc"] < first["observed_window_start_utc"]
+
+
+# ----- 5. Forward wall adjustment: positive drift, UTC endpoints ordered
+
+
+def test_forward_wall_adjustment_emits_positive_drift_with_endpoints_ordered(
+    capsys, monkeypatch
+):
+    """Wall advances MORE than monotonic during the window (e.g., an
+    NTP forward step mid-sample). Drift is positive by the step
+    magnitude. UTC endpoints remain correctly ordered (end > start).
+    Monotonic elapsed is unchanged.
+
+    Monotonic: start=1, end=3  → elapsed = 2.
+    Wall: start=1_000_000, end=1_000_005 → wall delta = 5
+    (clock jumped forward by 3 somewhere during the sample).
+    Drift = 5 − 2 = +3.0 (exact, positive).
+    end_utc > start_utc (forward adjustments preserve ordering).
+    """
+    from app.observability import event_loop_lag as _ell  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _ell, "_now_mono",
+        _chain_then_repeat([0.0, 1.0, 3.0, 3.0], tail=4.0).__next__,
+    )
+    START_WALL = 1_000_000.0
+    END_WALL = 1_000_005.0  # wall advanced 5s; mono advanced only 2s
+    monkeypatch.setattr(
+        _ell, "_now_wall",
+        _chain_then_repeat([START_WALL, END_WALL], tail=END_WALL).__next__,
+    )
+
+    asyncio.run(
+        _run_until_first_emit_or_timeout(
+            emit_interval_s=2.0,
+            sample_interval_s=0.001,
+            window_samples=1,
+            real_timeout_s=0.10,
+        )
+    )
+    events = _parse_event_lines(capsys.readouterr().out)
+    assert events
+
+    first = events[0]
+    assert first["samples"] == 1
+    # Monotonic duration unchanged by the forward wall adjustment.
+    assert first["observed_window_elapsed_seconds"] == pytest.approx(2.0, abs=1e-9)
+    # Exact drift: 5 − 2 = 3.0 (positive).
+    assert first["wall_clock_drift_seconds"] == pytest.approx(3.0, abs=1e-9)
+    assert first["wall_clock_drift_seconds"] > 0.0
+    # UTC endpoints remain correctly ordered.
+    assert first["observed_window_start_utc"] == _iso_utc(START_WALL)
+    assert first["observed_window_end_utc"] == _iso_utc(END_WALL)
+    assert first["observed_window_end_utc"] > first["observed_window_start_utc"], (
+        "forward adjustments preserve UTC ordering; drift alone exposes the shift"
+    )
+
+
+# ----- 6. Backward wall adjustment with endpoints ordered: the key case -
+
+
+def test_backward_wall_adjustment_with_endpoints_ordered_emits_negative_drift(
+    capsys, monkeypatch
+):
+    """Wall advances LESS than monotonic — the clock stepped BACKWARD
+    partway through the sample (e.g., an NTP correction dialed it
+    back) but net wall advance is still positive. UTC endpoints
+    therefore REMAIN CORRECTLY ORDERED (end > start) and a UTC-only
+    reader would see nothing wrong. The drift field is the ONLY
+    signal that distinguishes this from a drift-free window.
+
+    This is the case the reviewer specifically asked be covered: UTC
+    endpoints are ordered, yet correlation is unreliable because
+    wall time disagreed with monotonic during the window.
+
+    Monotonic: start=1, end=6  → elapsed = 5.
+    Wall: start=1_000_000, end=1_000_002 → wall delta = 2 (clock went
+    backward 3s partway, net wall advance still positive).
+    Drift = 2 − 5 = −3.0 (exact, negative, but UTC still ordered).
+    """
+    from app.observability import event_loop_lag as _ell  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _ell, "_now_mono",
+        _chain_then_repeat([0.0, 1.0, 6.0, 6.0], tail=7.0).__next__,
+    )
+    START_WALL = 1_000_000.0
+    END_WALL = 1_000_002.0  # end_wall > start_wall (ordered), but wall delta < mono delta
+    monkeypatch.setattr(
+        _ell, "_now_wall",
+        _chain_then_repeat([START_WALL, END_WALL], tail=END_WALL).__next__,
+    )
+
+    asyncio.run(
+        _run_until_first_emit_or_timeout(
+            emit_interval_s=5.0,
+            sample_interval_s=0.001,
+            window_samples=1,
+            real_timeout_s=0.10,
+        )
+    )
+    events = _parse_event_lines(capsys.readouterr().out)
+    assert events
+
+    first = events[0]
+    assert first["samples"] == 1
+    # Monotonic duration unchanged.
+    assert first["observed_window_elapsed_seconds"] == pytest.approx(5.0, abs=1e-9)
+    # Exact drift: 2 − 5 = −3.0.
+    assert first["wall_clock_drift_seconds"] == pytest.approx(-3.0, abs=1e-9)
+    assert first["wall_clock_drift_seconds"] < 0.0
+    # UTC endpoints: correctly ordered. This is the whole point —
+    # a UTC-only check would NOT flag this emission as suspicious.
+    assert first["observed_window_start_utc"] == _iso_utc(START_WALL)
+    assert first["observed_window_end_utc"] == _iso_utc(END_WALL)
+    assert first["observed_window_end_utc"] > first["observed_window_start_utc"], (
+        "backward adjustments can leave UTC endpoints correctly ordered — "
+        "exactly the scenario the drift field is designed to surface"
     )
