@@ -32,6 +32,22 @@ jobs:
       - name: Run pytest
         run: pytest tests/ -v
 
+      # Gate 2 helpers v6 tests live outside backend/, under
+      # ops/gate2-helpers/v6/tests/. Explicit step is required so
+      # CI actually runs them — PR #36's first pass reported
+      # "backend-tests pass" without ever executing v6's suite.
+      #
+      # No compatibility fallback: if the directory is absent this
+      # step FAILS. The earlier `else echo "…skipping"` branch
+      # silently recreated the original problem — a green run
+      # that never touched v6. Any branch that lands after this
+      # workflow change must carry the v6 test directory; branches
+      # created before this change won't run this workflow, so no
+      # transition path is needed.
+      - name: Run Gate 2 v6 helper tests
+        working-directory: ${{ github.workspace }}
+        run: python -m pytest ops/gate2-helpers/v6/tests/ -v
+
   # Firestore-emulator-backed transactional-recheck test for PR-T1-B.
   # Scoped narrowly: proves that activity committed BEFORE the termination
   # transaction opens is respected by the recheck. Does NOT claim to validate
