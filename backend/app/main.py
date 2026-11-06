@@ -864,6 +864,21 @@ def _resolve_room_context(
     return org, None
 
 
+async def _is_room_live_async(org_id: str, room_id: str) -> bool:
+    """Run multichurch_store.is_room_live on the default executor.
+
+    FirestoreMultiChurchStore.is_room_live performs a synchronous Firestore
+    ``.get(timeout=_FS_TIMEOUT)`` RPC. Called inline from an async handler
+    (e.g. the ``/ws/translate`` upgrade check) it blocks the asyncio event
+    loop for the full RPC round-trip — observed in production as event-loop
+    lag ERROR emissions on listener-connection-heavy minutes. See
+    diag/firestore-sync-in-async-hot-paths.
+    """
+    return await asyncio.get_running_loop().run_in_executor(
+        None, multichurch_store.is_room_live, org_id, room_id
+    )
+
+
 def _prompt_overrides_for_org(org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     clean_org_id = _clean_token(org_id)
     if not clean_org_id:
@@ -1473,7 +1488,7 @@ async def ws_translate(ws: WebSocket):
     # Service has already fired — without this, the socket would linger until
     # the next `roomStatus=ended` broadcast, or forever if none is sent.
     try:
-        _room_still_live = multichurch_store.is_room_live(joined_org_id, joined_room_id)
+        _room_still_live = await _is_room_live_async(joined_org_id, joined_room_id)
     except Exception:
         _room_still_live = True  # Fail open — a Firestore hiccup shouldn't reject live viewers.
     if not _room_still_live:
@@ -1641,7 +1656,7 @@ async def ws_translate(ws: WebSocket):
         # Re-check room status AFTER registration to close the race where End
         # Service fires between the initial is_room_live check and this join.
         try:
-            _still_live_after_join = multichurch_store.is_room_live(joined_org_id, joined_room_id)
+            _still_live_after_join = await _is_room_live_async(joined_org_id, joined_room_id)
         except Exception:
             _still_live_after_join = True
         if not _still_live_after_join:
@@ -2018,7 +2033,7 @@ async def ws_translate(ws: WebSocket):
                     # would install a listener that only leaves via the next
                     # terminal broadcast — or never, if none is coming.
                     try:
-                        _cj_room_live = multichurch_store.is_room_live(joined_org_id, joined_room_id)
+                        _cj_room_live = await _is_room_live_async(joined_org_id, joined_room_id)
                     except Exception:
                         _cj_room_live = True  # fail open on Firestore error
                     if not _cj_room_live:
@@ -2431,7 +2446,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     # fresh Deepgram session — real provider cost — for a room nobody is
     # listening to.
     try:
-        _room_live_pre = multichurch_store.is_room_live(org_id, room_id)
+        _room_live_pre = await _is_room_live_async(org_id, room_id)
     except Exception:
         _room_live_pre = True
     if not _room_live_pre:
@@ -2536,7 +2551,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
     # Recheck AFTER host registration to close the race where End Service
     # fires between the pre-connect check and register_host.
     try:
-        _room_live_post = multichurch_store.is_room_live(org_id, room_id)
+        _room_live_post = await _is_room_live_async(org_id, room_id)
     except Exception:
         _room_live_post = True
     if not _room_live_post:
