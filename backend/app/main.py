@@ -869,14 +869,112 @@ async def _is_room_live_async(org_id: str, room_id: str) -> bool:
 
     FirestoreMultiChurchStore.is_room_live performs a synchronous Firestore
     ``.get(timeout=_FS_TIMEOUT)`` RPC. Called inline from an async handler
-    (e.g. the ``/ws/translate`` upgrade check) it blocks the asyncio event
-    loop for the full RPC round-trip — observed in production as event-loop
-    lag ERROR emissions on listener-connection-heavy minutes. See
-    diag/firestore-sync-in-async-hot-paths.
+    it blocks the asyncio event loop for the full RPC round-trip. Dispatching
+    it to the default ``ThreadPoolExecutor`` keeps the loop responsive for
+    the duration of the RPC. See diag/firestore-sync-in-async-hot-paths.
     """
     return await asyncio.get_running_loop().run_in_executor(
         None, multichurch_store.is_room_live, org_id, room_id
     )
+
+
+async def _ws_translate_post_register_recheck_or_cleanup(
+    *,
+    ws,
+    joined_org_id: str,
+    joined_room_id: str,
+    viewer_ip: str,
+) -> bool:
+    """Perform the post-register room-live recheck for /ws/translate.
+
+    Returns True if the room is still live. If the room is no longer live,
+    runs cleanup (``manager.disconnect`` + per-IP counter decrement +
+    ``ws.close(1000, room_ended)``) and returns False.
+
+    If the awaiting task is cancelled, runs the same cleanup (closing with
+    code 1011 instead of 1000 to distinguish error from normal close) and
+    re-raises CancelledError. ``CancelledError`` is a BaseException in
+    Py3.8+, so an ``except Exception`` guard alone would let cancellation
+    bypass cleanup and leak the listener registration + IP-counter slot.
+
+    All other exceptions fail open (treat room as live, return True) so
+    a transient Firestore error does not disconnect live viewers.
+    """
+    try:
+        is_live = await _is_room_live_async(joined_org_id, joined_room_id)
+    except asyncio.CancelledError:
+        manager.disconnect(ws)
+        with _ws_viewer_ip_lock:
+            _remaining = _ws_viewer_ip_conns.get(viewer_ip, 1) - 1
+            if _remaining <= 0:
+                _ws_viewer_ip_conns.pop(viewer_ip, None)
+            else:
+                _ws_viewer_ip_conns[viewer_ip] = _remaining
+        try:
+            await ws.close(code=1011)
+        except Exception:
+            pass
+        raise
+    except Exception:
+        is_live = True
+    if is_live:
+        return True
+    manager.disconnect(ws)
+    with _ws_viewer_ip_lock:
+        _remaining = _ws_viewer_ip_conns.get(viewer_ip, 1) - 1
+        if _remaining <= 0:
+            _ws_viewer_ip_conns.pop(viewer_ip, None)
+        else:
+            _ws_viewer_ip_conns[viewer_ip] = _remaining
+    try:
+        await ws.close(code=1000, reason="room_ended")
+    except Exception:
+        pass
+    return False
+
+
+async def _ws_stt_deepgram_post_register_recheck_or_cleanup(
+    *,
+    websocket,
+    dg,
+    org_id: str,
+    room_id: str,
+) -> bool:
+    """Perform the post-register room-live recheck for /ws/stt/deepgram.
+
+    Same contract as the listener helper above, adapted for the host path:
+    cleanup on `False` OR CancelledError is ``note_host_disconnected`` +
+    ``dg.close()`` + ``websocket.close()``. Returns True if the room is
+    still live. See the listener helper docstring for the CancelledError
+    rationale.
+    """
+    try:
+        is_live = await _is_room_live_async(org_id, room_id)
+    except asyncio.CancelledError:
+        manager.note_host_disconnected(websocket)
+        try:
+            await asyncio.wait_for(dg.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        raise
+    except Exception:
+        is_live = True
+    if is_live:
+        return True
+    manager.note_host_disconnected(websocket)
+    try:
+        await asyncio.wait_for(dg.close(), timeout=3.0)
+    except Exception:
+        pass
+    try:
+        await websocket.close(code=1000, reason="room_ended")
+    except Exception:
+        pass
+    return False
 
 
 def _prompt_overrides_for_org(org_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -1655,39 +1753,14 @@ async def ws_translate(ws: WebSocket):
             return
         # Re-check room status AFTER registration to close the race where End
         # Service fires between the initial is_room_live check and this join.
-        # CancelledError is BaseException in Py3.8+, so `except Exception` does
-        # not catch it; a client/server cancellation mid-await here would
-        # otherwise leak the manager.register_listener registration plus the
-        # IP-counter slot. Mirror the register_listener cleanup path above.
-        try:
-            _still_live_after_join = await _is_room_live_async(joined_org_id, joined_room_id)
-        except asyncio.CancelledError:
-            manager.disconnect(ws)
-            with _ws_viewer_ip_lock:
-                _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
-                if _remaining <= 0:
-                    _ws_viewer_ip_conns.pop(_viewer_ip, None)
-                else:
-                    _ws_viewer_ip_conns[_viewer_ip] = _remaining
-            try:
-                await ws.close(code=1011)
-            except Exception:
-                pass
-            raise
-        except Exception:
-            _still_live_after_join = True
-        if not _still_live_after_join:
-            manager.disconnect(ws)
-            with _ws_viewer_ip_lock:
-                _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
-                if _remaining <= 0:
-                    _ws_viewer_ip_conns.pop(_viewer_ip, None)
-                else:
-                    _ws_viewer_ip_conns[_viewer_ip] = _remaining
-            try:
-                await ws.close(code=1000, reason="room_ended")
-            except Exception:
-                pass
+        # The helper handles the three cases (live, not-live, cancelled) with
+        # the same cleanup cascade; see its docstring.
+        if not await _ws_translate_post_register_recheck_or_cleanup(
+            ws=ws,
+            joined_org_id=joined_org_id,
+            joined_room_id=joined_room_id,
+            viewer_ip=_viewer_ip,
+        ):
             return
         try:
             multichurch_store.bump_listener_peak(joined_org_id, joined_room_id, viewer_count)
@@ -2577,36 +2650,12 @@ async def ws_stt_deepgram(websocket: WebSocket):
         return
 
     # Recheck AFTER host registration to close the race where End Service
-    # fires between the pre-connect check and register_host.
-    # Cancellation guard: CancelledError (BaseException) is not caught by
-    # `except Exception` and would leak the manager.register_host
-    # registration, the shutdown-callback, the open Deepgram session, and
-    # the un-closed WebSocket. Mirror the register_host cleanup path above.
-    try:
-        _room_live_post = await _is_room_live_async(org_id, room_id)
-    except asyncio.CancelledError:
-        manager.note_host_disconnected(websocket)  # also unregisters callback
-        try:
-            await asyncio.wait_for(dg.close(), timeout=3.0)
-        except Exception:
-            pass
-        try:
-            await websocket.close(code=1011)
-        except Exception:
-            pass
-        raise
-    except Exception:
-        _room_live_post = True
-    if not _room_live_post:
-        manager.note_host_disconnected(websocket)  # also unregisters callback
-        try:
-            await asyncio.wait_for(dg.close(), timeout=3.0)
-        except Exception:
-            pass
-        try:
-            await websocket.close(code=1000, reason="room_ended")
-        except Exception:
-            pass
+    # fires between the pre-connect check and register_host. Helper handles
+    # the three cases (live, not-live, cancelled) with the same cleanup
+    # cascade; see its docstring.
+    if not await _ws_stt_deepgram_post_register_recheck_or_cleanup(
+        websocket=websocket, dg=dg, org_id=org_id, room_id=room_id,
+    ):
         return
 
     finalize_event = asyncio.Event()

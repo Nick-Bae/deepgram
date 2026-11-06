@@ -1,28 +1,30 @@
-"""Regression tests for the ``_is_room_live_async`` wrapper and the
-cancellation-cleanup guards at the five patched WS hot sites.
+"""Regression tests for the ``_is_room_live_async`` wrapper and the two
+production helpers that each patched WebSocket handler actually invokes.
 
 Context: ``FirestoreMultiChurchStore.is_room_live`` performs a synchronous
-Firestore ``.get(timeout=_FS_TIMEOUT)`` RPC. Five hot WebSocket code sites in
-``app.main`` call it; three of those sites are AFTER manager registration,
-so a mid-await cancellation leaks the registration, the per-IP counter
-slot, and any already-opened downstream resources (e.g. the Deepgram
-session). The sync-in-async pattern is demonstrated by code inspection;
-its contribution to the historical production lag remains unverified (see
-INVESTIGATION.md).
+Firestore ``.get(timeout=_FS_TIMEOUT)`` RPC. Called inline from an async
+handler it blocks the asyncio event loop for the full RPC round-trip. The
+sync-in-async pattern is demonstrated by code inspection; its contribution
+to the historical production lag remains unverified (see INVESTIGATION.md).
 
-This test module covers:
+This module tests:
 
-- ``_is_room_live_async`` dispatches the sync impl off the event-loop thread.
-- Progress during the block: a concurrent coroutine continues ticking WHILE
-  the worker is blocked (not just before/after the wrapper returns).
-- The wrapper propagates both ``Exception`` and ``asyncio.CancelledError``.
-- ``ws_stt_deepgram``'s post-register recheck runs its cleanup
-  (``note_host_disconnected`` + ``dg.close()`` + ``ws.close(code=1011)``)
-  before re-raising ``CancelledError``.
+- ``_is_room_live_async``: dispatches off the event-loop thread, remains
+  responsive while a concurrent coroutine runs, propagates both
+  ``Exception`` and ``asyncio.CancelledError``.
+- ``_ws_translate_post_register_recheck_or_cleanup``: the EXACT helper
+  the ``/ws/translate`` handler invokes after ``manager.register_listener``.
+  Three regression tests cover is-live PASS, not-live cleanup, and
+  CancelledError cleanup (which includes an auxiliary check: removing the
+  helper's ``except asyncio.CancelledError`` guard makes the regression
+  test fail).
+- ``_ws_stt_deepgram_post_register_recheck_or_cleanup``: the EXACT helper
+  the ``/ws/stt/deepgram`` handler invokes after ``manager.register_host``.
+  Same three-case coverage with the same auxiliary "remove the guard → test
+  fails" demonstration.
 
-The tests intentionally do NOT skip on import failure. ``app.main`` is a
-required prerequisite for this regression surface; an unexpected import
-error fails the test run rather than silently masking a regression.
+``app.main`` is a prerequisite for this regression surface; unexpected
+import failure fails the run rather than silently skipping.
 """
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ import asyncio
 import os as _os
 import threading
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -39,9 +41,14 @@ import pytest
 # origin so import succeeds in isolated test runs.
 _os.environ.setdefault("CORS_ALLOW_ORIGINS", "http://localhost:3000")
 
-# Required imports — any failure fails every test (intentional).
+# Required imports — any failure fails every test (intentional, not skipped).
 from app import main as _main  # noqa: E402  pylint: disable=wrong-import-position
-from app.main import _is_room_live_async, multichurch_store  # noqa: E402
+from app.main import (  # noqa: E402
+    _is_room_live_async,
+    _ws_stt_deepgram_post_register_recheck_or_cleanup,
+    _ws_translate_post_register_recheck_or_cleanup,
+    multichurch_store,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,48 +74,34 @@ async def test_is_room_live_async_runs_on_worker_thread() -> None:
     assert result is True
     assert recorded["org"] == "org-x"
     assert recorded["room"] == "room-y"
-    assert recorded["tid"] != loop_tid, (
-        "is_room_live ran on the event loop thread; the wrapper would block "
-        "the loop during the Firestore RPC."
-    )
+    assert recorded["tid"] != loop_tid
 
 
 @pytest.mark.asyncio
 async def test_is_room_live_async_concurrent_ticker_progresses_during_block() -> None:
-    """Assert the ticker makes progress WHILE the slow worker is still blocking.
+    """Assert the ticker makes progress WHILE the slow worker is blocked.
 
-    The prior version of this test awaited the ticker task to completion
-    before checking its count. That version passes even when the wrapper is
-    replaced with a blocking inline call, because the ticker completes its
-    20 ticks AFTER the sync block returns.
-
-    This test counts ticks within a snapshot window that straddles the
-    middle of the worker's sleep, so a blocking inline call cannot pass.
+    Snapshots the ticker count immediately before invoking the slow wrapper
+    and immediately after it returns; a blocking inline implementation
+    would produce 0-1 ticks during the 100-ms wrapper call and fail the
+    assertion. The offloaded implementation yields and the ticker runs.
     """
     tick_count = {"n": 0}
 
     async def ticker() -> None:
-        # ~500 ticks × 1 ms interval ≈ 0.5 s — long enough to span the block.
         for _ in range(500):
             tick_count["n"] += 1
             await asyncio.sleep(0.001)
 
     def slow_impl(org: str, room: str) -> bool:
-        time.sleep(0.1)  # 100 ms blocking — mimics a slow Firestore RPC
+        time.sleep(0.1)
         return True
 
     ticker_task = asyncio.create_task(ticker())
-    # Let the ticker accumulate a baseline so we have a non-zero "before"
-    # value. If the event loop is blocked for this 10 ms await, the ticker
-    # has NO chance to warm up — the test becomes less discriminating.
-    # Using asyncio.sleep yields to the loop, so the ticker runs here.
-    await asyncio.sleep(0.01)
+    await asyncio.sleep(0.01)  # warm-up
     tick_before = tick_count["n"]
 
     with patch.object(multichurch_store, "is_room_live", side_effect=slow_impl):
-        # Start the wrapper; if offloaded, this returns to the event loop
-        # immediately and the ticker keeps running during the executor's
-        # 100 ms sleep. If inline, the loop blocks for 100 ms.
         start_mono = time.monotonic()
         await _is_room_live_async("org-x", "room-y")
         block_elapsed = time.monotonic() - start_mono
@@ -122,23 +115,15 @@ async def test_is_room_live_async_concurrent_ticker_progresses_during_block() ->
     except asyncio.CancelledError:
         pass
 
-    # The 100 ms sync sleep is simulated. During that window, the ticker
-    # must have made many ticks IF the wrapper correctly offloaded. If the
-    # wrapper blocked the loop, ticks_during_block would be ≤ 1.
-    #
-    # Lower bound chosen conservatively: with offloading, the loop is free
-    # for ~100 ms and the ticker has ~100 × 1 ms intervals. Scheduling
-    # overhead on CI can suppress a fraction; 30 ticks is a safe floor.
     assert ticks_during_block >= 30, (
         f"ticker made only {ticks_during_block} ticks during the "
         f"{block_elapsed*1000:.1f}-ms wrapper call. With offloading, "
-        f"expected ≥ 30. The event loop was likely blocked."
+        "expected ≥ 30. The event loop was likely blocked."
     )
 
 
 @pytest.mark.asyncio
 async def test_is_room_live_async_propagates_exceptions() -> None:
-    """Firestore errors must propagate so callers can fail-open explicitly."""
     class _FakeFirestoreError(RuntimeError):
         pass
 
@@ -152,19 +137,13 @@ async def test_is_room_live_async_propagates_exceptions() -> None:
 
 @pytest.mark.asyncio
 async def test_is_room_live_async_propagates_cancellation() -> None:
-    """When the awaiting task is cancelled, CancelledError must propagate.
-
-    CancelledError is a BaseException in Py3.8+. An ``except Exception``
-    guard surrounding the wrapper will NOT catch it, so the caller's
-    explicit cancellation-handling clause can run before re-raising.
-    """
+    """CancelledError must propagate so the handler's cleanup can run."""
     def slow_impl(org: str, room: str) -> bool:
-        time.sleep(0.5)  # long enough to be cancelled
+        time.sleep(0.5)
         return True
 
     with patch.object(multichurch_store, "is_room_live", side_effect=slow_impl):
         task = asyncio.create_task(_is_room_live_async("org-x", "room-y"))
-        # Yield briefly so the executor picks up the work.
         await asyncio.sleep(0.02)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -172,14 +151,12 @@ async def test_is_room_live_async_propagates_cancellation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Handler-level cancellation test — ws_stt_deepgram post-register recheck
+# Production-helper tests: /ws/translate post-register
 # ---------------------------------------------------------------------------
 
 
 class _FakeWS:
-    """Minimal async-WebSocket stand-in. Records which close codes were
-    requested so the handler-level cancellation test can assert cleanup."""
-
+    """Minimal async-WebSocket stand-in that records close calls."""
     def __init__(self) -> None:
         self.close_calls: list[dict] = []
         self.closed = False
@@ -189,9 +166,19 @@ class _FakeWS:
         self.closed = True
 
 
-class _FakeDgSession:
-    """Minimal Deepgram-session stand-in with an async close()."""
+class _FakeManager:
+    def __init__(self) -> None:
+        self.disconnect_calls: list[object] = []
+        self.note_host_disconnected_calls: list[object] = []
 
+    def disconnect(self, ws: object) -> None:
+        self.disconnect_calls.append(ws)
+
+    def note_host_disconnected(self, ws: object) -> None:
+        self.note_host_disconnected_calls.append(ws)
+
+
+class _FakeDg:
     def __init__(self) -> None:
         self.close_calls = 0
 
@@ -199,111 +186,246 @@ class _FakeDgSession:
         self.close_calls += 1
 
 
-@pytest.mark.asyncio
-async def test_ws_stt_deepgram_recheck_cleans_up_on_cancellation() -> None:
-    """Direct test of the cancellation cleanup block at the ``ws_stt_deepgram``
-    post-register recheck.
+@pytest.fixture
+def listener_mocks():
+    """Provide a complete mock surface for the listener helper.
 
-    The handler itself is not easily unit-testable end-to-end (parse,
-    auth, accept, Deepgram-session construction, etc. all run before the
-    recheck site). This test instead exercises a minimal replica of the
-    patched block that invokes the SAME wrapper and the SAME cleanup-call
-    shape as the handler. A failure here means the cleanup block was
-    modified in a way that would leak resources on cancellation.
+    Patches app.main's module-level ``manager``, ``_ws_viewer_ip_conns``, and
+    ``_ws_viewer_ip_lock`` with test doubles so the helper exercises its
+    real code path. Tests can patch ``_is_room_live_async`` on top of this.
     """
     fake_ws = _FakeWS()
-    fake_dg = _FakeDgSession()
-    manager_calls = {"note_host_disconnected": 0}
-    extra_cleanup_tracker = {"close_waitfor_entered": 0}
+    fake_manager = _FakeManager()
+    viewer_ip = "ip-1"
+    # Start with the viewer already counted (as the real handler does
+    # before this recheck runs).
+    ip_counter: dict[str, int] = {viewer_ip: 1}
 
-    def fake_note_host_disconnected(ws: object) -> None:
-        manager_calls["note_host_disconnected"] += 1
-        assert ws is fake_ws
-
-    async def cancelled_recheck(org: str, room: str) -> bool:
-        raise asyncio.CancelledError()
-
-    async def recheck_block_replica(org_id: str, room_id: str) -> None:
-        """Replicates the exact cleanup pattern at the patched ws_stt_deepgram
-        post-register site in app/main.py. Keep in sync with the handler.
-        Uses ``_main._is_room_live_async`` so the test's patch on that
-        attribute is honored."""
-        try:
-            _ = await _main._is_room_live_async(org_id, room_id)
-        except asyncio.CancelledError:
-            fake_note_host_disconnected(fake_ws)
-            try:
-                extra_cleanup_tracker["close_waitfor_entered"] += 1
-                await asyncio.wait_for(fake_dg.close(), timeout=3.0)
-            except Exception:
-                pass
-            try:
-                await fake_ws.close(code=1011)
-            except Exception:
-                pass
-            raise
-
-    with patch.object(_main, "_is_room_live_async", side_effect=cancelled_recheck):
-        with pytest.raises(asyncio.CancelledError):
-            await recheck_block_replica("org-x", "room-y")
-
-    # All three cleanup legs must have fired BEFORE CancelledError propagated.
-    assert manager_calls["note_host_disconnected"] == 1, (
-        "note_host_disconnected was not called on cancellation; the host and "
-        "shutdown-callback registration would leak."
-    )
-    assert fake_dg.close_calls == 1, (
-        "dg.close() was not called on cancellation; the Deepgram session "
-        "would remain open."
-    )
-    assert fake_ws.close_calls, "websocket.close() was not called on cancellation."
-    assert fake_ws.close_calls[-1]["code"] == 1011, (
-        f"websocket.close() code on cancellation was {fake_ws.close_calls[-1]['code']!r}; "
-        "expected 1011 (error) to distinguish from the normal room_ended path."
-    )
+    with patch.object(_main, "manager", fake_manager), \
+         patch.object(_main, "_ws_viewer_ip_conns", ip_counter), \
+         patch.object(_main, "_ws_viewer_ip_lock", threading.Lock()):
+        yield {
+            "ws": fake_ws,
+            "manager": fake_manager,
+            "viewer_ip": viewer_ip,
+            "ip_counter": ip_counter,
+        }
 
 
 @pytest.mark.asyncio
-async def test_ws_translate_post_register_recheck_cleans_up_on_cancellation() -> None:
-    """Direct test of the cancellation cleanup block at the ``ws_translate``
-    post-register recheck (line 1662 area). Mirrors the test above for
-    the listener registration cleanup shape."""
-    fake_ws = _FakeWS()
-    manager_calls = {"disconnect": 0}
-    ip_counter: dict[str, int] = {"ip-1": 1}  # pre-registered
-    viewer_ip = "ip-1"
+async def test_ws_translate_helper_returns_true_when_live(listener_mocks) -> None:
+    """When the room is live, the helper returns True and does NOT clean up."""
+    m = listener_mocks
+    with patch.object(_main, "_is_room_live_async", return_value=True):
+        result = await _ws_translate_post_register_recheck_or_cleanup(
+            ws=m["ws"], joined_org_id="org-x", joined_room_id="room-y",
+            viewer_ip=m["viewer_ip"],
+        )
 
-    def fake_disconnect(ws: object) -> None:
-        manager_calls["disconnect"] += 1
-        assert ws is fake_ws
+    assert result is True
+    assert m["manager"].disconnect_calls == []
+    assert m["ip_counter"].get(m["viewer_ip"]) == 1  # unchanged
+    assert m["ws"].close_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ws_translate_helper_cleans_up_when_not_live(listener_mocks) -> None:
+    """When the room is not live, the helper cleans up and returns False."""
+    m = listener_mocks
+    with patch.object(_main, "_is_room_live_async", return_value=False):
+        result = await _ws_translate_post_register_recheck_or_cleanup(
+            ws=m["ws"], joined_org_id="org-x", joined_room_id="room-y",
+            viewer_ip=m["viewer_ip"],
+        )
+
+    assert result is False
+    assert m["manager"].disconnect_calls == [m["ws"]]
+    assert m["viewer_ip"] not in m["ip_counter"]
+    assert m["ws"].close_calls == [{"code": 1000, "reason": "room_ended"}]
+
+
+@pytest.mark.asyncio
+async def test_ws_translate_helper_cleans_up_on_cancellation(listener_mocks) -> None:
+    """On CancelledError during the recheck, the helper cleans up BEFORE
+    re-raising. This is the regression: without the ``except asyncio.CancelledError``
+    guard, CancelledError bypasses ``except Exception`` and leaks the
+    listener registration + IP-counter slot."""
+    m = listener_mocks
 
     async def cancelled_recheck(org: str, room: str) -> bool:
         raise asyncio.CancelledError()
 
-    async def recheck_block_replica(org_id: str, room_id: str) -> None:
-        """Replicates the exact cleanup pattern at the patched ws_translate
-        post-register site in app/main.py. Uses ``_main._is_room_live_async``
-        so the test's patch on that attribute is honored."""
+    with patch.object(_main, "_is_room_live_async", side_effect=cancelled_recheck):
+        with pytest.raises(asyncio.CancelledError):
+            await _ws_translate_post_register_recheck_or_cleanup(
+                ws=m["ws"], joined_org_id="org-x", joined_room_id="room-y",
+                viewer_ip=m["viewer_ip"],
+            )
+
+    assert m["manager"].disconnect_calls == [m["ws"]]
+    assert m["viewer_ip"] not in m["ip_counter"]
+    assert m["ws"].close_calls == [{"code": 1011, "reason": None}]
+
+
+@pytest.mark.asyncio
+async def test_ws_translate_helper_unguarded_leaks_on_cancellation(listener_mocks) -> None:
+    """Auxiliary discriminator: construct the exact SAME helper body but
+    WITHOUT the ``except asyncio.CancelledError`` guard. Assert that in
+    that configuration, cancellation propagates WITHOUT cleanup — proving
+    the guard is load-bearing and the previous test is not trivially green.
+    """
+    m = listener_mocks
+
+    async def unguarded_variant(*, ws, joined_org_id, joined_room_id, viewer_ip):
+        # Same shape as the production helper but WITHOUT the
+        # `except asyncio.CancelledError` guard. CancelledError should
+        # escape here unhandled.
         try:
-            _ = await _main._is_room_live_async(org_id, room_id)
-        except asyncio.CancelledError:
-            fake_disconnect(fake_ws)
-            _remaining = ip_counter.get(viewer_ip, 1) - 1
+            is_live = await _main._is_room_live_async(joined_org_id, joined_room_id)
+        except Exception:
+            is_live = True
+        if is_live:
+            return True
+        _main.manager.disconnect(ws)
+        with _main._ws_viewer_ip_lock:
+            _remaining = _main._ws_viewer_ip_conns.get(viewer_ip, 1) - 1
             if _remaining <= 0:
-                ip_counter.pop(viewer_ip, None)
+                _main._ws_viewer_ip_conns.pop(viewer_ip, None)
             else:
-                ip_counter[viewer_ip] = _remaining
-            try:
-                await fake_ws.close(code=1011)
-            except Exception:
-                pass
-            raise
+                _main._ws_viewer_ip_conns[viewer_ip] = _remaining
+        try:
+            await ws.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return False
+
+    async def cancelled_recheck(org: str, room: str) -> bool:
+        raise asyncio.CancelledError()
 
     with patch.object(_main, "_is_room_live_async", side_effect=cancelled_recheck):
         with pytest.raises(asyncio.CancelledError):
-            await recheck_block_replica("org-x", "room-y")
+            await unguarded_variant(
+                ws=m["ws"], joined_org_id="org-x", joined_room_id="room-y",
+                viewer_ip=m["viewer_ip"],
+            )
 
-    assert manager_calls["disconnect"] == 1
-    assert viewer_ip not in ip_counter, "IP counter slot was not decremented/popped"
-    assert fake_ws.close_calls, "websocket.close() was not called on cancellation."
-    assert fake_ws.close_calls[-1]["code"] == 1011
+    # LEAK: cleanup did NOT run because the unguarded variant has no
+    # except-CancelledError clause. This is the behaviour the production
+    # helper's guard prevents.
+    assert m["manager"].disconnect_calls == [], (
+        "Unguarded variant called disconnect; the test does not actually "
+        "exercise the pre-guard behaviour."
+    )
+    assert m["ip_counter"].get(m["viewer_ip"]) == 1, "IP counter was cleaned up by unguarded variant"
+    assert m["ws"].close_calls == [], "WebSocket was closed by unguarded variant"
+
+
+# ---------------------------------------------------------------------------
+# Production-helper tests: /ws/stt/deepgram post-register
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def deepgram_mocks():
+    fake_ws = _FakeWS()
+    fake_dg = _FakeDg()
+    fake_manager = _FakeManager()
+    with patch.object(_main, "manager", fake_manager):
+        yield {
+            "ws": fake_ws,
+            "dg": fake_dg,
+            "manager": fake_manager,
+        }
+
+
+@pytest.mark.asyncio
+async def test_ws_stt_deepgram_helper_returns_true_when_live(deepgram_mocks) -> None:
+    m = deepgram_mocks
+    with patch.object(_main, "_is_room_live_async", return_value=True):
+        result = await _ws_stt_deepgram_post_register_recheck_or_cleanup(
+            websocket=m["ws"], dg=m["dg"], org_id="org-x", room_id="room-y",
+        )
+
+    assert result is True
+    assert m["manager"].note_host_disconnected_calls == []
+    assert m["dg"].close_calls == 0
+    assert m["ws"].close_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ws_stt_deepgram_helper_cleans_up_when_not_live(deepgram_mocks) -> None:
+    m = deepgram_mocks
+    with patch.object(_main, "_is_room_live_async", return_value=False):
+        result = await _ws_stt_deepgram_post_register_recheck_or_cleanup(
+            websocket=m["ws"], dg=m["dg"], org_id="org-x", room_id="room-y",
+        )
+
+    assert result is False
+    assert m["manager"].note_host_disconnected_calls == [m["ws"]]
+    assert m["dg"].close_calls == 1
+    assert m["ws"].close_calls == [{"code": 1000, "reason": "room_ended"}]
+
+
+@pytest.mark.asyncio
+async def test_ws_stt_deepgram_helper_cleans_up_on_cancellation(deepgram_mocks) -> None:
+    """Regression: CancelledError during the recheck must trigger cleanup
+    (``note_host_disconnected`` + ``dg.close()`` + ``websocket.close(1011)``)
+    before CancelledError propagates. Without the ``except asyncio.CancelledError``
+    guard, cancellation would leave the host registration, shutdown
+    callback, Deepgram session, and WebSocket all dangling."""
+    m = deepgram_mocks
+
+    async def cancelled_recheck(org: str, room: str) -> bool:
+        raise asyncio.CancelledError()
+
+    with patch.object(_main, "_is_room_live_async", side_effect=cancelled_recheck):
+        with pytest.raises(asyncio.CancelledError):
+            await _ws_stt_deepgram_post_register_recheck_or_cleanup(
+                websocket=m["ws"], dg=m["dg"], org_id="org-x", room_id="room-y",
+            )
+
+    assert m["manager"].note_host_disconnected_calls == [m["ws"]]
+    assert m["dg"].close_calls == 1
+    assert m["ws"].close_calls == [{"code": 1011, "reason": None}]
+
+
+@pytest.mark.asyncio
+async def test_ws_stt_deepgram_helper_unguarded_leaks_on_cancellation(
+    deepgram_mocks,
+) -> None:
+    """Auxiliary discriminator: unguarded variant exposes the leak the
+    production helper's except-CancelledError prevents."""
+    m = deepgram_mocks
+
+    async def unguarded_variant(*, websocket, dg, org_id, room_id):
+        try:
+            is_live = await _main._is_room_live_async(org_id, room_id)
+        except Exception:
+            is_live = True
+        if is_live:
+            return True
+        _main.manager.note_host_disconnected(websocket)
+        try:
+            await asyncio.wait_for(dg.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1000, reason="room_ended")
+        except Exception:
+            pass
+        return False
+
+    async def cancelled_recheck(org: str, room: str) -> bool:
+        raise asyncio.CancelledError()
+
+    with patch.object(_main, "_is_room_live_async", side_effect=cancelled_recheck):
+        with pytest.raises(asyncio.CancelledError):
+            await unguarded_variant(
+                websocket=m["ws"], dg=m["dg"], org_id="org-x", room_id="room-y",
+            )
+
+    assert m["manager"].note_host_disconnected_calls == [], (
+        "Unguarded variant called note_host_disconnected"
+    )
+    assert m["dg"].close_calls == 0, "Unguarded variant closed dg"
+    assert m["ws"].close_calls == [], "Unguarded variant closed websocket"
