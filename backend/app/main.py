@@ -1655,8 +1655,25 @@ async def ws_translate(ws: WebSocket):
             return
         # Re-check room status AFTER registration to close the race where End
         # Service fires between the initial is_room_live check and this join.
+        # CancelledError is BaseException in Py3.8+, so `except Exception` does
+        # not catch it; a client/server cancellation mid-await here would
+        # otherwise leak the manager.register_listener registration plus the
+        # IP-counter slot. Mirror the register_listener cleanup path above.
         try:
             _still_live_after_join = await _is_room_live_async(joined_org_id, joined_room_id)
+        except asyncio.CancelledError:
+            manager.disconnect(ws)
+            with _ws_viewer_ip_lock:
+                _remaining = _ws_viewer_ip_conns.get(_viewer_ip, 1) - 1
+                if _remaining <= 0:
+                    _ws_viewer_ip_conns.pop(_viewer_ip, None)
+                else:
+                    _ws_viewer_ip_conns[_viewer_ip] = _remaining
+            try:
+                await ws.close(code=1011)
+            except Exception:
+                pass
+            raise
         except Exception:
             _still_live_after_join = True
         if not _still_live_after_join:
@@ -2032,8 +2049,19 @@ async def ws_translate(ws: WebSocket):
                     # live. Without this, a consumer_join with an ended room
                     # would install a listener that only leaves via the next
                     # terminal broadcast — or never, if none is coming.
+                    # Cancellation guard: CancelledError bypasses `except
+                    # Exception` and would leave the register_listener
+                    # registration dangling. Mirror the register_listener
+                    # cleanup above.
                     try:
                         _cj_room_live = await _is_room_live_async(joined_org_id, joined_room_id)
+                    except asyncio.CancelledError:
+                        manager.disconnect(ws)
+                        try:
+                            await ws.close(code=1011)
+                        except Exception:
+                            pass
+                        raise
                     except Exception:
                         _cj_room_live = True  # fail open on Firestore error
                     if not _cj_room_live:
@@ -2550,8 +2578,23 @@ async def ws_stt_deepgram(websocket: WebSocket):
 
     # Recheck AFTER host registration to close the race where End Service
     # fires between the pre-connect check and register_host.
+    # Cancellation guard: CancelledError (BaseException) is not caught by
+    # `except Exception` and would leak the manager.register_host
+    # registration, the shutdown-callback, the open Deepgram session, and
+    # the un-closed WebSocket. Mirror the register_host cleanup path above.
     try:
         _room_live_post = await _is_room_live_async(org_id, room_id)
+    except asyncio.CancelledError:
+        manager.note_host_disconnected(websocket)  # also unregisters callback
+        try:
+            await asyncio.wait_for(dg.close(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        raise
     except Exception:
         _room_live_post = True
     if not _room_live_post:
