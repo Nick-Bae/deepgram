@@ -161,12 +161,16 @@ class StripeBillingClient:
     ) -> Dict[str, Any]:
         """Create a two-phase schedule: current plan until phase_end_unix, then new plan.
 
-        `metadata` is stamped on the schedule at create time. Callers
-        use it to tie future reads of `subscription.schedule` back to
-        the app operation that wrote it (per operator review of the
-        M1 reconcile logic — list-by-subscription was undocumented; a
-        subscription has at most one attached schedule exposed as
-        `subscription.schedule`).
+        Two-step sequence (Stripe's documented contract): `POST
+        /v1/subscription_schedules` with ONLY `from_subscription` as
+        the body — Stripe rejects additional fields on that creation
+        form — then `POST /v1/subscription_schedules/<id>` with the
+        full `phases` payload AND any `metadata`. The caller uses
+        `metadata` (e.g. `{"orgId": <orgId>}`) to tie future reads of
+        `subscription.schedule` back to the app operation that wrote
+        it (per operator review of the M1 reconcile logic — the
+        documented `subscription.schedule` field exposes at most one
+        attached schedule per subscription).
         """
         clean_sub_id = str(subscription_id or "").strip()
         if not clean_sub_id:
