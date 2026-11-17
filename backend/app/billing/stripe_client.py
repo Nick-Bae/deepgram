@@ -1,13 +1,83 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, Optional
 
 import httpx
 
 
+logger = logging.getLogger(__name__)
+
+
 class StripeClientError(RuntimeError):
-    pass
+    """Raised for every non-2xx Stripe response and every transport
+    failure. When Stripe returned a structured error body, the
+    optional attributes `http_status`, `stripe_error_type`, and
+    `stripe_error_code` carry those fields so callers can gate
+    compensation behavior precisely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: Optional[int] = None,
+        stripe_error_type: Optional[str] = None,
+        stripe_error_code: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.stripe_error_type = stripe_error_type
+        self.stripe_error_code = stripe_error_code
+
+
+def _is_schedule_update_validation_rejection(exc: StripeClientError) -> bool:
+    """Narrow compensation gate for `create_subscription_schedule`'s
+    step-2 phase-update failure.
+
+    Release ONLY when Stripe definitively rejected the payload itself:
+    HTTP 400 with `error.type == invalid_request_error` (the observed
+    sandbox-run shape — "phases[0][start_date] must be present" is a
+    parameter-missing validation rejection). The request was not
+    applied; the just-created schedule is safe to release so a retry
+    can proceed.
+
+    Preserve the schedule (NO release; log the id for reconciliation)
+    on every other failure mode:
+
+      - 409 (state conflict): the sub may have had a schedule
+        attached between step 1 and step 2, or Stripe sees an
+        idempotency or state conflict. Releasing would clobber work
+        we don't own.
+      - 429 (rate-limit / `lock_timeout`): Stripe returned before
+        applying the update, but a subsequent retry may collide
+        with a write that landed. Releasing here can race with a
+        concurrent write.
+      - 401 / 403 / 404 and any non-`invalid_request_error` 400:
+        not a payload-validation rejection. Treat as uncertain.
+      - 5xx / network / invalid-JSON: Stripe may have applied the
+        update server-side. Never release — releasing a schedule
+        whose update actually took effect would silently discard
+        that work.
+
+    Structured fields are used when the server supplied them; the
+    gate falls back to HTTP status alone only if the type field is
+    absent (older Stripe responses, test harnesses).
+    """
+    # `lock_timeout` is always uncertain regardless of HTTP status.
+    if exc.stripe_error_code == "lock_timeout":
+        return False
+    if exc.http_status != 400:
+        return False
+    # Require the explicit `invalid_request_error` type. An untyped
+    # 400 (missing structured type field — malformed/intercepted
+    # response, older Stripe-compat shim, a non-Stripe proxy) is
+    # uncertain: without Stripe's own classification we can't tell
+    # whether the payload was rejected or transformed-then-applied.
+    # Preserve the schedule; the operator reconciles out-of-band.
+    if exc.stripe_error_type != "invalid_request_error":
+        return False
+    return True
 
 
 class StripeBillingClient:
@@ -55,12 +125,26 @@ class StripeBillingClient:
             raise StripeClientError(f"stripe_network_error:{type(exc).__name__}") from exc
         if res.status_code >= 400:
             detail = ""
+            err_type: Optional[str] = None
+            err_code: Optional[str] = None
             try:
                 payload = res.json()
-                detail = str(((payload or {}).get("error") or {}).get("message") or "")
+                err_obj = (payload or {}).get("error") or {}
+                detail = str(err_obj.get("message") or "")
+                err_type = (
+                    str(err_obj["type"]) if err_obj.get("type") else None
+                )
+                err_code = (
+                    str(err_obj["code"]) if err_obj.get("code") else None
+                )
             except Exception:
                 detail = (res.text or "").strip()
-            raise StripeClientError(f"stripe_http_{res.status_code}:{detail[:200]}")
+            raise StripeClientError(
+                f"stripe_http_{res.status_code}:{detail[:200]}",
+                http_status=res.status_code,
+                stripe_error_type=err_type,
+                stripe_error_code=err_code,
+            )
         try:
             return res.json()
         except json.JSONDecodeError as exc:
@@ -157,12 +241,40 @@ class StripeBillingClient:
         current_price_id: str,
         new_price_id: str,
         phase_end_unix: int,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Create a two-phase schedule: current plan until phase_end_unix, then new plan."""
+        """Create a two-phase schedule: current plan until phase_end_unix, then new plan.
+
+        Two-step sequence (Stripe's documented contract):
+
+          1. `POST /v1/subscription_schedules` with ONLY
+             `from_subscription` as the body — Stripe rejects
+             additional fields on that creation form. Stripe populates
+             `phases[0]` from the subscription's active phase.
+
+          2. `POST /v1/subscription_schedules/<id>` with the full
+             `phases` payload AND any `metadata`. `phases[0][start_date]`
+             must match the active phase Stripe returned on step 1 —
+             otherwise Stripe can either reject the update or drift
+             the active phase off the subscription's
+             `current_period_start`, leaving the sub with a
+             mis-dated attached schedule.
+
+        Compensation: if step 2 is DEFINITIVELY rejected (4xx) after
+        step 1 succeeded, release the schedule created in step 1 so
+        the subscription returns to normal and a retry can proceed.
+        A 5xx / network timeout / invalid-JSON response is UNCERTAIN
+        — Stripe may have applied the update server-side — so we
+        do NOT release in that case; we log the schedule id for
+        operator-side reconciliation and re-raise the original error
+        unchanged. The release itself is best-effort: a release
+        failure never masks the original step-2 error, but its
+        failure IS logged with the schedule id for reconciliation.
+        """
         clean_sub_id = str(subscription_id or "").strip()
         if not clean_sub_id:
             raise StripeClientError("stripe_subscription_id_missing")
-        # Step 1: create schedule from existing subscription
+        # Step 1: create schedule from existing subscription.
         schedule = self._request(
             "POST",
             "/subscription_schedules",
@@ -171,16 +283,76 @@ class StripeBillingClient:
         schedule_id = str((schedule or {}).get("id") or "").strip()
         if not schedule_id:
             raise StripeClientError("stripe_schedule_create_failed")
-        # Step 2: update schedule with two explicit phases
+        # Read the active phase's start_date from the step-1 response.
+        # Stripe's `from_subscription` form always writes phases[0]
+        # with the subscription's `current_period_start` as start_date.
+        step1_phases = (schedule or {}).get("phases") or []
+        active_start: Optional[int] = None
+        if step1_phases:
+            raw_start = (step1_phases[0] or {}).get("start_date")
+            try:
+                active_start = int(raw_start) if raw_start is not None else None
+            except (TypeError, ValueError):
+                active_start = None
+        if not active_start:
+            self._release_schedule_best_effort(schedule_id)
+            raise StripeClientError("stripe_schedule_create_missing_active_start_date")
+        # Step 2: update schedule with two explicit phases + metadata.
         phase_payload: Dict[str, Any] = {
             "end_behavior": "release",
+            "phases[0][start_date]": str(active_start),
             "phases[0][items][0][price]": str(current_price_id or "").strip(),
             "phases[0][items][0][quantity]": "1",
             "phases[0][end_date]": str(int(phase_end_unix)),
             "phases[1][items][0][price]": str(new_price_id or "").strip(),
             "phases[1][items][0][quantity]": "1",
         }
-        return self._request("POST", f"/subscription_schedules/{schedule_id}", data=phase_payload)
+        for key, value in (metadata or {}).items():
+            phase_payload[f"metadata[{key}]"] = str(value)
+        try:
+            return self._request(
+                "POST", f"/subscription_schedules/{schedule_id}", data=phase_payload,
+            )
+        except StripeClientError as step2_exc:
+            if _is_schedule_update_validation_rejection(step2_exc):
+                self._release_schedule_best_effort(schedule_id)
+            else:
+                # Not a payload-validation rejection — preserve the
+                # schedule and surface its id on the exception so the
+                # caller can reconcile it into local state. Covers 409
+                # state conflicts, 429 lock_timeout / rate-limit, 5xx,
+                # network errors, and any non-invalid_request_error 400.
+                step2_exc.preserved_schedule_id = schedule_id
+                logger.warning(
+                    "stripe_schedule_update_uncertain "
+                    "schedule_id=%s http_status=%s err_type=%s err_code=%s "
+                    "err=%s — compensation release SKIPPED",
+                    schedule_id,
+                    step2_exc.http_status,
+                    step2_exc.stripe_error_type,
+                    step2_exc.stripe_error_code,
+                    step2_exc,
+                )
+            raise
+
+    def _release_schedule_best_effort(self, schedule_id: str) -> None:
+        """Release a schedule created in THIS operation when step 2
+        of `create_subscription_schedule` is DEFINITIVELY rejected.
+        A release failure is swallowed so the caller still sees the
+        original step-2 error — but the schedule id is logged so an
+        operator can reconcile the now-orphaned (but attached)
+        schedule."""
+        try:
+            self._request(
+                "POST", f"/subscription_schedules/{schedule_id}/release",
+            )
+        except Exception as release_exc:
+            logger.warning(
+                "stripe_schedule_compensation_release_failed "
+                "schedule_id=%s err=%s — reconcile this schedule out-of-band",
+                schedule_id, release_exc,
+            )
+            return
 
     def cancel_subscription_schedule(self, *, schedule_id: str) -> Dict[str, Any]:
         """Release a subscription schedule, returning the subscription to normal."""
@@ -188,6 +360,17 @@ class StripeBillingClient:
         if not clean_id:
             raise StripeClientError("stripe_schedule_id_missing")
         return self._request("POST", f"/subscription_schedules/{clean_id}/release")
+
+    def retrieve_subscription_schedule(self, *, schedule_id: str) -> Dict[str, Any]:
+        """Retrieve a Stripe subscription_schedule by id. Used by the
+        change_plan route to verify a preserved schedule's actual
+        phases (target price and effective date) before adopting it
+        into local pending state — subscription attachment alone
+        proves neither."""
+        clean_id = str(schedule_id or "").strip()
+        if not clean_id:
+            raise StripeClientError("stripe_schedule_id_missing")
+        return self._request("GET", f"/subscription_schedules/{clean_id}")
 
     def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> Dict[str, Any]:
         clean_customer_id = str(customer_id or "").strip()
