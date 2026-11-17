@@ -1192,6 +1192,64 @@ def change_plan(
         return {"ok": True, "effective": "immediate", "pendingPlanKey": None, "pendingPlanDate": None}
 
     # Downgrade: create subscription schedule for period end.
+    #
+    # Reconcile step (operator review follow-up): before the normal
+    # release+create, list schedules Stripe actually holds for this
+    # subscription. Release any ACTIVE schedule whose id does NOT
+    # match our locally-tracked `pendingScheduleId` — these are
+    # orphans from an earlier attempt where the backend lost track of
+    # the Stripe-side state (e.g. create timed out between Stripe's
+    # commit and our response; or a compensating release itself
+    # failed and never retried). Without reconciliation the next
+    # create would collide with the orphan on Stripe and 502. Listing
+    # here costs one extra GET per downgrade attempt and makes
+    # retries deterministic.
+    prior_schedule_id = _clean(billing.get("pendingScheduleId"))
+    try:
+        current_sched_list = client.list_subscription_schedules(
+            subscription_id=subscription_id,
+        )
+    except StripeClientError as list_exc:
+        logger.warning(
+            "change_plan_list_schedules_failed org=%s sub=%s: %s",
+            body.orgId, subscription_id, list_exc,
+        )
+        raise HTTPException(
+            status_code=502, detail="stripe_schedule_failed",
+        ) from list_exc
+    orphan_schedule_ids: list[str] = []
+    for row in (current_sched_list.get("data") or []):
+        sched_id = _clean((row or {}).get("id"))
+        sched_status = _clean((row or {}).get("status")).lower()
+        if not sched_id or sched_status in {"released", "canceled", "cancelled", "completed"}:
+            continue
+        if prior_schedule_id and sched_id == prior_schedule_id:
+            continue  # known; handled by the explicit release below
+        orphan_schedule_ids.append(sched_id)
+    for orphan_id in orphan_schedule_ids:
+        try:
+            client.cancel_subscription_schedule(schedule_id=orphan_id)
+            logger.info(
+                "change_plan_orphan_schedule_released org=%s sched=%s",
+                body.orgId, orphan_id,
+            )
+        except StripeClientError as orphan_exc:
+            if _is_schedule_already_terminal_error(orphan_exc):
+                logger.info(
+                    "change_plan_orphan_schedule_already_terminal "
+                    "org=%s sched=%s: %s",
+                    body.orgId, orphan_id, orphan_exc,
+                )
+            else:
+                logger.warning(
+                    "change_plan_orphan_schedule_release_failed "
+                    "org=%s sched=%s: %s",
+                    body.orgId, orphan_id, orphan_exc,
+                )
+                raise HTTPException(
+                    status_code=502, detail="stripe_schedule_failed",
+                ) from orphan_exc
+
     # M1 fix (release-before-create): Stripe refuses
     # `/subscription_schedules?from_subscription=` when a non-released
     # schedule already exists. If we have a prior `pendingScheduleId`
@@ -1199,7 +1257,6 @@ def change_plan(
     # against races — a terminal-shape error (already released, not
     # found) is swallowed. Any other error bubbles up as
     # `stripe_schedule_failed` (existing contract).
-    prior_schedule_id = _clean(billing.get("pendingScheduleId"))
     prior_released_or_absent = not prior_schedule_id  # true iff nothing to release
     if prior_schedule_id:
         try:
@@ -1242,10 +1299,12 @@ def change_plan(
         logger.warning("change_plan_schedule_failed org=%s: %s", body.orgId, exc)
         # Failure window 1 (post-release, pre-create-success): Stripe
         # has NO schedule (we just released the prior; nothing new).
-        # If we don't clear the local pending fields, the UI would
-        # say a downgrade is pending while Stripe shows nothing. Clear
-        # them so the app accurately reports its state. Caller sees
-        # 502 and retries; the retry sees no prior and creates fresh.
+        # Clear the local pending fields so the app accurately
+        # reports its state. CAS-gate on `pendingScheduleId ==
+        # prior_schedule_id` so a concurrent request that has since
+        # committed its own newer schedule is NOT clobbered by this
+        # stale clear: StaleBillingPatchError → log + swallow → raise
+        # the 502. The newer request's pending state wins.
         if prior_released_or_absent and prior_schedule_id:
             try:
                 multichurch_store.patch_org_billing_fields(
@@ -1255,12 +1314,19 @@ def change_plan(
                         "pendingPlanDate": None,
                         "pendingScheduleId": None,
                     },
+                    expected={"pendingScheduleId": prior_schedule_id},
+                )
+            except StaleBillingPatchError:
+                # A newer request has committed a different pending
+                # schedule since we read `billing` at the top of this
+                # handler. Do NOT clear — that would clobber the
+                # newer (winning) pending state.
+                logger.info(
+                    "change_plan_clear_local_pending_skipped_cas_mismatch "
+                    "org=%s prior=%s (newer request's pending state kept)",
+                    body.orgId, prior_schedule_id,
                 )
             except Exception as clear_exc:
-                # Record and continue to raise the 502 — the clear is
-                # best-effort; the retry path still converges because
-                # the next release call on the released prior returns
-                # a terminal-shape error and is swallowed.
                 logger.warning(
                     "change_plan_clear_local_pending_after_create_failure_failed "
                     "org=%s: %s", body.orgId, clear_exc,
@@ -1312,6 +1378,13 @@ def change_plan(
                         "pendingPlanDate": None,
                         "pendingScheduleId": None,
                     },
+                    expected={"pendingScheduleId": prior_schedule_id},
+                )
+            except StaleBillingPatchError:
+                logger.info(
+                    "change_plan_clear_local_pending_skipped_cas_mismatch_persist "
+                    "org=%s prior=%s (newer request's pending state kept)",
+                    body.orgId, prior_schedule_id,
                 )
             except Exception as clear_exc:
                 logger.warning(

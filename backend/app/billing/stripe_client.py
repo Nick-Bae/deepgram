@@ -189,6 +189,31 @@ class StripeBillingClient:
             raise StripeClientError("stripe_schedule_id_missing")
         return self._request("POST", f"/subscription_schedules/{clean_id}/release")
 
+    def list_subscription_schedules(
+        self,
+        *,
+        subscription_id: str,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """List subscription schedules attached to a subscription.
+
+        Used by `change_plan` to reconcile orphaned schedules — e.g.
+        a prior request that timed out between Stripe-side create and
+        the backend response, or a compensating release that itself
+        failed — by listing what Stripe actually holds now and
+        releasing anything the backend does not recognize before
+        creating the new schedule.
+        """
+        clean_sub_id = str(subscription_id or "").strip()
+        if not clean_sub_id:
+            raise StripeClientError("stripe_subscription_id_missing")
+        clean_limit = max(1, min(100, int(limit)))
+        return self._request(
+            "GET",
+            "/subscription_schedules",
+            params={"subscription": clean_sub_id, "limit": str(clean_limit)},
+        )
+
     def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> Dict[str, Any]:
         clean_customer_id = str(customer_id or "").strip()
         if not clean_customer_id:
