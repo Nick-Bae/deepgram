@@ -1175,7 +1175,20 @@ def change_plan(
         raise HTTPException(status_code=502, detail="stripe_update_failed")
     item_id = _clean(first_item["id"])
 
+    # Validate downgrade inputs BEFORE any Stripe-side mutation.
+    # A missing `current_period_end` means we have nothing to anchor
+    # the schedule's phase[0][end_date] to. Raising here avoids the
+    # window where the prior schedule has already been released but
+    # no new schedule can be created — leaving the subscription with
+    # neither a prior nor a new pending downgrade.
     upgrading = _is_upgrade(current_plan_key, target_plan.key)
+    period_end_dt: Optional[datetime] = None
+    period_end_unix: Optional[int] = None
+    if not upgrading:
+        period_end_unix = subscription.get("current_period_end")
+        period_end_dt = _to_datetime(period_end_unix)
+        if not period_end_dt or not period_end_unix:
+            raise HTTPException(status_code=502, detail="stripe_update_failed")
 
     if upgrading:
         try:
@@ -1253,10 +1266,6 @@ def change_plan(
                 ) from release_exc
 
     current_price_id = _clean_price_id(_price_id_from_subscription(subscription))
-    period_end_unix = subscription.get("current_period_end")
-    period_end_dt = _to_datetime(period_end_unix)
-    if not period_end_dt or not period_end_unix:
-        raise HTTPException(status_code=502, detail="stripe_update_failed")
 
     try:
         schedule = client.create_subscription_schedule(
@@ -1268,15 +1277,163 @@ def change_plan(
         )
     except StripeClientError as exc:
         logger.warning("change_plan_schedule_failed org=%s: %s", body.orgId, exc)
+        # Reconcile a client-preserved schedule BEFORE touching local
+        # pending state. On an uncertain step-2 (409/429 lock_timeout/
+        # 5xx/network), the stripe client has preserved the step-1
+        # schedule on Stripe and surfaced its id via
+        # `preserved_schedule_id`. Verify ownership (the schedule must
+        # still be attached to THIS subscription) and adopt it into
+        # local pending state so the next change_plan can
+        # release-before-create rather than deadlock on 409
+        # schedule_attached_externally.
+        preserved_id = getattr(exc, "preserved_schedule_id", None)
+        preserved_adopted = False
+        if preserved_id:
+            # Subscription attachment alone proves neither the target
+            # price nor the effective date. Before adopting the
+            # preserved schedule as a pending downgrade, verify ALL
+            # three invariants against Stripe's actual schedule state:
+            #   (a) `subscription.schedule == preserved_id`   (still attached)
+            #   (b) `schedule.status` is live (`not_started`/`active`) — a
+            #       schedule released/canceled/completed between the
+            #       subscription lookup and this schedule lookup must
+            #       NOT be adopted
+            #   (c) `schedule.subscription == subscription_id` —
+            #       the schedule's own back-reference points at THIS
+            #       sub; cross-sub mix-ups are refused
+            #   (d) schedule.phases[1].items[0].price.id == target price_id
+            #   (e) schedule.phases[0].end_date == period_end_unix
+            # If step 2 failed before phases/metadata were applied,
+            # the schedule exists on Stripe but only with phase[0]
+            # (the current plan from `from_subscription`) — adopting
+            # it as a pending downgrade would be a lie. In that case
+            # we log and leave the Stripe-side schedule for operator
+            # reconciliation; we do not release (that could mask a
+            # race we didn't win).
+            try:
+                sub_now = client.retrieve_subscription(
+                    subscription_id=subscription_id,
+                )
+                attached_now = _clean(sub_now.get("schedule"))
+            except StripeClientError as verify_exc:
+                attached_now = ""
+                logger.warning(
+                    "change_plan_preserved_schedule_sub_verify_failed "
+                    "org=%s preserved=%s: %s",
+                    body.orgId, preserved_id, verify_exc,
+                )
+            if attached_now != preserved_id:
+                logger.warning(
+                    "change_plan_preserved_schedule_not_attached "
+                    "org=%s preserved=%s attached_now=%s — not adopting",
+                    body.orgId, preserved_id, attached_now or "<none>",
+                )
+            else:
+                sched_ok = False
+                try:
+                    sched_now = client.retrieve_subscription_schedule(
+                        schedule_id=preserved_id,
+                    )
+                    sched_status = str((sched_now or {}).get("status") or "").lower()
+                    sched_subscription = _clean_subscription_id(
+                        (sched_now or {}).get("subscription")
+                    )
+                    phases = (sched_now or {}).get("phases") or []
+                    phase0 = phases[0] if len(phases) >= 1 else {}
+                    phase1 = phases[1] if len(phases) >= 2 else {}
+                    phase1_items = (phase1.get("items") or [])
+                    phase1_price = ""
+                    if phase1_items:
+                        phase1_price = _clean_price_id(
+                            ((phase1_items[0] or {}).get("price") or {}).get("id")
+                            if isinstance((phase1_items[0] or {}).get("price"), dict)
+                            else (phase1_items[0] or {}).get("price")
+                        )
+                    phase0_end = phase0.get("end_date")
+                    try:
+                        phase0_end_int = int(phase0_end) if phase0_end is not None else None
+                    except (TypeError, ValueError):
+                        phase0_end_int = None
+                    target_price_id = _clean_price_id(price_id)
+                    expected_end = int(period_end_unix)
+                    sched_ok = bool(
+                        sched_status in {"not_started", "active"}
+                        and sched_subscription == subscription_id
+                        and len(phases) >= 2
+                        and phase1_price
+                        and phase1_price == target_price_id
+                        and phase0_end_int == expected_end
+                    )
+                    if not sched_ok:
+                        logger.warning(
+                            "change_plan_preserved_schedule_contents_mismatch "
+                            "org=%s preserved=%s status=%r sub=%r expected_sub=%r "
+                            "phase_count=%d phase1_price=%r expected_price=%r "
+                            "phase0_end=%r expected_end=%r — not adopting",
+                            body.orgId, preserved_id, sched_status,
+                            sched_subscription, subscription_id, len(phases),
+                            phase1_price, target_price_id,
+                            phase0_end_int, expected_end,
+                        )
+                except StripeClientError as verify_exc:
+                    logger.warning(
+                        "change_plan_preserved_schedule_retrieve_failed "
+                        "org=%s preserved=%s: %s — not adopting",
+                        body.orgId, preserved_id, verify_exc,
+                    )
+                except Exception as verify_exc:
+                    # Broad catch is intentional: ANY failure to
+                    # verify the schedule's phases/price/date means we
+                    # cannot prove the preserved id is a correct
+                    # pending downgrade. Fail closed — do not adopt,
+                    # do not release; leave Stripe-side for operator
+                    # reconciliation.
+                    logger.warning(
+                        "change_plan_preserved_schedule_verify_unexpected "
+                        "org=%s preserved=%s: %s — not adopting",
+                        body.orgId, preserved_id, verify_exc,
+                    )
+                if sched_ok:
+                    try:
+                        multichurch_store.patch_org_billing_fields(
+                            org_id=body.orgId,
+                            updates={
+                                "pendingPlanKey": target_plan.key,
+                                "pendingPlanDate": period_end_dt,
+                                "pendingScheduleId": preserved_id,
+                            },
+                            expected={"pendingScheduleId": prior_schedule_id or None},
+                        )
+                        preserved_adopted = True
+                        logger.info(
+                            "change_plan_preserved_schedule_reconciled "
+                            "org=%s preserved=%s",
+                            body.orgId, preserved_id,
+                        )
+                    except StaleBillingPatchError:
+                        # Concurrent request committed its own pending
+                        # id between our initial read and this
+                        # adoption. Leave their state intact.
+                        logger.info(
+                            "change_plan_preserved_schedule_adopt_cas_skip "
+                            "org=%s preserved=%s",
+                            body.orgId, preserved_id,
+                        )
+                    except Exception as adopt_exc:
+                        logger.warning(
+                            "change_plan_preserved_schedule_adopt_failed "
+                            "org=%s preserved=%s: %s",
+                            body.orgId, preserved_id, adopt_exc,
+                        )
         # Failure window 1 (post-release, pre-create-success): Stripe
         # has NO schedule (we just released the prior; nothing new).
         # Clear the local pending fields so the app accurately
         # reports its state. CAS-gate on `pendingScheduleId ==
         # prior_schedule_id` so a concurrent request that has since
         # committed its own newer schedule is NOT clobbered by this
-        # stale clear: StaleBillingPatchError → log + swallow → raise
-        # the 502. The newer request's pending state wins.
-        if prior_released_or_absent and prior_schedule_id:
+        # stale clear. Also skip when we just adopted a preserved id —
+        # clearing would erase what we just wrote.
+        if not preserved_adopted and prior_released_or_absent and prior_schedule_id:
             try:
                 multichurch_store.patch_org_billing_fields(
                     org_id=body.orgId,
@@ -1288,10 +1445,6 @@ def change_plan(
                     expected={"pendingScheduleId": prior_schedule_id},
                 )
             except StaleBillingPatchError:
-                # A newer request has committed a different pending
-                # schedule since we read `billing` at the top of this
-                # handler. Do NOT clear — that would clobber the
-                # newer (winning) pending state.
                 logger.info(
                     "change_plan_clear_local_pending_skipped_cas_mismatch "
                     "org=%s prior=%s (newer request's pending state kept)",
@@ -1313,16 +1466,155 @@ def change_plan(
                 "pendingPlanDate": period_end_dt,
                 "pendingScheduleId": schedule_id,
             },
+            # CAS-gate: the write is only valid under the pending state
+            # we read at the top of the handler. A concurrent writer
+            # (Portal downgrade, admin cancel, another change_plan)
+            # that committed a different pending id in the meantime
+            # raises StaleBillingPatchError — we handle below by
+            # compensating and returning 409 so the caller retries
+            # with fresh state.
+            expected={"pendingScheduleId": prior_schedule_id or None},
         )
-    except ValueError as exc:
+    except StaleBillingPatchError as exc:
+        # The CAS-gate rejected our write because stored
+        # `pendingScheduleId` did not equal `prior_schedule_id` at
+        # commit time. Before releasing anything on Stripe, verify by
+        # re-reading the billing profile:
+        #   (a) stored == OUR schedule_id → write actually landed
+        #       (retry / idempotency / out-of-order commit); DO NOT
+        #       release, return success.
+        #   (b) read-back itself fails → ambiguous; preserve the
+        #       Stripe schedule, return 503 billing_reconciliation_required
+        #       so the caller / operator can investigate.
+        #   (c) stored == some other id (concurrent winner) → our
+        #       schedule is a genuine orphan; release it on Stripe
+        #       and return 409 billing_state_changed.
+        try:
+            billing_after_cas = multichurch_store.get_org_billing_profile(
+                org_id=body.orgId,
+            )
+            stored_after_cas = _clean(
+                (billing_after_cas or {}).get("pendingScheduleId")
+            )
+        except Exception as reread_exc:
+            logger.warning(
+                "change_plan_cas_conflict_reread_failed "
+                "org=%s sched=%s: %s — preserving Stripe schedule, "
+                "returning reconciliation-required",
+                body.orgId, schedule_id, reread_exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="billing_reconciliation_required",
+            ) from exc
+        if schedule_id and stored_after_cas == schedule_id:
+            logger.info(
+                "change_plan_cas_conflict_write_actually_landed "
+                "org=%s sched=%s — preserving Stripe schedule, "
+                "treating as success",
+                body.orgId, schedule_id,
+            )
+            effective_iso = period_end_dt.isoformat()
+            _send_billing_email(
+                "plan_changed", org_id=body.orgId,
+                plan_key=target_plan.key, old_plan_key=current_plan_key,
+                effective=effective_iso,
+            )
+            return {
+                "ok": True,
+                "effective": effective_iso,
+                "pendingPlanKey": target_plan.key,
+                "pendingPlanDate": effective_iso,
+            }
+        # Stored state references some other schedule (or no schedule
+        # at all) — our just-created Stripe schedule is a genuine
+        # orphan. Release it.
+        if schedule_id:
+            try:
+                client.cancel_subscription_schedule(schedule_id=schedule_id)
+                logger.info(
+                    "change_plan_cas_conflict_release_succeeded "
+                    "org=%s sched=%s stored=%s",
+                    body.orgId, schedule_id, stored_after_cas or "<none>",
+                )
+            except StripeClientError as compensate_exc:
+                logger.warning(
+                    "change_plan_cas_conflict_release_failed "
+                    "org=%s sched=%s: %s",
+                    body.orgId, schedule_id, compensate_exc,
+                )
+        raise HTTPException(status_code=409, detail="billing_state_changed") from exc
+    except Exception as exc:
         # Failure window 2 (post-create-success, persist-failure):
-        # Stripe NOW has a fresh schedule we cannot save locally. If we
-        # just raise, the UI reports the OLD prior schedule (or
-        # nothing after the release) while Stripe holds a new orphan.
-        # Compensate by releasing the new schedule on Stripe so Stripe
-        # and local agree. Best-effort — if the compensating release
-        # also fails, log and continue to raise so the caller knows the
-        # change didn't commit.
+        # Stripe NOW has a fresh schedule. Classify:
+        #
+        #   DEFINITIVELY REJECTED (ValueError subclass raised by the
+        #   store on business-rule rejection — org_not_found,
+        #   validation, etc.): the write cannot land now OR later.
+        #   Safe to compensate (release the Stripe schedule) and
+        #   return 400.
+        #
+        #   AMBIGUOUS / DELAYED-COMMIT POSSIBLE (RuntimeError /
+        #   RetryError / transport error / anything non-ValueError):
+        #   the write may have committed server-side already, may
+        #   land later via retry, or may genuinely have failed. We
+        #   verify what we can by re-reading — if stored matches our
+        #   schedule_id we treat as success. Otherwise we PRESERVE
+        #   the Stripe schedule (cannot release what may still be
+        #   written or already was) and return 503
+        #   billing_reconciliation_required. Only StaleBillingPatchError
+        #   — handled in its own except branch above — is treated as
+        #   "fenced out" (the CAS itself proves the write will not
+        #   land), which is safe to compensate.
+        store_matches_intended_write = False
+        reread_failed = False
+        try:
+            billing_after = multichurch_store.get_org_billing_profile(
+                org_id=body.orgId,
+            )
+            stored_sched = _clean((billing_after or {}).get("pendingScheduleId"))
+            store_matches_intended_write = bool(schedule_id and stored_sched == schedule_id)
+        except Exception as reread_exc:
+            reread_failed = True
+            logger.warning(
+                "change_plan_persist_verify_reread_failed org=%s: %s",
+                body.orgId, reread_exc,
+            )
+        if store_matches_intended_write:
+            logger.info(
+                "change_plan_persist_error_write_actually_committed "
+                "org=%s sched=%s — treating as success, no Stripe release",
+                body.orgId, schedule_id,
+            )
+            effective_iso = period_end_dt.isoformat()
+            _send_billing_email(
+                "plan_changed", org_id=body.orgId,
+                plan_key=target_plan.key, old_plan_key=current_plan_key,
+                effective=effective_iso,
+            )
+            return {
+                "ok": True,
+                "effective": effective_iso,
+                "pendingPlanKey": target_plan.key,
+                "pendingPlanDate": effective_iso,
+            }
+        is_definitive_rejection = isinstance(exc, ValueError)
+        if not is_definitive_rejection:
+            # Ambiguous — including delayed-commit scenarios where the
+            # write lands AFTER our re-read. Preserve the Stripe
+            # schedule, log the id, return reconciliation-required.
+            logger.warning(
+                "change_plan_persist_uncertain_preserving_schedule "
+                "org=%s sched=%s reread_failed=%s: %s",
+                body.orgId, schedule_id, reread_failed, exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="billing_reconciliation_required",
+            ) from exc
+        # Definitively rejected by the store. If the re-read itself
+        # failed we still release — the rejection means no delayed
+        # commit will land.
         if schedule_id:
             try:
                 client.cancel_subscription_schedule(schedule_id=schedule_id)
@@ -1336,10 +1628,6 @@ def change_plan(
                     "org=%s sched=%s: %s",
                     body.orgId, schedule_id, compensate_exc,
                 )
-        # Local pending fields now accurately reflect either (a) the
-        # just-released prior (which we also released at the top, so
-        # effectively "nothing pending"), or (b) nothing — both match
-        # Stripe after the compensating release.
         if prior_released_or_absent and prior_schedule_id:
             try:
                 multichurch_store.patch_org_billing_fields(
@@ -1362,7 +1650,10 @@ def change_plan(
                     "change_plan_clear_local_pending_after_persist_failure_failed "
                     "org=%s: %s", body.orgId, clear_exc,
                 )
-        raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc) or "billing_profile_update_failed",
+        ) from exc
 
     effective_iso = period_end_dt.isoformat()
     _send_billing_email("plan_changed", org_id=body.orgId, plan_key=target_plan.key, old_plan_key=current_plan_key, effective=effective_iso)

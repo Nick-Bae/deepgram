@@ -318,10 +318,11 @@ class StripeBillingClient:
                 self._release_schedule_best_effort(schedule_id)
             else:
                 # Not a payload-validation rejection — preserve the
-                # schedule and log the id so an operator can
-                # reconcile out-of-band. Covers 409 state conflicts,
-                # 429 lock_timeout / rate-limit, 5xx, network errors,
-                # and any non-invalid_request_error 400.
+                # schedule and surface its id on the exception so the
+                # caller can reconcile it into local state. Covers 409
+                # state conflicts, 429 lock_timeout / rate-limit, 5xx,
+                # network errors, and any non-invalid_request_error 400.
+                step2_exc.preserved_schedule_id = schedule_id
                 logger.warning(
                     "stripe_schedule_update_uncertain "
                     "schedule_id=%s http_status=%s err_type=%s err_code=%s "
@@ -359,6 +360,17 @@ class StripeBillingClient:
         if not clean_id:
             raise StripeClientError("stripe_schedule_id_missing")
         return self._request("POST", f"/subscription_schedules/{clean_id}/release")
+
+    def retrieve_subscription_schedule(self, *, schedule_id: str) -> Dict[str, Any]:
+        """Retrieve a Stripe subscription_schedule by id. Used by the
+        change_plan route to verify a preserved schedule's actual
+        phases (target price and effective date) before adopting it
+        into local pending state — subscription attachment alone
+        proves neither."""
+        clean_id = str(schedule_id or "").strip()
+        if not clean_id:
+            raise StripeClientError("stripe_schedule_id_missing")
+        return self._request("GET", f"/subscription_schedules/{clean_id}")
 
     def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> Dict[str, Any]:
         clean_customer_id = str(customer_id or "").strip()

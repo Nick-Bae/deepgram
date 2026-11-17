@@ -1261,6 +1261,669 @@ class M1_RepeatedChangePlanAttempts(_AuditBase):
 
 
 # ---------------------------------------------------------------------------
+# M1b — PR #54 follow-up: input validation before mutation, client-preserved
+# schedule reconciliation, happy-path CAS, verify-before-release on Firestore
+# error.
+# ---------------------------------------------------------------------------
+
+class M1b_ChangePlanFailurePathRegressions(_AuditBase):
+    """Four regression tests covering the PR #54 review findings:
+      1. Missing `current_period_end` is caught BEFORE the prior
+         schedule is released — the subscription must not be left with
+         no attached schedule and no pending downgrade.
+      2. An uncertain step-2 outcome (client preserves step-1 schedule)
+         is reconciled into local pending state so the next change_plan
+         release-before-create path recognizes ownership instead of
+         deadlocking on 409 schedule_attached_externally.
+      3. A Firestore persist failure whose write actually committed
+         server-side is detected via re-read and treated as success —
+         the Stripe-side schedule is NOT released.
+      4. A Firestore CAS mismatch (concurrent writer) on the happy-path
+         persist triggers a compensating Stripe release and returns 409
+         `billing_state_changed`.
+    """
+
+    def _seed_billing(self, org_id: str, *, prior_schedule_id: Optional[str]) -> None:
+        billing = self.store.get_org_billing_profile(org_id=org_id)
+        billing["stripeCustomerId"] = "cus_m1b"
+        billing["stripeSubscriptionId"] = "sub_m1b"
+        billing["status"] = "active"
+        billing["planKey"] = "growth"
+        if prior_schedule_id:
+            billing["pendingScheduleId"] = prior_schedule_id
+            billing["pendingPlanKey"] = "starter"
+        self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+    def test_missing_current_period_end_is_caught_before_prior_release(self) -> None:
+        """Validate the downgrade inputs BEFORE releasing the prior.
+        If Stripe returns a subscription without `current_period_end`,
+        the route must raise 502 WITHOUT having touched the prior
+        schedule on Stripe — the subscription stays in its current
+        state and the caller can retry safely."""
+        released: List[str] = []
+
+        class _NoPeriodEndClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                # current_period_end intentionally absent / falsy.
+                return {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": int(time.time()),
+                    "current_period_end": None,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, **_kw):
+                raise AssertionError(
+                    "create_subscription_schedule reached despite missing current_period_end"
+                )
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _NoPeriodEndClient()):
+            org_id = self._bootstrap_owner(uid="owner-m1b-np", slug="m1b-np-church", name="M1b NP Church")
+            self._seed_billing(org_id, prior_schedule_id="sub_sched_m1b_np_prior")
+
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1b-np"),
+                )
+            self.assertEqual(cm.exception.status_code, 502)
+            self.assertEqual(cm.exception.detail, "stripe_update_failed")
+
+        # CRITICAL: prior schedule was NOT released. The subscription
+        # still has its original schedule attached on Stripe; local
+        # pending state is unchanged.
+        self.assertEqual(
+            released, [],
+            "prior schedule MUST NOT be released when current_period_end validation fails — "
+            "releasing would leave the sub with no schedule and no pending state"
+        )
+        after = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(after.get("pendingScheduleId"), "sub_sched_m1b_np_prior")
+        self.assertEqual(after.get("pendingPlanKey"), "starter")
+
+    def test_uncertain_step2_adopts_preserved_schedule_into_pending_state(self) -> None:
+        """When the stripe client preserves a step-1 schedule after an
+        uncertain step-2 (409/429/5xx/network), the route must adopt
+        that schedule id into local pending state so the next
+        change_plan sees ownership and uses release-before-create
+        instead of returning 409 schedule_attached_externally.
+
+        Verification chain: client raises StripeClientError with
+        `preserved_schedule_id` attribute; route re-retrieves the sub
+        and confirms `subscription.schedule == preserved_id`; route
+        retrieves the schedule itself and confirms phases/target
+        price/effective date; route persists preserved_id as
+        pendingScheduleId with CAS-gate."""
+        released: List[str] = []
+        now_ts = int(time.time())
+        target_end = now_ts + 30 * 86400
+
+        class _PreservePathClient(_FakeStripeClient):
+            calls = {"retrieve": 0}
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                self_inner.calls["retrieve"] += 1
+                base = {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": target_end,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+                if self_inner.calls["retrieve"] >= 2:
+                    base["schedule"] = "sub_sched_m1b_preserved"
+                return base
+            def retrieve_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                # Valid 2-phase schedule with correct target and date.
+                return {
+                    "id": schedule_id, "status": "not_started",
+                    "subscription": "sub_m1b",
+                    "phases": [
+                        {"start_date": now_ts, "end_date": target_end,
+                         "items": [{"price": {"id": "price_growth"}, "quantity": 1}]},
+                        {"start_date": target_end,
+                         "items": [{"price": {"id": "price_starter"}, "quantity": 1}]},
+                    ],
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                exc = StripeClientError(
+                    "stripe_http_503:service_unavailable",
+                    http_status=503,
+                    stripe_error_type="api_error",
+                )
+                exc.preserved_schedule_id = "sub_sched_m1b_preserved"
+                raise exc
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _PreservePathClient()):
+            org_id = self._bootstrap_owner(uid="owner-m1b-pr", slug="m1b-pr-church", name="M1b PR Church")
+            self._seed_billing(org_id, prior_schedule_id=None)
+
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1b-pr"),
+                )
+            self.assertEqual(cm.exception.status_code, 502)
+            self.assertEqual(cm.exception.detail, "stripe_schedule_failed")
+
+        # The preserved schedule is now persisted locally; the next
+        # change_plan can release it and create a fresh one.
+        after = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(
+            after.get("pendingScheduleId"), "sub_sched_m1b_preserved",
+            "preserved schedule id MUST be adopted into local pending state so "
+            "next change_plan recognizes ownership via release-before-create"
+        )
+        self.assertEqual(after.get("pendingPlanKey"), "starter")
+        self.assertEqual(
+            released, [],
+            "preserve path must not release the schedule — the client held it intentionally"
+        )
+
+    def test_uncertain_step2_schedule_has_only_growth_phase_is_not_adopted(self) -> None:
+        """Step 2 failed before phases were applied. The schedule on
+        Stripe is attached to the subscription but only has phase[0]
+        (the current Growth phase from `from_subscription`); phase[1]
+        with the target Starter price is absent. Adopting this id as
+        a pending downgrade would be a lie — the schedule wouldn't
+        actually downgrade anything. Route must log and leave
+        Stripe-side alone (no adopt, no release)."""
+        released: List[str] = []
+        now_ts = int(time.time())
+        target_end = now_ts + 30 * 86400
+
+        class _StepTwoNeverRanClient(_FakeStripeClient):
+            calls = {"retrieve": 0}
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                self_inner.calls["retrieve"] += 1
+                base = {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": target_end,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+                if self_inner.calls["retrieve"] >= 2:
+                    base["schedule"] = "sub_sched_m1b_growth_only"
+                return base
+            def retrieve_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                # Step-1-only: phases[] has JUST the current Growth
+                # phase; phase[1] never set because step 2 failed.
+                return {
+                    "id": schedule_id, "status": "not_started",
+                    "subscription": "sub_m1b",
+                    "phases": [
+                        {"start_date": now_ts, "end_date": target_end,
+                         "items": [{"price": {"id": "price_growth"}, "quantity": 1}]},
+                    ],
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                exc = StripeClientError(
+                    "stripe_http_503:service_unavailable",
+                    http_status=503,
+                    stripe_error_type="api_error",
+                )
+                exc.preserved_schedule_id = "sub_sched_m1b_growth_only"
+                raise exc
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _StepTwoNeverRanClient()):
+            org_id = self._bootstrap_owner(uid="owner-m1b-go", slug="m1b-go-church", name="M1b GO Church")
+            self._seed_billing(org_id, prior_schedule_id=None)
+
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1b-go"),
+                )
+            self.assertEqual(cm.exception.status_code, 502)
+            self.assertEqual(cm.exception.detail, "stripe_schedule_failed")
+
+        after = self.store.get_org_billing_profile(org_id=org_id)
+        # Schedule is incomplete — route must NOT record any pending
+        # downgrade. Assert all three pending-* fields are absent.
+        self.assertIn(
+            after.get("pendingScheduleId"), (None, ""),
+            "step-1-only schedule must NOT be adopted as pendingScheduleId"
+        )
+        self.assertIn(
+            after.get("pendingPlanKey"), (None, ""),
+            "step-1-only schedule must NOT be recorded as a pendingPlanKey"
+        )
+        self.assertIn(
+            after.get("pendingPlanDate"), (None, ""),
+            "step-1-only schedule must NOT be recorded as a pendingPlanDate"
+        )
+        # Route also must NOT silently release — it may be a race
+        # with a concurrent writer; leave for operator reconciliation.
+        self.assertEqual(
+            released, [],
+            "uncertain step-2 with incomplete schedule must NOT auto-release — operator reconciles"
+        )
+
+    def test_uncertain_step2_schedule_released_between_sub_and_schedule_lookup_is_not_adopted(self) -> None:
+        """Race condition: the preserved schedule is still attached
+        to the subscription when the sub-lookup happens, but it
+        gets released (by a concurrent cancel-pending, Stripe
+        cascade, or dashboard action) between that lookup and the
+        subsequent schedule-lookup. Status check catches this — a
+        released schedule is not live and MUST NOT be adopted."""
+        released: List[str] = []
+        now_ts = int(time.time())
+        target_end = now_ts + 30 * 86400
+
+        class _ScheduleReleasedMidflowClient(_FakeStripeClient):
+            calls = {"retrieve": 0}
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                self_inner.calls["retrieve"] += 1
+                base = {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": target_end,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+                if self_inner.calls["retrieve"] >= 2:
+                    # Subscription STILL shows the schedule attached at
+                    # sub-lookup time — the race is invisible here.
+                    base["schedule"] = "sub_sched_m1b_racerelease"
+                return base
+            def retrieve_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                # Between the sub-lookup and this schedule-lookup,
+                # the schedule was released. Status reflects it.
+                return {
+                    "id": schedule_id, "status": "released",
+                    "subscription": "sub_m1b",
+                    "released_at": now_ts,
+                    "phases": [
+                        {"start_date": now_ts, "end_date": target_end,
+                         "items": [{"price": {"id": "price_growth"}, "quantity": 1}]},
+                        {"start_date": target_end,
+                         "items": [{"price": {"id": "price_starter"}, "quantity": 1}]},
+                    ],
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                exc = StripeClientError(
+                    "stripe_http_503:service_unavailable",
+                    http_status=503,
+                    stripe_error_type="api_error",
+                )
+                exc.preserved_schedule_id = "sub_sched_m1b_racerelease"
+                raise exc
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _ScheduleReleasedMidflowClient()):
+            org_id = self._bootstrap_owner(uid="owner-m1b-rr2", slug="m1b-rr2-church", name="M1b RR2 Church")
+            self._seed_billing(org_id, prior_schedule_id=None)
+
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1b-rr2"),
+                )
+            self.assertEqual(cm.exception.status_code, 502)
+            self.assertEqual(cm.exception.detail, "stripe_schedule_failed")
+
+        after = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertIn(after.get("pendingScheduleId"), (None, ""),
+                      "schedule released between lookups must NOT be adopted")
+        self.assertIn(after.get("pendingPlanKey"), (None, ""),
+                      "schedule released between lookups must NOT record pendingPlanKey")
+        self.assertEqual(released, [],
+                         "already-released schedule — nothing for us to release")
+
+    def test_firestore_cas_conflict_winner_stored_same_schedule_id_preserves_and_returns_success(self) -> None:
+        """Edge: happy-path CAS fires StaleBillingPatchError but the
+        stored state turns out to reference OUR schedule id (retry /
+        idempotency / out-of-order commit). The schedule on Stripe
+        is correctly tracked locally; releasing would create a
+        divergence. Verify by re-reading stored state and treat as
+        success — no release, 200."""
+        released: List[str] = []
+        created: List[str] = []
+
+        class _CreateOkClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                sid = "sub_sched_m1b_racewin"
+                created.append(sid)
+                return {"id": sid}
+
+        from app.services.multichurch_store import StaleBillingPatchError as _Stale
+        original_patch = self.store.patch_org_billing_fields
+        done = [False]
+        def tracked_patch(*, org_id, updates, expected=None):
+            # On the happy-path persist for our schedule, actually
+            # commit the write (simulating retry/idempotent write
+            # landing) then raise StaleBillingPatchError as if a
+            # later-arriving CAS check saw the pre-write state.
+            if not done[0] and updates.get("pendingScheduleId") == "sub_sched_m1b_racewin":
+                original_patch(org_id=org_id, updates=updates, expected=None)
+                done[0] = True
+                raise _Stale(
+                    "simulated: write landed, then CAS fired post-commit",
+                    mismatches={"pendingScheduleId": (expected.get("pendingScheduleId") if expected else None, "sub_sched_m1b_racewin")},
+                )
+            return original_patch(org_id=org_id, updates=updates, expected=expected)
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _CreateOkClient()), \
+             patch.object(self.store, "patch_org_billing_fields", side_effect=tracked_patch):
+            org_id = self._bootstrap_owner(uid="owner-m1b-rw", slug="m1b-rw-church", name="M1b RW Church")
+            self._seed_billing(org_id, prior_schedule_id=None)
+
+            result = billing_routes.change_plan(
+                billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                user=self._user("owner-m1b-rw"),
+            )
+            self.assertTrue(result.get("ok"))
+            self.assertEqual(result.get("pendingPlanKey"), "starter")
+
+        self.assertEqual(
+            released, [],
+            "StaleBillingPatchError whose stored state already matches OUR schedule must NOT release"
+        )
+        self.assertEqual(len(created), 1)
+        after = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(after.get("pendingScheduleId"), "sub_sched_m1b_racewin")
+
+    def test_firestore_cas_conflict_reread_fails_preserves_schedule_and_returns_503(self) -> None:
+        """StaleBillingPatchError fires and the follow-up read-back
+        also fails. We cannot prove the stored state does NOT
+        reference our schedule, so we must NOT release it on Stripe.
+        Return 503 billing_reconciliation_required for the operator
+        to investigate; the Stripe-side schedule stays attached."""
+        released: List[str] = []
+        created: List[str] = []
+
+        class _CreateOkClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                sid = "sub_sched_m1b_rr"
+                created.append(sid)
+                return {"id": sid}
+
+        from app.services.multichurch_store import StaleBillingPatchError as _Stale
+        original_patch = self.store.patch_org_billing_fields
+
+        def tracked_patch(*, org_id, updates, expected=None):
+            if updates.get("pendingScheduleId") == "sub_sched_m1b_rr":
+                raise _Stale(
+                    "simulated CAS mismatch on happy-path persist",
+                    mismatches={"pendingScheduleId": (None, "sub_sched_rival")},
+                )
+            return original_patch(org_id=org_id, updates=updates, expected=expected)
+
+        def read_fails(*_args, **_kw):
+            raise RuntimeError("firestore_unavailable_during_reread")
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _CreateOkClient()), \
+             patch.object(self.store, "patch_org_billing_fields", side_effect=tracked_patch), \
+             patch.object(self.store, "get_org_billing_profile", side_effect=read_fails):
+            org_id_placeholder = "sbx-m1b-rr-stub"
+            # We cannot bootstrap through the route (get_org_billing_profile
+            # is patched to always fail), so bootstrap first and then
+            # start the patch.
+
+        # Second pass: bootstrap first, THEN patch reads to fail.
+        org_id = self._bootstrap_owner(uid="owner-m1b-rr", slug="m1b-rr-church", name="M1b RR Church")
+        self._seed_billing(org_id, prior_schedule_id=None)
+        original_get = self.store.get_org_billing_profile
+        reread_call = {"count": 0}
+        def get_billing_fail_after_first(org_id: str) -> Dict[str, Any]:
+            reread_call["count"] += 1
+            if reread_call["count"] == 1:
+                return original_get(org_id=org_id)
+            raise RuntimeError("firestore_unavailable_during_reread")
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _CreateOkClient()), \
+             patch.object(self.store, "patch_org_billing_fields", side_effect=tracked_patch), \
+             patch.object(self.store, "get_org_billing_profile", side_effect=get_billing_fail_after_first):
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1b-rr"),
+                )
+            self.assertEqual(cm.exception.status_code, 503)
+            self.assertEqual(cm.exception.detail, "billing_reconciliation_required")
+
+        self.assertEqual(
+            released, [],
+            "cannot verify stored state → must NOT release; operator reconciles via logs"
+        )
+        self.assertEqual(len(created), 1)
+
+    def test_firestore_persist_delayed_commit_preserves_schedule_and_returns_503(self) -> None:
+        """Delayed-commit scenario: the persist raises a transport
+        error (RuntimeError / RetryError / timeout), but the write
+        may still land server-side AFTER our handler returns. Policy:
+        preserve the Stripe schedule (do NOT release — releasing a
+        schedule whose write eventually lands would create a
+        divergence); return 503 billing_reconciliation_required so
+        the operator can verify. Contrast this with the ValueError
+        path: a ValueError is a definitive store-side rejection, so
+        release is safe there."""
+        released: List[str] = []
+        created: List[str] = []
+
+        class _CreateOkClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                sid = f"sub_sched_m1b_delayed_{len(created) + 1}"
+                created.append(sid)
+                return {"id": sid}
+
+        original_patch = self.store.patch_org_billing_fields
+        def tracked_patch(*, org_id, updates, expected=None):
+            # Simulate delayed commit: raise a transport-layer error.
+            # DO NOT actually commit in this test path — the handler's
+            # re-read will therefore see no stored schedule, which is
+            # the exact scenario where a later retry could still land.
+            if updates.get("pendingScheduleId") and \
+               str(updates.get("pendingScheduleId")).startswith("sub_sched_m1b_delayed_"):
+                raise RuntimeError("firestore_timeout_write_might_land_later")
+            return original_patch(org_id=org_id, updates=updates, expected=expected)
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _CreateOkClient()), \
+             patch.object(self.store, "patch_org_billing_fields", side_effect=tracked_patch):
+            org_id = self._bootstrap_owner(uid="owner-m1b-dc", slug="m1b-dc-church", name="M1b DC Church")
+            self._seed_billing(org_id, prior_schedule_id=None)
+
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1b-dc"),
+                )
+            self.assertEqual(cm.exception.status_code, 503)
+            self.assertEqual(cm.exception.detail, "billing_reconciliation_required")
+
+        # Stripe-side schedule stays attached (NO compensating release).
+        self.assertEqual(
+            released, [],
+            "transport-layer persist error MUST NOT release — delayed commit may still land"
+        )
+        self.assertEqual(len(created), 1)
+
+    def test_firestore_persist_error_but_write_committed_treated_as_success(self) -> None:
+        """When the persist raises but the write ACTUALLY committed
+        server-side (write-side timeout, retry exhaustion after
+        commit), the route verifies by re-reading the billing
+        profile. If stored pendingScheduleId matches what we wrote,
+        we return success and do NOT release the Stripe schedule —
+        releasing would create the inverse divergence."""
+        released: List[str] = []
+        created: List[str] = []
+
+        class _CreateOkClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                sid = f"sub_sched_m1b_committed_{len(created) + 1}"
+                created.append(sid)
+                return {"id": sid}
+
+        original_patch = self.store.patch_org_billing_fields
+        def tracked_patch(*, org_id, updates, expected=None):
+            # Simulate: the write actually committed server-side,
+            # but the client then raised a transport-layer exception
+            # (e.g. RetryError after successful commit). Perform the
+            # write, then raise a non-ValueError.
+            if updates.get("pendingScheduleId") and \
+               str(updates.get("pendingScheduleId")).startswith("sub_sched_m1b_committed_"):
+                original_patch(org_id=org_id, updates=updates, expected=expected)
+                raise RuntimeError("firestore_retry_exhausted_after_commit")
+            return original_patch(org_id=org_id, updates=updates, expected=expected)
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _CreateOkClient()), \
+             patch.object(self.store, "patch_org_billing_fields", side_effect=tracked_patch):
+            org_id = self._bootstrap_owner(uid="owner-m1b-cmt", slug="m1b-cmt-church", name="M1b CMT Church")
+            self._seed_billing(org_id, prior_schedule_id=None)
+
+            result = billing_routes.change_plan(
+                billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                user=self._user("owner-m1b-cmt"),
+            )
+            self.assertTrue(result.get("ok"))
+            self.assertEqual(result.get("pendingPlanKey"), "starter")
+
+        # Stripe-side schedule stays attached (NO compensating release).
+        self.assertEqual(
+            released, [],
+            "Firestore error whose write committed MUST NOT release the Stripe schedule"
+        )
+        self.assertEqual(len(created), 1)
+        after = self.store.get_org_billing_profile(org_id=org_id)
+        self.assertEqual(after.get("pendingScheduleId"), created[0])
+        self.assertEqual(after.get("pendingPlanKey"), "starter")
+
+    def test_firestore_cas_conflict_on_persist_releases_new_schedule_and_returns_409(self) -> None:
+        """When a concurrent writer committed a different pending
+        state between our billing read and the happy-path persist,
+        the CAS-gated patch raises StaleBillingPatchError. Our
+        just-created Stripe schedule is an orphan — we must release
+        it and return 409 so the caller retries against fresh state."""
+        released: List[str] = []
+        created: List[str] = []
+
+        class _CreateOkClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_m1b",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_m1b", "price": {"id": "price_growth"}}]},
+                }
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                released.append(schedule_id)
+                return {"id": schedule_id, "status": "released"}
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix, metadata=None):
+                sid = f"sub_sched_m1b_cas_{len(created) + 1}"
+                created.append(sid)
+                return {"id": sid}
+
+        from app.services.multichurch_store import StaleBillingPatchError as _Stale
+        original_patch = self.store.patch_org_billing_fields
+        fail_on_happy_path = [True]
+        def tracked_patch(*, org_id, updates, expected=None):
+            # Only the happy-path persist (which writes pendingScheduleId
+            # with expected=prior) should trigger the simulated CAS
+            # miss. The compensating clear-on-prior uses different
+            # expected values and should proceed normally.
+            if fail_on_happy_path[0] and expected is not None and \
+               "pendingScheduleId" in (expected or {}) and \
+               updates.get("pendingScheduleId") and \
+               str(updates.get("pendingScheduleId")).startswith("sub_sched_m1b_cas_"):
+                fail_on_happy_path[0] = False
+                raise _Stale(
+                    "simulated concurrent writer committed between read and happy-path persist",
+                    mismatches={"pendingScheduleId": (expected.get("pendingScheduleId"), "sub_sched_rival")},
+                )
+            return original_patch(org_id=org_id, updates=updates, expected=expected)
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _CreateOkClient()), \
+             patch.object(self.store, "patch_org_billing_fields", side_effect=tracked_patch):
+            org_id = self._bootstrap_owner(uid="owner-m1b-cas", slug="m1b-cas-church", name="M1b CAS Church")
+            self._seed_billing(org_id, prior_schedule_id=None)
+
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1b-cas"),
+                )
+            self.assertEqual(cm.exception.status_code, 409)
+            self.assertEqual(cm.exception.detail, "billing_state_changed")
+
+        # Our just-created schedule was released so Stripe-side no
+        # longer holds our orphan.
+        self.assertEqual(len(created), 1)
+        self.assertEqual(
+            released, [created[0]],
+            "CAS mismatch on happy-path persist MUST release the just-created Stripe schedule"
+        )
+
+
+# ---------------------------------------------------------------------------
 # M4 — corrected: labeled missing-metadata / unknown-customer edge case.
 # ---------------------------------------------------------------------------
 
