@@ -562,20 +562,20 @@ class H5b_ConcurrentDeliveryGetsConflict(_AuditBase):
 # ---------------------------------------------------------------------------
 
 class M1_RepeatedChangePlanAttempts(_AuditBase):
-    """CORRECTED (previously overstated): a repeated downgrade call
-    attempts to create a new Stripe schedule each time; local billing
-    only tracks the latest schedule id. Whether Stripe actually CREATES a
-    second schedule depends on Stripe-side existing-schedule constraints
-    (Stripe refuses `/subscription_schedules?from_subscription=` when a
-    non-released schedule already exists on that subscription). This
-    test only probes our LOCAL behavior: no release call is made before
-    the second attempt. The Stripe-side outcome is a sandbox question.
+    """UPDATED post-fix (fix/billing-change-plan-release-prior-schedule):
+    `change_plan`'s downgrade branch now releases any prior
+    `pendingScheduleId` BEFORE creating a new schedule, so Stripe's
+    refusal of a second `from_subscription=` create on the same
+    subscription cannot surface as a user-facing `stripe_schedule_failed`
+    on a repeat click.
+
+    These tests assert LOCAL behavior. The Stripe-side outcome is
+    covered by Scenario 5 of the sandbox plan when `--mode sandbox`
+    runs; the fix makes that sandbox run succeed where previously it
+    would 502.
     """
 
-    def test_second_downgrade_attempt_fires_without_releasing_prior(self) -> None:
-        released: List[str] = []
-        created: List[str] = []
-
+    def _make_tracking_client(self, released, created, create_returns=None):
         class _TrackingClient(_FakeStripeClient):
             def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
                 now_ts = int(time.time())
@@ -598,7 +598,13 @@ class M1_RepeatedChangePlanAttempts(_AuditBase):
                 released.append(schedule_id)
                 return {"id": schedule_id, "status": "released"}
 
-        with patch.object(billing_routes, "_stripe_client", lambda: _TrackingClient()):
+        return _TrackingClient()
+
+    def test_second_downgrade_attempt_releases_prior_schedule_before_new_create(self) -> None:
+        released: List[str] = []
+        created: List[str] = []
+
+        with patch.object(billing_routes, "_stripe_client", lambda: self._make_tracking_client(released, created)):
             org_id = self._bootstrap_owner(uid="owner-m1", slug="m1-church", name="M1 Church")
             billing = self.store.get_org_billing_profile(org_id=org_id)
             billing["stripeCustomerId"] = "cus_m1"
@@ -614,10 +620,159 @@ class M1_RepeatedChangePlanAttempts(_AuditBase):
                 billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
                 user=self._user("owner-m1"),
             )
-        self.assertEqual(len(created), 2)
-        self.assertEqual(released, [],
-                         "no release call made — Stripe may itself refuse the second create "
-                         "(sandbox-only question), but LOCALLY we don't gate")
+
+        # Fix contract: prior schedule MUST be released before a new one
+        # is created. First call creates sched_1 with no prior to release.
+        # Second call finds pendingScheduleId=sched_1 and releases it.
+        self.assertEqual(len(created), 2, "two create calls expected")
+        self.assertEqual(
+            released, ["sub_sched_m1_1"],
+            "exactly the prior schedule must be released; second create must not stack a schedule",
+        )
+
+    def test_first_downgrade_attempt_does_not_call_release(self) -> None:
+        """A fresh org with no prior pendingScheduleId must not call
+        cancel on the first downgrade. Only the second+ attempts (or a
+        changed-target re-request) have anything to release."""
+        released: List[str] = []
+        created: List[str] = []
+
+        with patch.object(billing_routes, "_stripe_client", lambda: self._make_tracking_client(released, created)):
+            org_id = self._bootstrap_owner(uid="owner-m1-first", slug="m1-first-church", name="M1 First Church")
+            billing = self.store.get_org_billing_profile(org_id=org_id)
+            billing["stripeCustomerId"] = "cus_m1_first"
+            billing["stripeSubscriptionId"] = "sub_m1_first"
+            billing["status"] = "active"
+            billing["planKey"] = "growth"
+            # NOTE: no pendingScheduleId — a fresh downgrade attempt.
+            self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+            billing_routes.change_plan(
+                billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                user=self._user("owner-m1-first"),
+            )
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(released, [], "no prior schedule → no release call")
+
+    def test_changed_target_release_prior_then_create_new(self) -> None:
+        """Changed-target case: user changes mind from Starter to a
+        different downgrade target before the first schedule's end. The
+        prior (Starter) schedule must be released; the new target gets
+        the fresh schedule."""
+        released: List[str] = []
+        created: List[str] = []
+
+        with patch.object(billing_routes, "_stripe_client", lambda: self._make_tracking_client(released, created)):
+            org_id = self._bootstrap_owner(uid="owner-m1-ch", slug="m1-ch-church", name="M1 Ch Church")
+            billing = self.store.get_org_billing_profile(org_id=org_id)
+            billing["stripeCustomerId"] = "cus_m1_ch"
+            billing["stripeSubscriptionId"] = "sub_m1_ch"
+            billing["status"] = "active"
+            billing["planKey"] = "premium"
+            self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+            # First: Premium → Growth (downgrade).
+            billing_routes.change_plan(
+                billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="growth"),
+                user=self._user("owner-m1-ch"),
+            )
+            # Second: user changes their mind → Premium → Starter instead.
+            billing_routes.change_plan(
+                billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                user=self._user("owner-m1-ch"),
+            )
+
+        self.assertEqual(len(created), 2, "both targets get a schedule created")
+        self.assertEqual(
+            released, ["sub_sched_m1_1"],
+            "the Growth-target prior schedule was released before the Starter one was created",
+        )
+
+    def test_release_terminal_prior_schedule_is_swallowed(self) -> None:
+        """Idempotence guarantee: if the prior schedule is already
+        released (e.g. a webhook cancelled it between our billing read
+        and this call), the terminal-shape Stripe error is swallowed
+        and the new schedule is created. Repeated clicks or races must
+        not leave the caller stuck."""
+        created: List[str] = []
+
+        class _AlreadyReleasedClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_m1_rel",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_m1", "price": {"id": "price_growth"}}]},
+                }
+            def create_subscription_schedule(self_inner, *, subscription_id, current_price_id,
+                                              new_price_id, phase_end_unix):
+                sid = f"sub_sched_m1_rel_{len(created) + 1}"
+                created.append(sid)
+                return {"id": sid}
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                # Stripe's exact text for cancelling an already-released schedule.
+                raise StripeClientError(
+                    "stripe_http_400:You cannot release a subscription schedule that is not currently active."
+                )
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _AlreadyReleasedClient()):
+            org_id = self._bootstrap_owner(uid="owner-m1-rel", slug="m1-rel-church", name="M1 Rel Church")
+            billing = self.store.get_org_billing_profile(org_id=org_id)
+            billing["stripeCustomerId"] = "cus_m1_rel"
+            billing["stripeSubscriptionId"] = "sub_m1_rel"
+            billing["status"] = "active"
+            billing["planKey"] = "growth"
+            # Preload a prior pendingScheduleId that is already released on Stripe.
+            billing["pendingScheduleId"] = "sub_sched_m1_rel_prior"
+            billing["pendingPlanKey"] = "starter"
+            self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+            # Must NOT raise 502; must create the new schedule.
+            billing_routes.change_plan(
+                billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                user=self._user("owner-m1-rel"),
+            )
+        self.assertEqual(len(created), 1, "new schedule is created despite terminal release error on prior")
+
+    def test_release_unknown_error_bubbles_as_stripe_schedule_failed(self) -> None:
+        """A NON-terminal error on release (e.g. 500 internal) must NOT
+        be swallowed — it bubbles up as `stripe_schedule_failed` so the
+        caller doesn't silently proceed over a backend issue."""
+        class _ReleaseFailsClient(_FakeStripeClient):
+            def retrieve_subscription(self_inner, *, subscription_id: str) -> Dict[str, Any]:
+                now_ts = int(time.time())
+                return {
+                    "id": subscription_id, "customer": "cus_m1_err",
+                    "status": "active", "cancel_at_period_end": False,
+                    "current_period_start": now_ts,
+                    "current_period_end": now_ts + 30 * 86400,
+                    "items": {"data": [{"id": "si_m1", "price": {"id": "price_growth"}}]},
+                }
+            def create_subscription_schedule(self_inner, **kw):
+                raise AssertionError("must not reach create after unknown release failure")
+            def cancel_subscription_schedule(self_inner, *, schedule_id: str) -> Dict[str, Any]:
+                raise StripeClientError("stripe_http_500:internal_error")
+
+        with patch.object(billing_routes, "_stripe_client", lambda: _ReleaseFailsClient()):
+            org_id = self._bootstrap_owner(uid="owner-m1-err", slug="m1-err-church", name="M1 Err Church")
+            billing = self.store.get_org_billing_profile(org_id=org_id)
+            billing["stripeCustomerId"] = "cus_m1_err"
+            billing["stripeSubscriptionId"] = "sub_m1_err"
+            billing["status"] = "active"
+            billing["planKey"] = "growth"
+            billing["pendingScheduleId"] = "sub_sched_m1_err_prior"
+            billing["pendingPlanKey"] = "starter"
+            self.store.set_org_billing_profile(org_id=org_id, billing=billing)
+
+            with self.assertRaises(HTTPException) as cm:
+                billing_routes.change_plan(
+                    billing_routes.ChangePlanRequest(orgId=org_id, targetPlanKey="starter"),
+                    user=self._user("owner-m1-err"),
+                )
+        self.assertEqual(cm.exception.status_code, 502)
+        self.assertEqual(cm.exception.detail, "stripe_schedule_failed")
 
 
 # ---------------------------------------------------------------------------

@@ -188,6 +188,35 @@ def _is_missing_subscription_error(exc: StripeClientError) -> bool:
     return "no such subscription" in token or ("subscription" in token and "not found" in token)
 
 
+def _is_schedule_already_terminal_error(exc: StripeClientError) -> bool:
+    """True iff cancelling (releasing) a subscription schedule returned
+    an error indicating the schedule is already terminal — i.e.
+    nothing further needs to be done to release it:
+
+      - already in `released` / `canceled` / `completed` state;
+      - the schedule id does not exist on Stripe.
+
+    Used by `change_plan` to make the release-before-new-create step
+    idempotent against races (a webhook may have released the prior
+    schedule between our billing read and this call).
+    """
+    token = _clean(str(exc)).lower()
+    if not token:
+        return False
+    if "no such subscription_schedule" in token:
+        return True
+    if "subscription schedule" in token and ("not found" in token):
+        return True
+    for state in ("released", "canceled", "cancelled", "completed"):
+        if f"in a `{state}` state" in token or f"in {state} state" in token or f"already {state}" in token:
+            return True
+    # Stripe's exact text: "You cannot release a subscription schedule
+    # that is not currently active."
+    if "not currently active" in token and "subscription schedule" in token:
+        return True
+    return False
+
+
 def _status_from_stripe(raw_status: str, *, fallback_status: str) -> str:
     token = _clean(raw_status).lower()
     if token in {"trialing", "active", "past_due", "canceled", "incomplete", "unpaid"}:
@@ -1162,7 +1191,37 @@ def change_plan(
         _send_billing_email("plan_changed", org_id=body.orgId, plan_key=target_plan.key, old_plan_key=current_plan_key, effective="immediate")
         return {"ok": True, "effective": "immediate", "pendingPlanKey": None, "pendingPlanDate": None}
 
-    # Downgrade: create subscription schedule for period end
+    # Downgrade: create subscription schedule for period end.
+    # M1 fix: Stripe refuses `/subscription_schedules?from_subscription=`
+    # when a non-released schedule already exists on that subscription.
+    # If we have a prior `pendingScheduleId` tracked locally (e.g. from a
+    # customer who clicked Downgrade twice, or changed their mind on the
+    # target plan), release it FIRST so the create can succeed. The
+    # release is idempotent against races — a webhook that already
+    # released it, or a schedule that no longer exists on Stripe, yields
+    # a terminal-shape error that we swallow. Any other error bubbles up
+    # as `stripe_schedule_failed` (existing contract).
+    prior_schedule_id = _clean(billing.get("pendingScheduleId"))
+    if prior_schedule_id:
+        try:
+            client.cancel_subscription_schedule(schedule_id=prior_schedule_id)
+        except StripeClientError as release_exc:
+            if _is_schedule_already_terminal_error(release_exc):
+                logger.info(
+                    "change_plan_prior_schedule_already_terminal "
+                    "org=%s sched=%s: %s",
+                    body.orgId, prior_schedule_id, release_exc,
+                )
+            else:
+                logger.warning(
+                    "change_plan_release_prior_schedule_failed "
+                    "org=%s sched=%s: %s",
+                    body.orgId, prior_schedule_id, release_exc,
+                )
+                raise HTTPException(
+                    status_code=502, detail="stripe_schedule_failed",
+                ) from release_exc
+
     current_price_id = _clean_price_id(_price_id_from_subscription(subscription))
     period_end_unix = subscription.get("current_period_end")
     period_end_dt = _to_datetime(period_end_unix)
