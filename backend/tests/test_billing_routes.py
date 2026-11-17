@@ -104,12 +104,6 @@ class _FakeStripeClient:
             ]
         }
 
-    def list_subscription_schedules(self, *, subscription_id: str, limit: int = 100) -> dict:
-        # Default: no active schedules on the subscription. Tests that
-        # exercise orphan reconciliation override this to return the
-        # specific shape they need.
-        return {"data": []}
-
 
 class BillingRouteTests(unittest.TestCase):
     def setUp(self) -> None:

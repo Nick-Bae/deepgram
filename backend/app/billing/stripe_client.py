@@ -157,8 +157,17 @@ class StripeBillingClient:
         current_price_id: str,
         new_price_id: str,
         phase_end_unix: int,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Create a two-phase schedule: current plan until phase_end_unix, then new plan."""
+        """Create a two-phase schedule: current plan until phase_end_unix, then new plan.
+
+        `metadata` is stamped on the schedule at create time. Callers
+        use it to tie future reads of `subscription.schedule` back to
+        the app operation that wrote it (per operator review of the
+        M1 reconcile logic — list-by-subscription was undocumented; a
+        subscription has at most one attached schedule exposed as
+        `subscription.schedule`).
+        """
         clean_sub_id = str(subscription_id or "").strip()
         if not clean_sub_id:
             raise StripeClientError("stripe_subscription_id_missing")
@@ -171,7 +180,7 @@ class StripeBillingClient:
         schedule_id = str((schedule or {}).get("id") or "").strip()
         if not schedule_id:
             raise StripeClientError("stripe_schedule_create_failed")
-        # Step 2: update schedule with two explicit phases
+        # Step 2: update schedule with two explicit phases + metadata
         phase_payload: Dict[str, Any] = {
             "end_behavior": "release",
             "phases[0][items][0][price]": str(current_price_id or "").strip(),
@@ -180,6 +189,8 @@ class StripeBillingClient:
             "phases[1][items][0][price]": str(new_price_id or "").strip(),
             "phases[1][items][0][quantity]": "1",
         }
+        for key, value in (metadata or {}).items():
+            phase_payload[f"metadata[{key}]"] = str(value)
         return self._request("POST", f"/subscription_schedules/{schedule_id}", data=phase_payload)
 
     def cancel_subscription_schedule(self, *, schedule_id: str) -> Dict[str, Any]:
@@ -188,31 +199,6 @@ class StripeBillingClient:
         if not clean_id:
             raise StripeClientError("stripe_schedule_id_missing")
         return self._request("POST", f"/subscription_schedules/{clean_id}/release")
-
-    def list_subscription_schedules(
-        self,
-        *,
-        subscription_id: str,
-        limit: int = 100,
-    ) -> Dict[str, Any]:
-        """List subscription schedules attached to a subscription.
-
-        Used by `change_plan` to reconcile orphaned schedules — e.g.
-        a prior request that timed out between Stripe-side create and
-        the backend response, or a compensating release that itself
-        failed — by listing what Stripe actually holds now and
-        releasing anything the backend does not recognize before
-        creating the new schedule.
-        """
-        clean_sub_id = str(subscription_id or "").strip()
-        if not clean_sub_id:
-            raise StripeClientError("stripe_subscription_id_missing")
-        clean_limit = max(1, min(100, int(limit)))
-        return self._request(
-            "GET",
-            "/subscription_schedules",
-            params={"subscription": clean_sub_id, "limit": str(clean_limit)},
-        )
 
     def list_subscriptions(self, *, customer_id: str, status: str = "all", limit: int = 5) -> Dict[str, Any]:
         clean_customer_id = str(customer_id or "").strip()

@@ -1193,62 +1193,32 @@ def change_plan(
 
     # Downgrade: create subscription schedule for period end.
     #
-    # Reconcile step (operator review follow-up): before the normal
-    # release+create, list schedules Stripe actually holds for this
-    # subscription. Release any ACTIVE schedule whose id does NOT
-    # match our locally-tracked `pendingScheduleId` — these are
-    # orphans from an earlier attempt where the backend lost track of
-    # the Stripe-side state (e.g. create timed out between Stripe's
-    # commit and our response; or a compensating release itself
-    # failed and never retried). Without reconciliation the next
-    # create would collide with the orphan on Stripe and 502. Listing
-    # here costs one extra GET per downgrade attempt and makes
-    # retries deterministic.
+    # Attached-schedule ownership check (operator review follow-up):
+    # Stripe exposes at most one attached schedule per subscription
+    # via `subscription.schedule`. We rely on that documented field
+    # (not the undocumented `GET /subscription_schedules?subscription=`
+    # list filter). If the attached schedule differs from our
+    # locally-tracked `pendingScheduleId`, we cannot safely tie the
+    # Stripe-side schedule to THIS app operation — it could be a
+    # concurrent request still in flight from the same org, a
+    # Portal-created schedule, or an admin-created one. Operator-
+    # mandated behavior: **leave it intact and abort with 409** so
+    # the caller (or admin) can investigate. We do NOT blindly
+    # release schedules we did not create as part of the current
+    # request's traceable state.
     prior_schedule_id = _clean(billing.get("pendingScheduleId"))
-    try:
-        current_sched_list = client.list_subscription_schedules(
-            subscription_id=subscription_id,
-        )
-    except StripeClientError as list_exc:
+    attached_schedule_id = _clean(subscription.get("schedule"))
+    if attached_schedule_id and attached_schedule_id != prior_schedule_id:
         logger.warning(
-            "change_plan_list_schedules_failed org=%s sub=%s: %s",
-            body.orgId, subscription_id, list_exc,
+            "change_plan_schedule_attached_externally "
+            "org=%s sub=%s attached=%s local_prior=%s",
+            body.orgId, subscription_id, attached_schedule_id,
+            prior_schedule_id or "<none>",
         )
         raise HTTPException(
-            status_code=502, detail="stripe_schedule_failed",
-        ) from list_exc
-    orphan_schedule_ids: list[str] = []
-    for row in (current_sched_list.get("data") or []):
-        sched_id = _clean((row or {}).get("id"))
-        sched_status = _clean((row or {}).get("status")).lower()
-        if not sched_id or sched_status in {"released", "canceled", "cancelled", "completed"}:
-            continue
-        if prior_schedule_id and sched_id == prior_schedule_id:
-            continue  # known; handled by the explicit release below
-        orphan_schedule_ids.append(sched_id)
-    for orphan_id in orphan_schedule_ids:
-        try:
-            client.cancel_subscription_schedule(schedule_id=orphan_id)
-            logger.info(
-                "change_plan_orphan_schedule_released org=%s sched=%s",
-                body.orgId, orphan_id,
-            )
-        except StripeClientError as orphan_exc:
-            if _is_schedule_already_terminal_error(orphan_exc):
-                logger.info(
-                    "change_plan_orphan_schedule_already_terminal "
-                    "org=%s sched=%s: %s",
-                    body.orgId, orphan_id, orphan_exc,
-                )
-            else:
-                logger.warning(
-                    "change_plan_orphan_schedule_release_failed "
-                    "org=%s sched=%s: %s",
-                    body.orgId, orphan_id, orphan_exc,
-                )
-                raise HTTPException(
-                    status_code=502, detail="stripe_schedule_failed",
-                ) from orphan_exc
+            status_code=409,
+            detail="schedule_attached_externally",
+        )
 
     # M1 fix (release-before-create): Stripe refuses
     # `/subscription_schedules?from_subscription=` when a non-released
@@ -1294,6 +1264,7 @@ def change_plan(
             current_price_id=current_price_id or price_id,
             new_price_id=price_id,
             phase_end_unix=int(period_end_unix),
+            metadata={"orgId": body.orgId},
         )
     except StripeClientError as exc:
         logger.warning("change_plan_schedule_failed org=%s: %s", body.orgId, exc)
