@@ -1192,19 +1192,19 @@ def change_plan(
         return {"ok": True, "effective": "immediate", "pendingPlanKey": None, "pendingPlanDate": None}
 
     # Downgrade: create subscription schedule for period end.
-    # M1 fix: Stripe refuses `/subscription_schedules?from_subscription=`
-    # when a non-released schedule already exists on that subscription.
-    # If we have a prior `pendingScheduleId` tracked locally (e.g. from a
-    # customer who clicked Downgrade twice, or changed their mind on the
-    # target plan), release it FIRST so the create can succeed. The
-    # release is idempotent against races — a webhook that already
-    # released it, or a schedule that no longer exists on Stripe, yields
-    # a terminal-shape error that we swallow. Any other error bubbles up
-    # as `stripe_schedule_failed` (existing contract).
+    # M1 fix (release-before-create): Stripe refuses
+    # `/subscription_schedules?from_subscription=` when a non-released
+    # schedule already exists. If we have a prior `pendingScheduleId`
+    # tracked locally, release it FIRST. The release is idempotent
+    # against races — a terminal-shape error (already released, not
+    # found) is swallowed. Any other error bubbles up as
+    # `stripe_schedule_failed` (existing contract).
     prior_schedule_id = _clean(billing.get("pendingScheduleId"))
+    prior_released_or_absent = not prior_schedule_id  # true iff nothing to release
     if prior_schedule_id:
         try:
             client.cancel_subscription_schedule(schedule_id=prior_schedule_id)
+            prior_released_or_absent = True
         except StripeClientError as release_exc:
             if _is_schedule_already_terminal_error(release_exc):
                 logger.info(
@@ -1212,12 +1212,15 @@ def change_plan(
                     "org=%s sched=%s: %s",
                     body.orgId, prior_schedule_id, release_exc,
                 )
+                prior_released_or_absent = True
             else:
                 logger.warning(
                     "change_plan_release_prior_schedule_failed "
                     "org=%s sched=%s: %s",
                     body.orgId, prior_schedule_id, release_exc,
                 )
+                # Prior still exists on Stripe; local pending fields
+                # still correctly reference it. Nothing to clean up.
                 raise HTTPException(
                     status_code=502, detail="stripe_schedule_failed",
                 ) from release_exc
@@ -1237,10 +1240,34 @@ def change_plan(
         )
     except StripeClientError as exc:
         logger.warning("change_plan_schedule_failed org=%s: %s", body.orgId, exc)
+        # Failure window 1 (post-release, pre-create-success): Stripe
+        # has NO schedule (we just released the prior; nothing new).
+        # If we don't clear the local pending fields, the UI would
+        # say a downgrade is pending while Stripe shows nothing. Clear
+        # them so the app accurately reports its state. Caller sees
+        # 502 and retries; the retry sees no prior and creates fresh.
+        if prior_released_or_absent and prior_schedule_id:
+            try:
+                multichurch_store.patch_org_billing_fields(
+                    org_id=body.orgId,
+                    updates={
+                        "pendingPlanKey": None,
+                        "pendingPlanDate": None,
+                        "pendingScheduleId": None,
+                    },
+                )
+            except Exception as clear_exc:
+                # Record and continue to raise the 502 — the clear is
+                # best-effort; the retry path still converges because
+                # the next release call on the released prior returns
+                # a terminal-shape error and is swallowed.
+                logger.warning(
+                    "change_plan_clear_local_pending_after_create_failure_failed "
+                    "org=%s: %s", body.orgId, clear_exc,
+                )
         raise HTTPException(status_code=502, detail="stripe_schedule_failed") from exc
 
     schedule_id = _clean((schedule or {}).get("id"))
-    # Review-pass v8 gap #1: patch only the pending-plan fields.
     try:
         multichurch_store.patch_org_billing_fields(
             org_id=body.orgId,
@@ -1251,6 +1278,46 @@ def change_plan(
             },
         )
     except ValueError as exc:
+        # Failure window 2 (post-create-success, persist-failure):
+        # Stripe NOW has a fresh schedule we cannot save locally. If we
+        # just raise, the UI reports the OLD prior schedule (or
+        # nothing after the release) while Stripe holds a new orphan.
+        # Compensate by releasing the new schedule on Stripe so Stripe
+        # and local agree. Best-effort — if the compensating release
+        # also fails, log and continue to raise so the caller knows the
+        # change didn't commit.
+        if schedule_id:
+            try:
+                client.cancel_subscription_schedule(schedule_id=schedule_id)
+                logger.info(
+                    "change_plan_compensating_release_succeeded "
+                    "org=%s sched=%s", body.orgId, schedule_id,
+                )
+            except StripeClientError as compensate_exc:
+                logger.warning(
+                    "change_plan_compensating_release_failed "
+                    "org=%s sched=%s: %s",
+                    body.orgId, schedule_id, compensate_exc,
+                )
+        # Local pending fields now accurately reflect either (a) the
+        # just-released prior (which we also released at the top, so
+        # effectively "nothing pending"), or (b) nothing — both match
+        # Stripe after the compensating release.
+        if prior_released_or_absent and prior_schedule_id:
+            try:
+                multichurch_store.patch_org_billing_fields(
+                    org_id=body.orgId,
+                    updates={
+                        "pendingPlanKey": None,
+                        "pendingPlanDate": None,
+                        "pendingScheduleId": None,
+                    },
+                )
+            except Exception as clear_exc:
+                logger.warning(
+                    "change_plan_clear_local_pending_after_persist_failure_failed "
+                    "org=%s: %s", body.orgId, clear_exc,
+                )
         raise HTTPException(status_code=400, detail=str(exc) or "billing_profile_update_failed") from exc
 
     effective_iso = period_end_dt.isoformat()
